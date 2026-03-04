@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { prisma } from '@/lib/prisma';
+import { execute } from '@/lib/db';
 
 const DELETE_SQL = `
   DELETE FROM tbl_tracking
@@ -90,7 +90,7 @@ export async function POST(request: Request) {
 
     let deleted: number;
     try {
-      deleted = await prisma.$executeRawUnsafe(DELETE_SQL, ...params);
+      deleted = await execute(DELETE_SQL, params);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       // eslint-disable-next-line no-console
@@ -109,7 +109,7 @@ export async function POST(request: Request) {
 
     let inserted: number;
     try {
-      inserted = await prisma.$executeRawUnsafe(INSERT_SQL, ...params);
+      inserted = await execute(INSERT_SQL, params);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       // eslint-disable-next-line no-console

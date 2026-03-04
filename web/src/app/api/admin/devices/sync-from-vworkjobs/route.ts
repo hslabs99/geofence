@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { prisma } from '@/lib/prisma';
+import { execute, query } from '@/lib/db';
 
 /**
  * Sync devices from tbl_vworkjobs.worker into tbl_devices:
@@ -24,21 +24,21 @@ export async function POST() {
     `;
     let inserted = 0;
     try {
-      inserted = await prisma.$executeRawUnsafe(withGroup);
+      inserted = await execute(withGroup);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       if (msg.includes('"!group"') || msg.includes('!group') || msg.includes('column')) {
-        inserted = await prisma.$executeRawUnsafe(withoutGroup);
+        inserted = await execute(withoutGroup);
       } else {
         throw e;
       }
     }
 
-    const countResult = await prisma.$queryRaw<{ count: bigint }[]>`SELECT COUNT(*) AS count FROM tbl_devices`;
+    const countResult = await query<{ count: string }>('SELECT COUNT(*) AS count FROM tbl_devices');
     const totalDevices = Number(countResult[0]?.count ?? 0);
-    const workersResult = await prisma.$queryRaw<{ count: bigint }[]>`
-      SELECT COUNT(DISTINCT trim(worker)) AS count FROM tbl_vworkjobs WHERE worker IS NOT NULL AND trim(worker) <> ''
-    `;
+    const workersResult = await query<{ count: string }>(
+      "SELECT COUNT(DISTINCT trim(worker)) AS count FROM tbl_vworkjobs WHERE worker IS NOT NULL AND trim(worker) <> ''"
+    );
     const totalWorkers = Number(workersResult[0]?.count ?? 0);
 
     return NextResponse.json({

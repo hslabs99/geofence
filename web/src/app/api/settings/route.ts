@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { prisma } from '@/lib/prisma';
+import { query, execute } from '@/lib/db';
 
 export async function GET(request: Request) {
   try {
@@ -9,11 +9,10 @@ export async function GET(request: Request) {
     if (!type || !name) {
       return NextResponse.json({ error: 'type and name required' }, { status: 400 });
     }
-    const rows = await prisma.$queryRaw<{ settingvalue: string | null }[]>`
-      SELECT settingvalue FROM tbl_settings
-      WHERE type = ${type} AND settingname = ${name}
-      LIMIT 1
-    `;
+    const rows = await query<{ settingvalue: string | null }>(
+      'SELECT settingvalue FROM tbl_settings WHERE type = $1 AND settingname = $2 LIMIT 1',
+      [type, name]
+    );
     const row = rows[0];
     if (!row || row.settingvalue == null) {
       return NextResponse.json({ settingvalue: null });
@@ -37,11 +36,12 @@ export async function PUT(request: Request) {
       return NextResponse.json({ error: 'type and settingname required', received: { type, settingname: name } }, { status: 400 });
     }
     const valueStr = value == null ? null : String(value);
-    await prisma.$executeRaw`
-      INSERT INTO tbl_settings (type, settingname, settingvalue)
-      VALUES (${type}, ${name}, ${valueStr})
-      ON CONFLICT (type, settingname) DO UPDATE SET settingvalue = EXCLUDED.settingvalue
-    `;
+    await execute(
+      `INSERT INTO tbl_settings (type, settingname, settingvalue)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (type, settingname) DO UPDATE SET settingvalue = EXCLUDED.settingvalue`,
+      [type, name, valueStr]
+    );
     return NextResponse.json({ ok: true });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

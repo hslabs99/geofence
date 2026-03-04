@@ -1,11 +1,9 @@
 import { NextResponse } from 'next/server';
-import { prisma } from '@/lib/prisma';
+import { query } from '@/lib/db';
 
 export async function GET() {
   try {
-    const rows = await prisma.tblGpsmapping.findMany({
-      orderBy: { id: 'asc' },
-    });
+    const rows = await query('SELECT * FROM tbl_gpsmappings ORDER BY id ASC');
     return NextResponse.json({ rows });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -30,13 +28,12 @@ export async function POST(request: Request) {
     if (!gpsname || typeof gpsname !== 'string' || !gpsname.trim()) {
       return NextResponse.json({ error: 'gpsname required' }, { status: 400 });
     }
-    const row = await prisma.tblGpsmapping.create({
-      data: {
-        type: type.trim(),
-        vwname: vwname.trim(),
-        gpsname: gpsname.trim(),
-      },
-    });
+    const inserted = await query(
+      `INSERT INTO tbl_gpsmappings (type, vwname, gpsname) VALUES ($1, $2, $3) RETURNING *`,
+      [type.trim(), vwname.trim(), gpsname.trim()]
+    );
+    const row = inserted[0];
+    if (!row) return NextResponse.json({ error: 'Insert failed' }, { status: 500 });
     return NextResponse.json({ row });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

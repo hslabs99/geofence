@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { prisma } from '@/lib/prisma';
+import { query } from '@/lib/db';
 
 /**
  * List devices from tbl_devices (subset we want to track).
@@ -7,11 +7,9 @@ import { prisma } from '@/lib/prisma';
  */
 export async function GET() {
   try {
-    const rows = await prisma.$queryRaw<
-      Array<{ device_name: string | null }>
-    >`
-      SELECT device_name FROM tbl_devices ORDER BY device_name
-    `;
+    const rows = await query<{ device_name: string | null }>(
+      'SELECT device_name FROM tbl_devices ORDER BY device_name'
+    );
     const devices = rows
       .map((r) => ({ deviceName: r.device_name?.trim() ?? '' }))
       .filter((d) => d.deviceName);

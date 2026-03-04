@@ -4,7 +4,30 @@
  * Optional args: jobId (single job), force (ignore steps_fetched filter when loading job list).
  */
 
-/** Add deltaMinutes to a timestamp string; return YYYY-MM-DD HH:mm:ss for derived-steps API. */
+/** NZ offset in hours for position_time_nz (tbl_tracking is stored in NZ time). */
+const NZ_OFFSET_HOURS = 13;
+
+/**
+ * Parse timestamp as UTC (vworkjobs API sends dateToLiteralUTC = UTC), add NZ offset so result
+ * is comparable to position_time_nz, then add deltaMinutes. Use for positionAfter/positionBefore
+ * so the window matches tbl_tracking.position_time_nz (NZ time).
+ */
+export function addMinutesToTimestampAsNZ(ts: string, deltaMinutes: number): string {
+  const s = String(ts).trim();
+  const iso = s.includes('T') ? s : s.replace(' ', 'T') + 'Z';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return s;
+  d.setUTCMinutes(d.getUTCMinutes() + NZ_OFFSET_HOURS * 60 + deltaMinutes);
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(d.getUTCDate()).padStart(2, '0');
+  const h = String(d.getUTCHours()).padStart(2, '0');
+  const min = String(d.getUTCMinutes()).padStart(2, '0');
+  const sec = String(d.getUTCSeconds()).padStart(2, '0');
+  return `${y}-${m}-${day} ${h}:${min}:${sec}`;
+}
+
+/** Add deltaMinutes to a timestamp string (local time); return YYYY-MM-DD HH:mm:ss. Use for display only. */
 export function addMinutesToTimestamp(ts: string, deltaMinutes: number): string {
   const s = String(ts).trim();
   const d = new Date(s);
@@ -52,23 +75,29 @@ export async function runFetchStepsForJobs(options: RunFetchStepsOptions): Promi
   const log: FetchStepsLogEntry[] = [];
   let lastResult: unknown;
 
+  /** Normalize field from job (API/DB may return mixed-case keys e.g. Worker, Actual_Start_Time). */
+  const get = (j: Record<string, unknown>, ...keys: string[]): string => {
+    for (const k of keys) {
+      const v = j[k];
+      if (v != null && v !== '') return String(v).trim();
+    }
+    return '';
+  };
+
   for (let i = 0; i < jobs.length; i++) {
-    const job = jobs[i];
+    const job = jobs[i] as Record<string, unknown>;
     const jobIdStr = job.job_id != null ? String(job.job_id) : '';
-    const device = (job.worker != null ? String(job.worker).trim() : '') || (job.truck_id != null ? String(job.truck_id).trim() : '');
-    const actualStart = job.actual_start_time != null ? String(job.actual_start_time).trim() : '';
+    const device = get(job, 'worker', 'Worker') || get(job, 'truck_id', 'Truck_ID');
+    const actualStart = get(job, 'actual_start_time', 'Actual_Start_Time');
     const actualEnd =
-      job.actual_end_time != null
-        ? String(job.actual_end_time).trim()
-        : job.gps_end_time != null
-          ? String(job.gps_end_time).trim()
-          : '';
+      get(job, 'actual_end_time', 'Actual_End_Time') ||
+      get(job, 'gps_end_time', 'Gps_End_Time');
 
     if (!device || !actualStart) {
       log.push({ job_id: jobIdStr || '?', status: 'skip', message: 'no worker (device_name) or actual_start_time' });
     } else {
-      const positionAfter = addMinutesToTimestamp(actualStart, -startLessMinutes);
-      const positionBefore = actualEnd ? addMinutesToTimestamp(actualEnd, endPlusMinutes) : '';
+      const positionAfter = addMinutesToTimestampAsNZ(actualStart, -startLessMinutes);
+      const positionBefore = actualEnd ? addMinutesToTimestampAsNZ(actualEnd, endPlusMinutes) : '';
       const params = new URLSearchParams({ jobId: jobIdStr, device, positionAfter });
       if (positionBefore) params.set('positionBefore', positionBefore);
       params.set('writeBack', '1');

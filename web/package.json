@@ -4,18 +4,14 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
-    "build": "prisma generate && next build --webpack && node scripts/fix-standalone.mjs",
+    "build": "next build --webpack && node scripts/fix-standalone.mjs",
     "start": "next start",
-    "lint": "eslint",
-    "postinstall": "prisma generate"
+    "lint": "eslint"
   },
   "dependencies": {
-    "@prisma/adapter-pg": "^6.9.0",
-    "@prisma/client": "^6.9.0",
     "bcryptjs": "^3.0.3",
     "pg": "^8.13.0",
     "next": "16.1.6",
-    "prisma": "^6.9.0",
     "react": "19.2.3",
     "react-dom": "19.2.3"
   },

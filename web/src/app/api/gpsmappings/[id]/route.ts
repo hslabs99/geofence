@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { prisma } from '@/lib/prisma';
+import { query, execute } from '@/lib/db';
 
 export async function PUT(
   request: Request,
@@ -24,10 +24,15 @@ export async function PUT(
     if (Object.keys(data).length === 0) {
       return NextResponse.json({ error: 'Nothing to update' }, { status: 400 });
     }
-    const row = await prisma.tblGpsmapping.update({
-      where: { id: rowId },
-      data,
-    });
+    const setClause = Object.keys(data).map((k, i) => `"${k}" = $${i + 1}`).join(', ');
+    const values: unknown[] = Object.values(data);
+    values.push(rowId);
+    const updated = await query(
+      `UPDATE tbl_gpsmappings SET ${setClause} WHERE id = $${values.length} RETURNING *`,
+      values
+    );
+    const row = updated[0];
+    if (!row) return NextResponse.json({ error: 'Not found' }, { status: 404 });
     return NextResponse.json({ row });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -45,7 +50,8 @@ export async function DELETE(
     if (isNaN(rowId)) {
       return NextResponse.json({ error: 'Invalid id' }, { status: 400 });
     }
-    await prisma.tblGpsmapping.delete({ where: { id: rowId } });
+    const n = await execute('DELETE FROM tbl_gpsmappings WHERE id = $1', [rowId]);
+    if (n === 0) return NextResponse.json({ error: 'Not found' }, { status: 404 });
     return NextResponse.json({ ok: true });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

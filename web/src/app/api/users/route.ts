@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { prisma } from '@/lib/prisma';
+import { query, execute } from '@/lib/db';
 import { dateToLiteralUTC } from '@/lib/utils';
 import bcrypt from 'bcryptjs';
 
@@ -20,9 +20,9 @@ function jsonSafe<T>(obj: T): T {
 
 export async function GET() {
   try {
-    const users = await prisma.user.findMany({
-      orderBy: { userid: 'asc' },
-    });
+    const users = await query(
+      'SELECT * FROM tbl_users ORDER BY userid ASC'
+    );
     return NextResponse.json({ users: jsonSafe(users) });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -51,24 +51,19 @@ export async function POST(request: Request) {
     const uType = userType?.trim() || 'Admin';
     const cust = uType === 'Client' ? (customer?.trim() || null) : null;
     const hashed = await bcrypt.hash(password, 10);
-    const user = await prisma.user.create({
-      data: {
-        email: email.trim().toLowerCase(),
-        password: hashed,
-        firstname: firstname?.trim() || null,
-        surname: surname?.trim() || null,
-        phone: phone?.trim() || null,
-        userType: uType,
-        customer: cust,
-      },
-    });
+    const rows = await query(
+      `INSERT INTO tbl_users (email, password, firstname, surname, phone, user_type, customer)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING *`,
+      [email.trim().toLowerCase(), hashed, firstname?.trim() || null, surname?.trim() || null, phone?.trim() || null, uType, cust]
+    );
+    const user = rows[0];
+    if (!user) return NextResponse.json({ error: 'Insert failed' }, { status: 500 });
     return NextResponse.json({ user: jsonSafe(user) });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    const isDuplicateEmail =
-      (err as { code?: string; meta?: { target?: string[] } }).code === 'P2002' &&
-      ((err as { meta?: { target?: string[] } }).meta?.target?.includes('email') ?? true);
-    if (isDuplicateEmail) {
+    const code = (err as { code?: string }).code;
+    if (code === '23505') {
       return NextResponse.json({ error: 'Email already exists' }, { status: 400 });
     }
     return NextResponse.json({ error: message }, { status: 500 });

@@ -3,7 +3,7 @@
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'next/navigation';
 import { formatColumnLabel, formatDateNZ, computeColumnWidths } from '@/lib/utils';
-import { addMinutesToTimestamp, runFetchStepsForJobs } from '@/lib/fetch-steps';
+import { addMinutesToTimestampAsNZ, runFetchStepsForJobs } from '@/lib/fetch-steps';
 
 type Row = Record<string, unknown>;
 
@@ -465,7 +465,7 @@ function InspectContent() {
     }
     setTrackingLoading(true);
     const offset = (trackingPage - 1) * trackingPageSize;
-    const positionAfter = addMinutesToTimestamp(actualStartTime.trim(), -startLessMinutes);
+    const positionAfter = addMinutesToTimestampAsNZ(actualStartTime.trim(), -startLessMinutes);
     const params = new URLSearchParams({
       device: deviceForTracking,
       positionAfter,
@@ -473,7 +473,7 @@ function InspectContent() {
       offset: String(offset),
     });
     if (actualEndTime.trim()) {
-      params.set('positionBefore', addMinutesToTimestamp(actualEndTime.trim(), endPlusMinutes));
+      params.set('positionBefore', addMinutesToTimestampAsNZ(actualEndTime.trim(), endPlusMinutes));
     }
     if (trackingTableView === 'entry_exit') {
       params.set('geofenceFilter', 'entry_or_exit');
@@ -482,7 +482,7 @@ function InspectContent() {
       .then((r) => r.json())
       .then((data) => {
         setTrackingRows(data?.rows ?? []);
-        setTrackingSql(data?.sql ?? '');
+        setTrackingSql(data?.sqlCopyPaste ?? data?.sql ?? '');
         setTrackingTotal(typeof data?.total === 'number' ? data.total : 0);
       })
       .catch(() => {
@@ -1121,13 +1121,13 @@ function InspectContent() {
                   </>
                 )}
             {deviceForTracking && actualStartTime.trim() && (
-              <pre className="mt-3 select-all rounded border border-zinc-200 bg-zinc-50 p-3 font-mono text-xs text-zinc-800 dark:border-zinc-600 dark:bg-zinc-800/50 dark:text-zinc-200" title="Copy and paste to run in your SQL editor">
+              <pre className="mt-3 select-all rounded border border-zinc-200 bg-zinc-50 p-3 font-mono text-xs text-zinc-800 dark:border-zinc-600 dark:bg-zinc-800/50 dark:text-zinc-200" title="Copy and paste to run in your SQL editor (window in NZ for position_time_nz)">
                 {trackingSql || (() => {
-                const after = addMinutesToTimestamp(actualStartTime.trim(), -startLessMinutes);
-                const before = actualEndTime.trim() ? addMinutesToTimestamp(actualEndTime.trim(), endPlusMinutes) : null;
+                const after = addMinutesToTimestampAsNZ(actualStartTime.trim(), -startLessMinutes);
+                const before = actualEndTime.trim() ? addMinutesToTimestampAsNZ(actualEndTime.trim(), endPlusMinutes) : null;
                 let where = `t.device_name='${String(deviceForTracking).replace(/'/g, "''")}' AND t.position_time_nz>'${after.replace(/'/g, "''")}'`;
                 if (before) where += ` AND t.position_time_nz<'${before.replace(/'/g, "''")}'`;
-                return `SELECT t.id, t.device_name, g.fence_name, t.geofence_type, t.position_time_nz, t.position_time FROM tbl_tracking t LEFT JOIN tbl_geofences g ON g.fence_id = t.geofence_id WHERE ${where} ORDER BY t.position_time_nz LIMIT 500`;
+                return `SELECT t.id, t.device_name, g.fence_name, t.geofence_type, t.position_time_nz, t.position_time FROM tbl_tracking t LEFT JOIN tbl_geofences g ON g.fence_id = t.geofence_id WHERE ${where} ORDER BY t.position_time_nz ASC LIMIT 500`;
               })()}
               </pre>
             )}

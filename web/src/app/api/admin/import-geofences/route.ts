@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { prisma } from '@/lib/prisma';
+import { execute } from '@/lib/db';
 
 type GeoJSONPolygon = { type: 'Polygon'; coordinates: number[][][] };
 type GeoJSONMultiPolygon = { type: 'MultiPolygon'; coordinates: number[][][][] };
@@ -83,15 +83,10 @@ export async function POST(request: Request) {
 
     for (const fence of fences) {
       try {
-        await prisma.$executeRawUnsafe(
-          `DELETE FROM tbl_geofences WHERE fence_name = $1`,
-          fence.name
-        );
-        await prisma.$executeRawUnsafe(
-          `INSERT INTO tbl_geofences (fence_name, geom)
-           VALUES ($1, ST_SetSRID(ST_GeomFromGeoJSON($2), 4326))`,
-          fence.name,
-          JSON.stringify(fence.geom)
+        await execute('DELETE FROM tbl_geofences WHERE fence_name = $1', [fence.name]);
+        await execute(
+          'INSERT INTO tbl_geofences (fence_name, geom) VALUES ($1, ST_SetSRID(ST_GeomFromGeoJSON($2), 4326))',
+          [fence.name, JSON.stringify(fence.geom)]
         );
         imported += 1;
         names.push(fence.name);

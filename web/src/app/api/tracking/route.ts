@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { prisma } from '@/lib/prisma';
+import { query } from '@/lib/db';
 import { dateToLiteralUTC } from '@/lib/utils';
 
 /** Parse to YYYY-MM-DD HH:mm:ss — no timezone logic, use literal digits only. */
@@ -53,10 +53,7 @@ export async function GET(request: Request) {
 
     const positionBefore = searchParams.get('positionBefore');
     const tsAfter = toTimestampLiteral(positionAfter) ?? positionAfter;
-    const escapedAfter = String(tsAfter).replace(/'/g, "''");
-    const escapedDevice = String(device).replace(/'/g, "''");
     const tsBefore = positionBefore ? (toTimestampLiteral(positionBefore) ?? positionBefore) : null;
-    const escapedBefore = tsBefore ? String(tsBefore).replace(/'/g, "''") : null;
 
     const limit = Math.min(Math.max(1, parseInt(searchParams.get('limit') ?? '50', 10) || 50), 500);
     const offset = Math.max(0, parseInt(searchParams.get('offset') ?? '0', 10) || 0);
@@ -66,22 +63,35 @@ export async function GET(request: Request) {
       ? ` AND (t.geofence_type = 'ENTER' OR t.geofence_type = 'EXIT')`
       : '';
 
-    let timeCondition = `t.position_time_nz > '${escapedAfter}'`;
-    if (escapedBefore) {
-      timeCondition += ` AND t.position_time_nz < '${escapedBefore}'`;
+    const params: unknown[] = [device.trim(), tsAfter];
+    let timeCondition = 't.position_time_nz > $2';
+    if (tsBefore) {
+      params.push(tsBefore);
+      timeCondition += ' AND t.position_time_nz < $3';
     }
-    const whereClause = `t.device_name='${escapedDevice}' AND ${timeCondition}${geofenceTypeCondition}`;
+    const whereClause = `t.device_name = $1 AND ${timeCondition}${geofenceTypeCondition}`;
+    const countParams = [...params];
+    params.push(limit, offset);
 
-    const countResult = await prisma.$queryRawUnsafe<{ count: bigint }[]>(
-      `SELECT COUNT(*) AS count FROM tbl_tracking t LEFT JOIN tbl_geofences g ON g.fence_id = t.geofence_id WHERE ${whereClause}`
+    const countRows = await query<{ count: string }>(
+      `SELECT COUNT(*) AS count FROM tbl_tracking t LEFT JOIN tbl_geofences g ON g.fence_id = t.geofence_id WHERE ${whereClause}`,
+      countParams
     );
-    const total = Number(countResult[0]?.count ?? 0);
+    const total = Number(countRows[0]?.count ?? 0);
 
-    const sql = `SELECT t.device_name, g.fence_name, t.geofence_type, t.position_time_nz, t.position_time FROM tbl_tracking t LEFT JOIN tbl_geofences g ON g.fence_id = t.geofence_id WHERE ${whereClause} ORDER BY t.position_time_nz ASC LIMIT ${limit} OFFSET ${offset}`;
+    const limitPlaceholder = params.length - 1;
+    const offsetPlaceholder = params.length;
+    const sql = `SELECT t.device_name, g.fence_name, t.geofence_type, t.position_time_nz, t.position_time FROM tbl_tracking t LEFT JOIN tbl_geofences g ON g.fence_id = t.geofence_id WHERE ${whereClause} ORDER BY t.position_time_nz ASC LIMIT $${limitPlaceholder} OFFSET $${offsetPlaceholder}`;
 
-    const rows = await prisma.$queryRawUnsafe<unknown[]>(sql);
+    const rows = await query(sql, params);
 
-    return NextResponse.json({ rows: jsonSafe(rows), sql, total });
+    const esc = (v: string) => `'${String(v).replace(/'/g, "''")}'`;
+    const timePart = tsBefore
+      ? `t.position_time_nz > ${esc(tsAfter)} AND t.position_time_nz < ${esc(tsBefore)}`
+      : `t.position_time_nz > ${esc(tsAfter)}`;
+    const sqlCopyPaste = `SELECT t.device_name, g.fence_name, t.geofence_type, t.position_time_nz, t.position_time FROM tbl_tracking t LEFT JOIN tbl_geofences g ON g.fence_id = t.geofence_id WHERE t.device_name = ${esc(device.trim())} AND ${timePart}${geofenceTypeCondition} ORDER BY t.position_time_nz ASC LIMIT ${limit} OFFSET ${offset}`;
+
+    return NextResponse.json({ rows: jsonSafe(rows), sql, sqlCopyPaste, total });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return NextResponse.json({ error: message }, { status: 500 });

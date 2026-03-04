@@ -7,7 +7,7 @@ import {
   getDayRangeUTC,
   TracksolidApiError,
 } from '@/lib/tracksolid';
-import { prisma } from '@/lib/prisma';
+import { execute } from '@/lib/db';
 
 export async function GET(request: Request) {
   try {
@@ -41,14 +41,10 @@ export async function GET(request: Request) {
     // Log single-day API fetch to tbl_logs for auditing
     if (date) {
       try {
-        await prisma.log.create({
-          data: {
-            logtype: 'APIfetch',
-            logcat1: deviceName || imei.trim(),
-            logcat2: date,
-            logdetails: `rowcount: ${trackResult.points.length}`,
-          },
-        });
+        await execute(
+          'INSERT INTO tbl_logs (logtype, logcat1, logcat2, logdetails) VALUES ($1, $2, $3, $4)',
+          ['APIfetch', deviceName || imei.trim(), date, `rowcount: ${trackResult.points.length}`]
+        );
       } catch (logErr) {
         // eslint-disable-next-line no-console
         console.error('[tracksolid/track] Failed to write tbl_logs:', logErr);

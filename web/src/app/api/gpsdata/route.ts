@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { prisma } from '@/lib/prisma';
+import { query } from '@/lib/db';
 import { dateToLiteralUTC } from '@/lib/utils';
 
 /** JSON serialization — no Date/toISOString; timestamps shown as stored (raw). */
@@ -20,11 +20,7 @@ function jsonSafe<T>(obj: T): T {
 
 /**
  * GET: Return tbl_tracking rows for the GPS Tracking tab.
- * Raw dates only — no timezone conversion. to_char only for display format.
- * Pagination: limit (default 500), offset (default 0).
- * Order: orderBy (position_time_nz | position_time), orderDir (asc | desc). Default: position_time_nz asc (earliest first).
- * Optional ?device= to filter by device_name.
- * Optional ?geofenceType=: '' (all), 'ENTER', 'EXIT', 'entry_or_exit' (both ENTER and EXIT) — server-side so you get 500 matching rows per page.
+ * Pagination and filters via query params; uses parameterized queries.
  */
 const TRACKING_SELECT = `
   t.device_name,
@@ -52,31 +48,41 @@ export async function GET(request: Request) {
     const geofenceType = searchParams.get('geofenceType') ?? '';
 
     const conditions: string[] = [];
+    const params: unknown[] = [];
+    let idx = 1;
     if (device && String(device).trim() !== '') {
-      conditions.push(`t.device_name = '${String(device).trim().replace(/'/g, "''")}'`);
+      conditions.push(`t.device_name = $${idx++}`);
+      params.push(String(device).trim());
     }
     if (geofenceType === 'ENTER' || geofenceType === 'EXIT') {
-      conditions.push(`t.geofence_type = '${geofenceType.replace(/'/g, "''")}'`);
+      conditions.push(`t.geofence_type = $${idx++}`);
+      params.push(geofenceType);
     } else if (geofenceType === 'entry_or_exit') {
       conditions.push(`(t.geofence_type = 'ENTER' OR t.geofence_type = 'EXIT')`);
     }
     const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
-
-    // Order by raw table column — no timezone or expression, so earliest/latest are correct
     const orderClause = `ORDER BY t.${orderBy} ${orderDir} NULLS LAST`;
 
-    const countSql = `SELECT COUNT(*) AS total FROM tbl_tracking t LEFT JOIN tbl_geofences g ON g.fence_id = t.geofence_id ${whereClause}`;
-    const countResult = await prisma.$queryRawUnsafe<{ total: bigint }[]>(countSql);
-    const total = Number(countResult[0]?.total ?? 0);
+    const countRows = await query<{ total: string }>(
+      `SELECT COUNT(*) AS total FROM tbl_tracking t LEFT JOIN tbl_geofences g ON g.fence_id = t.geofence_id ${whereClause}`,
+      params
+    );
+    const total = Number(countRows[0]?.total ?? 0);
 
-    const sql = `SELECT ${TRACKING_SELECT}
-FROM tbl_tracking t
-LEFT JOIN tbl_geofences g ON g.fence_id = t.geofence_id
-${whereClause}
-${orderClause}
-LIMIT ${limit} OFFSET ${offset}`;
+    const limitNum = idx;
+    const offsetNum = idx + 1;
+    params.push(limit, offset);
+    const rows = await query(
+      `SELECT ${TRACKING_SELECT}
+       FROM tbl_tracking t
+       LEFT JOIN tbl_geofences g ON g.fence_id = t.geofence_id
+       ${whereClause}
+       ${orderClause}
+       LIMIT $${limitNum} OFFSET $${offsetNum}`,
+      params
+    );
 
-    const rows = await prisma.$queryRawUnsafe<unknown[]>(sql);
+    const sql = `SELECT ... FROM tbl_tracking t ... ${whereClause} ${orderClause} LIMIT ${limit} OFFSET ${offset}`;
     return NextResponse.json({
       rows: jsonSafe(rows),
       total,

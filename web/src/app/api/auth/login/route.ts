@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { prisma } from '@/lib/prisma';
+import { query } from '@/lib/db';
 import bcrypt from 'bcryptjs';
 
 export async function POST(request: Request) {
@@ -14,9 +14,11 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Password is required' }, { status: 400 });
     }
 
-    const user = await prisma.user.findUnique({
-      where: { email: email.trim().toLowerCase() },
-    });
+    const rows = await query<{ userid: string; email: string; password: string; firstname: string | null; surname: string | null; user_type: string | null }>(
+      'SELECT userid, email, password, firstname, surname, user_type FROM tbl_users WHERE LOWER(TRIM(email)) = $1',
+      [email.trim().toLowerCase()]
+    );
+    const user = rows[0];
 
     if (!user) {
       return NextResponse.json({ error: 'Invalid email or password' }, { status: 401 });
@@ -27,7 +29,6 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Invalid email or password' }, { status: 401 });
     }
 
-    // Not in flow yet: always treat as Super Admin
     return NextResponse.json({
       ok: true,
       user: {

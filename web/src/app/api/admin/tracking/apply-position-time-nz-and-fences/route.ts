@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { prisma } from '@/lib/prisma';
+import { execute, query } from '@/lib/db';
 
 /**
  * Run once after all devices have been merged to tbl_tracking:
@@ -10,7 +10,7 @@ import { prisma } from '@/lib/prisma';
 export async function POST() {
   const positionTimeNzStart = Date.now();
   try {
-    const updateCount = await prisma.$executeRawUnsafe(`
+    const updateCount = await execute(`
       UPDATE public.tbl_tracking
       SET position_time_nz = position_time + interval '13 hours'
       WHERE position_time IS NOT NULL
@@ -18,7 +18,7 @@ export async function POST() {
     const positionTimeNzMs = Date.now() - positionTimeNzStart;
 
     const storeFencesStart = Date.now();
-    await prisma.$queryRawUnsafe(`SELECT "store_fences"()`);
+    await query(`SELECT "store_fences"()`);
     const storeFencesMs = Date.now() - storeFencesStart;
 
     return NextResponse.json({

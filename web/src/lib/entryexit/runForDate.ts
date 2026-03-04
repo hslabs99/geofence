@@ -4,15 +4,11 @@
  * - Scan in extended window, run state machine, batch update, log per device
  */
 
-import { prisma } from '@/lib/prisma';
+import { query, execute } from '@/lib/db';
 import { runStateMachine, type ScanRow, type TagUpdate } from './stateMachine';
 import { writeWindow, scanWindow } from './dateWindow';
 
 const ALGO_VERSION = '1.0';
-
-function escapeSql(s: string): string {
-  return s.replace(/'/g, "''");
-}
 
 export interface DeviceResult {
   deviceName: string;
@@ -38,7 +34,7 @@ export type ProgressEvent =
   | { stage: 'device_start'; deviceName: string; index: number; total: number }
   | { stage: 'device_scan'; deviceName: string; rowsRead: number }
   | { stage: 'device_update'; deviceName: string; updatesWritten: number }
-  | { stage: 'device_log'; deviceName: string; logId: number | string }
+  | { stage: 'device_log'; deviceName: string; logId: number | string | undefined }
   | { stage: 'device_done'; deviceName: string; result: DeviceResult }
   | { stage: 'done'; summary: RunSummary }
   | { stage: 'error'; message: string };
@@ -59,10 +55,6 @@ export async function runForDate(options: RunOptions): Promise<RunSummary> {
   const startedAt = new Date().toISOString();
   const { start: writeStart, end: writeEnd } = writeWindow(dateX);
   const { start: scanStart, end: scanEnd } = scanWindow(dateX);
-  const escapedWriteStart = escapeSql(writeStart);
-  const escapedWriteEnd = escapeSql(writeEnd);
-  const escapedScanStart = escapeSql(scanStart);
-  const escapedScanEnd = escapeSql(scanEnd);
 
   const results: DeviceResult[] = [];
   let totalRowsRead = 0;
@@ -71,18 +63,16 @@ export async function runForDate(options: RunOptions): Promise<RunSummary> {
   // Reset: clear ENTER/EXIT (and legacy CHANGE) in write window for all selected devices
   onProgress?.({ stage: 'reset', message: `Resetting ENTER/EXIT for ${dateX}…` });
   for (const deviceName of deviceNames) {
-    const escapedDevice = escapeSql(deviceName.trim());
-    await prisma.$executeRawUnsafe(
+    await execute(
       `UPDATE tbl_tracking SET geofence_type = NULL
-       WHERE device_name = '${escapedDevice}'
-         AND position_time_nz >= '${escapedWriteStart}' AND position_time_nz < '${escapedWriteEnd}'
-         AND geofence_type IN ('ENTER','EXIT','CHANGE')`
+       WHERE device_name = $1 AND position_time_nz >= $2 AND position_time_nz < $3
+       AND geofence_type IN ('ENTER','EXIT','CHANGE')`,
+      [deviceName.trim(), writeStart, writeEnd]
     );
   }
 
   for (let i = 0; i < deviceNames.length; i++) {
     const deviceName = deviceNames[i].trim();
-    const escapedDevice = escapeSql(deviceName);
     const deviceStartedAt = new Date().toISOString();
     onProgress?.({
       stage: 'device_start',
@@ -98,12 +88,12 @@ export async function runForDate(options: RunOptions): Promise<RunSummary> {
     let logId: number | string | undefined;
 
     try {
-      const rows = await prisma.$queryRawUnsafe<ScanRow[]>(
+      const rows = await query<ScanRow>(
         `SELECT id, position_time_nz, geofence_id
          FROM tbl_tracking
-         WHERE device_name = '${escapedDevice}'
-           AND position_time_nz >= '${escapedScanStart}' AND position_time_nz < '${escapedScanEnd}'
-         ORDER BY position_time_nz, id`
+         WHERE device_name = $1 AND position_time_nz >= $2 AND position_time_nz < $3
+         ORDER BY position_time_nz, id`,
+        [deviceName, scanStart, scanEnd]
       );
       rowsRead = rows?.length ?? 0;
       totalRowsRead += rowsRead;
@@ -118,9 +108,7 @@ export async function runForDate(options: RunOptions): Promise<RunSummary> {
         for (const u of updates) {
           const id = typeof u.id === 'bigint' ? Number(u.id) : u.id;
           const type = u.geofence_type;
-          await prisma.$executeRawUnsafe(
-            `UPDATE tbl_tracking SET geofence_type = '${type}' WHERE id = ${id}`
-          );
+          await execute('UPDATE tbl_tracking SET geofence_type = $1 WHERE id = $2', [type, id]);
         }
       }
 
@@ -140,15 +128,12 @@ export async function runForDate(options: RunOptions): Promise<RunSummary> {
         duration_ms: durationMs,
         algo_version: ALGO_VERSION,
       });
-      const log = await prisma.log.create({
-        data: {
-          logtype: 'entryexit',
-          logcat1: deviceName,
-          logcat2: dateX,
-          logdetails: logDetails,
-        },
-      });
-      logId = typeof log.logid === 'bigint' ? Number(log.logid) : log.logid;
+      const logRows = await query<{ logid: number | string }>(
+        'INSERT INTO tbl_logs (logtype, logcat1, logcat2, logdetails) VALUES ($1, $2, $3, $4) RETURNING logid',
+        ['entryexit', deviceName, dateX, logDetails]
+      );
+      const log = logRows[0];
+      logId = log != null ? (typeof log.logid === 'bigint' ? Number(log.logid) : log.logid) : undefined;
       onProgress?.({ stage: 'device_log', deviceName, logId });
 
       const result: DeviceResult = {
@@ -183,15 +168,12 @@ export async function runForDate(options: RunOptions): Promise<RunSummary> {
         algo_version: ALGO_VERSION,
       });
       try {
-        const log = await prisma.log.create({
-          data: {
-            logtype: 'entryexit',
-            logcat1: deviceName,
-            logcat2: dateX,
-            logdetails: logDetails,
-          },
-        });
-        logId = typeof log.logid === 'bigint' ? Number(log.logid) : log.logid;
+        const logRows = await query<{ logid: number | string }>(
+          'INSERT INTO tbl_logs (logtype, logcat1, logcat2, logdetails) VALUES ($1, $2, $3, $4) RETURNING logid',
+          ['entryexit', deviceName, dateX, logDetails]
+        );
+        const log = logRows[0];
+        logId = log != null ? (typeof log.logid === 'bigint' ? Number(log.logid) : log.logid) : undefined;
       } catch {
         // ignore log failure
       }

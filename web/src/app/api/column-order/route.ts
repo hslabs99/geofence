@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { prisma } from '@/lib/prisma';
+import { query, execute } from '@/lib/db';
 
 const TABLE_NAME = 'tbl_vworkjobs';
 
@@ -44,11 +44,13 @@ export async function GET(request: Request) {
   try {
     const { searchParams } = new URL(request.url);
     const table = searchParams.get('table') ?? TABLE_NAME;
-    const row = await prisma.tableColumnOrder.findUnique({
-      where: { tableName: table },
-    });
+    const rows = await query<{ column_order: string }>(
+      'SELECT column_order FROM tbl_table_column_order WHERE table_name = $1',
+      [table]
+    );
+    const row = rows[0];
     if (!row) return NextResponse.json({ columnOrder: null, hiddenColumns: null });
-    const { columnOrder, hiddenColumns } = parseStored(row.columnOrder);
+    const { columnOrder, hiddenColumns } = parseStored(row.column_order);
     return NextResponse.json({
       columnOrder: columnOrder.length ? columnOrder : null,
       hiddenColumns: hiddenColumns.length ? hiddenColumns : null,
@@ -68,11 +70,12 @@ export async function PUT(request: Request) {
       return NextResponse.json({ error: 'columnOrder must be a non-empty string array' }, { status: 400 });
     const hiddenColumns = parseHidden(body) ?? [];
     const stored = JSON.stringify({ columnOrder, hiddenColumns });
-    await prisma.tableColumnOrder.upsert({
-      where: { tableName: table },
-      create: { tableName: table, columnOrder: stored },
-      update: { columnOrder: stored },
-    });
+    await execute(
+      `INSERT INTO tbl_table_column_order (table_name, column_order)
+       VALUES ($1, $2)
+       ON CONFLICT (table_name) DO UPDATE SET column_order = EXCLUDED.column_order, updated_at = NOW()`,
+      [table, stored]
+    );
     return NextResponse.json({ ok: true });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

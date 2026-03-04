@@ -1,4 +1,4 @@
-import type { PrismaClient } from '@prisma/client';
+import { query } from '@/lib/db';
 
 /** Same as tracking API: parse to YYYY-MM-DD HH:mm:ss only — no timezone in output. Handles Date (e.g. from DB) and strings; strips GMT+1300 etc. so PostgreSQL never sees them. */
 function normalizeTimestampString(s: string | Date | null): string | null {
@@ -45,7 +45,6 @@ export type FenceResolutionDebug = {
 
 /** Get all fence_ids from tbl_geofences for names list (original vwork name + mapped gpsnames). Used so we match any fence in the list. */
 async function getFenceIdsForVworkNameWithDebug(
-  prisma: PrismaClient,
   type: 'Vineyard' | 'Winery',
   vworkName: string
 ): Promise<{ fenceIds: number[]; debug: FenceResolutionDebug }> {
@@ -62,12 +61,9 @@ async function getFenceIdsForVworkNameWithDebug(
     return { fenceIds: [], debug };
   }
 
-  const mappings = await prisma.$queryRawUnsafe<
-    { type: string; vwname: string | null; gpsname: string | null }[]
-  >(
-    `SELECT type, vwname, gpsname FROM tbl_gpsmappings WHERE type = $1 AND (TRIM(vwname) = $2 OR TRIM(gpsname) = $2)`,
-    type,
-    vworkName.trim()
+  const mappings = await query<{ type: string; vwname: string | null; gpsname: string | null }>(
+    'SELECT type, vwname, gpsname FROM tbl_gpsmappings WHERE type = $1 AND (TRIM(vwname) = $2 OR TRIM(gpsname) = $2)',
+    [type, vworkName.trim()]
   );
 
   debug.mappingsFound = mappings.map((m) => ({ vwname: m.vwname, gpsname: m.gpsname }));
@@ -79,9 +75,10 @@ async function getFenceIdsForVworkNameWithDebug(
   }
   debug.fenceNamesInList = [...names];
 
-  const escaped = names.map((n) => `'${String(n).replace(/'/g, "''")}'`);
-  const rows = await prisma.$queryRawUnsafe<{ fence_id: number | bigint; fence_name: string | null }[]>(
-    `SELECT fence_id, fence_name FROM tbl_geofences WHERE fence_name IN (${escaped.join(', ')})`
+  if (names.length === 0) return { fenceIds: [], debug };
+  const rows = await query<{ fence_id: number | string; fence_name: string | null }>(
+    'SELECT fence_id, fence_name FROM tbl_geofences WHERE fence_name = ANY($1::text[])',
+    [names]
   );
   debug.resolvedFenceNames = rows.map((r) => ({ fence_id: Number(r.fence_id), fence_name: r.fence_name }));
   debug.fenceIds = rows.map((r) => Number(r.fence_id));
@@ -105,7 +102,6 @@ export type TrackingLookupDebug = {
 
 /** First (or last if orderDesc) tracking row in window at any of the given fences with given geofence_type (ENTER or EXIT). */
 async function getFirstTrackingInWindowWithDebug(
-  prisma: PrismaClient,
   device: string,
   positionAfter: string,
   positionBefore: string | null,
@@ -113,15 +109,8 @@ async function getFirstTrackingInWindowWithDebug(
   geofenceType: 'ENTER' | 'EXIT',
   orderDesc = false
 ): Promise<{ value: string | null; trackingId: number | null; debug: TrackingLookupDebug }> {
-  const escapedDevice = String(device).replace(/'/g, "''");
   const rawAfter = normalizeTimestampString(positionAfter) ?? String(positionAfter).trim().slice(0, 19);
-  const escapedAfter = String(rawAfter).replace(/'/g, "''");
   const rawBefore = positionBefore ? (normalizeTimestampString(positionBefore) ?? String(positionBefore).trim().slice(0, 19)) : null;
-  const escapedBefore = rawBefore ? String(rawBefore).replace(/'/g, "''") : null;
-  // Same condition as tbl_tracking API: literal comparison, no cast, no timezone
-  const timeCondition = escapedBefore
-    ? `t.position_time_nz > '${escapedAfter}' AND t.position_time_nz < '${escapedBefore}'`
-    : `t.position_time_nz > '${escapedAfter}'`;
 
   if (fenceIds.length === 0) {
     return {
@@ -143,13 +132,20 @@ async function getFirstTrackingInWindowWithDebug(
 
   const orderClause = orderDesc ? 'DESC' : 'ASC';
   const fenceIdList = fenceIds.map((id) => Number(id)).join(', ');
-  const sqlHint = `SELECT t.id, t.position_time_nz FROM tbl_tracking t WHERE t.device_name='...' AND t.geofence_id IN (${fenceIdList}) AND t.geofence_type='${geofenceType}' AND ${timeCondition} ORDER BY t.position_time_nz ${orderClause} LIMIT 1`;
+  const sqlHint = `SELECT t.id, t.position_time_nz FROM tbl_tracking t WHERE t.device_name=$1 AND t.geofence_id = ANY($2) AND t.geofence_type=$3 AND position_time_nz > $4 ... ORDER BY t.position_time_nz ${orderClause} LIMIT 1`;
 
-  const rows = await prisma.$queryRawUnsafe<{ id: unknown; position_time_nz: unknown }[]>(
+  const params: unknown[] = [device, fenceIds, geofenceType, rawAfter];
+  let timeCondition = 't.position_time_nz > $4';
+  if (rawBefore) {
+    params.push(rawBefore);
+    timeCondition += ' AND t.position_time_nz < $5';
+  }
+
+  const rows = await query<{ id: unknown; position_time_nz: unknown }>(
     `SELECT t.id, t.position_time_nz FROM tbl_tracking t
-     WHERE t.device_name = '${escapedDevice}' AND t.geofence_id IN (${fenceIdList}) AND t.geofence_type = '${geofenceType}'
-     AND ${timeCondition}
-     ORDER BY t.position_time_nz ${orderClause} LIMIT 1`
+     WHERE t.device_name = $1 AND t.geofence_id = ANY($2::int[]) AND t.geofence_type = $3 AND ${timeCondition}
+     ORDER BY t.position_time_nz ${orderClause} LIMIT 1`,
+    params
   );
 
   const val = rows[0]?.position_time_nz;
@@ -264,7 +260,6 @@ export type DerivedStepsOptions = {
 
 /** Part 1: Fetch GPS candidates for each step (winery/vineyard, ENTER/EXIT). No decision — just lookups. */
 async function fetchGpsStepCandidates(
-  prisma: PrismaClient,
   job: JobForDerivedSteps,
   options: DerivedStepsOptions,
   debug: DerivedStepsDebug
@@ -278,14 +273,14 @@ async function fetchGpsStepCandidates(
   let step4Value: string | null = null;
 
   if (vineyardName) {
-    const { fenceIds: vineyardFenceIds, debug: vineyardDebug } = await getFenceIdsForVworkNameWithDebug(prisma, 'Vineyard', vineyardName);
+    const { fenceIds: vineyardFenceIds, debug: vineyardDebug } = await getFenceIdsForVworkNameWithDebug('Vineyard', vineyardName);
     Object.assign(debug.vineyard, vineyardDebug);
     if (vineyardFenceIds.length > 0) {
-      const step2Result = await getFirstTrackingInWindowWithDebug(prisma, truckId, positionAfter, positionBefore, vineyardFenceIds, 'ENTER');
+      const step2Result = await getFirstTrackingInWindowWithDebug(truckId, positionAfter, positionBefore, vineyardFenceIds, 'ENTER');
       step2Value = step2Result.value;
       debug.vineyard.step2 = step2Result.debug;
       if (step2Result.value != null) candidates.step2 = { value: step2Result.value, trackingId: step2Result.trackingId };
-      const step3Result = await getFirstTrackingInWindowWithDebug(prisma, truckId, positionAfter, positionBefore, vineyardFenceIds, 'EXIT');
+      const step3Result = await getFirstTrackingInWindowWithDebug(truckId, positionAfter, positionBefore, vineyardFenceIds, 'EXIT');
       step3Value = step3Result.value;
       debug.vineyard.step3 = step3Result.debug;
       if (step3Result.value != null) candidates.step3 = { value: step3Result.value, trackingId: step3Result.trackingId };
@@ -293,19 +288,18 @@ async function fetchGpsStepCandidates(
   }
 
   if (deliveryWinery) {
-    const { fenceIds: wineryFenceIds, debug: wineryDebug } = await getFenceIdsForVworkNameWithDebug(prisma, 'Winery', deliveryWinery);
+    const { fenceIds: wineryFenceIds, debug: wineryDebug } = await getFenceIdsForVworkNameWithDebug('Winery', deliveryWinery);
     Object.assign(debug.winery, wineryDebug);
     if (wineryFenceIds.length > 0) {
       const step1Before = step2Value ?? positionBefore;
-      const step1Result = await getFirstTrackingInWindowWithDebug(prisma, truckId, positionAfter, step1Before, wineryFenceIds, 'EXIT');
+      const step1Result = await getFirstTrackingInWindowWithDebug(truckId, positionAfter, step1Before, wineryFenceIds, 'EXIT');
       debug.winery.step1 = step1Result.debug;
       if (step1Result.value != null) candidates.step1 = { value: step1Result.value, trackingId: step1Result.trackingId };
-      /** First Winery ENTER in window; if both step2 and step3 exist, must be after max(step2, step3). */
       const step4After =
         step2Value != null && step3Value != null
           ? (step2Value > step3Value ? step2Value : step3Value)
           : positionAfter;
-      const step4Result = await getFirstTrackingInWindowWithDebug(prisma, truckId, step4After, positionBefore, wineryFenceIds, 'ENTER');
+      const step4Result = await getFirstTrackingInWindowWithDebug(truckId, step4After, positionBefore, wineryFenceIds, 'ENTER');
       step4Value = step4Result.value;
       debug.winery.step4 = step4Result.debug;
       if (step4Result.value != null) candidates.step4 = { value: step4Result.value, trackingId: step4Result.trackingId };
@@ -314,7 +308,7 @@ async function fetchGpsStepCandidates(
         : null;
       const step5WindowEnd = vworkStep5 != null ? (positionBefore != null && positionBefore < vworkStep5 ? positionBefore : vworkStep5) : positionBefore;
       if (step4Value != null && vworkStep5 != null && step5WindowEnd != null && vworkStep5 > step4Value) {
-        const step5Result = await getFirstTrackingInWindowWithDebug(prisma, truckId, step4Value, step5WindowEnd, wineryFenceIds, 'EXIT', false);
+        const step5Result = await getFirstTrackingInWindowWithDebug(truckId, step4Value, step5WindowEnd, wineryFenceIds, 'EXIT', false);
         debug.winery.step5 = step5Result.debug;
         if (step5Result.value != null) candidates.step5 = { value: step5Result.value, trackingId: step5Result.trackingId };
       }
@@ -347,7 +341,6 @@ function decideFinalSteps(candidates: FetchedGpsCandidates, job: JobForDerivedSt
 }
 
 export async function deriveGpsStepsForJob(
-  prisma: PrismaClient,
   job: JobForDerivedSteps,
   options: DerivedStepsOptions
 ): Promise<DerivedStepsResultWithDebug> {
@@ -367,7 +360,7 @@ export async function deriveGpsStepsForJob(
     winery: { type: 'Winery', vworkName: '', mappingsFound: [], fenceNamesInList: [], fenceIds: [], resolvedFenceNames: [] },
   };
   if (!options.device || !options.positionAfter) return { ...emptyResult, debug };
-  const candidates = await fetchGpsStepCandidates(prisma, job, options, debug);
+  const candidates = await fetchGpsStepCandidates(job, options, debug);
   const result = decideFinalSteps(candidates, job);
   return { ...result, debug };
 }

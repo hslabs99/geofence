@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { prisma } from '@/lib/prisma';
+import { query } from '@/lib/db';
 import { dateToLiteralUTC } from '@/lib/utils';
 
 function jsonSafe<T>(obj: T): T {
@@ -24,15 +24,21 @@ export async function GET(request: Request) {
     const type = searchParams.get('type') ?? undefined;
     const cat1 = searchParams.get('cat1') ?? undefined;
 
-    const logs = await prisma.log.findMany({
-      where: {
-        ...(type && { logtype: type }),
-        ...(cat1 && { logcat1: cat1 }),
-      },
-      orderBy: { logid: 'desc' },
-      take: limit,
-    });
+    let sql = 'SELECT * FROM tbl_logs WHERE 1=1';
+    const params: string[] = [];
+    let i = 1;
+    if (type) {
+      sql += ` AND logtype = $${i++}`;
+      params.push(type);
+    }
+    if (cat1) {
+      sql += ` AND logcat1 = $${i++}`;
+      params.push(cat1);
+    }
+    sql += ` ORDER BY logid DESC LIMIT $${i}`;
+    params.push(String(limit));
 
+    const logs = await query(sql, params);
     return NextResponse.json({ logs: jsonSafe(logs) });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

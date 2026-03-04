@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
-import { prisma } from '@/lib/prisma';
-import { deriveGpsStepsForJob } from '@/lib/derived-steps';
+import { query, execute } from '@/lib/db';
+import { deriveGpsStepsForJob, type JobForDerivedSteps } from '@/lib/derived-steps';
 
 /** Recursively convert BigInt to number (or string if too large) so JSON.stringify works. */
 function sanitizeForJson<T>(value: T): T {
@@ -43,23 +43,12 @@ export async function GET(request: Request) {
     const jobId = jobIdParam.trim();
     const debugBase = { jobId, windowMinutes, step: 'job_lookup' as const };
 
-    let jobRows: {
-      job_id: unknown;
-      vineyard_name: string | null;
-      delivery_winery: string | null;
-      truck_id: string | null;
-      worker: string | null;
-      actual_start_time: string | null;
-      actual_end_time: string | null;
-      step_5_completed_at: string | null;
-    }[] = [];
+    let jobRows: Record<string, unknown>[] = [];
 
     try {
-      jobRows = await prisma.$queryRawUnsafe<
-        typeof jobRows
-      >(
-        `SELECT job_id, vineyard_name, delivery_winery, truck_id, worker, actual_start_time, actual_end_time, step_5_completed_at FROM tbl_vworkjobs WHERE job_id::text = $1 LIMIT 1`,
-        jobId
+      jobRows = await query<Record<string, unknown>>(
+        'SELECT * FROM tbl_vworkjobs WHERE job_id::text = $1 LIMIT 1',
+        [jobId]
       );
     } catch (queryErr) {
       const qMsg = queryErr instanceof Error ? queryErr.message : String(queryErr);
@@ -79,8 +68,8 @@ export async function GET(request: Request) {
       }), { status: 500 });
     }
 
-    const job = jobRows[0];
-    if (!job) {
+    const rawJob = jobRows[0];
+    if (!rawJob) {
       return NextResponse.json(sanitizeForJson({
         error: 'Job not found',
         step1: null,
@@ -97,12 +86,32 @@ export async function GET(request: Request) {
       }), { status: 404 });
     }
 
+    /** Normalize job so we have worker/vineyard_name/delivery_winery regardless of DB column case (Worker vs worker, etc.). */
+    const row = rawJob as Record<string, unknown>;
+    const pick = (...keys: string[]): unknown => {
+      for (const k of keys) {
+        const v = row[k];
+        if (v !== undefined) return v;
+      }
+      return null;
+    };
+    const job: JobForDerivedSteps = {
+      job_id: pick('job_id', 'Job_ID'),
+      vineyard_name: (pick('vineyard_name', 'Vineyard_Name') as string | null) ?? undefined,
+      delivery_winery: (pick('delivery_winery', 'Delivery_Winery') as string | null) ?? undefined,
+      truck_id: (pick('truck_id', 'Truck_ID') as string | null) ?? undefined,
+      worker: (pick('worker', 'Worker') as string | null) ?? undefined,
+      actual_start_time: (pick('actual_start_time', 'Actual_Start_Time') as string | null) ?? undefined,
+      actual_end_time: (pick('actual_end_time', 'Actual_End_Time') as string | null) ?? undefined,
+      step_5_completed_at: (pick('step_5_completed_at', 'Step_5_Completed_At') as string | null) ?? undefined,
+    };
+
     /** Use worker (tbl_vwork.worker = tbl_tracking.device_name) for GPS scan; fallback to request device. */
     const deviceForTracking = (job.worker != null && String(job.worker).trim() !== ''
       ? String(job.worker).trim()
       : device.trim());
 
-    const result = await deriveGpsStepsForJob(prisma, job, {
+    const result = await deriveGpsStepsForJob(job, {
       windowMinutes,
       device: deviceForTracking,
       positionAfter: positionAfter.trim(),
@@ -111,7 +120,7 @@ export async function GET(request: Request) {
 
     if (writeBack) {
       try {
-        await prisma.$executeRawUnsafe(
+        await execute(
           `UPDATE tbl_vworkjobs SET
             Step_1_GPS_completed_at = $1::timestamp,
             Step1_gps_id = $2,
@@ -124,19 +133,21 @@ export async function GET(request: Request) {
             Step_5_GPS_completed_at = $9::timestamp,
             Step5_gps_id = $10
           WHERE job_id::text = $11`,
-          result.step1 ?? null,
-          result.step1TrackingId ?? null,
-          result.step2 ?? null,
-          result.step2TrackingId ?? null,
-          result.step3 ?? null,
-          result.step3TrackingId ?? null,
-          result.step4 ?? null,
-          result.step4TrackingId ?? null,
-          result.step5 ?? null,
-          result.step5TrackingId ?? null,
-          jobId
+          [
+            result.step1 ?? null,
+            result.step1TrackingId ?? null,
+            result.step2 ?? null,
+            result.step2TrackingId ?? null,
+            result.step3 ?? null,
+            result.step3TrackingId ?? null,
+            result.step4 ?? null,
+            result.step4TrackingId ?? null,
+            result.step5 ?? null,
+            result.step5TrackingId ?? null,
+            jobId,
+          ]
         );
-        await prisma.$executeRawUnsafe(
+        await execute(
           `UPDATE tbl_vworkjobs SET
             step_1_actual_time = COALESCE(step_1_gps_completed_at, step_1_completed_at),
             step_1_via = CASE WHEN step_1_gps_completed_at IS NOT NULL THEN 'GPS' ELSE 'VW' END,
@@ -149,15 +160,15 @@ export async function GET(request: Request) {
             step_5_actual_time = COALESCE(step_5_gps_completed_at, step_5_completed_at),
             step_5_via = CASE WHEN step_5_gps_completed_at IS NOT NULL THEN 'GPS' ELSE 'VW' END
           WHERE job_id::text = $1`,
-          jobId
+          [jobId]
         );
         try {
-          await prisma.$executeRawUnsafe(
-            `UPDATE tbl_vworkjobs SET steps_fetched = true, steps_fetched_when = now() WHERE job_id::text = $1`,
-            jobId
+          await execute(
+            'UPDATE tbl_vworkjobs SET steps_fetched = true, steps_fetched_when = now() WHERE job_id::text = $1',
+            [jobId]
           );
         } catch {
-          /* steps_fetched / steps_fetched_when columns may not exist yet; run prisma/migrations/add_steps_fetched_tbl_vworkjobs.sql */
+          /* steps_fetched / steps_fetched_when columns may not exist yet */
         }
       } catch (writeErr) {
         const wMsg = writeErr instanceof Error ? writeErr.message : String(writeErr);

@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { prisma } from '@/lib/prisma';
+import { query } from '@/lib/db';
 
 /**
  * GET: Return max date/timestamp from tbl_vworkjobs.actual_start_time and tbl_tracking.position_time_nz
@@ -8,11 +8,11 @@ import { prisma } from '@/lib/prisma';
 export async function GET() {
   try {
     const [vworkResult, trackingResult] = await Promise.all([
-      prisma.$queryRawUnsafe<{ max_actual_start: Date | string | null }[]>(
-        `SELECT MAX(actual_start_time) AS max_actual_start FROM tbl_vworkjobs WHERE actual_start_time IS NOT NULL`
+      query<{ max_actual_start: Date | string | null }>(
+        'SELECT MAX(actual_start_time) AS max_actual_start FROM tbl_vworkjobs WHERE actual_start_time IS NOT NULL'
       ),
-      prisma.$queryRawUnsafe<{ max_position_time_nz: Date | string | null }[]>(
-        `SELECT MAX(position_time_nz) AS max_position_time_nz FROM tbl_tracking WHERE position_time_nz IS NOT NULL`
+      query<{ max_position_time_nz: Date | string | null }>(
+        'SELECT MAX(position_time_nz) AS max_position_time_nz FROM tbl_tracking WHERE position_time_nz IS NOT NULL'
       ),
     ]);
 

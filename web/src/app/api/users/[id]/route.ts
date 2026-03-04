@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { prisma } from '@/lib/prisma';
+import { query, execute } from '@/lib/db';
 import { dateToLiteralUTC } from '@/lib/utils';
 import bcrypt from 'bcryptjs';
 
@@ -24,8 +24,9 @@ export async function GET(
 ) {
   try {
     const { id } = await params;
-    const userid = BigInt(id);
-    const user = await prisma.user.findUnique({ where: { userid } });
+    const userid = id;
+    const rows = await query('SELECT * FROM tbl_users WHERE userid = $1', [userid]);
+    const user = rows[0];
     if (!user) return NextResponse.json({ error: 'User not found' }, { status: 404 });
     return NextResponse.json({ user: jsonSafe(user) });
   } catch (err) {
@@ -40,7 +41,7 @@ export async function PUT(
 ) {
   try {
     const { id } = await params;
-    const userid = BigInt(id);
+    const userid = id;
     const body = await request.json();
     const { email, password, firstname, surname, phone, userType, customer } = body as {
       email?: string;
@@ -51,21 +52,18 @@ export async function PUT(
       userType?: string | null;
       customer?: string | null;
     };
-    const data: {
-      email?: string; password?: string; firstname?: string | null; surname?: string | null; phone?: string | null;
-      userType?: string; customer?: string | null;
-    } = {};
+    const data: Record<string, unknown> = {};
     if (email !== undefined) data.email = String(email).trim().toLowerCase();
     if (firstname !== undefined) data.firstname = firstname?.trim() || null;
     if (surname !== undefined) data.surname = surname?.trim() || null;
     if (phone !== undefined) data.phone = phone?.trim() || null;
     if (userType !== undefined) {
-      data.userType = userType?.trim() || 'Admin';
-      data.customer = data.userType === 'Client' ? (customer?.trim() ?? null) : null;
+      data.user_type = userType?.trim() || 'Admin';
+      data.customer = data.user_type === 'Client' ? (customer?.trim() ?? null) : null;
     }
-    if (customer !== undefined && data.userType === undefined) {
-      const existing = await prisma.user.findUnique({ where: { userid }, select: { userType: true } });
-      if (existing?.userType === 'Client') data.customer = customer?.trim() || null;
+    if (customer !== undefined && data.user_type === undefined) {
+      const existing = await query<{ user_type: string }>('SELECT user_type FROM tbl_users WHERE userid = $1', [userid]);
+      if (existing[0]?.user_type === 'Client') data.customer = customer?.trim() || null;
     }
     if (password !== undefined && password !== '' && typeof password === 'string' && password.length >= 6) {
       data.password = await bcrypt.hash(password, 10);
@@ -73,17 +71,21 @@ export async function PUT(
     if (Object.keys(data).length === 0) {
       return NextResponse.json({ error: 'Nothing to update' }, { status: 400 });
     }
-    const user = await prisma.user.update({
-      where: { userid },
-      data,
-    });
+    const setClause = Object.keys(data).map((k, i) => `"${k}" = $${i + 1}`).join(', ');
+    const values = Object.values(data);
+    values.push(userid);
+    await execute(
+      `UPDATE tbl_users SET ${setClause} WHERE userid = $${values.length}`,
+      values
+    );
+    const rows = await query('SELECT * FROM tbl_users WHERE userid = $1', [userid]);
+    const user = rows[0];
+    if (!user) return NextResponse.json({ error: 'User not found after update' }, { status: 404 });
     return NextResponse.json({ user: jsonSafe(user) });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    const isDuplicateEmail =
-      (err as { code?: string; meta?: { target?: string[] } }).code === 'P2002' &&
-      ((err as { meta?: { target?: string[] } }).meta?.target?.includes('email') ?? true);
-    if (isDuplicateEmail) {
+    const code = (err as { code?: string }).code;
+    if (code === '23505') {
       return NextResponse.json({ error: 'Email already exists' }, { status: 400 });
     }
     return NextResponse.json({ error: message }, { status: 500 });
@@ -96,8 +98,9 @@ export async function DELETE(
 ) {
   try {
     const { id } = await params;
-    const userid = BigInt(id);
-    await prisma.user.delete({ where: { userid } });
+    const userid = id;
+    const n = await execute('DELETE FROM tbl_users WHERE userid = $1', [userid]);
+    if (n === 0) return NextResponse.json({ error: 'User not found' }, { status: 404 });
     return NextResponse.json({ ok: true });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { prisma } from '@/lib/prisma';
+import { query } from '@/lib/db';
 import { dateToLiteralUTC } from '@/lib/utils';
 
 /** JSON serialization — no toISOString. */
@@ -21,11 +21,11 @@ function jsonSafe<T>(obj: T): T {
 export async function GET(request: Request) {
   try {
     const { searchParams } = new URL(request.url);
-    const dateParam = searchParams.get('date'); // YYYY-MM-DD: jobs with actual_start_time on this date
-    const stepsFetchedParam = searchParams.get('stepsFetched'); // 'true' | 'false': filter by steps_fetched
+    const dateParam = searchParams.get('date');
+    const stepsFetchedParam = searchParams.get('stepsFetched');
 
     let rows: unknown[];
-    let debug: { date?: string; stepsFetchedFilter?: string; stepsFetchedFilterApplied: boolean; stepsFetchedFilterSkipped?: boolean; whereHint?: string } = { stepsFetchedFilterApplied: false };
+    const debug: { date?: string; stepsFetchedFilter?: string; stepsFetchedFilterApplied: boolean; stepsFetchedFilterSkipped?: boolean; whereHint?: string } = { stepsFetchedFilterApplied: false };
     if (dateParam || stepsFetchedParam === 'false' || stepsFetchedParam === 'true') {
       const conditions: string[] = [];
       const values: unknown[] = [];
@@ -46,9 +46,9 @@ export async function GET(request: Request) {
       const whereClause = conditions.length ? ` WHERE ${conditions.join(' AND ')}` : '';
       debug.whereHint = whereClause || '(none)';
       try {
-        rows = await prisma.$queryRawUnsafe(
+        rows = await query(
           `SELECT * FROM tbl_vworkjobs${whereClause} ORDER BY job_id LIMIT 500`,
-          ...values
+          values
         );
         debug.stepsFetchedFilterApplied = Boolean(debug.stepsFetchedFilter);
       } catch (err) {
@@ -62,7 +62,7 @@ export async function GET(request: Request) {
             dateOnlyValues.push(`${dateParam}T00:00:00`);
           }
           const w = dateOnlyConditions.length ? ` WHERE ${dateOnlyConditions.join(' AND ')}` : '';
-          rows = await prisma.$queryRawUnsafe(`SELECT * FROM tbl_vworkjobs${w} ORDER BY job_id LIMIT 500`, ...dateOnlyValues);
+          rows = await query(`SELECT * FROM tbl_vworkjobs${w} ORDER BY job_id LIMIT 500`, dateOnlyValues);
           debug.stepsFetchedFilterSkipped = true;
           debug.stepsFetchedFilterApplied = false;
           debug.whereHint = `(steps_fetched column missing) ${w || '(none)'}`;
@@ -71,7 +71,7 @@ export async function GET(request: Request) {
         }
       }
     } else {
-      rows = await prisma.$queryRaw`SELECT * FROM tbl_vworkjobs ORDER BY job_id LIMIT 500`;
+      rows = await query('SELECT * FROM tbl_vworkjobs ORDER BY job_id LIMIT 500');
     }
     return NextResponse.json({ rows: jsonSafe(rows), debug });
   } catch (err) {

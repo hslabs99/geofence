@@ -1,6 +1,5 @@
 import { NextResponse } from 'next/server';
-import { Prisma } from '@prisma/client';
-import { prisma } from '@/lib/prisma';
+import { execute } from '@/lib/db';
 
 const SOURCE = 'tracksolid';
 const BATCH_SIZE = 500;
@@ -54,24 +53,26 @@ export async function POST(request: Request) {
     const minTime = new Date(Math.min(...rows.map((r) => r.positionTime.getTime())));
     const maxTime = new Date(Math.max(...rows.map((r) => r.positionTime.getTime())));
 
-    const deleted = await prisma.$executeRaw`
-      DELETE FROM tbl_apifeed
-      WHERE device_name = ${deviceName}
-        AND position_time >= ${minTime}
-        AND position_time <= ${maxTime}
-    `;
+    const deleted = await execute(
+      'DELETE FROM tbl_apifeed WHERE device_name = $1 AND position_time >= $2 AND position_time <= $3',
+      [deviceName, minTime, maxTime]
+    );
 
     let inserted = 0;
     for (let i = 0; i < rows.length; i += BATCH_SIZE) {
       const batch = rows.slice(i, i + BATCH_SIZE);
-      const values = batch.map(
-        (r) =>
-          Prisma.sql`(${deviceName}, ${imeiVal}, ${r.location}, ${r.positionTime}, ${SOURCE}, ${r.payloadJson}::jsonb)`
+      const values: unknown[] = [];
+      const placeholders: string[] = [];
+      let paramIdx = 1;
+      for (const r of batch) {
+        placeholders.push(`($${paramIdx}, $${paramIdx + 1}, $${paramIdx + 2}, $${paramIdx + 3}, $${paramIdx + 4}, $${paramIdx + 5}::jsonb)`);
+        values.push(deviceName, imeiVal, r.location, r.positionTime, SOURCE, r.payloadJson);
+        paramIdx += 6;
+      }
+      await execute(
+        `INSERT INTO tbl_apifeed (device_name, imei, location, position_time, source, payload) VALUES ${placeholders.join(', ')}`,
+        values
       );
-      await prisma.$executeRaw`
-        INSERT INTO tbl_apifeed (device_name, imei, location, position_time, source, payload)
-        VALUES ${Prisma.join(values, ',')}
-      `;
       inserted += batch.length;
     }
 
@@ -80,7 +81,7 @@ export async function POST(request: Request) {
       inserted,
       skipped,
       total: points.length,
-      deleted: Number(deleted),
+      deleted,
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

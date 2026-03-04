@@ -2,7 +2,7 @@ import { createHash } from 'crypto';
 import { join } from 'path';
 import { loadEnvConfig } from '@next/env';
 import { dateToLiteralUTC } from './utils';
-import { prisma } from './prisma';
+import { query, execute } from './db';
 
 const projectDir = process.cwd();
 loadEnvConfig(projectDir);
@@ -205,14 +205,14 @@ export async function clearTokenCache(endpoint?: string | null): Promise<void> {
     tokenCache.delete(baseUrl);
     const key = getTokenCacheKey(baseUrl);
     try {
-      await prisma.setting.deleteMany({ where: { type: TOKEN_SETTINGS_TYPE, settingname: key } });
+      await execute('DELETE FROM tbl_settings WHERE type = $1 AND settingname = $2', [TOKEN_SETTINGS_TYPE, key]);
     } catch {
       // ignore DB errors
     }
   } else {
     tokenCache.clear();
     try {
-      await prisma.setting.deleteMany({ where: { type: TOKEN_SETTINGS_TYPE } });
+      await execute('DELETE FROM tbl_settings WHERE type = $1', [TOKEN_SETTINGS_TYPE]);
     } catch {
       // ignore
     }
@@ -221,9 +221,11 @@ export async function clearTokenCache(endpoint?: string | null): Promise<void> {
 
 async function getTokenFromDb(cacheKey: string): Promise<{ token: string; expiresAt: number } | null> {
   try {
-    const row = await prisma.setting.findUnique({
-      where: { type_settingname: { type: TOKEN_SETTINGS_TYPE, settingname: cacheKey } },
-    });
+    const rows = await query<{ settingvalue: string | null }>(
+      'SELECT settingvalue FROM tbl_settings WHERE type = $1 AND settingname = $2 LIMIT 1',
+      [TOKEN_SETTINGS_TYPE, cacheKey]
+    );
+    const row = rows[0];
     if (!row?.settingvalue) return null;
     const data = JSON.parse(row.settingvalue) as { token?: string; expiresAt?: number };
     if (typeof data?.token === 'string' && typeof data?.expiresAt === 'number') return data as { token: string; expiresAt: number };
@@ -235,11 +237,12 @@ async function getTokenFromDb(cacheKey: string): Promise<{ token: string; expire
 
 async function setTokenInDb(cacheKey: string, token: string, expiresAt: number): Promise<void> {
   try {
-    await prisma.setting.upsert({
-      where: { type_settingname: { type: TOKEN_SETTINGS_TYPE, settingname: cacheKey } },
-      create: { type: TOKEN_SETTINGS_TYPE, settingname: cacheKey, settingvalue: JSON.stringify({ token, expiresAt }) },
-      update: { settingvalue: JSON.stringify({ token, expiresAt }) },
-    });
+    const value = JSON.stringify({ token, expiresAt });
+    await execute(
+      `INSERT INTO tbl_settings (type, settingname, settingvalue) VALUES ($1, $2, $3)
+       ON CONFLICT (type, settingname) DO UPDATE SET settingvalue = EXCLUDED.settingvalue`,
+      [TOKEN_SETTINGS_TYPE, cacheKey, value]
+    );
   } catch {
     // ignore DB errors; in-memory cache still works
   }
