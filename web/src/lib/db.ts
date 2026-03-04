@@ -8,7 +8,7 @@ function getPool(): Pool {
     pool = new Pool({ connectionString: process.env.DATABASE_URL, max: 10 });
     return pool;
   }
-  const host = process.env.PGHOST;
+  const host = process.env.PGHOST?.trim() ?? '';
   if (!host || !process.env.PGUSER || !process.env.PGPASSWORD) {
     throw new Error('Missing DATABASE_URL or PGHOST/PGUSER/PGPASSWORD');
   }
@@ -17,7 +17,7 @@ function getPool(): Pool {
     port: host.startsWith('/') ? undefined : parseInt(process.env.PGPORT || '5432', 10),
     user: process.env.PGUSER,
     password: process.env.PGPASSWORD,
-    database: process.env.PGDATABASE || 'geodata',
+    database: (process.env.PGDATABASE ?? 'geodata').trim(),
     max: 10,
   });
   return pool;
