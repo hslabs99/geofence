@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
-    "build": "prisma generate && next build && node scripts/fix-standalone.mjs",
+    "build": "prisma generate && next build --webpack && node scripts/fix-standalone.mjs",
     "start": "next start",
     "lint": "eslint",
     "postinstall": "prisma generate"

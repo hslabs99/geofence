@@ -1,32 +1,39 @@
 import { PrismaClient } from '@prisma/client';
 
-/** Run before first Prisma use so request-time env (e.g. PGHOST from App Hosting) is applied. */
-function ensureDatabaseUrl(): void {
-  if (process.env.DATABASE_URL) return;
+/**
+ * Build DATABASE_URL from env. For Unix socket (App Hosting), Prisma needs
+ * the placeholder host (localhost) before the ?host= path.
+ */
+function getDatabaseUrl(): string {
+  if (process.env.DATABASE_URL) return process.env.DATABASE_URL;
   if (process.env.PGHOST && process.env.PGUSER && process.env.PGPASSWORD) {
     const password = encodeURIComponent(process.env.PGPASSWORD);
     const db = process.env.PGDATABASE ?? 'geodata';
     const host = process.env.PGHOST;
-    process.env.DATABASE_URL = `postgresql://${process.env.PGUSER}:${password}@/${db}?host=${encodeURIComponent(host)}`;
-    if (process.env.PGPORT) {
-      process.env.DATABASE_URL += `&port=${process.env.PGPORT}`;
-    }
+    let url = `postgresql://${process.env.PGUSER}:${password}@localhost/${db}?host=${encodeURIComponent(host)}`;
+    // Unix socket (/cloudsql/...) ignores port; only add for TCP hosts to avoid URL issues
+    if (process.env.PGPORT && !host.startsWith('/')) url += `&port=${process.env.PGPORT}`;
+    return url;
   }
+  throw new Error('Missing DATABASE_URL or PGHOST/PGUSER/PGPASSWORD');
 }
 
 const globalForPrisma = globalThis as unknown as { prisma: PrismaClient | undefined };
 
 function getPrisma(): PrismaClient {
-  ensureDatabaseUrl();
   if (globalForPrisma.prisma) return globalForPrisma.prisma;
+  const url = getDatabaseUrl();
   const client = new PrismaClient({
+    datasources: {
+      db: { url },
+    },
     log: process.env.NODE_ENV === 'development' ? ['error', 'warn'] : ['error'],
   });
   if (process.env.NODE_ENV !== 'production') globalForPrisma.prisma = client;
   return client;
 }
 
-// Lazy proxy so ensureDatabaseUrl() runs on first use (request-time env in App Hosting)
+// Lazy proxy so URL is built on first use (request-time env in App Hosting)
 export const prisma = new Proxy({} as PrismaClient, {
   get(_target, prop) {
     return (getPrisma() as unknown as Record<string | symbol, unknown>)[prop];
