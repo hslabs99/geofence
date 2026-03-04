@@ -5,11 +5,11 @@ import { PrismaPg } from '@prisma/adapter-pg';
 const globalForPrisma = globalThis as unknown as { prisma: PrismaClient | undefined };
 
 function createPrisma(): PrismaClient {
+  // Point to the folder (PGHOST), not the file; pg finds .s.PGSQL.5432
   const pool = process.env.DATABASE_URL
     ? new Pool({ connectionString: process.env.DATABASE_URL, max: 5 })
     : new Pool({
         host: process.env.PGHOST,
-        port: process.env.PGHOST?.startsWith('/') ? undefined : parseInt(process.env.PGPORT || '5432', 10),
         user: process.env.PGUSER,
         password: process.env.PGPASSWORD,
         database: process.env.PGDATABASE || 'geodata',

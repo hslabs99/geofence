@@ -6,7 +6,7 @@ runConfig:
   cpu: 1
   memoryMiB: 512
   cloudSqlInstances:
-    - connectionName: "cel-geosystem:australia-southeast1:geofence"
+    - "cel-geosystem:australia-southeast1:geofence"
 
 env:
   - variable: PGHOST
