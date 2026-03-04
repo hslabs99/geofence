@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
-    "build": "next build && node scripts/fix-standalone.mjs",
+    "build": "prisma generate && next build && node scripts/fix-standalone.mjs",
     "start": "next start",
     "lint": "eslint",
     "postinstall": "prisma generate"
@@ -12,6 +12,7 @@
   "dependencies": {
     "@prisma/client": "^6.9.0",
     "bcryptjs": "^3.0.3",
+    "pg": "^8.13.0",
     "next": "16.1.6",
     "prisma": "^6.9.0",
     "react": "19.2.3",

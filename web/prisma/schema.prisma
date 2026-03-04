@@ -1,7 +1,8 @@
 // Local dev: DATABASE_URL in .env.local (Cloud SQL Proxy → 127.0.0.1:5433)
 // Production: DATABASE_URL or PGHOST/PGPASSWORD from env (e.g. /cloudsql/...)
 generator client {
-  provider = "prisma-client-js"
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "debian-openssl-3.0.x"]
 }
 
 datasource db {
