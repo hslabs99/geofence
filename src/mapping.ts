@@ -73,3 +73,48 @@ export const HEADER_TO_COLUMN: Record<string, string> = {
   'worker': 'worker',
   'worker duration (mins)': 'worker_duration_mins',
 };
+
+/**
+ * Maps normalized header names to tbl_gpsdata column names.
+ * Handles truncated Excel headers (e.g. "evice nam" -> device_name, "ence nam" -> fence_name).
+ */
+export const GPS_HEADER_TO_COLUMN: Record<string, string> = {
+  'no.': 'no',
+  'no': 'no',
+  'evice nam': 'device_name',
+  'device name': 'device_name',
+  'imei': 'imei',
+  'model': 'model',
+  'driver name': 'driver_name',
+  'number plate': 'number_plate',
+  'sim': 'sim',
+  'phone': 'phone',
+  'ence nam': 'fence_name',
+  'fence name': 'fence_name',
+  'enter time': 'enter_time',
+  'outer time': 'outer_time',
+  'out time': 'outer_time',
+  'exit time': 'outer_time',
+  'stay time': 'stay_time',
+};
+
+/**
+ * Maps normalized header names to tbl_tracking column names.
+ * Hardcoded for Track Details XLS (e.g. Track Details_20260223095117.xls).
+ */
+export const TRACKING_HEADER_TO_COLUMN: Record<string, string> = {
+  'no.': 'device_no',
+  'no': 'device_no',
+  'device name': 'device_name',
+  'imei': 'imei',
+  'model': 'model',
+  'ignition': 'ignition',
+  'position time': 'position_time',
+  'speed': 'speed_raw',
+  'azimuth': 'azimuth',
+  'position type': 'position_type',
+  'no. of satellites': 'satellites',
+  'data type': 'data_type',
+  'coordinates': 'coordinates', // special: parsed to lat, lon, geom
+  'address': 'address',
+};

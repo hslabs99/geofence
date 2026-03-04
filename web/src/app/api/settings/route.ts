@@ -1,0 +1,52 @@
+import { NextResponse } from 'next/server';
+import { prisma } from '@/lib/prisma';
+
+export async function GET(request: Request) {
+  try {
+    const { searchParams } = new URL(request.url);
+    const type = searchParams.get('type');
+    const name = searchParams.get('name');
+    if (!type || !name) {
+      return NextResponse.json({ error: 'type and name required' }, { status: 400 });
+    }
+    const rows = await prisma.$queryRaw<{ settingvalue: string | null }[]>`
+      SELECT settingvalue FROM tbl_settings
+      WHERE type = ${type} AND settingname = ${name}
+      LIMIT 1
+    `;
+    const row = rows[0];
+    if (!row || row.settingvalue == null) {
+      return NextResponse.json({ settingvalue: null });
+    }
+    return NextResponse.json({ settingvalue: row.settingvalue });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    // eslint-disable-next-line no-console
+    console.error('[api/settings GET] Error:', message, err instanceof Error ? err.stack : '');
+    return NextResponse.json({ error: message }, { status: 500 });
+  }
+}
+
+export async function PUT(request: Request) {
+  try {
+    const body = await request.json().catch(() => ({}));
+    const type = (body as { type?: string }).type;
+    const name = (body as { settingname?: string }).settingname;
+    const value = (body as { settingvalue?: string | null }).settingvalue ?? null;
+    if (!type || typeof type !== 'string' || !name || typeof name !== 'string') {
+      return NextResponse.json({ error: 'type and settingname required', received: { type, settingname: name } }, { status: 400 });
+    }
+    const valueStr = value == null ? null : String(value);
+    await prisma.$executeRaw`
+      INSERT INTO tbl_settings (type, settingname, settingvalue)
+      VALUES (${type}, ${name}, ${valueStr})
+      ON CONFLICT (type, settingname) DO UPDATE SET settingvalue = EXCLUDED.settingvalue
+    `;
+    return NextResponse.json({ ok: true });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    // eslint-disable-next-line no-console
+    console.error('[api/settings PUT] Error:', message, err instanceof Error ? err.stack : '');
+    return NextResponse.json({ error: message }, { status: 500 });
+  }
+}

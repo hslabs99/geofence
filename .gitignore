@@ -19,3 +19,6 @@ build/
 
 # Firebase
 .firebase/
+
+# Service account keys (never commit)
+cel-geosystem-*.json

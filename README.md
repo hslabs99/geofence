@@ -52,5 +52,6 @@ gcloud run deploy geodata-import \
 Ensure these objects exist:
 
 - Sequence: `seq_vwork_batch`
+- Sequence: `seq_gpsdata_batch` (for GPS import batchnumber)
 - Table: `tbl_vworkjobs` with columns including `job_id` (unique), `raw_row` (jsonb), and mapped columns
 - Table: `import_file` with `drive_file_id` (unique), `filename`, `status`, `row_count`, `batchnumber`, `error_message`

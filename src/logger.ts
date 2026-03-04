@@ -1,8 +1,14 @@
 /** Structured logs for Cloud Logging. Use level+context+message for fast debugging. */
 type LogContext = Record<string, unknown>;
 
+function tsLiteral(): string {
+  const d = new Date();
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
 function log(level: string, context: LogContext, message: string): void {
-  const entry = { level, ...context, message, ts: new Date().toISOString() };
+  const entry = { level, ...context, message, ts: tsLiteral() };
   const out = JSON.stringify(entry);
   if (level === 'ERROR') console.error(out);
   else console.log(out);
