@@ -10,8 +10,9 @@ function getDatabaseUrl(): string {
     const password = encodeURIComponent(process.env.PGPASSWORD);
     const db = process.env.PGDATABASE ?? 'geodata';
     const host = process.env.PGHOST;
-    let url = `postgresql://${process.env.PGUSER}:${password}@localhost/${db}?host=${encodeURIComponent(host)}`;
-    // Unix socket (/cloudsql/...) ignores port; only add for TCP hosts to avoid URL issues
+    // Cloud SQL Unix socket: point to the actual socket file so Prisma doesn't append :5432 to the path
+    const socketPath = host.startsWith('/') ? `${host}/.s.PGSQL.5432` : host;
+    let url = `postgresql://${process.env.PGUSER}:${password}@localhost/${db}?host=${encodeURIComponent(socketPath)}`;
     if (process.env.PGPORT && !host.startsWith('/')) url += `&port=${process.env.PGPORT}`;
     return url;
   }
