@@ -1,48 +1,28 @@
+import { Pool } from 'pg';
 import { PrismaClient } from '@prisma/client';
-
-/**
- * Goldilocks connection string for Prisma on Google Cloud Run/App Hosting.
- * Format: postgresql://USER:PASS@localhost/DBNAME?host=PATH (folder only, no trailing slash, no .s.PGSQL.5432).
- */
-function getDatabaseUrl(): string {
-  if (process.env.DATABASE_URL) return process.env.DATABASE_URL;
-
-  const user = process.env.PGUSER;
-  const pass = encodeURIComponent(process.env.PGPASSWORD || '');
-  const db = process.env.PGDATABASE || 'geodata';
-  const host = process.env.PGHOST; // folder path e.g. /cloudsql/project:region:instance
-
-  if (!host || !user) throw new Error('Missing DATABASE_URL or PGHOST/PGUSER/PGPASSWORD');
-
-  // Unix socket: localhost + ?host= path (folder only, no trailing slash)
-  if (host.startsWith('/')) {
-    const pathEncoded = encodeURIComponent(host.replace(/\/$/, '')); // ensure no trailing slash
-    return `postgresql://${user}:${pass}@localhost/${db}?host=${pathEncoded}`;
-  }
-
-  // TCP (e.g. local dev)
-  let url = `postgresql://${user}:${pass}@${host}/${db}`;
-  if (process.env.PGPORT) url += `?port=${process.env.PGPORT}`;
-  return url;
-}
+import { PrismaPg } from '@prisma/adapter-pg';
 
 const globalForPrisma = globalThis as unknown as { prisma: PrismaClient | undefined };
 
-function getPrisma(): PrismaClient {
-  if (globalForPrisma.prisma) return globalForPrisma.prisma;
-  const client = new PrismaClient({
-    datasources: {
-      db: { url: getDatabaseUrl() },
-    },
-    log: process.env.NODE_ENV === 'development' ? ['error', 'warn'] : ['error'],
+function createPrisma(): PrismaClient {
+  const pool = process.env.DATABASE_URL
+    ? new Pool({ connectionString: process.env.DATABASE_URL, max: 5 })
+    : new Pool({
+        host: process.env.PGHOST,
+        port: process.env.PGHOST?.startsWith('/') ? undefined : parseInt(process.env.PGPORT || '5432', 10),
+        user: process.env.PGUSER,
+        password: process.env.PGPASSWORD,
+        database: process.env.PGDATABASE || 'geodata',
+        max: 5,
+      });
+
+  const adapter = new PrismaPg(pool);
+  return new PrismaClient({
+    adapter,
+    log: process.env.NODE_ENV === 'development' ? ['query', 'error', 'warn'] : ['error'],
   });
-  if (process.env.NODE_ENV !== 'production') globalForPrisma.prisma = client;
-  return client;
 }
 
-// Lazy proxy so URL is built on first use (request-time env in App Hosting)
-export const prisma = new Proxy({} as PrismaClient, {
-  get(_target, prop) {
-    return (getPrisma() as unknown as Record<string | symbol, unknown>)[prop];
-  },
-});
+export const prisma = globalForPrisma.prisma ?? createPrisma();
+
+if (process.env.NODE_ENV !== 'production') globalForPrisma.prisma = prisma;
