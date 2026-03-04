@@ -1,34 +1,38 @@
 import { PrismaClient } from '@prisma/client';
 
 /**
- * Build DATABASE_URL from env. LibPQ Unix socket format: postgresql://user:pass@/db?host=SOCKET_DIR
- * (empty host after @ so Prisma/driver does not append :5432 to the path).
+ * Goldilocks connection string for Prisma on Google Cloud Run/App Hosting.
+ * Format: postgresql://USER:PASS@localhost/DBNAME?host=PATH (folder only, no trailing slash, no .s.PGSQL.5432).
  */
 function getDatabaseUrl(): string {
   if (process.env.DATABASE_URL) return process.env.DATABASE_URL;
-  if (process.env.PGHOST && process.env.PGUSER && process.env.PGPASSWORD) {
-    const user = process.env.PGUSER;
-    const password = encodeURIComponent(process.env.PGPASSWORD);
-    const db = process.env.PGDATABASE ?? 'geodata';
-    const socketDir = process.env.PGHOST; // e.g. /cloudsql/project:region:instance
-    if (socketDir.startsWith('/')) {
-      return `postgresql://${user}:${password}@/${db}?host=${encodeURIComponent(socketDir)}`;
-    }
-    let url = `postgresql://${user}:${password}@${socketDir}/${db}`;
-    if (process.env.PGPORT) url += `?port=${process.env.PGPORT}`;
-    return url;
+
+  const user = process.env.PGUSER;
+  const pass = encodeURIComponent(process.env.PGPASSWORD || '');
+  const db = process.env.PGDATABASE || 'geodata';
+  const host = process.env.PGHOST; // folder path e.g. /cloudsql/project:region:instance
+
+  if (!host || !user) throw new Error('Missing DATABASE_URL or PGHOST/PGUSER/PGPASSWORD');
+
+  // Unix socket: localhost + ?host= path (folder only, no trailing slash)
+  if (host.startsWith('/')) {
+    const pathEncoded = encodeURIComponent(host.replace(/\/$/, '')); // ensure no trailing slash
+    return `postgresql://${user}:${pass}@localhost/${db}?host=${pathEncoded}`;
   }
-  throw new Error('Missing DATABASE_URL or PGHOST/PGUSER/PGPASSWORD');
+
+  // TCP (e.g. local dev)
+  let url = `postgresql://${user}:${pass}@${host}/${db}`;
+  if (process.env.PGPORT) url += `?port=${process.env.PGPORT}`;
+  return url;
 }
 
 const globalForPrisma = globalThis as unknown as { prisma: PrismaClient | undefined };
 
 function getPrisma(): PrismaClient {
   if (globalForPrisma.prisma) return globalForPrisma.prisma;
-  const url = getDatabaseUrl();
   const client = new PrismaClient({
     datasources: {
-      db: { url },
+      db: { url: getDatabaseUrl() },
     },
     log: process.env.NODE_ENV === 'development' ? ['error', 'warn'] : ['error'],
   });
