@@ -1,16 +1,19 @@
 # Firebase App Hosting – Geofence Next.js app
 # Set app root to "web" when creating the backend if repo root is parent.
 # https://firebase.google.com/docs/app-hosting/configure
+#
+# Database: connect via Cloud SQL public IP (no Unix socket).
+# Set secret CLOUD_SQL_PUBLIC_IP to your instance's public IP:
+#   firebase apphosting:secrets:set CLOUD_SQL_PUBLIC_IP
+# Get the IP from: Cloud Console → SQL → your instance → Overview → Public IP.
 
 runConfig:
   cpu: 1
   memoryMiB: 512
-  cloudSqlInstances:
-    - "cel-geosystem:australia-southeast1:geofence"
 
 env:
   - variable: PGHOST
-    value: /cloudsql/cel-geosystem:australia-southeast1:geofence
+    secret: CLOUD_SQL_PUBLIC_IP
     availability: [RUNTIME]
   - variable: PGPORT
     value: "5432"
