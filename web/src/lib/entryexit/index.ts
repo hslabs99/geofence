@@ -1,4 +1,4 @@
-export { writeWindow, scanWindow, inWindow, parseTimestampToMs } from './dateWindow';
+export { writeWindow, scanWindow, taggingRange, inWindow, parseTimestampToMs } from './dateWindow';
 export { runStateMachine, type ScanRow, type TagUpdate } from './stateMachine';
 export {
   runForDate,

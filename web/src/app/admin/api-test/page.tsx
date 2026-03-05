@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { runFetchStepsForJobs } from '@/lib/fetch-steps';
 
 const ENDPOINT_OPTIONS: { value: string; label: string; url: string }[] = [
@@ -101,6 +101,7 @@ export default function ApiTestPage() {
   const [mergeDebug, setMergeDebug] = useState<{ failedStep?: string; rawSql?: string } | null>(null);
   const [copyFeedback, setCopyFeedback] = useState(false);
   const [endpoint, setEndpoint] = useState<string>('hk');
+  const [apiTestTab, setApiTestTab] = useState<'devices' | 'fences'>('devices');
   // Single-day fetch: YYYY-MM-DD (UTC 00:00:00–23:59:59). Default yesterday.
   const [trackDate, setTrackDate] = useState<string>(() => {
     const d = new Date();
@@ -143,6 +144,14 @@ export default function ApiTestPage() {
   } | null>(null);
   const [resetStepsLoading, setResetStepsLoading] = useState(false);
   const [resetStepsMessage, setResetStepsMessage] = useState<string | null>(null);
+  const [fenceSyncLoading, setFenceSyncLoading] = useState(false);
+  const [fenceSyncLog, setFenceSyncLog] = useState<Array<{ stage: string; message?: string; current?: number; total?: number; fetched?: number; inserted?: number; updated?: number; deleted?: number; action?: 'inserted' | 'updated'; fence_name?: string }>>([]);
+  const [fenceSyncResult, setFenceSyncResult] = useState<{ fetched: number; inserted: number; updated: number; deleted: number } | null>(null);
+  const [fenceSyncError, setFenceSyncError] = useState<string | null>(null);
+  const fenceSyncLogScrollRef = useRef<HTMLDivElement | null>(null);
+  const [fenceListFetchLoading, setFenceListFetchLoading] = useState(false);
+  const [fenceListFetched, setFenceListFetched] = useState<Array<{ fenceId: string; name: string; type: string }> | null>(null);
+  const [fenceListFetchError, setFenceListFetchError] = useState<string | null>(null);
 
   const fetchMaxDates = async () => {
     setMaxDatesError(null);
@@ -619,6 +628,10 @@ export default function ApiTestPage() {
     );
   }, [devices?.length, fleetRows.length]);
 
+  useEffect(() => {
+    fenceSyncLogScrollRef.current?.scrollTo({ top: fenceSyncLogScrollRef.current.scrollHeight, behavior: 'smooth' });
+  }, [fenceSyncLog.length]);
+
   const copyDebugPayload = (payload: DevicesDebugPayload) => {
     const parts: string[] = ['--- Tracksolid API debug (for tech support) ---'];
     if ('steps' in payload) {
@@ -736,6 +749,33 @@ export default function ApiTestPage() {
         </div>
       </div>
 
+      <div className="mb-4 flex gap-1 rounded-lg border border-zinc-200 bg-zinc-100 p-1 dark:border-zinc-700 dark:bg-zinc-800">
+        <button
+          type="button"
+          onClick={() => setApiTestTab('devices')}
+          className={`rounded-md px-4 py-2 text-sm font-medium transition-colors ${
+            apiTestTab === 'devices'
+              ? 'bg-white text-zinc-900 shadow dark:bg-zinc-700 dark:text-zinc-100'
+              : 'text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100'
+          }`}
+        >
+          Devices
+        </button>
+        <button
+          type="button"
+          onClick={() => setApiTestTab('fences')}
+          className={`rounded-md px-4 py-2 text-sm font-medium transition-colors ${
+            apiTestTab === 'fences'
+              ? 'bg-white text-zinc-900 shadow dark:bg-zinc-700 dark:text-zinc-100'
+              : 'text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100'
+          }`}
+        >
+          Fences
+        </button>
+      </div>
+
+      {apiTestTab === 'devices' && (
+      <>
       <section className="mb-8 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900">
         <h2 className="mb-3 text-lg font-medium text-zinc-800 dark:text-zinc-200">Devices</h2>
         <p className="mb-3 text-sm text-zinc-600 dark:text-zinc-400">
@@ -1367,6 +1407,185 @@ export default function ApiTestPage() {
           </div>
         )}
       </section>
+      </>
+      )}
+
+      {apiTestTab === 'fences' && (
+      <section className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900">
+        <h2 className="mb-3 text-lg font-medium text-zinc-800 dark:text-zinc-200">
+          Import/merge Fences (Tracksolid platform)
+        </h2>
+        <p className="mb-3 text-sm text-zinc-600 dark:text-zinc-400">
+          Two stages: (1) Fetch fence list from the API and review; (2) Process and merge into <code className="rounded bg-zinc-200 px-1 dark:bg-zinc-700">tbl_geofences</code> — each fence is inserted or updated and shown in the log. Endpoint: <strong>{endpoint}</strong>.
+        </p>
+
+        <div className="mb-4 flex flex-wrap items-center gap-2">
+          <span className="text-xs font-medium uppercase text-zinc-500 dark:text-zinc-400">Stage 1</span>
+          <button
+            type="button"
+            onClick={async () => {
+              setFenceListFetchError(null);
+              setFenceListFetched(null);
+              setFenceListFetchLoading(true);
+              try {
+                const res = await fetch('/api/admin/tracksolid/fences/fetch', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ endpoint }),
+                });
+                const data = await res.json();
+                if (!res.ok) {
+                  setFenceListFetchError(data?.error ?? res.statusText ?? 'Fetch failed');
+                  return;
+                }
+                setFenceListFetched(data.fences ?? []);
+              } catch (e) {
+                setFenceListFetchError(e instanceof Error ? e.message : String(e));
+              } finally {
+                setFenceListFetchLoading(false);
+              }
+            }}
+            disabled={fenceListFetchLoading}
+            className="rounded bg-zinc-600 px-4 py-2 text-sm font-medium text-white hover:bg-zinc-700 disabled:opacity-50 dark:bg-zinc-700 dark:hover:bg-zinc-600"
+          >
+            {fenceListFetchLoading ? 'Fetching…' : '1. Fetch fence list'}
+          </button>
+        </div>
+        {fenceListFetchError && (
+          <p className="mb-3 text-sm text-red-600 dark:text-red-400">{fenceListFetchError}</p>
+        )}
+        {fenceListFetched && (
+          <div className="mb-4 rounded border border-zinc-200 bg-zinc-50 p-3 dark:border-zinc-700 dark:bg-zinc-800/50">
+            <p className="mb-2 text-xs font-medium uppercase text-zinc-500 dark:text-zinc-400">
+              Fence list ({fenceListFetched.length} fence{fenceListFetched.length !== 1 ? 's' : ''})
+            </p>
+            <div className="max-h-48 overflow-y-auto font-mono text-sm text-zinc-700 dark:text-zinc-300">
+              {fenceListFetched.map((f, i) => (
+                <div key={f.fenceId ?? i}>{f.name ?? f.fenceId ?? '—'}</div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        <div className="mb-4 flex flex-wrap items-center gap-2">
+          <span className="text-xs font-medium uppercase text-zinc-500 dark:text-zinc-400">Stage 2</span>
+          <button
+            type="button"
+            onClick={async () => {
+              setFenceSyncError(null);
+              setFenceSyncResult(null);
+              setFenceSyncLog([]);
+              setFenceSyncLoading(true);
+              try {
+                const res = await fetch('/api/admin/tracksolid/fences/sync', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ endpoint }),
+                });
+                if (!res.ok || !res.body) {
+                  setFenceSyncError(res.statusText || 'Sync failed');
+                  return;
+                }
+                const reader = res.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = '';
+                while (true) {
+                  const { done, value } = await reader.read();
+                  if (done) break;
+                  buffer += decoder.decode(value, { stream: true });
+                  const lines = buffer.split('\n');
+                  buffer = lines.pop() ?? '';
+                  for (const line of lines) {
+                    if (!line.trim()) continue;
+                    try {
+                      const e = JSON.parse(line) as { stage: string; message?: string; current?: number; total?: number; fetched?: number; inserted?: number; updated?: number; deleted?: number; error?: string; action?: 'inserted' | 'updated'; fence_name?: string };
+                      setFenceSyncLog((prev) => [...prev, e]);
+                      if (e.stage === 'done' && e.fetched != null) {
+                        setFenceSyncResult({
+                          fetched: e.fetched,
+                          inserted: e.inserted ?? 0,
+                          updated: e.updated ?? 0,
+                          deleted: e.deleted ?? 0,
+                        });
+                      }
+                      if (e.stage === 'error') {
+                        setFenceSyncError(e.error ?? e.message ?? 'Sync failed');
+                      }
+                    } catch {
+                      /* ignore parse */
+                    }
+                  }
+                }
+                if (buffer.trim()) {
+                  try {
+                    const e = JSON.parse(buffer) as { stage: string; message?: string; fetched?: number; inserted?: number; updated?: number; deleted?: number; error?: string };
+                    setFenceSyncLog((prev) => [...prev, e]);
+                    if (e.stage === 'done' && e.fetched != null) {
+                      setFenceSyncResult({
+                        fetched: e.fetched,
+                        inserted: e.inserted ?? 0,
+                        updated: e.updated ?? 0,
+                        deleted: e.deleted ?? 0,
+                      });
+                    }
+                    if (e.stage === 'error') setFenceSyncError(e.error ?? e.message ?? 'Sync failed');
+                  } catch {
+                    /* ignore */
+                  }
+                }
+              } catch (e) {
+                setFenceSyncError(e instanceof Error ? e.message : String(e));
+              } finally {
+                setFenceSyncLoading(false);
+              }
+            }}
+            disabled={fenceSyncLoading}
+            className="rounded bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-700 disabled:opacity-50 dark:bg-indigo-700 dark:hover:bg-indigo-600"
+          >
+            {fenceSyncLoading ? 'Processing…' : '2. Process (insert/update)'}
+          </button>
+        </div>
+        {fenceSyncError && (
+          <p className="mt-3 text-sm text-red-600 dark:text-red-400">{fenceSyncError}</p>
+        )}
+        {fenceSyncLog.length > 0 && (
+          <div className="mt-3 rounded border border-zinc-200 bg-zinc-50 p-3 dark:border-zinc-700 dark:bg-zinc-800/50">
+            <p className="mb-2 text-xs font-medium uppercase text-zinc-500 dark:text-zinc-400">
+              Progress (live)
+            </p>
+            <div
+              ref={fenceSyncLogScrollRef}
+              className="max-h-48 overflow-y-auto font-mono text-sm"
+              style={{ scrollBehavior: 'smooth' }}
+            >
+              {fenceSyncLog.map((e, i) => (
+                <div
+                  key={i}
+                  className={
+                    e.stage === 'error' ? 'text-red-600 dark:text-red-400' :
+                    e.stage === 'done' ? 'font-semibold text-emerald-700 dark:text-emerald-400' :
+                    e.stage === 'debug_result_keys' ? 'text-amber-700 dark:text-amber-400' :
+                    e.stage === 'fence' && e.action === 'inserted' ? 'text-emerald-600 dark:text-emerald-400' :
+                    e.stage === 'fence' && e.action === 'updated' ? 'text-blue-600 dark:text-blue-400' :
+                    'text-zinc-700 dark:text-zinc-300'
+                  }
+                >
+                  {e.stage === 'fence' ? (e.message ?? `${e.action}: ${e.fence_name ?? '—'}`) : (e.message ?? e.stage)}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+        {fenceSyncResult && (
+          <div className="mt-3 rounded border border-emerald-200 bg-emerald-50 p-3 dark:border-emerald-800 dark:bg-emerald-900/20">
+            <p className="text-sm font-medium text-emerald-800 dark:text-emerald-200">Summary</p>
+            <p className="mt-1 text-sm text-emerald-700 dark:text-emerald-300">
+              Fetched <strong>{fenceSyncResult.fetched}</strong> · inserted <strong>{fenceSyncResult.inserted}</strong> · updated <strong>{fenceSyncResult.updated}</strong> · deleted <strong>{fenceSyncResult.deleted}</strong>
+            </p>
+          </div>
+        )}
+      </section>
+      )}
     </div>
   );
 }

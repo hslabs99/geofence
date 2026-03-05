@@ -66,6 +66,8 @@ export default function VworkPage() {
   const [dateFilterCol, setDateFilterCol] = useState<string>('');
   const [dateFrom, setDateFrom] = useState<string>('');
   const [dateTo, setDateTo] = useState<string>('');
+  const [filterCustomer, setFilterCustomer] = useState<string>('');
+  const [filterTemplate, setFilterTemplate] = useState<string>('');
   const [columnOrder, setColumnOrder] = useState<string[]>([]);
   const [hiddenColumns, setHiddenColumns] = useState<Set<string>>(new Set());
   const [showColumnConfig, setShowColumnConfig] = useState(false);
@@ -177,6 +179,31 @@ export default function VworkPage() {
 
   const dateColumns = useMemo(() => columns.filter((c) => DATE_COLUMNS.has(c)), [columns]);
 
+  const distinctCustomers = useMemo(() => {
+    const set = new Set<string>();
+    for (const row of rows) {
+      const v = row.Customer ?? row.customer;
+      if (v != null && String(v).trim() !== '') set.add(String(v).trim());
+    }
+    return Array.from(set).sort();
+  }, [rows]);
+
+  const distinctTemplates = useMemo(() => {
+    if (!filterCustomer.trim()) return [];
+    const set = new Set<string>();
+    for (const row of rows) {
+      const cust = row.Customer ?? row.customer;
+      if (cust == null || String(cust).trim() !== filterCustomer) continue;
+      const v = row.template;
+      if (v != null && String(v).trim() !== '') set.add(String(v).trim());
+    }
+    return Array.from(set).sort();
+  }, [rows, filterCustomer]);
+
+  useEffect(() => {
+    setFilterTemplate('');
+  }, [filterCustomer]);
+
   const [dragCol, setDragCol] = useState<string | null>(null);
   const [dropTargetCol, setDropTargetCol] = useState<string | null>(null);
 
@@ -226,19 +253,28 @@ export default function VworkPage() {
   }, []);
 
   const filteredRows = useMemo(() => {
-    if (!dateFilterCol || (!dateFrom && !dateTo)) return rows;
     return rows.filter((row) => {
-      const v = row[dateFilterCol];
-      if (v == null || v === '') return false;
-      const str = String(v);
-      if (!/^\d{4}-\d{2}-\d{2}/.test(str)) return false;
-      const datePart = str.match(/^(\d{4})-(\d{2})-(\d{2})/)?.[0] ?? '';
-      if (!datePart) return false;
-      if (dateFrom && datePart < dateFrom.slice(0, 10)) return false;
-      if (dateTo && datePart > dateTo.slice(0, 10)) return false;
+      if (filterCustomer) {
+        const v = row.Customer ?? row.customer;
+        if (v == null || String(v).trim() !== filterCustomer) return false;
+      }
+      if (filterTemplate) {
+        const v = row.template;
+        if (v == null || String(v).trim() !== filterTemplate) return false;
+      }
+      if (dateFilterCol && (dateFrom || dateTo)) {
+        const v = row[dateFilterCol];
+        if (v == null || v === '') return false;
+        const str = String(v);
+        if (!/^\d{4}-\d{2}-\d{2}/.test(str)) return false;
+        const datePart = str.match(/^(\d{4})-(\d{2})-(\d{2})/)?.[0] ?? '';
+        if (!datePart) return false;
+        if (dateFrom && datePart < dateFrom.slice(0, 10)) return false;
+        if (dateTo && datePart > dateTo.slice(0, 10)) return false;
+      }
       return true;
     });
-  }, [rows, dateFilterCol, dateFrom, dateTo]);
+  }, [rows, filterCustomer, filterTemplate, dateFilterCol, dateFrom, dateTo]);
 
   const sortedRows = useMemo(() => {
     const [c1, c2, c3] = sortColumns;
@@ -411,6 +447,29 @@ export default function VworkPage() {
               )}
             </div>
             <div>
+              <label className="mb-1 block text-xs font-medium text-zinc-500">Customer</label>
+              <select
+                value={filterCustomer}
+                onChange={(e) => setFilterCustomer(e.target.value)}
+                className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+              >
+                <option value="">— All —</option>
+                {distinctCustomers.map((c) => <option key={c} value={c}>{c}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="mb-1 block text-xs font-medium text-zinc-500">Template</label>
+              <select
+                value={filterTemplate}
+                onChange={(e) => setFilterTemplate(e.target.value)}
+                className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+                disabled={!filterCustomer}
+              >
+                <option value="">— All —</option>
+                {distinctTemplates.map((t) => <option key={t} value={t}>{t}</option>)}
+              </select>
+            </div>
+            <div>
               <label className="mb-1 block text-xs font-medium text-zinc-500">Date column</label>
               <select
                 value={dateFilterCol}
@@ -432,7 +491,7 @@ export default function VworkPage() {
                 className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800" />
             </div>
           </div>
-          <div className="max-h-[28rem] overflow-auto rounded-lg border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900">
+          <div className="max-h-[56rem] overflow-auto rounded-lg border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900">
             <table className="w-max table-fixed text-left text-sm">
               <colgroup>
                 {columns.map((col) => (
@@ -473,7 +532,7 @@ export default function VworkPage() {
           </div>
           <p className="mt-3 text-zinc-500">
             {sortedRows.length} row{sortedRows.length !== 1 ? 's' : ''}
-            {dateFilterCol && ` (filtered from ${rows.length})`} · max 500 from API
+            {(filterCustomer || filterTemplate || dateFilterCol) && ` (filtered from ${rows.length})`} · max 500 from API
           </p>
         </>
       )}

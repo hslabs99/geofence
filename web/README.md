@@ -1,6 +1,6 @@
 # Geofence Web (Next.js)
 
-Hello-world UI that lists all rows from `tbl_vworkjobs` in the geodata PostgreSQL DB. Uses **Prisma** and **DATABASE_URL** (no hardcoded credentials).
+Hello-world UI that lists all rows from `tbl_vworkjobs` in the geodata PostgreSQL DB. Connects directly via **pg**; credentials from env/secrets (e.g. **DATABASE_URL** or **PGHOST** + **PGPASSWORD**), no hardcoded credentials.
 
 ---
 

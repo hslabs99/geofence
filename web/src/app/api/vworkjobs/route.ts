@@ -2,6 +2,15 @@ import { NextResponse } from 'next/server';
 import { query } from '@/lib/db';
 import { dateToLiteralUTC } from '@/lib/utils';
 
+/** Raw timestamp columns in tbl_vworkjobs: SELECT as to_char so API returns exact DB digits. Only columns that exist in tbl_vworkjobs (no gps_start_time/gps_end_time — those are not in this table). */
+const RAW_TIMESTAMP_COLS = [
+  'actual_start_time', 'actual_end_time', 'planned_start_time',
+  'step_1_completed_at', 'step_2_completed_at', 'step_3_completed_at', 'step_4_completed_at', 'step_5_completed_at',
+  'step_1_gps_completed_at', 'step_2_gps_completed_at', 'step_3_gps_completed_at', 'step_4_gps_completed_at', 'step_5_gps_completed_at',
+  'step_1_actual_time', 'step_2_actual_time', 'step_3_actual_time', 'step_4_actual_time', 'step_5_actual_time',
+] as const;
+const RAW_SELECT_FRAGMENT = RAW_TIMESTAMP_COLS.map((c) => `to_char(t.${c}, 'YYYY-MM-DD HH24:MI:SS') AS ${c}_raw`).join(', ');
+
 /** JSON serialization — no toISOString. */
 function jsonSafe<T>(obj: T): T {
   if (obj === null || obj === undefined) return obj;
@@ -47,7 +56,7 @@ export async function GET(request: Request) {
       debug.whereHint = whereClause || '(none)';
       try {
         rows = await query(
-          `SELECT * FROM tbl_vworkjobs${whereClause} ORDER BY job_id LIMIT 500`,
+          `SELECT t.*, ${RAW_SELECT_FRAGMENT} FROM tbl_vworkjobs t${whereClause} ORDER BY t.job_id LIMIT 500`,
           values
         );
         debug.stepsFetchedFilterApplied = Boolean(debug.stepsFetchedFilter);
@@ -62,7 +71,7 @@ export async function GET(request: Request) {
             dateOnlyValues.push(`${dateParam}T00:00:00`);
           }
           const w = dateOnlyConditions.length ? ` WHERE ${dateOnlyConditions.join(' AND ')}` : '';
-          rows = await query(`SELECT * FROM tbl_vworkjobs${w} ORDER BY job_id LIMIT 500`, dateOnlyValues);
+          rows = await query(`SELECT t.*, ${RAW_SELECT_FRAGMENT} FROM tbl_vworkjobs t${w} ORDER BY t.job_id LIMIT 500`, dateOnlyValues);
           debug.stepsFetchedFilterSkipped = true;
           debug.stepsFetchedFilterApplied = false;
           debug.whereHint = `(steps_fetched column missing) ${w || '(none)'}`;
@@ -71,9 +80,22 @@ export async function GET(request: Request) {
         }
       }
     } else {
-      rows = await query('SELECT * FROM tbl_vworkjobs ORDER BY job_id LIMIT 500');
+      rows = await query(`SELECT t.*, ${RAW_SELECT_FRAGMENT} FROM tbl_vworkjobs t ORDER BY t.job_id LIMIT 500`);
     }
-    return NextResponse.json({ rows: jsonSafe(rows), debug });
+    // Use raw timestamp strings from to_char — exact DB digits, no Date, no timezone, no add/subtract.
+    const normalized = (rows as Record<string, unknown>[]).map((row) => {
+      const out = { ...row };
+      for (const col of RAW_TIMESTAMP_COLS) {
+        const rawKey = `${col}_raw`;
+        const rawVal = out[rawKey];
+        if (typeof rawVal === 'string') {
+          out[col] = rawVal;
+          delete out[rawKey];
+        }
+      }
+      return out;
+    });
+    return NextResponse.json({ rows: jsonSafe(normalized), debug });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return NextResponse.json({ error: message }, { status: 500 });

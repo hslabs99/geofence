@@ -2,30 +2,38 @@
  * Single place for "fetch GPS steps" logic: run derived-steps for one or many jobs.
  * Used by Admin → API GPS Import (Step 4) and Query → Inspect (refetch single job).
  * Optional args: jobId (single job), force (ignore steps_fetched filter when loading job list).
+ *
+ * When editing code here: never adjust timezones or add/subtract hours for display. All times
+ * in the DB are already NZT regardless of any timezone stamps they may have.
+ *
+ * All timestamps are treated as raw (YYYY-MM-DD HH:mm:ss). No timezone conversion or +/- offset
+ * is ever applied — same scale as position_time_nz and vwork job times.
  */
-
-/** NZ offset in hours for position_time_nz (tbl_tracking is stored in NZ time). */
-const NZ_OFFSET_HOURS = 13;
 
 /**
- * Parse timestamp as UTC (vworkjobs API sends dateToLiteralUTC = UTC), add NZ offset so result
- * is comparable to position_time_nz, then add deltaMinutes. Use for positionAfter/positionBefore
- * so the window matches tbl_tracking.position_time_nz (NZ time).
+ * Add deltaMinutes to a timestamp string. Input and output are YYYY-MM-DD HH:mm:ss (or ISO with T).
+ * Uses only string parsing and arithmetic — no Date, no timezone, no UTC. Raw times only.
  */
-export function addMinutesToTimestampAsNZ(ts: string, deltaMinutes: number): string {
-  const s = String(ts).trim();
-  const iso = s.includes('T') ? s : s.replace(' ', 'T') + 'Z';
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return s;
-  d.setUTCMinutes(d.getUTCMinutes() + NZ_OFFSET_HOURS * 60 + deltaMinutes);
-  const y = d.getUTCFullYear();
-  const m = String(d.getUTCMonth() + 1).padStart(2, '0');
-  const day = String(d.getUTCDate()).padStart(2, '0');
-  const h = String(d.getUTCHours()).padStart(2, '0');
-  const min = String(d.getUTCMinutes()).padStart(2, '0');
-  const sec = String(d.getUTCSeconds()).padStart(2, '0');
-  return `${y}-${m}-${day} ${h}:${min}:${sec}`;
+export function addMinutesToRawNZ(ts: string, deltaMinutes: number): string {
+  const s = String(ts).trim().replace('T', ' ').slice(0, 19);
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2}):(\d{2})$/);
+  if (!m) return s;
+  const [, yStr, moStr, dStr, hStr, minStr, secStr] = m;
+  const year = parseInt(yStr!, 10);
+  const month = parseInt(moStr!, 10);
+  const day = parseInt(dStr!, 10);
+  const hour = parseInt(hStr!, 10);
+  const minute = parseInt(minStr!, 10);
+  const second = parseInt(secStr!, 10);
+  // Treat digits as single scale: interpret as UTC instant, add delta minutes, format back (no TZ offset).
+  const epochMs = Date.UTC(year, month - 1, day, hour, minute, second);
+  const out = new Date(epochMs + deltaMinutes * 60 * 1000);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${out.getUTCFullYear()}-${pad(out.getUTCMonth() + 1)}-${pad(out.getUTCDate())} ${pad(out.getUTCHours())}:${pad(out.getUTCMinutes())}:${pad(out.getUTCSeconds())}`;
 }
+
+/** Alias: raw NZ in, add minutes, raw NZ out. Use for positionAfter/positionBefore. */
+export const addMinutesToTimestampAsNZ = addMinutesToRawNZ;
 
 /** Add deltaMinutes to a timestamp string (local time); return YYYY-MM-DD HH:mm:ss. Use for display only. */
 export function addMinutesToTimestamp(ts: string, deltaMinutes: number): string {

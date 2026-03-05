@@ -37,8 +37,18 @@ export default function UsersPage() {
   const [form, setForm] = useState(emptyForm());
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [distinctCustomers, setDistinctCustomers] = useState<string[]>([]);
+  const [customersLoading, setCustomersLoading] = useState(false);
   const isAdd = modal?.mode === 'add';
   const editing = modal?.mode === 'edit' ? modal.user : null;
+
+  const loadCustomers = useCallback(() => {
+    setCustomersLoading(true);
+    fetch('/api/vworkjobs/customers')
+      .then((r) => r.json())
+      .then((data) => setDistinctCustomers(data.customers ?? []))
+      .catch(() => setDistinctCustomers([]))
+      .finally(() => setCustomersLoading(false));
+  }, []);
 
   const loadUsers = () => {
     setLoading(true);
@@ -54,13 +64,7 @@ export default function UsersPage() {
   };
 
   useEffect(() => loadUsers(), []);
-
-  useEffect(() => {
-    fetch('/api/vworkjobs/customers')
-      .then((r) => r.json())
-      .then((data) => setDistinctCustomers(data.customers ?? []))
-      .catch(() => setDistinctCustomers([]));
-  }, []);
+  useEffect(() => loadCustomers(), [loadCustomers]);
 
   const openAdd = useCallback(() => {
     setSubmitError(null);
@@ -288,7 +292,23 @@ export default function UsersPage() {
               </div>
               {form.userType === 'Client' && (
                 <div>
-                  <label className="mb-1 block text-xs font-medium text-zinc-500">Customer (assigned)</label>
+                  <div className="mb-1 flex items-center justify-between">
+                    <label className="text-xs font-medium text-zinc-500">Customer (assigned)</label>
+                    <button
+                      type="button"
+                      onClick={loadCustomers}
+                      disabled={customersLoading}
+                      title="Refresh client list from vwork"
+                      className="rounded p-1 text-zinc-500 hover:bg-zinc-200 hover:text-zinc-700 disabled:opacity-50 dark:hover:bg-zinc-700 dark:hover:text-zinc-300"
+                    >
+                      <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={customersLoading ? 'animate-spin' : ''}>
+                        <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+                        <path d="M3 3v5h5" />
+                        <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16" />
+                        <path d="M16 21h5v-5" />
+                      </svg>
+                    </button>
+                  </div>
                   <select
                     value={form.customer}
                     onChange={(e) => setForm((f) => ({ ...f, customer: e.target.value }))}

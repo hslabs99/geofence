@@ -65,101 +65,122 @@ export default function Sidebar() {
           </div>
         </div>
         <div className="my-1 border-t border-zinc-200 dark:border-zinc-700" />
-        <div className="mt-2 rounded-md border-l-4 border-blue-500 bg-blue-50 px-3 py-1.5 text-xs font-bold uppercase tracking-wider text-blue-800 dark:border-blue-400 dark:bg-blue-950/50 dark:text-blue-200">
-          Query
-        </div>
-        <Link
-          href="/query/vwork"
-          className={`rounded px-3 py-2 text-sm ${
-            pathname === '/query/vwork' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
-          }`}
-        >
-          Vwork
-        </Link>
-        <Link
-          href="/query/gpsdata"
-          className={`rounded px-3 py-2 text-sm ${
-            pathname === '/query/gpsdata' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
-          }`}
-        >
-          GPS Tracking
-        </Link>
-        <Link
-          href="/query/inspect"
-          className={`rounded px-3 py-2 text-sm ${
-            pathname === '/query/inspect' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
-          }`}
-        >
-          Inspect
-        </Link>
-        <Link
-          href="/query/summary"
-          className={`rounded px-3 py-2 text-sm ${
-            pathname === '/query/summary' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
-          }`}
-        >
-          Summary
-        </Link>
-        <div className="my-1 border-t border-zinc-200 dark:border-zinc-700" />
-        <div className="mt-2 rounded-md border-l-4 border-amber-500 bg-amber-50 px-3 py-1.5 text-xs font-bold uppercase tracking-wider text-amber-800 dark:border-amber-400 dark:bg-amber-950/50 dark:text-amber-200">
-          Admin
-        </div>
+        {viewMode === 'client' ? (
           <Link
-            href="/admin/users"
+            href="/query/summary"
             className={`rounded px-3 py-2 text-sm ${
-              pathname === '/admin/users' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
+              pathname === '/query/summary' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
             }`}
           >
-            Users
+            Summary
           </Link>
-          <Link
-            href="/admin/autoruns"
-            className={`rounded px-3 py-2 text-sm ${
-              pathname === '/admin/autoruns' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
-            }`}
-          >
-            AutoRuns
-          </Link>
-          <Link
-            href="/admin/gps-mappings"
-            className={`rounded px-3 py-2 text-sm ${
-              pathname === '/admin/gps-mappings' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
-            }`}
-          >
-            GPS Mappings
-          </Link>
-          <Link
-            href="/admin/import-geofences"
-            className={`rounded px-3 py-2 text-sm ${
-              pathname === '/admin/import-geofences' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
-            }`}
-          >
-            Import Geofences
-          </Link>
-          <Link
-            href="/admin/tagging"
-            className={`rounded px-3 py-2 text-sm ${
-              pathname === '/admin/tagging' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
-            }`}
-          >
-            Tagging
-          </Link>
-          <Link
-            href="/admin/settings"
-            className={`rounded px-3 py-2 text-sm ${
-              pathname === '/admin/settings' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
-            }`}
-          >
-            Settings
-          </Link>
-          <Link
-            href="/admin/api-test"
-            className={`rounded px-3 py-2 text-sm ${
-              pathname === '/admin/api-test' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
-            }`}
-          >
-            API GPS Import
-          </Link>
+        ) : (
+          <>
+            <div className="mt-2 rounded-md border-l-4 border-blue-500 bg-blue-50 px-3 py-1.5 text-xs font-bold uppercase tracking-wider text-blue-800 dark:border-blue-400 dark:bg-blue-950/50 dark:text-blue-200">
+              Query
+            </div>
+            <Link
+              href="/query/vwork"
+              className={`rounded px-3 py-2 text-sm ${
+                pathname === '/query/vwork' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
+              }`}
+            >
+              Vwork
+            </Link>
+            <Link
+              href="/query/gpsdata"
+              className={`rounded px-3 py-2 text-sm ${
+                pathname === '/query/gpsdata' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
+              }`}
+            >
+              GPS Tracking
+            </Link>
+            <Link
+              href="/query/inspect"
+              className={`rounded px-3 py-2 text-sm ${
+                pathname === '/query/inspect' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
+              }`}
+            >
+              Inspect
+            </Link>
+            <Link
+              href="/query/summary"
+              className={`rounded px-3 py-2 text-sm ${
+                pathname === '/query/summary' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
+              }`}
+            >
+              Summary
+            </Link>
+            <div className="my-1 border-t border-zinc-200 dark:border-zinc-700" />
+            <div className="mt-2 rounded-md border-l-4 border-amber-500 bg-amber-50 px-3 py-1.5 text-xs font-bold uppercase tracking-wider text-amber-800 dark:border-amber-400 dark:bg-amber-950/50 dark:text-amber-200">
+              Admin
+            </div>
+            <Link
+              href="/admin/users"
+              className={`rounded px-3 py-2 text-sm ${
+                pathname === '/admin/users' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
+              }`}
+            >
+              Users
+            </Link>
+            <Link
+              href="/admin/autoruns"
+              className={`rounded px-3 py-2 text-sm ${
+                pathname === '/admin/autoruns' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
+              }`}
+            >
+              AutoRuns
+            </Link>
+            <Link
+              href="/admin/gps-mappings"
+              className={`rounded px-3 py-2 text-sm ${
+                pathname === '/admin/gps-mappings' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
+              }`}
+            >
+              GPS Mappings
+            </Link>
+            <Link
+              href="/admin/import-geofences"
+              className={`rounded px-3 py-2 text-sm ${
+                pathname === '/admin/import-geofences' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
+              }`}
+            >
+              Import Geofences
+            </Link>
+            <Link
+              href="/admin/tagging"
+              className={`rounded px-3 py-2 text-sm ${
+                pathname === '/admin/tagging' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
+              }`}
+            >
+              Tagging
+            </Link>
+            <Link
+              href="/admin/template-minutes"
+              className={`rounded px-3 py-2 text-sm ${
+                pathname === '/admin/template-minutes' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
+              }`}
+            >
+              Template Minutes
+            </Link>
+            <Link
+              href="/admin/settings"
+              className={`rounded px-3 py-2 text-sm ${
+                pathname === '/admin/settings' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
+              }`}
+            >
+              Settings
+            </Link>
+            <Link
+              href="/admin/api-test"
+              className={`rounded px-3 py-2 text-sm ${
+                pathname === '/admin/api-test' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
+              }`}
+            >
+              API GPS Import
+            </Link>
+          </>
+        )}
       </nav>
     </aside>
   );

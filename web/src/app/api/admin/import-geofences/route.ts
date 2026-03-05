@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { execute } from '@/lib/db';
+import { execute, query } from '@/lib/db';
 
 type GeoJSONPolygon = { type: 'Polygon'; coordinates: number[][][] };
 type GeoJSONMultiPolygon = { type: 'MultiPolygon'; coordinates: number[][][][] };
@@ -83,11 +83,22 @@ export async function POST(request: Request) {
 
     for (const fence of fences) {
       try {
-        await execute('DELETE FROM tbl_geofences WHERE fence_name = $1', [fence.name]);
-        await execute(
-          'INSERT INTO tbl_geofences (fence_name, geom) VALUES ($1, ST_SetSRID(ST_GeomFromGeoJSON($2), 4326))',
-          [fence.name, JSON.stringify(fence.geom)]
+        const existing = await query<{ fence_id: number }>(
+          'SELECT fence_id FROM tbl_geofences WHERE fence_name = $1 LIMIT 1',
+          [fence.name]
         );
+        const geomJson = JSON.stringify(fence.geom);
+        if (existing.length > 0) {
+          await execute(
+            'UPDATE tbl_geofences SET geom = ST_SetSRID(ST_GeomFromGeoJSON($1), 4326), updated_at = now() WHERE fence_id = $2',
+            [geomJson, existing[0].fence_id]
+          );
+        } else {
+          await execute(
+            'INSERT INTO tbl_geofences (fence_name, geom) VALUES ($1, ST_SetSRID(ST_GeomFromGeoJSON($2), 4326))',
+            [fence.name, geomJson]
+          );
+        }
         imported += 1;
         names.push(fence.name);
       } catch (err) {

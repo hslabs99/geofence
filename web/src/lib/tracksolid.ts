@@ -382,6 +382,145 @@ export async function getTrackForDevice(
   };
 }
 
+/** Platform geofence from jimi.open.platform.fence.list (7.45). lastModified when API returns update_time / last_modified / modify_time (UTC). */
+export interface TracksolidPlatformFence {
+  fenceId: string;
+  name: string;
+  type: 'circle' | 'polygon';
+  color?: string;
+  description?: string;
+  geom: string;
+  radius?: number;
+  /** Platform last-modified time when API provides it (e.g. update_time, last_modified). ISO string or undefined. */
+  lastModified?: string;
+}
+
+const FENCE_PAGE_SIZE = 100;
+
+function extractFenceList(obj: Record<string, unknown> | RawFence[] | undefined): RawFence[] {
+  type RawFence = {
+    fence_id?: unknown;
+    fence_name?: string;
+    fence_type?: string;
+    geom?: string;
+    radius?: unknown;
+    fence_color?: string;
+    description?: string;
+    update_time?: string | number;
+    last_modified?: string | number;
+    updateTime?: string | number;
+    modify_time?: string | number;
+  };
+  let list: RawFence[] = [];
+  if (Array.isArray(obj)) {
+    list = obj as RawFence[];
+  } else if (obj && typeof obj === 'object') {
+    const from = (o: Record<string, unknown>) =>
+      (o.rows as RawFence[]) ?? (o.list as RawFence[]) ?? (o.fenceList as RawFence[]) ?? (o.fences as RawFence[]) ?? (o.pageList as RawFence[]) ?? (o.items as RawFence[]) ?? (Array.isArray(o.data) ? (o.data as RawFence[]) : []) ?? (Array.isArray(o.result) ? (o.result as RawFence[]) : []);
+    list = from(obj);
+    if (list.length === 0 && obj.data && typeof obj.data === 'object') {
+      list = from(obj.data as Record<string, unknown>);
+    }
+    if (list.length === 0 && obj.result && typeof obj.result === 'object' && !Array.isArray(obj.result)) {
+      list = from(obj.result as Record<string, unknown>);
+    }
+  }
+  return list;
+}
+
+function getTotalFromResult(raw: unknown): number | undefined {
+  if (raw == null || typeof raw !== 'object') return undefined;
+  const o = raw as Record<string, unknown>;
+  const t = o.total ?? o.totalCount ?? o.total_count ?? o.count;
+  if (typeof t === 'number' && t >= 0) return t;
+  if (typeof t === 'string') {
+    const n = parseInt(t, 10);
+    return Number.isFinite(n) && n >= 0 ? n : undefined;
+  }
+  return undefined;
+}
+
+type RawFence = {
+  fence_id?: unknown;
+  fence_name?: string;
+  fence_type?: string;
+  geom?: string;
+  radius?: unknown;
+  fence_color?: string;
+  description?: string;
+  update_time?: string | number;
+  last_modified?: string | number;
+  updateTime?: string | number;
+  modify_time?: string | number;
+};
+
+export async function listPlatformFences(
+  accessToken: string,
+  endpoint?: string | null
+): Promise<{ fences: TracksolidPlatformFence[]; debug: TracksolidDebug; resultKeys?: string[] }> {
+  const config = getConfig();
+  const baseUrl = getBaseUrl(endpoint);
+  const allRaw: RawFence[] = [];
+  let pageNo = 1;
+  let total: number | undefined;
+  let lastDebug: TracksolidDebug = { endpoint: baseUrl, method: 'jimi.open.platform.fence.list', requestParamsRedacted: {}, requestBodyLength: 0, httpStatus: 0, responseBody: '', timestamp: '' };
+  let firstResultKeys: string[] | undefined;
+
+  do {
+    const params: Record<string, string> = {
+      ...commonParams(config),
+      method: 'jimi.open.platform.fence.list',
+      access_token: accessToken,
+      account: config.account,
+      page_no: String(pageNo),
+      page_size: String(FENCE_PAGE_SIZE),
+    };
+    const out = await post(params, config, { method: 'jimi.open.platform.fence.list' }, baseUrl);
+    lastDebug = out._debug;
+    const raw = out.result;
+    const obj = raw as Record<string, unknown> | RawFence[] | undefined;
+    if (firstResultKeys === undefined && obj && typeof obj === 'object' && !Array.isArray(obj)) {
+      firstResultKeys = Object.keys(obj);
+    }
+    if (total === undefined && obj && typeof obj === 'object' && !Array.isArray(obj)) {
+      total = getTotalFromResult(obj);
+    }
+    const list = extractFenceList(obj);
+    allRaw.push(...list);
+    if (list.length < FENCE_PAGE_SIZE) break;
+    if (total != null && allRaw.length >= total) break;
+    pageNo += 1;
+  } while (true);
+
+  /** Normalize API timestamp to ISO string; API often uses yyyy-MM-dd HH:mm:ss (UTC). */
+  const toLastModified = (v: string | number | undefined): string | undefined => {
+    if (v == null) return undefined;
+    const s = String(v).trim();
+    if (!s) return undefined;
+    const d = new Date(s);
+    return Number.isFinite(d.getTime()) ? d.toISOString() : undefined;
+  };
+  const fences: TracksolidPlatformFence[] = allRaw.map((f) => {
+    const lastModified =
+      toLastModified(f.update_time) ??
+      toLastModified(f.last_modified) ??
+      toLastModified(f.updateTime) ??
+      toLastModified(f.modify_time);
+    return {
+      fenceId: String(f.fence_id ?? ''),
+      name: String(f.fence_name ?? ''),
+      type: (f.fence_type === 'circle' ? 'circle' : 'polygon') as 'circle' | 'polygon',
+      color: f.fence_color ?? undefined,
+      description: f.description ?? undefined,
+      geom: String(f.geom ?? ''),
+      radius: typeof f.radius === 'number' ? f.radius : Number(f.radius) || undefined,
+      lastModified,
+    };
+  });
+  const resultKeys = fences.length === 0 ? firstResultKeys : undefined;
+  return { fences, debug: lastDebug, resultKeys };
+}
+
 export function getYesterdayUTC(): { begin: string; end: string } {
   const y = new Date(Date.UTC(
     new Date().getUTCFullYear(),

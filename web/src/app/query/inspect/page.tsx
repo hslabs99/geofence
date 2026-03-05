@@ -89,6 +89,8 @@ function InspectContent() {
   const [dateFilterCol, setDateFilterCol] = useState<string>('');
   const [dateFrom, setDateFrom] = useState<string>('');
   const [dateTo, setDateTo] = useState<string>('');
+  const [filterCustomer, setFilterCustomer] = useState<string>('');
+  const [filterTemplate, setFilterTemplate] = useState<string>('');
   const [filterTruckId, setFilterTruckId] = useState<string>('');
   const [filterJobId, setFilterJobId] = useState<string>('');
   const [filterPlannedFrom, setFilterPlannedFrom] = useState<string>('');
@@ -108,14 +110,18 @@ function InspectContent() {
   const [trackingSortCol, setTrackingSortCol] = useState<string>('position_time_nz');
   const [trackingSortDir, setTrackingSortDir] = useState<'asc' | 'desc'>('asc');
   const [trackingPage, setTrackingPage] = useState(1);
-  const [trackingPageSize, setTrackingPageSize] = useState(50);
+  const [trackingPageSize, setTrackingPageSize] = useState(200);
   const [trackingTotal, setTrackingTotal] = useState(0);
   const [trackingTableView, setTrackingTableView] = useState<'raw' | 'entry_exit'>('entry_exit');
+  /** When set, GPS grid uses this window instead of job start/end (e.g. from clicking a step time). */
+  const [gpsWindowOverride, setGpsWindowOverride] = useState<{ positionAfter: string; positionBefore: string } | null>(null);
   const [startLessMinutes, setStartLessMinutes] = useState(10);
   const [endPlusMinutes, setEndPlusMinutes] = useState(60);
   const [derivedStepsDebug, setDerivedStepsDebug] = useState<Record<string, unknown> | null>(null);
   const [showDerivedStepsDebug, setShowDerivedStepsDebug] = useState(false);
   const [refetchStepsRunning, setRefetchStepsRunning] = useState(false);
+  const [retagAndRefetchRunning, setRetagAndRefetchRunning] = useState(false);
+  const [trackingRefreshKey, setTrackingRefreshKey] = useState(0);
   const apiColumns = useMemo(
     () => (rows.length > 0 ? Object.keys(rows[0]) : []),
     [rows],
@@ -324,8 +330,41 @@ function InspectContent() {
     return Array.from(set).sort();
   }, [rows]);
 
+  const distinctCustomers = useMemo(() => {
+    const set = new Set<string>();
+    for (const row of rows) {
+      const v = row.Customer ?? row.customer;
+      if (v != null && String(v).trim() !== '') set.add(String(v).trim());
+    }
+    return Array.from(set).sort();
+  }, [rows]);
+
+  const distinctTemplates = useMemo(() => {
+    if (!filterCustomer.trim()) return [];
+    const set = new Set<string>();
+    for (const row of rows) {
+      const cust = row.Customer ?? row.customer;
+      if (cust == null || String(cust).trim() !== filterCustomer) continue;
+      const v = row.template;
+      if (v != null && String(v).trim() !== '') set.add(String(v).trim());
+    }
+    return Array.from(set).sort();
+  }, [rows, filterCustomer]);
+
+  useEffect(() => {
+    setFilterTemplate('');
+  }, [filterCustomer]);
+
   const filteredRows = useMemo(() => {
     return rows.filter((row) => {
+      if (filterCustomer) {
+        const v = row.Customer ?? row.customer;
+        if (v == null || String(v).trim() !== filterCustomer) return false;
+      }
+      if (filterTemplate) {
+        const v = row.template;
+        if (v == null || String(v).trim() !== filterTemplate) return false;
+      }
       if (filterTruckId) {
         const v = row.truck_id;
         if (v == null || String(v).trim() !== filterTruckId) return false;
@@ -369,7 +408,7 @@ function InspectContent() {
       }
       return true;
     });
-  }, [rows, filterTruckId, filterJobId, filterPlannedFrom, filterPlannedTo, filterActualFrom, filterActualTo, dateFilterCol, dateFrom, dateTo]);
+  }, [rows, filterCustomer, filterTemplate, filterTruckId, filterJobId, filterPlannedFrom, filterPlannedTo, filterActualFrom, filterActualTo, dateFilterCol, dateFrom, dateTo]);
 
   const sortedRows = useMemo(() => {
     const [c1, c2, c3] = sortColumns;
@@ -424,10 +463,16 @@ function InspectContent() {
   }, [searchParams]);
 
   const paramToLocate = locateJobIdParam ?? jobIdParam;
+  /** Only apply URL job selection on first load; don't re-apply after refetch so user can move around and retag without jumping back. */
+  const appliedLocateParamRef = useRef<string | null>(null);
   useEffect(() => {
     if (!paramToLocate || sortedRows.length === 0) return;
+    if (appliedLocateParamRef.current === paramToLocate) return;
     const idx = sortedRows.findIndex((r) => String(r.job_id ?? '') === paramToLocate.trim());
-    if (idx >= 0) setSelectedRowIndex(idx);
+    if (idx >= 0) {
+      setSelectedRowIndex(idx);
+      appliedLocateParamRef.current = paramToLocate;
+    }
   }, [paramToLocate, sortedRows]);
 
   useEffect(() => {
@@ -456,6 +501,67 @@ function InspectContent() {
     ? String(selectedRow.actual_end_time ?? selectedRow.gps_end_time ?? '')
     : '';
 
+  /** Extract YYYY-MM-DD from job's actual_start_time (or similar timestamp) for tagging. */
+  const jobDateForTagging = useMemo(() => {
+    const raw = selectedRow?.actual_start_time ?? selectedRow?.actual_end_time ?? selectedRow?.planned_start_time;
+    if (raw == null || raw === '') return '';
+    const s = String(raw).trim();
+    const iso = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
+    const dmy = s.match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
+    if (dmy) {
+      const yy = dmy[3].length === 2 ? `20${dmy[3]}` : dmy[3];
+      return `${yy}-${dmy[2].padStart(2, '0')}-${dmy[1].padStart(2, '0')}`;
+    }
+    return '';
+  }, [selectedRow]);
+
+  /** Retag the day of the selected job (ENTER/EXIT for that device), then refetch steps for the job. */
+  const retagDayAndRefetchSteps = useCallback(async () => {
+    if (!selectedRow || !deviceForTracking || !jobDateForTagging) return;
+    setRetagAndRefetchRunning(true);
+    setDerivedStepsDebug(null);
+    try {
+      const tagRes = await fetch('/api/admin/tagging/run', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          dateFrom: jobDateForTagging,
+          dateTo: jobDateForTagging,
+          deviceNames: [deviceForTracking],
+          graceSeconds: 300,
+          bufferHours: 1,
+        }),
+      });
+      if (!tagRes.ok) {
+        const err = await tagRes.text();
+        throw new Error(err || `Tagging ${tagRes.status}`);
+      }
+      // Consume the stream to completion (same as Tagging page) so the server runs full tagging; do not cancel.
+      if (tagRes.body) {
+        const reader = tagRes.body.getReader();
+        while (true) {
+          const { done } = await reader.read();
+          if (done) break;
+        }
+      }
+      const result = await runFetchStepsForJobs({
+        jobs: [selectedRow],
+        startLessMinutes,
+        endPlusMinutes,
+      });
+      await refetchVworkJobs();
+      setTrackingRefreshKey((k) => k + 1);
+      if (result.lastResult != null && typeof result.lastResult === 'object') {
+        const d = (result.lastResult as { debug?: Record<string, unknown> }).debug;
+        setDerivedStepsDebug(d != null ? { ...d, _singleJob: true } : { _singleJob: true, fullResponse: result.lastResult });
+        setShowDerivedStepsDebug(true);
+      }
+    } finally {
+      setRetagAndRefetchRunning(false);
+    }
+  }, [selectedRow, deviceForTracking, jobDateForTagging, startLessMinutes, endPlusMinutes, refetchVworkJobs]);
+
   useEffect(() => {
     if (!deviceForTracking || !actualStartTime.trim()) {
       setTrackingRows([]);
@@ -465,37 +571,62 @@ function InspectContent() {
     }
     setTrackingLoading(true);
     const offset = (trackingPage - 1) * trackingPageSize;
-    const positionAfter = addMinutesToTimestampAsNZ(actualStartTime.trim(), -startLessMinutes);
+    const useOverride = gpsWindowOverride != null;
+    const positionAfter = useOverride
+      ? gpsWindowOverride.positionAfter
+      : addMinutesToTimestampAsNZ(actualStartTime.trim(), -startLessMinutes);
+    const positionBefore = useOverride
+      ? gpsWindowOverride.positionBefore
+      : (actualEndTime.trim() ? addMinutesToTimestampAsNZ(actualEndTime.trim(), endPlusMinutes) : null);
     const params = new URLSearchParams({
       device: deviceForTracking,
       positionAfter,
       limit: String(trackingPageSize),
       offset: String(offset),
     });
-    if (actualEndTime.trim()) {
-      params.set('positionBefore', addMinutesToTimestampAsNZ(actualEndTime.trim(), endPlusMinutes));
+    if (positionBefore) {
+      params.set('positionBefore', positionBefore);
     }
-    if (trackingTableView === 'entry_exit') {
+    const effectiveView = useOverride ? 'raw' : trackingTableView;
+    if (effectiveView === 'entry_exit') {
       params.set('geofenceFilter', 'entry_or_exit');
     }
     fetch(`/api/tracking?${params}`)
-      .then((r) => r.json())
-      .then((data) => {
-        setTrackingRows(data?.rows ?? []);
-        setTrackingSql(data?.sqlCopyPaste ?? data?.sql ?? '');
-        setTrackingTotal(typeof data?.total === 'number' ? data.total : 0);
+      .then(async (r) => {
+        const data = await r.json().catch(() => ({}));
+        if (r.ok && data != null && Array.isArray(data.rows)) {
+          setTrackingRows(data.rows);
+          setTrackingSql(data.sqlCopyPaste ?? data.sql ?? '');
+          setTrackingTotal(typeof data.total === 'number' ? data.total : 0);
+        }
       })
       .catch(() => {
-        setTrackingRows([]);
-        setTrackingSql('');
-        setTrackingTotal(0);
+        // Don't clear existing data on network error so we don't wipe the table
       })
       .finally(() => setTrackingLoading(false));
-  }, [deviceForTracking, actualStartTime, actualEndTime, trackingPage, trackingPageSize, trackingTableView, startLessMinutes, endPlusMinutes]);
+  }, [deviceForTracking, actualStartTime, actualEndTime, trackingPage, trackingPageSize, trackingTableView, startLessMinutes, endPlusMinutes, trackingRefreshKey, gpsWindowOverride]);
 
   useEffect(() => {
     setTrackingPage(1);
-  }, [deviceForTracking, actualStartTime, actualEndTime, trackingTableView, startLessMinutes, endPlusMinutes]);
+  }, [deviceForTracking, actualStartTime, actualEndTime, trackingTableView, startLessMinutes, endPlusMinutes, gpsWindowOverride]);
+
+  /** Clear step-time filter when job changes so we don't keep a stale window. */
+  useEffect(() => {
+    setGpsWindowOverride(null);
+  }, [actualStartTime, actualEndTime]);
+
+  /** Focus GPS grid on step time: RAW view, window = stepTime −2 min to job end +60 min. */
+  const focusGpsOnStepTime = useCallback((stepTime: unknown) => {
+    const normalized = normalizeForCompare(stepTime);
+    if (!normalized || !actualEndTime?.trim()) return;
+    setGpsWindowOverride({
+      positionAfter: addMinutesToTimestampAsNZ(normalized, -2),
+      positionBefore: addMinutesToTimestampAsNZ(actualEndTime.trim(), endPlusMinutes),
+    });
+    setTrackingTableView('raw');
+    setTrackingPage(1);
+    setTrackingRefreshKey((k) => k + 1);
+  }, [actualEndTime, endPlusMinutes]);
 
   const relevantMappings = useMemo(() => {
     const out: { type: string; vwname: string; gpsname: string }[] = [];
@@ -710,6 +841,29 @@ function InspectContent() {
               )}
             </div>
             <div>
+              <label className="mb-1 block text-xs font-medium text-zinc-500">Customer</label>
+              <select
+                value={filterCustomer}
+                onChange={(e) => setFilterCustomer(e.target.value)}
+                className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+              >
+                <option value="">— All —</option>
+                {distinctCustomers.map((c) => <option key={c} value={c}>{c}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="mb-1 block text-xs font-medium text-zinc-500">Template</label>
+              <select
+                value={filterTemplate}
+                onChange={(e) => setFilterTemplate(e.target.value)}
+                className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+                disabled={!filterCustomer}
+              >
+                <option value="">— All —</option>
+                {distinctTemplates.map((t) => <option key={t} value={t}>{t}</option>)}
+              </select>
+            </div>
+            <div>
               <label className="mb-1 block text-xs font-medium text-zinc-500">Date column</label>
               <select
                 value={dateFilterCol}
@@ -858,20 +1012,31 @@ function InspectContent() {
           </div>
           <p className="mt-3 text-zinc-500">
             {sortedRows.length} row{sortedRows.length !== 1 ? 's' : ''}
-            {(filterTruckId || filterJobId.trim() || filterPlannedFrom || filterPlannedTo || filterActualFrom || filterActualTo || dateFilterCol) && ` (filtered from ${rows.length})`} · max 500 from API · click row to select
+            {(filterCustomer || filterTemplate || filterTruckId || filterJobId.trim() || filterPlannedFrom || filterPlannedTo || filterActualFrom || filterActualTo || dateFilterCol) && ` (filtered from ${rows.length})`} · max 500 from API · click row to select
           </p>
           <section className="mt-6 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900">
             <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
               <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">Step details</h2>
-              <button
-                type="button"
-                onClick={() => void refetchStepsForSelectedJob()}
-                disabled={!selectedRow || !actualStartTime?.trim() || refetchStepsRunning}
-                className="rounded bg-blue-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50 dark:bg-blue-700 dark:hover:bg-blue-600 dark:disabled:opacity-50"
-                title="Refetch GPS steps for this job (force: runs even if steps_fetched=true). Same logic as API GPS Import Step 4."
-              >
-                {refetchStepsRunning ? 'Refetching…' : 'Refetch steps (this job)'}
-              </button>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => void retagDayAndRefetchSteps()}
+                  disabled={!selectedRow || !deviceForTracking || !jobDateForTagging || retagAndRefetchRunning || refetchStepsRunning}
+                  className="rounded bg-amber-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-amber-700 disabled:opacity-50 dark:bg-amber-700 dark:hover:bg-amber-600 dark:disabled:opacity-50"
+                  title="Run ENTER/EXIT tagging for the job's date and this device, then refetch GPS steps for the job. Use to test tagging logic quickly."
+                >
+                  {retagAndRefetchRunning ? 'Retag + refetch…' : 'Retag day + refetch steps'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void refetchStepsForSelectedJob()}
+                  disabled={!selectedRow || !actualStartTime?.trim() || refetchStepsRunning || retagAndRefetchRunning}
+                  className="rounded bg-blue-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50 dark:bg-blue-700 dark:hover:bg-blue-600 dark:disabled:opacity-50"
+                  title="Refetch GPS steps for this job (force: runs even if steps_fetched=true). Same logic as API GPS Import Step 4."
+                >
+                  {refetchStepsRunning ? 'Refetching…' : 'Refetch steps (this job)'}
+                </button>
+              </div>
             </div>
             <table className="w-full min-w-[48rem] text-left text-sm table-fixed">
               <colgroup>
@@ -919,17 +1084,35 @@ function InspectContent() {
                     }
                   }
                   const finalDisplay = finalValue != null && finalValue !== '' ? formatCell(finalValue) : '—';
+                  const vworkClickable = selectedRow && (selectedRow[completedKey] != null && selectedRow[completedKey] !== '');
+                  const gpsClickable = gpsStepValue != null && gpsStepValue !== '';
+                  const finalClickable = finalValue != null && finalValue !== '';
+                  const clickableClass = 'cursor-pointer underline decoration-dotted hover:bg-zinc-100 dark:hover:bg-zinc-800';
                   return (
                   <tr key={i} className="border-b border-zinc-100 dark:border-zinc-800">
                     <td className="whitespace-nowrap px-2 py-1.5 text-zinc-700 dark:text-zinc-300">
                       {selectedRow ? formatCell(selectedRow[nameKey]) : '—'}
                     </td>
-                    <td className="whitespace-nowrap px-2 py-1.5 text-zinc-700 dark:text-zinc-300">
+                    <td
+                      className={`whitespace-nowrap px-2 py-1.5 text-zinc-700 dark:text-zinc-300 ${vworkClickable ? clickableClass : ''}`}
+                      onClick={vworkClickable ? () => focusGpsOnStepTime(selectedRow![completedKey]) : undefined}
+                      title={vworkClickable ? 'Show GPS raw around this time (step −2 min to job end +60)' : undefined}
+                    >
                       {selectedRow ? formatCell(selectedRow[completedKey]) : '—'}
                     </td>
-                    <td className="whitespace-nowrap px-2 py-1.5 text-zinc-400 dark:text-zinc-500">{gpsStepDisplay}</td>
+                    <td
+                      className={`whitespace-nowrap px-2 py-1.5 text-zinc-400 dark:text-zinc-500 ${gpsClickable ? clickableClass : ''}`}
+                      onClick={gpsClickable ? () => focusGpsOnStepTime(gpsStepValue) : undefined}
+                      title={gpsClickable ? 'Show GPS raw around this time (step −2 min to job end +60)' : undefined}
+                    >
+                      {gpsStepDisplay}
+                    </td>
                     <td className="whitespace-nowrap px-2 py-1.5 text-zinc-400 dark:text-zinc-500 font-mono text-xs" title={gpsRowId != null && gpsRowId !== '' ? `tbl_tracking.id = ${gpsRowId}` : undefined}>{gpsRowDisplay}</td>
-                    <td className="whitespace-nowrap px-2 py-1.5 text-zinc-700 dark:text-zinc-300">
+                    <td
+                      className={`whitespace-nowrap px-2 py-1.5 text-zinc-700 dark:text-zinc-300 ${finalClickable ? clickableClass : ''}`}
+                      onClick={finalClickable ? () => focusGpsOnStepTime(finalValue) : undefined}
+                      title={finalClickable ? 'Show GPS raw around this time (step −2 min to job end +60)' : undefined}
+                    >
                       {finalDisplay}
                     </td>
                     <td className="whitespace-nowrap px-2 py-1.5 text-zinc-400 dark:text-zinc-500">—</td>
@@ -1006,13 +1189,30 @@ function InspectContent() {
           <section className="mt-6 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900">
             <div className="mb-3 flex flex-wrap items-center gap-4">
               <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">tbl_tracking</h2>
-              <span className="text-sm text-zinc-500">
-                Window: start −{startLessMinutes} min, end +{endPlusMinutes} min (Admin → Settings)
-              </span>
+              {gpsWindowOverride ? (
+                <>
+                  <span className="text-sm text-amber-600 dark:text-amber-400">
+                    Filtered: step time −2 min → job end +{endPlusMinutes} min (RAW)
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => { setGpsWindowOverride(null); setTrackingRefreshKey((k) => k + 1); }}
+                    className="rounded border border-zinc-300 bg-white px-2 py-1 text-sm text-zinc-700 hover:bg-zinc-50 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700"
+                  >
+                    Clear filters
+                  </button>
+                </>
+              ) : (
+                <span className="text-sm text-zinc-500">
+                  Window: start −{startLessMinutes} min, end +{endPlusMinutes} min (Admin → Settings)
+                </span>
+              )}
             </div>
+            {!gpsWindowOverride && (
             <p className="mb-2 text-sm text-zinc-500">
               position_time_nz &gt; actual_start_time − {startLessMinutes} min AND position_time_nz &lt; actual_end_time + {endPlusMinutes} min
             </p>
+            )}
             {trackingLoading && <p className="text-sm text-zinc-500">Loading…</p>}
             {!trackingLoading && !deviceForTracking && <p className="text-sm text-zinc-500">Select a job with worker (device for GPS) to load tracking data.</p>}
             {!trackingLoading && deviceForTracking && !actualStartTime.trim() && <p className="text-sm text-zinc-500">Job has no actual_start_time.</p>}

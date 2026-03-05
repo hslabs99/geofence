@@ -28,7 +28,10 @@ interface DeviceResult {
 }
 
 interface RunSummary {
-  dateX: string;
+  dateFrom: string;
+  dateTo: string;
+  windowStart?: string;
+  windowEnd?: string;
   deviceCount: number;
   totalRowsRead: number;
   totalUpdatesWritten: number;
@@ -89,7 +92,6 @@ function dateRange(fromDate: string, toDate: string): string[] {
 }
 
 export default function TaggingPage() {
-  const [dateX, setDateX] = useState(DEFAULT_DATE);
   const [dateFrom, setDateFrom] = useState(DEFAULT_DATE);
   const [dateTo, setDateTo] = useState(DEFAULT_DATE);
   const [stepsForce, setStepsForce] = useState(true);
@@ -156,23 +158,47 @@ export default function TaggingPage() {
     else setSelectedDevices(new Set(devices.map((d) => d.deviceName)));
   };
 
+  /** Call shared API: position_time_nz + store_fences (same as api-test between merge and tag). */
+  const applyPositionTimeNzAndFences = async (): Promise<{ ok: boolean; error?: string }> => {
+    try {
+      const res = await fetch('/api/admin/tracking/apply-position-time-nz-and-fences', { method: 'POST' });
+      const data = await res.json();
+      if (!res.ok || !data?.ok) return { ok: false, error: data?.error ?? `HTTP ${res.status}` };
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  };
+
   const runTagging = async () => {
     const list = Array.from(selectedDevices);
-    if (!dateX || list.length === 0) return;
+    const from = dateFrom.trim();
+    const to = dateTo.trim();
+    if (!from || !to || dateRange(from, to).length === 0 || list.length === 0) return;
     setRunStatus('running');
     setStreamLogs([]);
-    setCurrentStage('Starting…');
+    setCurrentStage('Applying position_time_nz and store_fences…');
     setSummary(null);
     setRunError(null);
 
     try {
+      const prep = await applyPositionTimeNzAndFences();
+      if (!prep.ok) {
+        setRunError(prep.error ?? 'Prep failed');
+        setRunStatus('error');
+        setCurrentStage('');
+        return;
+      }
+      setCurrentStage('Starting…');
       const res = await fetch('/api/admin/tagging/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          dateX: dateX.trim(),
+          dateFrom: from,
+          dateTo: to,
           deviceNames: list,
           graceSeconds: Math.max(0, Math.min(86400, graceSeconds)),
+          bufferHours: 1,
         }),
       });
       if (!res.ok || !res.body) {
@@ -264,62 +290,57 @@ export default function TaggingPage() {
     };
 
     try {
-      for (let d = 0; d < dates.length; d++) {
-        const date = dates[d];
-        setCurrentStage(`Date ${date} (${d + 1}/${dates.length}): Tags`);
-        appendLog(`=== ${date}: Tags ===`);
+      setCurrentStage('Applying position_time_nz and store_fences…');
+      appendLog('=== position_time_nz + store_fences ===');
+      const prep = await applyPositionTimeNzAndFences();
+      if (!prep.ok) {
+        setRunError(prep.error ?? 'Prep failed');
+        setRunStatus('error');
+        setCurrentStage('');
+        return;
+      }
+      appendLog('Prep done.');
 
-        const tagRes = await fetch('/api/admin/tagging/run', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            dateX: date,
-            deviceNames: list,
-            graceSeconds: Math.max(0, Math.min(86400, graceSeconds)),
-          }),
-        });
-        if (!tagRes.ok || !tagRes.body) {
-          const text = await tagRes.text();
-          let errMsg = text;
-          try {
-            const j = JSON.parse(text);
-            if (j?.error) errMsg = j.error;
-          } catch {
-            if (text) errMsg = text;
-          }
-          setRunError(`${date} tags: ${errMsg || `HTTP ${tagRes.status}`}`);
-          setRunStatus('error');
-          setCurrentStage('');
-          return;
+      setCurrentStage(`Tags for ${from} → ${to} (one run with buffer)`);
+      appendLog(`=== Tags: ${from} to ${to} (00:00 From to midnight To + 1h buffer each end) ===`);
+      const tagRes = await fetch('/api/admin/tagging/run', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          dateFrom: from,
+          dateTo: to,
+          deviceNames: list,
+          graceSeconds: Math.max(0, Math.min(86400, graceSeconds)),
+          bufferHours: 1,
+        }),
+      });
+      if (!tagRes.ok || !tagRes.body) {
+        const text = await tagRes.text();
+        let errMsg = text;
+        try {
+          const j = JSON.parse(text);
+          if (j?.error) errMsg = j.error;
+        } catch {
+          if (text) errMsg = text;
         }
-        const reader = tagRes.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split('\n');
-          buffer = lines.pop() ?? '';
-          for (const line of lines) {
-            if (!line.trim()) continue;
-            try {
-              const ev = JSON.parse(line) as StreamEvent;
-              appendLog(formatLogLine(ev));
-              if (ev.stage === 'error') {
-                setRunError(ev.message);
-                setRunStatus('error');
-                setCurrentStage('');
-                return;
-              }
-            } catch {
-              appendLog(`[Raw] ${line}`);
-            }
-          }
-        }
-        if (buffer.trim()) {
+        setRunError(`Tags: ${errMsg || `HTTP ${tagRes.status}`}`);
+        setRunStatus('error');
+        setCurrentStage('');
+        return;
+      }
+      const reader = tagRes.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
+        for (const line of lines) {
+          if (!line.trim()) continue;
           try {
-            const ev = JSON.parse(buffer) as StreamEvent;
+            const ev = JSON.parse(line) as StreamEvent;
             appendLog(formatLogLine(ev));
             if (ev.stage === 'error') {
               setRunError(ev.message);
@@ -328,11 +349,28 @@ export default function TaggingPage() {
               return;
             }
           } catch {
-            appendLog(`[Raw] ${buffer}`);
+            appendLog(`[Raw] ${line}`);
           }
         }
+      }
+      if (buffer.trim()) {
+        try {
+          const ev = JSON.parse(buffer) as StreamEvent;
+          appendLog(formatLogLine(ev));
+          if (ev.stage === 'error') {
+            setRunError(ev.message);
+            setRunStatus('error');
+            setCurrentStage('');
+            return;
+          }
+        } catch {
+          appendLog(`[Raw] ${buffer}`);
+        }
+      }
 
-        setCurrentStage(`Date ${date} (${d + 1}/${dates.length}): Steps`);
+      for (let d = 0; d < dates.length; d++) {
+        const date = dates[d];
+        setCurrentStage(`Steps ${date} (${d + 1}/${dates.length})`);
         appendLog(`=== ${date}: Steps ===`);
         const stepsUrl = stepsForce
           ? `/api/vworkjobs?date=${encodeURIComponent(date)}`
@@ -375,8 +413,9 @@ export default function TaggingPage() {
         Entry/Exit Tagging
       </h1>
       <p className="mb-6 text-sm text-zinc-600 dark:text-zinc-400">
-        Tag <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">tbl_tracking</code> with
-        ENTER on the first row in a fence and EXIT on the last row before leaving (null→fence, fence→null, fence→fence). Uses{' '}
+        Tag <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">tbl_tracking</code> with ENTER/EXIT by fence changes only.
+        ENTER when the device goes null→fence or fence→fence and that fence persists for the grace duration; EXIT when it leaves a fence and the next state (null or new fence) persists for the grace duration. No pairs or dependencies.
+        Code tags from <strong>00:00 on From date to midnight on To date</strong> (inclusive), plus a fixed 1 h buffer at each end (unlike Steps, no customisable buffer). One run over the full window; re-running the same range is idempotent (same tags). Uses{' '}
         <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">position_time_nz</code> only.
       </p>
 
@@ -386,20 +425,9 @@ export default function TaggingPage() {
             Parameters
           </h2>
           <div className="space-y-4">
-            <div>
-              <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">
-                Date (dateX) — single-day run
-              </label>
-              <input
-                type="date"
-                value={dateX}
-                onChange={(e) => setDateX(e.target.value)}
-                className="mt-1 block w-full rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
-              />
-            </div>
             <div className="rounded border border-zinc-200 bg-zinc-50/50 p-3 dark:border-zinc-600 dark:bg-zinc-800/30">
               <h3 className="mb-2 text-xs font-semibold uppercase tracking-wider text-zinc-500 dark:text-zinc-400">
-                Date range — Tags and Steps
+                Date range
               </h3>
               <div className="flex flex-wrap items-end gap-4">
                 <div>
@@ -470,8 +498,7 @@ export default function TaggingPage() {
                 className="mt-1 block w-full rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
               />
               <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
-                A geofence change counts only if the new state persists longer than this (default
-                300).
+                ENTER/EXIT only if the new state persists at least this long (default 300 s).
               </p>
             </div>
             <div>
@@ -522,7 +549,9 @@ export default function TaggingPage() {
                 onClick={runTagging}
                 disabled={
                   runStatus === 'running' ||
-                  !dateX ||
+                  !dateFrom ||
+                  !dateTo ||
+                  dateRange(dateFrom, dateTo).length === 0 ||
                   selectedDevices.size === 0 ||
                   devicesLoading
                 }
@@ -548,7 +577,7 @@ export default function TaggingPage() {
               </button>
             </div>
             <p className="text-xs text-zinc-500 dark:text-zinc-400">
-              Run Tags and Steps: for each day in the date range, runs tagging for all selected devices (all rows) then fetch steps for all jobs on that date. From this page we default to forced tagging and forced step fetching (no skip).
+              Run tagging: tags ENTER/EXIT for the date range above (00:00 From to midnight To + 1 h buffer). Run Tags and Steps: same tagging run, then for each day in the range fetches steps for jobs on that date. Forced step fetch by default.
             </p>
           </div>
         </section>
@@ -571,9 +600,14 @@ export default function TaggingPage() {
           {runStatus === 'done' && summary && (
             <div className="mb-3 rounded bg-green-50 py-3 px-3 dark:bg-green-950/30">
               <p className="text-sm font-medium text-green-800 dark:text-green-200">
-                Complete: {summary.totalRowsRead} rows read, {summary.totalUpdatesWritten} tags
+                Complete: {summary.dateFrom} → {summary.dateTo}, {summary.totalRowsRead} rows read, {summary.totalUpdatesWritten} tags
                 written in {summary.durationMs}ms
               </p>
+              {summary.windowStart != null && summary.windowEnd != null && (
+                <p className="mt-1 text-xs text-green-700 dark:text-green-300">
+                  Window: {summary.windowStart} to {summary.windowEnd}
+                </p>
+              )}
               <ul className="mt-2 list-inside list-disc text-xs text-green-700 dark:text-green-300">
                 {summary.results.map((r) => (
                   <li key={r.deviceName}>

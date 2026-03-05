@@ -1,5 +1,11 @@
 import { query } from '@/lib/db';
 
+/** Format a Date as YYYY-MM-DD HH:mm:ss using UTC components. Use only when DB returns Date; prefer to_char in SQL so value is already a string. Never use toISOString (it would shift times). */
+function formatDateAsRawLiteral(d: Date): string {
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
+}
+
 /** Same as tracking API: parse to YYYY-MM-DD HH:mm:ss only — no timezone in output. Handles Date (e.g. from DB) and strings; strips GMT+1300 etc. so PostgreSQL never sees them. */
 function normalizeTimestampString(s: string | Date | null): string | null {
   if (s == null) return null;
@@ -142,7 +148,7 @@ async function getFirstTrackingInWindowWithDebug(
   }
 
   const rows = await query<{ id: unknown; position_time_nz: unknown }>(
-    `SELECT t.id, t.position_time_nz FROM tbl_tracking t
+    `SELECT t.id, to_char(t.position_time_nz, 'YYYY-MM-DD HH24:MI:SS') AS position_time_nz FROM tbl_tracking t
      WHERE t.device_name = $1 AND t.geofence_id = ANY($2::int[]) AND t.geofence_type = $3 AND ${timeCondition}
      ORDER BY t.position_time_nz ${orderClause} LIMIT 1`,
     params
@@ -152,7 +158,7 @@ async function getFirstTrackingInWindowWithDebug(
   let value: string | null = null;
   if (val != null) {
     if (typeof val === 'string') value = normalizeTimestampString(val) ?? val.slice(0, 19);
-    else if (val instanceof Date) value = val.toISOString().replace('T', ' ').slice(0, 19);
+    else if (val instanceof Date) value = formatDateAsRawLiteral(val);
     else value = String(val).slice(0, 19);
   }
   const rawId = rows[0]?.id;

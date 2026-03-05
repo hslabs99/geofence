@@ -159,7 +159,7 @@ export default function SummaryPage() {
   const { viewMode, clientCustomer } = useViewMode();
   /** In client view, customer filter is locked to menu value; otherwise use local filter. */
   const effectiveCustomer = viewMode === 'client' ? clientCustomer : filterCustomer;
-  const [summaryTab, setSummaryTab] = useState<'by_job' | 'by_day'>('by_job');
+  const [summaryTab, setSummaryTab] = useState<'season' | 'by_day' | 'by_job'>('season');
   const [minsThresholds, setMinsThresholds] = useState<Record<string, string>>({
     '2': '', '3': '', '4': '', '5': '', travel: '', in_vineyard: '', in_winery: '', total: '',
   });
@@ -226,6 +226,34 @@ export default function SummaryPage() {
   useEffect(() => {
     setFilterTemplate('');
   }, [effectiveCustomer]);
+
+  /** When Customer + Template are selected, load minute limits from tbl_templateminutes (2=ToVine, 3=InVine, 4=ToWine, 5=InWine, travel=ToVine+ToWine, in_vineyard=InVine, in_winery=InWine, total=TotalMins). */
+  useEffect(() => {
+    if (!effectiveCustomer.trim() || !filterTemplate.trim()) return;
+    const params = new URLSearchParams({ customer: effectiveCustomer, template: filterTemplate });
+    fetch(`/api/admin/templateminutes?${params}`)
+      .then((r) => r.json())
+      .then((row) => {
+        if (!row || row.error) return;
+        const toV = row.ToVineMins != null ? String(row.ToVineMins) : '';
+        const inV = row.InVineMins != null ? String(row.InVineMins) : '';
+        const toW = row.ToWineMins != null ? String(row.ToWineMins) : '';
+        const inW = row.InWineMins != null ? String(row.InWineMins) : '';
+        const travelVal = (row.ToVineMins != null && row.ToWineMins != null) ? String(row.ToVineMins + row.ToWineMins) : '';
+        const totalVal = row.TotalMins != null ? String(row.TotalMins) : '';
+        setMinsThresholds({
+          '2': toV,
+          '3': inV,
+          '4': toW,
+          '5': inW,
+          travel: travelVal,
+          in_vineyard: inV,
+          in_winery: inW,
+          total: totalVal,
+        });
+      })
+      .catch(() => {});
+  }, [effectiveCustomer, filterTemplate]);
 
   const filteredRows = useMemo(() => {
     return rows.filter((row) => {
@@ -337,6 +365,55 @@ export default function SummaryPage() {
     }
     return out;
   }, [filteredRows, dayRange]);
+
+  /** Season (customer + template): one rollup over all matching jobs. Same metrics as daily. */
+  const seasonFilteredRows = useMemo(() => {
+    return rows.filter((row) => {
+      if (effectiveCustomer) {
+        const v = row.Customer ?? row.customer;
+        if (v == null || String(v).trim() !== effectiveCustomer) return false;
+      }
+      if (filterTemplate) {
+        const v = row.template;
+        if (v == null || String(v).trim() !== filterTemplate) return false;
+      }
+      return true;
+    });
+  }, [rows, effectiveCustomer, filterTemplate]);
+
+  const fromValuesToQuad = (values: number[]): MinsQuad => {
+    const valid = values.filter((v) => v != null && !Number.isNaN(v));
+    const n = valid.length;
+    const total = valid.reduce((a, b) => a + b, 0);
+    return {
+      total,
+      max: n ? Math.max(...valid) : 0,
+      min: n ? Math.min(...valid) : 0,
+      av: n ? Math.round(total / n) : 0,
+    };
+  };
+
+  const seasonRollup = useMemo((): {
+    jobs: Row[];
+    mins_2: MinsQuad; mins_3: MinsQuad; mins_4: MinsQuad; mins_5: MinsQuad; travel: MinsQuad; total: MinsQuad;
+  } | null => {
+    if (seasonFilteredRows.length === 0) return null;
+    const m2vals = seasonFilteredRows.map((row) => minsBetween(row, 1, 2)).filter((v): v is number => v != null);
+    const m3vals = seasonFilteredRows.map((row) => minsBetween(row, 2, 3)).filter((v): v is number => v != null);
+    const m4vals = seasonFilteredRows.map((row) => minsBetween(row, 3, 4)).filter((v): v is number => v != null);
+    const m5vals = seasonFilteredRows.map((row) => minsBetween(row, 4, 5)).filter((v): v is number => v != null);
+    const travelVals = seasonFilteredRows.map((row) => travelMins(row)).filter((v): v is number => v != null);
+    const totalVals = seasonFilteredRows.map((row) => totalMins(row)).filter((v): v is number => v != null);
+    return {
+      jobs: seasonFilteredRows,
+      mins_2: fromValuesToQuad(m2vals),
+      mins_3: fromValuesToQuad(m3vals),
+      mins_4: fromValuesToQuad(m4vals),
+      mins_5: fromValuesToQuad(m5vals),
+      travel: fromValuesToQuad(travelVals),
+      total: fromValuesToQuad(totalVals),
+    };
+  }, [seasonFilteredRows]);
 
   /** By Day footer: Total, Max, Min, Av across all days (from each day's .total, .max, .min, .av). */
   const byDayStats = useMemo(() => {
@@ -491,15 +568,23 @@ export default function SummaryPage() {
     const limit = getThresholdNum(key);
     return val != null && limit != null && val > limit;
   };
+  /** Threshold key for season/daily column: mins_2 -> '2', travel -> 'travel', etc. */
+  const thresholdKey = (col: string) => (col.startsWith('mins_') ? col.replace('mins_', '') : col);
+  const limitDisplay = (key: string) => {
+    const n = getThresholdNum(key);
+    return n != null ? String(n) : '—';
+  };
+  const redIfOver = (val: number | null, key: string) =>
+    isMinsOverThreshold(val, key) ? 'bg-red-200 text-red-900 dark:bg-red-900/40 dark:text-red-200' : '';
 
   const dayClientView = summaryTab === 'by_day' && viewMode === 'client';
   const jobClientView = summaryTab === 'by_job' && viewMode === 'client';
+  const seasonClientView = summaryTab === 'season' && viewMode === 'client';
 
   return (
     <div className="w-full min-w-0 p-6">
       <div className="mb-4">
         <h1 className="text-2xl font-semibold text-zinc-900 dark:text-zinc-100">Summary</h1>
-        <p className="mt-1 text-sm text-zinc-500">Job list with single source of truth for step times (Step 1–5) and source (GPS or VW).</p>
       </div>
       {loading && <p className="text-zinc-600">Loading…</p>}
       {error && (
@@ -509,22 +594,6 @@ export default function SummaryPage() {
       )}
       {!loading && !error && (
         <>
-          <div className="mb-4 flex gap-2 border-b border-zinc-200 dark:border-zinc-700">
-            <button
-              type="button"
-              onClick={() => setSummaryTab('by_day')}
-              className={`rounded-t px-4 py-2 text-sm font-medium ${summaryTab === 'by_day' ? 'bg-zinc-200 dark:bg-zinc-700 text-zinc-900 dark:text-zinc-100' : 'bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 hover:bg-zinc-150 dark:hover:bg-zinc-750'}`}
-            >
-              Summary
-            </button>
-            <button
-              type="button"
-              onClick={() => setSummaryTab('by_job')}
-              className={`rounded-t px-4 py-2 text-sm font-medium ${summaryTab === 'by_job' ? 'bg-zinc-200 dark:bg-zinc-700 text-zinc-900 dark:text-zinc-100' : 'bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 hover:bg-zinc-150 dark:hover:bg-zinc-750'}`}
-            >
-              By Job
-            </button>
-          </div>
           <div className="mb-4 flex flex-wrap items-end gap-4 rounded-lg border border-zinc-200 bg-white p-3 dark:border-zinc-700 dark:bg-zinc-900">
             <div>
               <label className="mb-1 block text-xs font-medium text-zinc-500">Customer</label>
@@ -646,10 +715,238 @@ export default function SummaryPage() {
               </button>
             </div>
           </div>
+          <div className="mb-4 flex gap-2 border-b border-zinc-200 dark:border-zinc-700">
+            <button
+              type="button"
+              onClick={() => setSummaryTab('season')}
+              className={`rounded-t px-4 py-2 text-sm font-medium ${summaryTab === 'season' ? 'bg-zinc-200 dark:bg-zinc-700 text-zinc-900 dark:text-zinc-100' : 'bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 hover:bg-zinc-150 dark:hover:bg-zinc-750'}`}
+            >
+              Season Summary
+            </button>
+            <button
+              type="button"
+              onClick={() => setSummaryTab('by_day')}
+              className={`rounded-t px-4 py-2 text-sm font-medium ${summaryTab === 'by_day' ? 'bg-zinc-200 dark:bg-zinc-700 text-zinc-900 dark:text-zinc-100' : 'bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 hover:bg-zinc-150 dark:hover:bg-zinc-750'}`}
+            >
+              Daily Summary
+            </button>
+            <button
+              type="button"
+              onClick={() => setSummaryTab('by_job')}
+              className={`rounded-t px-4 py-2 text-sm font-medium ${summaryTab === 'by_job' ? 'bg-zinc-200 dark:bg-zinc-700 text-zinc-900 dark:text-zinc-100' : 'bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 hover:bg-zinc-150 dark:hover:bg-zinc-750'}`}
+            >
+              By Job
+            </button>
+          </div>
+          {summaryTab === 'season' && (
+            <div className="max-h-[70vh] overflow-auto rounded-lg border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900">
+              <p className="mb-2 text-sm text-zinc-500">
+                {seasonClientView
+                  ? 'Season rollup for your account. Travel + In Vineyard + In Winery = Total mins.'
+                  : 'Rollup of all jobs for the selected Customer and Template (same column sections as Daily Summary for audit). Use the Customer and Template dropdowns above.'}
+              </p>
+              <table className={`w-full text-left text-sm ${seasonClientView ? 'min-w-[24rem]' : 'min-w-[64rem]'}`}>
+                <thead className="sticky top-0 z-10 bg-zinc-100 shadow-[0_1px_0_0_rgba(0,0,0,0.1)] dark:bg-zinc-800 dark:shadow-[0_1px_0_0_rgba(255,255,255,0.08)]">
+                  <tr className="border-b border-zinc-200 dark:border-zinc-700">
+                    <th className="border-r border-zinc-200 px-2 py-1 text-xs font-medium text-zinc-500 dark:border-zinc-700">Limit (red if &gt;)</th>
+                    <th className="border-r border-zinc-200 px-2 py-1 dark:border-zinc-700" />
+                    {(!seasonClientView ? (['2', '3', '4', '5', 'travel', 'in_vineyard', 'in_winery', 'total'] as const) : (['travel', 'in_vineyard', 'in_winery', 'total'] as const)).map((key) =>
+                      (seasonClientView ? (['Total', 'Av'] as const) : (['Total', 'Max', 'Min', 'Av'] as const)).map((sub) => (
+                        <th key={`limit-${key}-${sub}`} className="whitespace-nowrap border-r border-zinc-200 px-2 py-1 text-xs font-medium text-zinc-500 dark:border-zinc-700">
+                          {limitDisplay(key)}
+                        </th>
+                      ))
+                    )}
+                  </tr>
+                  <tr className="border-b border-zinc-200 dark:border-zinc-700">
+                    <th rowSpan={2} className="border-r border-zinc-200 px-3 py-2 font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100">Season</th>
+                    <th rowSpan={2} className="border-r border-zinc-200 px-3 py-2 text-xs font-medium text-zinc-500 dark:border-zinc-700">Jobs</th>
+                    {!seasonClientView && (
+                      <>
+                        <th colSpan={4} className={`border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[2]}`}>2. TO Vineyard Mins</th>
+                        <th colSpan={4} className={`border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[3]}`}>3. In Vineyard Mins</th>
+                        <th colSpan={4} className={`border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[4]}`}>4. TO Winery Mins</th>
+                        <th colSpan={4} className={`border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[5]}`}>5. End Mins</th>
+                      </>
+                    )}
+                    <th colSpan={seasonClientView ? 2 : 4} className="border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100">Travel</th>
+                    <th colSpan={seasonClientView ? 2 : 4} className={`border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[3]}`}>In Vineyard</th>
+                    <th colSpan={seasonClientView ? 2 : 4} className={`border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[5]}`}>In Winery</th>
+                    <th colSpan={seasonClientView ? 2 : 4} className="border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100">Total</th>
+                  </tr>
+                  <tr className="border-b border-zinc-200 dark:border-zinc-700">
+                    {(!seasonClientView ? ([2, 3, 4, 5, 'travel', 'in_vineyard', 'in_winery', 'total'] as const) : (['travel', 'in_vineyard', 'in_winery', 'total'] as const)).map((step, stepIdx) => {
+                      const groupBg = !seasonClientView && stepIdx < 4 ? STEP_GROUP_BG[(stepIdx + 2) as 2 | 3 | 4 | 5] : (step === 'in_vineyard' ? STEP_GROUP_BG[3] : step === 'in_winery' ? STEP_GROUP_BG[5] : '');
+                      return (seasonClientView ? (['Total', 'Av'] as const) : (['Total', 'Max', 'Min', 'Av'] as const)).map((sub) => (
+                        <th
+                          key={`${step}-${sub}`}
+                          className={`whitespace-nowrap border-r border-zinc-200 px-2 py-1 text-xs font-medium text-zinc-500 dark:border-zinc-700 ${groupBg} ${step === 'total' && sub === 'Av' ? 'border-r-0' : ''}`}
+                        >
+                          {sub}
+                        </th>
+                      ));
+                    })}
+                  </tr>
+                </thead>
+                <tbody>
+                  {!seasonRollup ? (
+                    <tr>
+                      <td colSpan={seasonClientView ? 10 : 34} className="px-3 py-6 text-center text-zinc-500">
+                        {effectiveCustomer || filterTemplate
+                          ? 'No jobs for the selected Customer and Template.'
+                          : 'Select Customer (and optionally Template) above to see season rollup.'}
+                      </td>
+                    </tr>
+                  ) : (
+                    <tr className="border-b border-zinc-100 dark:border-zinc-800 bg-zinc-50/50 dark:bg-zinc-800/30">
+                      <td className="whitespace-nowrap border-r border-zinc-200 px-3 py-2 font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100">
+                        {effectiveCustomer && filterTemplate ? `${effectiveCustomer} / ${filterTemplate}` : effectiveCustomer || 'All'}
+                      </td>
+                      <td className="whitespace-nowrap border-r border-zinc-200 px-3 py-2 tabular-nums text-zinc-500 dark:border-zinc-700 dark:text-zinc-400">
+                        {seasonRollup.jobs.length}
+                      </td>
+                      {!seasonClientView && [seasonRollup.mins_2, seasonRollup.mins_3, seasonRollup.mins_4, seasonRollup.mins_5].map((q, i) =>
+                        (['total', 'max', 'min', 'av'] as const).map((key) => {
+                          const colKey = `mins_${i + 2}` as 'mins_2' | 'mins_3' | 'mins_4' | 'mins_5';
+                          const redClass = key === 'av' ? redIfOver(q[key], thresholdKey(colKey)) : '';
+                          return (
+                            <td key={`${i}-${key}`} className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 tabular-nums ${STEP_GROUP_BG[(i + 2) as 2 | 3 | 4 | 5]} ${redClass || 'text-zinc-600 dark:text-zinc-400 dark:border-zinc-700'}`}>
+                              {q[key]}
+                            </td>
+                          );
+                        })
+                      )}
+                      {(seasonClientView ? (['total', 'av'] as const) : (['total', 'max', 'min', 'av'] as const)).map((key) => {
+                        const redClass = key === 'av' ? redIfOver(seasonRollup.travel[key], 'travel') : '';
+                        return (
+                          <td key={`travel-${key}`} className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 tabular-nums ${redClass || 'text-zinc-600 dark:border-zinc-700 dark:text-zinc-400'}`}>
+                            {seasonRollup.travel[key]}
+                          </td>
+                        );
+                      })}
+                      {(seasonClientView ? (['total', 'av'] as const) : (['total', 'max', 'min', 'av'] as const)).map((key) => {
+                        const redClass = key === 'av' ? redIfOver(seasonRollup.mins_3[key], 'in_vineyard') : '';
+                        return (
+                          <td key={`in_vineyard-${key}`} className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 tabular-nums ${STEP_GROUP_BG[3]} ${redClass || 'text-zinc-600 dark:text-zinc-400 dark:border-zinc-700'}`}>
+                            {seasonRollup.mins_3[key]}
+                          </td>
+                        );
+                      })}
+                      {(seasonClientView ? (['total', 'av'] as const) : (['total', 'max', 'min', 'av'] as const)).map((key) => {
+                        const redClass = key === 'av' ? redIfOver(seasonRollup.mins_5[key], 'in_winery') : '';
+                        return (
+                          <td key={`in_winery-${key}`} className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 tabular-nums ${STEP_GROUP_BG[5]} ${redClass || 'text-zinc-600 dark:text-zinc-400 dark:border-zinc-700'}`}>
+                            {seasonRollup.mins_5[key]}
+                          </td>
+                        );
+                      })}
+                      {(seasonClientView ? (['total', 'av'] as const) : (['total', 'max', 'min', 'av'] as const)).map((key) => {
+                        const redClass = key === 'av' ? redIfOver(seasonRollup.total[key], 'total') : '';
+                        return (
+                          <td key={`total-${key}`} className={`whitespace-nowrap border-zinc-200 px-2 py-2 tabular-nums font-medium ${redClass || 'text-zinc-700 dark:border-zinc-700 dark:text-zinc-300'}`}>
+                            {seasonRollup.total[key]}
+                          </td>
+                        );
+                      })}
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+              {seasonRollup && (
+                <div className="mt-6 flex flex-wrap items-start gap-8 border-t border-zinc-200 px-4 py-6 dark:border-zinc-700">
+                  {(() => {
+                    const travel = seasonRollup.travel.total;
+                    const inVineyard = seasonRollup.mins_3.total;
+                    const inWinery = seasonRollup.mins_5.total;
+                    const totalMins = seasonRollup.total.total;
+                    const pieSum = travel + inVineyard + inWinery;
+                    const barValues = [
+                      { label: 'Total', value: totalMins, fill: 'rgb(59 130 246)' },
+                      { label: 'Travel', value: travel, fill: 'rgb(34 197 94)' },
+                      { label: 'In Vineyard', value: inVineyard, fill: 'rgb(234 179 8)' },
+                      { label: 'In Winery', value: inWinery, fill: 'rgb(239 68 68)' },
+                    ];
+                    const barMax = Math.max(...barValues.map((b) => b.value), 1);
+                    const size = 200;
+                    const cx = size / 2;
+                    const cy = size / 2;
+                    const r = size / 2 - 4;
+                    const pieSegments = pieSum > 0
+                      ? [
+                          { label: 'Travel', value: travel, start: 0, sweep: (travel / pieSum) * 360, fill: 'rgb(34 197 94)' },
+                          { label: 'In Vineyard', value: inVineyard, start: (travel / pieSum) * 360, sweep: (inVineyard / pieSum) * 360, fill: 'rgb(234 179 8)' },
+                          { label: 'In Winery', value: inWinery, start: ((travel + inVineyard) / pieSum) * 360, sweep: (inWinery / pieSum) * 360, fill: 'rgb(239 68 68)' },
+                        ]
+                      : [];
+                    return (
+                      <>
+                        <div className="flex flex-col items-center gap-2">
+                          <span className="text-sm font-medium text-zinc-700 dark:text-zinc-300">Minutes by phase (Travel + Vineyard + Winery = Total)</span>
+                          <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} className="overflow-visible">
+                            {pieSum <= 0 ? (
+                              <circle cx={cx} cy={cy} r={r} fill="rgb(228 228 231)" stroke="rgb(161 161 170)" strokeWidth={1} />
+                            ) : (
+                              pieSegments.map((seg, i) => {
+                                const startDeg = seg.start - 90;
+                                const endDeg = startDeg + seg.sweep;
+                                const x1 = cx + r * Math.cos((startDeg * Math.PI) / 180);
+                                const y1 = cy + r * Math.sin((startDeg * Math.PI) / 180);
+                                const x2 = cx + r * Math.cos((endDeg * Math.PI) / 180);
+                                const y2 = cy + r * Math.sin((endDeg * Math.PI) / 180);
+                                const large = seg.sweep > 180 ? 1 : 0;
+                                const d = `M ${cx} ${cy} L ${x1} ${y1} A ${r} ${r} 0 ${large} 1 ${x2} ${y2} Z`;
+                                return <path key={i} d={d} fill={seg.fill} stroke="rgb(255 255 255)" strokeWidth={1} />;
+                              })
+                            )}
+                            <circle cx={cx} cy={cy} r={r} fill="none" stroke="rgb(161 161 170)" strokeWidth={1} />
+                          </svg>
+                          <div className="flex flex-wrap gap-4 text-xs">
+                            <span className="flex items-center gap-1.5"><span className="inline-block h-3 w-3 rounded-sm bg-green-500" /> Travel: {travel}</span>
+                            <span className="flex items-center gap-1.5"><span className="inline-block h-3 w-3 rounded-sm bg-yellow-500" /> In Vineyard: {inVineyard}</span>
+                            <span className="flex items-center gap-1.5"><span className="inline-block h-3 w-3 rounded-sm bg-red-500" /> In Winery: {inWinery}</span>
+                            <span className="font-medium">Total: {totalMins}</span>
+                          </div>
+                        </div>
+                        <div className="flex flex-col items-center gap-2">
+                          <span className="text-sm font-medium text-zinc-700 dark:text-zinc-300">Total, Travel, Vineyard, Winery (mins)</span>
+                          <svg width={320} height={180} viewBox="0 0 320 180" className="overflow-visible">
+                            <line x1={40} y1={140} x2={300} y2={140} stroke="rgb(161 161 170)" strokeWidth={1} />
+                            <line x1={40} y1={20} x2={40} y2={140} stroke="rgb(161 161 170)" strokeWidth={1} />
+                            {barValues.map((b, i) => {
+                              const x = 50 + i * 68;
+                              const h = barMax > 0 ? (b.value / barMax) * 100 : 0;
+                              return (
+                                <g key={b.label}>
+                                  <rect x={x} y={140 - h} width={48} height={h} fill={b.fill} stroke="rgb(255 255 255)" strokeWidth={1} />
+                                  <text x={x + 24} y={155} textAnchor="middle" className="fill-zinc-600 text-[10px] font-medium dark:fill-zinc-400">{b.label}</text>
+                                  <text x={x + 24} y={135 - h} textAnchor="middle" className="fill-zinc-800 text-[10px] font-medium dark:fill-zinc-200">{b.value}</text>
+                                </g>
+                              );
+                            })}
+                          </svg>
+                        </div>
+                      </>
+                    );
+                  })()}
+                </div>
+              )}
+            </div>
+          )}
           {summaryTab === 'by_day' && (
             <div className="max-h-[70vh] overflow-auto rounded-lg border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900">
               <table className="w-full min-w-[64rem] text-left text-sm">
                 <thead className="sticky top-0 z-10 bg-zinc-100 shadow-[0_1px_0_0_rgba(0,0,0,0.1)] dark:bg-zinc-800 dark:shadow-[0_1px_0_0_rgba(255,255,255,0.08)]">
+                  <tr className="border-b border-zinc-200 dark:border-zinc-700">
+                    <th className="border-r border-zinc-200 px-2 py-1 text-xs font-medium text-zinc-500 dark:border-zinc-700">Limit (red if &gt;)</th>
+                    <th className="border-r border-zinc-200 px-2 py-1 dark:border-zinc-700" />
+                    {(dayClientView ? (['travel', 'in_vineyard', 'in_winery', 'total'] as const) : (['2', '3', '4', '5', 'travel', 'in_vineyard', 'in_winery', 'total'] as const)).map((key) =>
+                      (dayClientView ? (['Total', 'Av'] as const) : (['Total', 'Max', 'Min', 'Av'] as const)).map((sub) => (
+                        <th key={`limit-${key}-${sub}`} className="whitespace-nowrap border-r border-zinc-200 px-2 py-1 text-xs font-medium text-zinc-500 dark:border-zinc-700">
+                          {limitDisplay(key)}
+                        </th>
+                      ))
+                    )}
+                  </tr>
                   <tr className="border-b border-zinc-200 dark:border-zinc-700">
                     <th rowSpan={2} className="border-r border-zinc-200 px-3 py-2 font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100">Date</th>
                     <th rowSpan={2} className="border-r border-zinc-200 px-3 py-2 text-xs font-medium text-zinc-500 dark:border-zinc-700">Jobs</th>
@@ -694,46 +991,66 @@ export default function SummaryPage() {
                     rowsByDay.map((r) => (
                       <tr key={r.date} className="border-b border-zinc-100 dark:border-zinc-800 hover:bg-zinc-50 dark:hover:bg-zinc-800/50">
                         <td className="whitespace-nowrap border-r border-zinc-200 px-3 py-2 dark:border-zinc-700">
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setFilterActualFrom(r.date);
-                              setFilterActualTo(r.date);
-                              setSummaryTab('by_job');
-                            }}
-                            className="font-medium text-blue-600 underline hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300"
-                          >
-                            {r.dateLabel}
-                          </button>
+                          {dayClientView ? (
+                            <span className="font-medium text-zinc-700 dark:text-zinc-300">{r.dateLabel}</span>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setFilterActualFrom(r.date);
+                                setFilterActualTo(r.date);
+                                setSummaryTab('by_job');
+                              }}
+                              className="font-medium text-blue-600 underline hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300"
+                            >
+                              {r.dateLabel}
+                            </button>
+                          )}
                         </td>
                         <td className="whitespace-nowrap border-r border-zinc-200 px-3 py-2 tabular-nums text-zinc-500 dark:border-zinc-700 dark:text-zinc-400">{r.jobs.length}</td>
                         {!dayClientView && [r.mins_2, r.mins_3, r.mins_4, r.mins_5].map((q, i) =>
-                          (['total', 'max', 'min', 'av'] as const).map((key) => (
-                            <td key={`${i}-${key}`} className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 tabular-nums text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[(i + 2) as 2 | 3 | 4 | 5]}`}>
-                              {q[key]}
-                            </td>
-                          ))
+                          (['total', 'max', 'min', 'av'] as const).map((key) => {
+                            const colKey = `mins_${i + 2}`;
+                            const redClass = key === 'av' ? redIfOver(q[key], thresholdKey(colKey)) : '';
+                            return (
+                              <td key={`${i}-${key}`} className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 tabular-nums ${STEP_GROUP_BG[(i + 2) as 2 | 3 | 4 | 5]} ${redClass || 'text-zinc-600 dark:text-zinc-400 dark:border-zinc-700'}`}>
+                                {q[key]}
+                              </td>
+                            );
+                          })
                         )}
-                        {(dayClientView ? (['total', 'av'] as const) : (['total', 'max', 'min', 'av'] as const)).map((key) => (
-                          <td key={`travel-${key}`} className="whitespace-nowrap border-r border-zinc-200 px-2 py-2 tabular-nums text-zinc-600 dark:border-zinc-700 dark:text-zinc-400">
-                            {r.travel[key]}
-                          </td>
-                        ))}
-                        {(dayClientView ? (['total', 'av'] as const) : (['total', 'max', 'min', 'av'] as const)).map((key) => (
-                          <td key={`in_vineyard-${key}`} className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 tabular-nums text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[3]}`}>
-                            {r.mins_3[key]}
-                          </td>
-                        ))}
-                        {(dayClientView ? (['total', 'av'] as const) : (['total', 'max', 'min', 'av'] as const)).map((key) => (
-                          <td key={`in_winery-${key}`} className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 tabular-nums text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[5]}`}>
-                            {r.mins_5[key]}
-                          </td>
-                        ))}
-                        {(dayClientView ? (['total', 'av'] as const) : (['total', 'max', 'min', 'av'] as const)).map((key) => (
-                          <td key={`total-${key}`} className="whitespace-nowrap border-zinc-200 px-2 py-2 tabular-nums font-medium text-zinc-700 dark:border-zinc-700 dark:text-zinc-300">
-                            {r.total[key]}
-                          </td>
-                        ))}
+                        {(dayClientView ? (['total', 'av'] as const) : (['total', 'max', 'min', 'av'] as const)).map((key) => {
+                          const redClass = key === 'av' ? redIfOver(r.travel[key], 'travel') : '';
+                          return (
+                            <td key={`travel-${key}`} className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 tabular-nums ${redClass || 'text-zinc-600 dark:border-zinc-700 dark:text-zinc-400'}`}>
+                              {r.travel[key]}
+                            </td>
+                          );
+                        })}
+                        {(dayClientView ? (['total', 'av'] as const) : (['total', 'max', 'min', 'av'] as const)).map((key) => {
+                          const redClass = key === 'av' ? redIfOver(r.mins_3[key], 'in_vineyard') : '';
+                          return (
+                            <td key={`in_vineyard-${key}`} className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 tabular-nums ${STEP_GROUP_BG[3]} ${redClass || 'text-zinc-600 dark:text-zinc-400 dark:border-zinc-700'}`}>
+                              {r.mins_3[key]}
+                            </td>
+                          );
+                        })}
+                        {(dayClientView ? (['total', 'av'] as const) : (['total', 'max', 'min', 'av'] as const)).map((key) => {
+                          const redClass = key === 'av' ? redIfOver(r.mins_5[key], 'in_winery') : '';
+                          return (
+                            <td key={`in_winery-${key}`} className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 tabular-nums ${STEP_GROUP_BG[5]} ${redClass || 'text-zinc-600 dark:text-zinc-400 dark:border-zinc-700'}`}>
+                              {r.mins_5[key]}
+                            </td>
+                          );
+                        })}
+                        {(dayClientView ? (['total', 'av'] as const) : (['total', 'max', 'min', 'av'] as const)).map((key) => {
+                          const redClass = key === 'av' ? redIfOver(r.total[key], 'total') : '';
+                          return (
+                            <td key={`total-${key}`} className={`whitespace-nowrap border-zinc-200 px-2 py-2 tabular-nums font-medium ${redClass || 'text-zinc-700 dark:border-zinc-700 dark:text-zinc-300'}`}>
+                              {r.total[key]}
+                            </td>
+                          );
+                        })}
                       </tr>
                     ))
                   )}
@@ -749,32 +1066,52 @@ export default function SummaryPage() {
                           {metric === 'total' ? rowsByDay.reduce((a, r) => a + r.jobs.length, 0) : '—'}
                         </td>
                         {!dayClientView && [byDayStats.mins_2, byDayStats.mins_3, byDayStats.mins_4, byDayStats.mins_5].map((s, i) =>
-                          (['total', 'max', 'min', 'av'] as const).map((key) => (
-                            <td key={`${i}-${key}`} className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-xs text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[(i + 2) as 2 | 3 | 4 | 5]}`}>
-                              {key === metric ? (metric === 'total' ? s.total : metric === 'max' ? s.max : metric === 'min' ? s.min : s.av) : '—'}
-                            </td>
-                          ))
+                          (['total', 'max', 'min', 'av'] as const).map((key) => {
+                            const val = key === metric ? (metric === 'total' ? s.total : metric === 'max' ? s.max : metric === 'min' ? s.min : s.av) : null;
+                            const redClass = metric === 'av' && val != null ? redIfOver(val, thresholdKey(`mins_${i + 2}`)) : '';
+                            return (
+                              <td key={`${i}-${key}`} className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-xs ${STEP_GROUP_BG[(i + 2) as 2 | 3 | 4 | 5]} ${redClass} ${val != null && !redClass ? 'text-zinc-600 dark:text-zinc-400 dark:border-zinc-700' : val == null ? 'text-zinc-600 dark:text-zinc-400 dark:border-zinc-700' : ''}`}>
+                                {key === metric ? (metric === 'total' ? s.total : metric === 'max' ? s.max : metric === 'min' ? s.min : s.av) : '—'}
+                              </td>
+                            );
+                          })
                         )}
-                        {(dayClientView ? (['total', 'av'] as const) : (['total', 'max', 'min', 'av'] as const)).map((key) => (
-                          <td key={`travel-${key}`} className="border-r border-zinc-200 px-2 py-1.5 tabular-nums text-xs text-zinc-600 dark:border-zinc-700 dark:text-zinc-400">
-                            {key === metric ? (metric === 'total' ? byDayStats.travel.total : byDayStats.travel.av) : '—'}
-                          </td>
-                        ))}
-                        {(dayClientView ? (['total', 'av'] as const) : (['total', 'max', 'min', 'av'] as const)).map((key) => (
-                          <td key={`in_vineyard-${key}`} className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-xs text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[3]}`}>
-                            {key === metric ? (metric === 'total' ? byDayStats.mins_3.total : byDayStats.mins_3.av) : '—'}
-                          </td>
-                        ))}
-                        {(dayClientView ? (['total', 'av'] as const) : (['total', 'max', 'min', 'av'] as const)).map((key) => (
-                          <td key={`in_winery-${key}`} className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-xs text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[5]}`}>
-                            {key === metric ? (metric === 'total' ? byDayStats.mins_5.total : byDayStats.mins_5.av) : '—'}
-                          </td>
-                        ))}
-                        {(dayClientView ? (['total', 'av'] as const) : (['total', 'max', 'min', 'av'] as const)).map((key) => (
-                          <td key={`total-${key}`} className="border-zinc-200 px-2 py-1.5 tabular-nums text-xs font-medium text-zinc-700 dark:border-zinc-700 dark:text-zinc-300">
-                            {key === metric ? (metric === 'total' ? byDayStats.total.total : byDayStats.total.av) : '—'}
-                          </td>
-                        ))}
+                        {(dayClientView ? (['total', 'av'] as const) : (['total', 'max', 'min', 'av'] as const)).map((key) => {
+                          const val = key === metric ? (metric === 'total' ? byDayStats.travel.total : byDayStats.travel.av) : null;
+                          const redClass = metric === 'av' && val != null ? redIfOver(val, 'travel') : '';
+                          return (
+                            <td key={`travel-${key}`} className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-xs ${redClass} ${val != null && !redClass ? 'text-zinc-600 dark:border-zinc-700 dark:text-zinc-400' : val == null ? 'text-zinc-600 dark:text-zinc-400 dark:border-zinc-700' : ''}`}>
+                              {key === metric ? (metric === 'total' ? byDayStats.travel.total : byDayStats.travel.av) : '—'}
+                            </td>
+                          );
+                        })}
+                        {(dayClientView ? (['total', 'av'] as const) : (['total', 'max', 'min', 'av'] as const)).map((key) => {
+                          const val = key === metric ? (metric === 'total' ? byDayStats.mins_3.total : byDayStats.mins_3.av) : null;
+                          const redClass = metric === 'av' && val != null ? redIfOver(val, 'in_vineyard') : '';
+                          return (
+                            <td key={`in_vineyard-${key}`} className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-xs ${STEP_GROUP_BG[3]} ${redClass} ${val != null && !redClass ? 'text-zinc-600 dark:text-zinc-400 dark:border-zinc-700' : val == null ? 'text-zinc-600 dark:text-zinc-400 dark:border-zinc-700' : ''}`}>
+                              {key === metric ? (metric === 'total' ? byDayStats.mins_3.total : byDayStats.mins_3.av) : '—'}
+                            </td>
+                          );
+                        })}
+                        {(dayClientView ? (['total', 'av'] as const) : (['total', 'max', 'min', 'av'] as const)).map((key) => {
+                          const val = key === metric ? (metric === 'total' ? byDayStats.mins_5.total : byDayStats.mins_5.av) : null;
+                          const redClass = metric === 'av' && val != null ? redIfOver(val, 'in_winery') : '';
+                          return (
+                            <td key={`in_winery-${key}`} className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-xs ${STEP_GROUP_BG[5]} ${redClass} ${val != null && !redClass ? 'text-zinc-600 dark:text-zinc-400 dark:border-zinc-700' : val == null ? 'text-zinc-600 dark:text-zinc-400 dark:border-zinc-700' : ''}`}>
+                              {key === metric ? (metric === 'total' ? byDayStats.mins_5.total : byDayStats.mins_5.av) : '—'}
+                            </td>
+                          );
+                        })}
+                        {(dayClientView ? (['total', 'av'] as const) : (['total', 'max', 'min', 'av'] as const)).map((key) => {
+                          const val = key === metric ? (metric === 'total' ? byDayStats.total.total : byDayStats.total.av) : null;
+                          const redClass = metric === 'av' && val != null ? redIfOver(val, 'total') : '';
+                          return (
+                            <td key={`total-${key}`} className={`border-zinc-200 px-2 py-1.5 tabular-nums text-xs font-medium ${redClass} ${val != null && !redClass ? 'text-zinc-700 dark:border-zinc-700 dark:text-zinc-300' : val == null ? 'text-zinc-700 dark:text-zinc-300 dark:border-zinc-700' : ''}`}>
+                              {key === metric ? (metric === 'total' ? byDayStats.total.total : byDayStats.total.av) : '—'}
+                            </td>
+                          );
+                        })}
                       </tr>
                     ))}
                   </tfoot>
@@ -1008,7 +1345,7 @@ export default function SummaryPage() {
                     <tr key={i} className="border-b border-zinc-100 dark:border-zinc-800 hover:bg-zinc-50 dark:hover:bg-zinc-800/50">
                       {LEAD_COLUMNS.map(({ key }) => (
                         <td key={key} className="whitespace-nowrap px-3 py-2 text-zinc-700 dark:text-zinc-300">
-                          {key === 'job_id' ? (
+                          {key === 'job_id' && viewMode !== 'client' ? (
                             <Link
                               href={inspectUrlForRow(row)}
                               className="text-blue-600 underline hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300"

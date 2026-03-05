@@ -1,15 +1,14 @@
 /**
- * ENTER/EXIT tagging: ENTER on first fence row, EXIT on last fence row.
- * - null → fence: ENTER on current row (first fence row) — only if row is in writeWindow.
- * - fence → null: EXIT on previous row (last fence row) — emit EXIT when stay duration >= graceSeconds
- *   so we always close the stay when the device leaves, even if the last fence row is just outside writeWindow
- *   (e.g. device exits at 00:34 and writeWindow ended at 00:00).
- * - fence → fence: EXIT on previous row (last of old fence), ENTER on current row (first of new fence).
- * Short-stay (noise) suppression: if the stay in a fence is shorter than graceSeconds, we do not tag
- * ENTER or EXIT for that bump (touch-and-go); the fence change did not persist.
+ * ENTER/EXIT tagging — simple rule:
+ * If a state (fence or null) persists >= graceSeconds (e.g. 300 s), it's real; else it's noise.
+ * We tag EXIT when leaving a fence whose stay was real (duration >= grace).
+ * We tag ENTER only when we have confirmed the fence stay was real: i.e. when we leave that
+ * fence (or end stream) and the fence segment lasted >= grace. So ENTER is applied to the
+ * first row of that segment. This avoids putting ENTER on a blip (brief in-and-out) and
+ * blocking the real ENTER when the device later enters and stays.
  */
 
-import { inWindow, parseTimestampToMs } from './dateWindow';
+import { parseTimestampToMs } from './dateWindow';
 
 /** DB may return position_time_nz as Date or string; geofence_id as number or string. */
 export interface ScanRow {
@@ -30,7 +29,7 @@ function normalizeFenceId(raw: string | number | null | undefined): string | nul
   return t === '' ? null : t;
 }
 
-/** position_time_nz from DB may be Date or string; normalize to YYYY-MM-DD HH:mm:ss for window comparison. */
+/** position_time_nz from DB may be Date or string; normalize to YYYY-MM-DD HH:mm:ss. */
 function normalizePositionTimeNz(raw: string | Date | null | undefined): string {
   if (raw == null) return '';
   if (typeof raw === 'string') return raw.trim();
@@ -41,57 +40,58 @@ function normalizePositionTimeNz(raw: string | Date | null | undefined): string 
   return String(raw);
 }
 
-function idEq(a: number | bigint | null, b: number | bigint | null): boolean {
-  if (a == null || b == null) return false;
-  return Number(a) === Number(b);
-}
-
-export function runStateMachine(
-  rows: ScanRow[],
-  writeStart: string,
-  writeEnd: string,
-  graceSeconds: number
-): TagUpdate[] {
+/**
+ * Run state machine: only treat a segment as real if it persisted >= graceSeconds.
+ * ENTER is tagged only when we leave a fence (or end in a fence) and that fence segment
+ * lasted >= grace — so we tag ENTER on the first row of that segment. This avoids
+ * putting ENTER on a blip (brief in-and-out) which would block the real ENTER later.
+ */
+export function runStateMachine(rows: ScanRow[], graceSeconds: number): TagUpdate[] {
   const updates: TagUpdate[] = [];
+  const graceMs = graceSeconds * 1000;
+
   let prevFenceId: string | null | undefined = undefined;
   let prevRowId: number | bigint | null = null;
-  let prevRowInWrite = false;
   let prevTs = '';
-  let lastEnterRowId: number | bigint | null = null;
-  let lastEnterTsMs: number | null = null;
-  const graceMs = graceSeconds * 1000;
+  let segmentStartTsMs: number = 0;
+  let segmentStartRowId: number | bigint | null = null;
 
   for (const row of rows) {
     const currentFenceId = normalizeFenceId(row.geofence_id);
-    const rowId = typeof row.id === 'bigint' ? Number(row.id) : row.id;
+    const rowIdRaw = row.id;
     const ts = normalizePositionTimeNz(row.position_time_nz);
-    const inWrite = inWindow(ts, writeStart, writeEnd);
+    const tsMs = parseTimestampToMs(ts);
 
-    if (prevFenceId !== undefined && currentFenceId !== prevFenceId) {
-      // Exiting previous fence (fence→null or fence→fence): apply EXIT or suppress short-stay noise.
-      // Emit EXIT on last fence row when duration >= graceMs even if that row is outside writeWindow,
-      // so a drop-off at end (fence then persistent null) still gets an EXIT and the stay is closed.
-      if (prevFenceId !== null && prevRowId !== null && prevTs && lastEnterTsMs != null && lastEnterRowId != null) {
-        const durationMs = parseTimestampToMs(prevTs) - lastEnterTsMs;
-        if (durationMs >= graceMs) {
+    if (prevFenceId === undefined) {
+      segmentStartTsMs = tsMs;
+      segmentStartRowId = rowIdRaw;
+    } else if (currentFenceId !== prevFenceId) {
+      const segmentDurationMs = prevTs ? parseTimestampToMs(prevTs) - segmentStartTsMs : 0;
+      const segmentPersisted = segmentDurationMs >= graceMs;
+
+      if (segmentPersisted) {
+        // Leaving a segment that was real: if it was a fence, tag ENTER on first row of that segment and EXIT on last
+        if (prevFenceId !== null && prevRowId !== null && segmentStartRowId !== null) {
+          updates.push({ id: segmentStartRowId, geofence_type: 'ENTER' });
           updates.push({ id: prevRowId, geofence_type: 'EXIT' });
-        } else {
-          const idx = updates.findIndex((u) => idEq(u.id, lastEnterRowId) && u.geofence_type === 'ENTER');
-          if (idx >= 0) updates.splice(idx, 1);
         }
       }
-      // Entering new fence (null→fence or fence→fence): ENTER on current row
-      if (currentFenceId !== null && inWrite) {
-        updates.push({ id: rowId, geofence_type: 'ENTER' });
-        lastEnterRowId = row.id;
-        lastEnterTsMs = parseTimestampToMs(ts);
-      }
+      // Always advance segment start on transition so the next segment is measured from here; when segment was short we still move state (no tags)
+      segmentStartTsMs = tsMs;
+      segmentStartRowId = rowIdRaw;
     }
 
     prevFenceId = currentFenceId;
-    prevRowId = rowId;
-    prevRowInWrite = inWrite;
+    prevRowId = rowIdRaw;
     prevTs = ts;
+  }
+
+  // If we ended while inside a fence and that segment persisted >= grace, tag ENTER on first row (no EXIT — we didn't leave)
+  if (prevFenceId !== null && prevTs && segmentStartRowId !== null) {
+    const segmentDurationMs = parseTimestampToMs(prevTs) - segmentStartTsMs;
+    if (segmentDurationMs >= graceMs) {
+      updates.push({ id: segmentStartRowId, geofence_type: 'ENTER' });
+    }
   }
 
   return updates;
