@@ -18,12 +18,41 @@ function jsonSafe<T>(obj: T): T {
   return obj;
 }
 
+const CANONICAL_USER_TYPES = ['Super Admin', 'Admin', 'Client'] as const;
+type CanonicalUserType = (typeof CANONICAL_USER_TYPES)[number];
+
+function normalizeUserType(raw: string | null | undefined): CanonicalUserType {
+  const s = (raw ?? '').trim();
+  if (/super\s*admin/i.test(s)) return 'Super Admin';
+  if (/^admin$/i.test(s)) return 'Admin';
+  if (/^client$/i.test(s)) return 'Client';
+  return 'Admin';
+}
+
+/** Read user_type from row; driver may return different key casing (user_type, User_Type, userType, etc.). */
+function getRawUserType(row: Record<string, unknown>): string | null | undefined {
+  const keys = ['user_type', 'User_Type', 'userType', 'UserType', 'usertype'];
+  for (const k of keys) {
+    const v = row[k];
+    if (v != null && typeof v === 'string') return v;
+  }
+  return undefined;
+}
+
+function mapUserRow(row: Record<string, unknown>): Record<string, unknown> & { userType: string } {
+  const safe = jsonSafe(row) as Record<string, unknown>;
+  const raw = getRawUserType(safe);
+  const userType = normalizeUserType(raw);
+  return { ...safe, userType };
+}
+
 export async function GET() {
   try {
     const users = await query(
       'SELECT * FROM tbl_users ORDER BY userid ASC'
     );
-    return NextResponse.json({ users: jsonSafe(users) });
+    const mapped = (users as Record<string, unknown>[]).map(mapUserRow);
+    return NextResponse.json({ users: mapped });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return NextResponse.json({ error: message }, { status: 500 });

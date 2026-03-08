@@ -109,6 +109,7 @@ export default function ApiTestPage() {
     return d.toISOString().slice(0, 10);
   });
   const [step3Mode, setStep3Mode] = useState<'single' | 'fleet'>('single');
+  const [step3IncludeTagging, setStep3IncludeTagging] = useState(true); // if false: fetch → apifeed → merge only (no position_time_nz/store_fences, no tagging)
   const [fleetRows, setFleetRows] = useState<FleetRow[]>([]);
   const [fleetRowsLoading, setFleetRowsLoading] = useState(false);
   const [fleetRowsError, setFleetRowsError] = useState<string | null>(null);
@@ -464,33 +465,35 @@ export default function ApiTestPage() {
         await mergeForDevice(row.deviceName, points);
       }
     }
-    setFencePrepStatus('running');
-    setFencePrepError(null);
-    setFencePrepDurationMs(null);
-    setFencePrepPositionTimeNzMs(null);
-    setFencePrepStoreFencesMs(null);
-    const fencePrepStart = Date.now();
-    try {
-      const globalRes = await fetch('/api/admin/tracking/apply-position-time-nz-and-fences', { method: 'POST' });
-      const globalData = await globalRes.json();
-      const fencePrepDuration = Date.now() - fencePrepStart;
-      setFencePrepDurationMs(fencePrepDuration);
-      if (globalData.positionTimeNzMs != null) setFencePrepPositionTimeNzMs(globalData.positionTimeNzMs);
-      if (globalData.storeFencesMs != null) setFencePrepStoreFencesMs(globalData.storeFencesMs);
-      if (!globalData.ok) {
+    if (step3IncludeTagging) {
+      setFencePrepStatus('running');
+      setFencePrepError(null);
+      setFencePrepDurationMs(null);
+      setFencePrepPositionTimeNzMs(null);
+      setFencePrepStoreFencesMs(null);
+      const fencePrepStart = Date.now();
+      try {
+        const globalRes = await fetch('/api/admin/tracking/apply-position-time-nz-and-fences', { method: 'POST' });
+        const globalData = await globalRes.json();
+        const fencePrepDuration = Date.now() - fencePrepStart;
+        setFencePrepDurationMs(fencePrepDuration);
+        if (globalData.positionTimeNzMs != null) setFencePrepPositionTimeNzMs(globalData.positionTimeNzMs);
+        if (globalData.storeFencesMs != null) setFencePrepStoreFencesMs(globalData.storeFencesMs);
+        if (!globalData.ok) {
+          setFencePrepStatus('error');
+          setFencePrepError(globalData.error ?? 'Fence_Prep failed');
+          console.error('[runAll] position_time_nz + store_fences failed:', globalData.error);
+        } else {
+          setFencePrepStatus('done');
+        }
+      } catch (e) {
         setFencePrepStatus('error');
-        setFencePrepError(globalData.error ?? 'Fence_Prep failed');
-        console.error('[runAll] position_time_nz + store_fences failed:', globalData.error);
-      } else {
-        setFencePrepStatus('done');
+        setFencePrepError(e instanceof Error ? e.message : String(e));
+        setFencePrepDurationMs(Date.now() - fencePrepStart);
       }
-    } catch (e) {
-      setFencePrepStatus('error');
-      setFencePrepError(e instanceof Error ? e.message : String(e));
-      setFencePrepDurationMs(Date.now() - fencePrepStart);
-    }
-    for (const row of fleetRows) {
-      await tagForDevice(row.deviceName);
+      for (const row of fleetRows) {
+        await tagForDevice(row.deviceName);
+      }
     }
     setFleetRunAllLoading(false);
   };
@@ -987,13 +990,23 @@ export default function ApiTestPage() {
               >
                 {fleetRowsLoading ? 'Loading…' : 'Refresh from tbl_devices'}
               </button>
+              <label className="ml-2 flex cursor-pointer items-center gap-2 text-sm text-zinc-700 dark:text-zinc-300" title="If unchecked: only Fetch → apifeed → Merge to tbl_tracking (no position_time_nz, store_fences, or tagging).">
+                <input
+                  type="checkbox"
+                  checked={step3IncludeTagging}
+                  onChange={(e) => setStep3IncludeTagging(e.target.checked)}
+                  className="rounded"
+                />
+                Include tagging
+              </label>
               <button
                 type="button"
                 onClick={runAllForDate}
                 disabled={fleetRunAllLoading || !fleetRows.length}
                 className="rounded bg-emerald-700 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-800 disabled:opacity-50"
+                title={step3IncludeTagging ? 'Fetch → apifeed → Merge → position_time_nz + store_fences → Tag' : 'Fetch → apifeed → Merge to tbl_tracking only'}
               >
-                {fleetRunAllLoading ? 'Running all…' : 'Run all (Fetch → apifeed → Merge → position_time_nz + store_fences → Tag)'}
+                {fleetRunAllLoading ? 'Running all…' : step3IncludeTagging ? 'Run all (Fetch → apifeed → Merge → position_time_nz + store_fences → Tag)' : 'Run all (Fetch → apifeed → Merge to tbl_tracking only)'}
               </button>
             </div>
             {fleetRowsLoading ? (

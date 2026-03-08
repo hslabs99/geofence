@@ -12,6 +12,7 @@ type User = {
   surname?: string | null;
   phone?: string | null;
   userType?: string | null;
+  user_type?: string | null; // API may return snake_case from DB
   customer?: string | null;
   createdAt?: string;
   updatedAt?: string;
@@ -74,13 +75,15 @@ export default function UsersPage() {
 
   const openEdit = useCallback((u: User) => {
     setSubmitError(null);
+    const rawType = u.userType ?? u.user_type ?? 'Admin';
+    const userType = (USER_TYPES.includes(rawType as UserType) ? rawType : 'Admin') as UserType;
     setForm({
       email: u.email,
       password: '',
       firstname: u.firstname ?? '',
       surname: u.surname ?? '',
       phone: u.phone ?? '',
-      userType: (USER_TYPES.includes((u.userType ?? 'Admin') as UserType) ? u.userType : 'Admin') as UserType,
+      userType,
       customer: u.customer ?? '',
     });
     setModal({ mode: 'edit', user: u });
@@ -175,7 +178,7 @@ export default function UsersPage() {
               {users.map((u) => (
                 <tr key={u.userid} className="border-b border-zinc-100 dark:border-zinc-800 hover:bg-zinc-50 dark:hover:bg-zinc-800/50">
                   <td className="whitespace-nowrap px-3 py-2 text-zinc-700 dark:text-zinc-300">{u.email}</td>
-                  <td className="whitespace-nowrap px-3 py-2 text-zinc-700 dark:text-zinc-300">{u.userType ?? '—'}</td>
+                  <td className="whitespace-nowrap px-3 py-2 text-zinc-700 dark:text-zinc-300">{u.userType ?? u.user_type ?? '—'}</td>
                   <td className="whitespace-nowrap px-3 py-2 text-zinc-700 dark:text-zinc-300">{u.customer ?? '—'}</td>
                   <td className="whitespace-nowrap px-3 py-2 text-zinc-700 dark:text-zinc-300">{u.firstname ?? '—'}</td>
                   <td className="whitespace-nowrap px-3 py-2 text-zinc-700 dark:text-zinc-300">{u.surname ?? '—'}</td>
