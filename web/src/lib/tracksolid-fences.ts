@@ -2,7 +2,7 @@ import type { Client, PoolClient } from 'pg';
 
 /** pg Client or PoolClient; both support query() and transactions. */
 type DbClient = Client | PoolClient;
-import { listPlatformFences, type TracksolidPlatformFence } from './tracksolid';
+import { listPlatformFences, type GetNewTokenFn, type TracksolidPlatformFence } from './tracksolid';
 
 const SOURCE_NAME = 'tracksolid';
 
@@ -78,14 +78,17 @@ export type SyncProgressEvent = {
   /** Per-fence: 'inserted' | 'updated' */
   action?: 'inserted' | 'updated';
   fence_name?: string;
+  /** Fetch progress: page number (e.g. 1, 2, …) */
+  pageNo?: number;
 };
 
-/** TRUNCATE staging then bulk INSERT. Staging table must have radius_meters column (nullable). Calls onProgress after each batch. */
+/** Staging is not persistent: we empty it before each run, then bulk INSERT. Calls onProgress after clear and each batch. */
 export async function loadTracksolidFencesToStaging(
   client: DbClient,
   rows: StagingRow[],
   onProgress?: (e: SyncProgressEvent) => void
 ): Promise<void> {
+  onProgress?.({ stage: 'staging_clear', message: 'Clearing staging table…' });
   await client.query('TRUNCATE TABLE public.stg_tracksolid_geofences');
   if (rows.length === 0) return;
   const totalBatches = Math.ceil(rows.length / STAGING_BATCH);
@@ -215,21 +218,21 @@ export async function mergeStagingIntoTblGeofencesWithProgress(
           : (String(raw).trim() || null);
 
     const existing = await client.query<{ fence_id: number }>(
-      'SELECT fence_id FROM tbl_geofences WHERE fence_name = $1 LIMIT 1',
+      'SELECT fence_id FROM tbl_geofences WHERE fence_name = $1::text LIMIT 1',
       [s.fence_name]
     );
 
     if (existing.rows.length === 0) {
       await client.query(
         `INSERT INTO tbl_geofences (fence_name, source_name, geom, source_updated_at)
-         VALUES ($1, $2,
+         VALUES ($1::text, $2::text,
            CASE
-             WHEN $4 = 'circle' AND $5 IS NOT NULL THEN
-               ST_Multi(ST_Buffer(ST_GeomFromText($3, 4326)::geography, $5)::geometry)
+             WHEN $4 = 'circle' AND $5::numeric IS NOT NULL THEN
+               ST_Multi(ST_Buffer(ST_GeomFromText($3::text, 4326)::geography, $5::numeric)::geometry)
              ELSE
-               ST_Multi(ST_GeomFromText($3, 4326))
+               ST_Multi(ST_GeomFromText($3::text, 4326))
            END,
-           CASE WHEN $6 IS NOT NULL AND $6 <> '' THEN $6::timestamptz ELSE NULL END
+           CASE WHEN NULLIF(TRIM(COALESCE($6::text, '')), '') IS NOT NULL THEN ($6::text)::timestamptz ELSE NULL END
          )`,
         [s.fence_name, s.source_name, s.geom_wkt, s.fence_type, s.radius_meters, sourceUpdatedAt]
       );
@@ -239,15 +242,15 @@ export async function mergeStagingIntoTblGeofencesWithProgress(
       await client.query(
         `UPDATE tbl_geofences
          SET geom = CASE
-               WHEN $4 = 'circle' AND $5 IS NOT NULL THEN
-                 ST_Multi(ST_Buffer(ST_GeomFromText($3, 4326)::geography, $5)::geometry)
+               WHEN $4 = 'circle' AND $5::numeric IS NOT NULL THEN
+                 ST_Multi(ST_Buffer(ST_GeomFromText($3::text, 4326)::geography, $5::numeric)::geometry)
                ELSE
-                 ST_Multi(ST_GeomFromText($3, 4326))
+                 ST_Multi(ST_GeomFromText($3::text, 4326))
              END,
-             source_name = $2,
-             source_updated_at = CASE WHEN $6 IS NOT NULL AND $6 <> '' THEN $6::timestamptz ELSE source_updated_at END,
+             source_name = $2::text,
+             source_updated_at = CASE WHEN NULLIF(TRIM(COALESCE($6::text, '')), '') IS NOT NULL THEN ($6::text)::timestamptz ELSE source_updated_at END,
              updated_at = now()
-         WHERE fence_name = $1`,
+         WHERE fence_name = $1::text`,
         [s.fence_name, s.source_name, s.geom_wkt, s.fence_type, s.radius_meters, sourceUpdatedAt]
       );
       updated += 1;
@@ -257,7 +260,7 @@ export async function mergeStagingIntoTblGeofencesWithProgress(
 
   const deleteResult = await client.query(
     `DELETE FROM tbl_geofences t
-     WHERE t.source_name = $1
+     WHERE t.source_name = $1::text
        AND NOT EXISTS (
          SELECT 1 FROM stg_tracksolid_geofences s
          WHERE s.fence_name = t.fence_name
@@ -284,10 +287,15 @@ export async function syncTracksolidPlatformGeofences(
   accessToken: string,
   endpoint: string | null | undefined,
   client: DbClient,
-  onProgress?: (e: SyncProgressEvent) => void
+  onProgress?: (e: SyncProgressEvent) => void,
+  getNewToken?: GetNewTokenFn
 ): Promise<SyncResult> {
   onProgress?.({ stage: 'fetch', message: 'Fetching platform fence list from Tracksolid…' });
-  const { fences, resultKeys } = await listPlatformFences(accessToken, endpoint);
+  const { fences, resultKeys } = await listPlatformFences(accessToken, endpoint, (e) => {
+    if (e.stage === 'fetch_page') {
+      onProgress?.({ stage: 'fetch_page', message: e.message, current: e.pageNo, total: e.total });
+    }
+  }, getNewToken);
   if (resultKeys?.length && fences.length === 0) {
     onProgress?.({ stage: 'debug_result_keys', message: `API returned 0 fences. Result top-level keys: ${resultKeys.join(', ')} — fence list may be nested under one of these.` });
   }
@@ -298,8 +306,18 @@ export async function syncTracksolidPlatformGeofences(
   });
 
   onProgress?.({ stage: 'convert', message: `Converting ${fences.length} fence(s) to staging rows…` });
-  const rows = fences.map(tracksolidFenceToStaging);
-  onProgress?.({ stage: 'converted', message: `Converted ${rows.length} row(s). Loading to staging…` });
+  const rowsRaw = fences.map(tracksolidFenceToStaging);
+  // Dedupe by (source_name, source_fence_id) — API can return same fence on multiple pages; keep last.
+  const rowsByKey = new Map<string, StagingRow>();
+  for (const r of rowsRaw) {
+    rowsByKey.set(`${r.source_name}\0${r.source_fence_id}`, r);
+  }
+  const rows = Array.from(rowsByKey.values());
+  if (rows.length < rowsRaw.length) {
+    onProgress?.({ stage: 'converted', message: `Converted ${rows.length} unique row(s) (${rowsRaw.length - rows.length} duplicates removed). Loading to staging…` });
+  } else {
+    onProgress?.({ stage: 'converted', message: `Converted ${rows.length} row(s). Loading to staging…` });
+  }
 
   await client.query('BEGIN');
   try {

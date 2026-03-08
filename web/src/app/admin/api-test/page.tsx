@@ -152,6 +152,15 @@ export default function ApiTestPage() {
   const [fenceListFetchLoading, setFenceListFetchLoading] = useState(false);
   const [fenceListFetched, setFenceListFetched] = useState<Array<{ fenceId: string; name: string; type: string }> | null>(null);
   const [fenceListFetchError, setFenceListFetchError] = useState<string | null>(null);
+  const [fenceListFetchDebug, setFenceListFetchDebug] = useState<{
+    requestDebug?: { endpointSource?: string | null; endpointValue?: string | null; resolvedBaseUrl?: string; note?: string };
+    requestParamsRedacted?: Record<string, string>;
+    endpoint?: string;
+    method?: string;
+    httpStatus?: number;
+    responseBody?: string;
+    fullResponse?: unknown;
+  } | null>(null);
 
   const fetchMaxDates = async () => {
     setMaxDatesError(null);
@@ -1426,19 +1435,35 @@ export default function ApiTestPage() {
             onClick={async () => {
               setFenceListFetchError(null);
               setFenceListFetched(null);
+              setFenceListFetchDebug(null);
               setFenceListFetchLoading(true);
               try {
                 const res = await fetch('/api/admin/tracksolid/fences/fetch', {
                   method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
+                  headers: {
+                    'Content-Type': 'application/json',
+                    'X-Tracksolid-Endpoint': endpoint,
+                  },
                   body: JSON.stringify({ endpoint }),
                 });
                 const data = await res.json();
+                const requestDebug = data?.requestDebug ?? data?.debug?.requestDebug;
+                const debugPayload = requestDebug || data?.debug ? {
+                  requestDebug: requestDebug ?? data?.debug?.requestDebug,
+                  requestParamsRedacted: data?.debug?.requestParamsRedacted,
+                  endpoint: data?.debug?.endpoint,
+                  method: data?.debug?.method,
+                  httpStatus: data?.debug?.httpStatus,
+                  responseBody: data?.debug?.responseBody,
+                  fullResponse: data?.debug?.fullResponse,
+                } : null;
                 if (!res.ok) {
                   setFenceListFetchError(data?.error ?? res.statusText ?? 'Fetch failed');
+                  setFenceListFetchDebug(debugPayload ?? (data?.requestDebug ? { requestDebug: data.requestDebug } : null));
                   return;
                 }
                 setFenceListFetched(data.fences ?? []);
+                setFenceListFetchDebug(debugPayload ?? (data?.requestDebug ? { requestDebug: data.requestDebug } : null));
               } catch (e) {
                 setFenceListFetchError(e instanceof Error ? e.message : String(e));
               } finally {
@@ -1452,7 +1477,50 @@ export default function ApiTestPage() {
           </button>
         </div>
         {fenceListFetchError && (
-          <p className="mb-3 text-sm text-red-600 dark:text-red-400">{fenceListFetchError}</p>
+          <div className="mb-3">
+            <p className="text-sm text-red-600 dark:text-red-400">{fenceListFetchError}</p>
+            {fenceListFetchDebug && (
+              <details className="mt-2 rounded border border-zinc-200 bg-zinc-50 p-2 dark:border-zinc-700 dark:bg-zinc-800/50">
+                <summary className="cursor-pointer text-xs font-medium text-zinc-600 dark:text-zinc-400">Request / response debug</summary>
+                <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap break-words font-mono text-xs text-zinc-700 dark:text-zinc-300">
+                  {[
+                    fenceListFetchDebug.requestDebug && [
+                      '——— Endpoint resolution ———',
+                      `Source: ${fenceListFetchDebug.requestDebug.endpointSource ?? 'none'}`,
+                      `Value: ${fenceListFetchDebug.requestDebug.endpointValue ?? 'none'}`,
+                      `Resolved base URL: ${fenceListFetchDebug.requestDebug.resolvedBaseUrl ?? '—'}`,
+                      fenceListFetchDebug.requestDebug.note ? `Note: ${fenceListFetchDebug.requestDebug.note}` : null,
+                    ].filter(Boolean).join('\n'),
+                    fenceListFetchDebug.requestParamsRedacted && [
+                      '',
+                      '——— Params sent (redacted) ———',
+                      JSON.stringify(fenceListFetchDebug.requestParamsRedacted, null, 2),
+                    ].join('\n'),
+                    fenceListFetchDebug.responseBody != null && [
+                      '',
+                      '——— Response body ———',
+                      fenceListFetchDebug.responseBody,
+                    ].join('\n'),
+                    fenceListFetchDebug.fullResponse != null && [
+                      '',
+                      '——— Full response (parsed) ———',
+                      JSON.stringify(fenceListFetchDebug.fullResponse, null, 2),
+                    ].join('\n'),
+                  ].filter(Boolean).join('\n') || 'No debug data'}
+                </pre>
+              </details>
+            )}
+          </div>
+        )}
+        {fenceListFetchDebug && !fenceListFetchError && (
+          <details className="mb-3 rounded border border-zinc-200 bg-zinc-50 p-2 dark:border-zinc-700 dark:bg-zinc-800/50">
+            <summary className="cursor-pointer text-xs font-medium text-zinc-600 dark:text-zinc-400">Request debug (endpoint used)</summary>
+            <pre className="mt-2 font-mono text-xs text-zinc-700 dark:text-zinc-300">
+              {fenceListFetchDebug.requestDebug
+                ? `Source: ${fenceListFetchDebug.requestDebug.endpointSource ?? 'none'}\nValue: ${fenceListFetchDebug.requestDebug.endpointValue ?? 'none'}\nResolved: ${fenceListFetchDebug.requestDebug.resolvedBaseUrl ?? '—'}`
+                : '—'}
+            </pre>
+          </details>
         )}
         {fenceListFetched && (
           <div className="mb-4 rounded border border-zinc-200 bg-zinc-50 p-3 dark:border-zinc-700 dark:bg-zinc-800/50">
@@ -1479,7 +1547,10 @@ export default function ApiTestPage() {
               try {
                 const res = await fetch('/api/admin/tracksolid/fences/sync', {
                   method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
+                  headers: {
+                    'Content-Type': 'application/json',
+                    'X-Tracksolid-Endpoint': endpoint,
+                  },
                   body: JSON.stringify({ endpoint }),
                 });
                 if (!res.ok || !res.body) {

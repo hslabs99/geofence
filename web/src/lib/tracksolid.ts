@@ -19,7 +19,7 @@ export const TRACKSOLID_ENDPOINTS = {
 
 export type TracksolidEndpointKey = keyof typeof TRACKSOLID_ENDPOINTS;
 
-function getBaseUrl(override?: string | null): string {
+export function getBaseUrl(override?: string | null): string {
   const key = override?.toLowerCase().trim();
   if (key && key in TRACKSOLID_ENDPOINTS) {
     return TRACKSOLID_ENDPOINTS[key as TracksolidEndpointKey];
@@ -59,7 +59,8 @@ export interface TracksolidDebug {
 export class TracksolidApiError extends Error {
   constructor(
     message: string,
-    public debug: TracksolidDebug
+    public debug: TracksolidDebug,
+    public code: number = -1
   ) {
     super(message);
     this.name = 'TracksolidApiError';
@@ -180,7 +181,8 @@ async function post(
   if (code !== 0) {
     throw new TracksolidApiError(
       `Tracksolid ${context.method}: code=${code} message=${data.message ?? 'unknown'}`,
-      debug
+      debug,
+      code
     );
   }
   return {
@@ -395,7 +397,14 @@ export interface TracksolidPlatformFence {
   lastModified?: string;
 }
 
-const FENCE_PAGE_SIZE = 100;
+/** jimi.open.platform.fence.list: page_size 1–50, default 10. Use 50 for minimal requests. */
+const FENCE_PAGE_SIZE = 50;
+const FENCE_MAX_PAGES = 500;
+const FENCE_PAGE_DELAY_MS = 200;
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function extractFenceList(obj: Record<string, unknown> | RawFence[] | undefined): RawFence[] {
   type RawFence = {
@@ -445,6 +454,7 @@ type RawFence = {
   fence_name?: string;
   fence_type?: string;
   geom?: string;
+  coordinates?: string;
   radius?: unknown;
   fence_color?: string;
   description?: string;
@@ -454,43 +464,77 @@ type RawFence = {
   modify_time?: string | number;
 };
 
+export type ListPlatformFencesProgress = {
+  stage: string;
+  message?: string;
+  pageNo?: number;
+  totalSoFar?: number;
+  total?: number;
+};
+
+/** Optional: when API returns 1004 (token exception), call this to get a fresh token and retry the current page. */
+export type GetNewTokenFn = () => Promise<string>;
+
 export async function listPlatformFences(
   accessToken: string,
-  endpoint?: string | null
+  endpoint?: string | null,
+  onProgress?: (e: ListPlatformFencesProgress) => void,
+  getNewToken?: GetNewTokenFn
 ): Promise<{ fences: TracksolidPlatformFence[]; debug: TracksolidDebug; resultKeys?: string[] }> {
   const config = getConfig();
   const baseUrl = getBaseUrl(endpoint);
   const allRaw: RawFence[] = [];
   let pageNo = 1;
-  let total: number | undefined;
+  let totalNum: number | undefined;
   let lastDebug: TracksolidDebug = { endpoint: baseUrl, method: 'jimi.open.platform.fence.list', requestParamsRedacted: {}, requestBodyLength: 0, httpStatus: 0, responseBody: '', timestamp: '' };
   let firstResultKeys: string[] | undefined;
+  let token = accessToken;
 
-  do {
+  while (pageNo <= FENCE_MAX_PAGES) {
+    // API 7.45: page_no (>=1), page_size (1–50); result.total is string, result.rows is the list
     const params: Record<string, string> = {
       ...commonParams(config),
       method: 'jimi.open.platform.fence.list',
-      access_token: accessToken,
+      access_token: token,
       account: config.account,
       page_no: String(pageNo),
       page_size: String(FENCE_PAGE_SIZE),
     };
-    const out = await post(params, config, { method: 'jimi.open.platform.fence.list' }, baseUrl);
+    let out: { result?: unknown; _debug: TracksolidDebug };
+    try {
+      out = await post(params, config, { method: 'jimi.open.platform.fence.list' }, baseUrl);
+    } catch (err) {
+      if (err instanceof TracksolidApiError && err.code === 1004 && getNewToken) {
+        token = await getNewToken();
+        continue; // retry same page with new token
+      }
+      throw err;
+    }
     lastDebug = out._debug;
     const raw = out.result;
     const obj = raw as Record<string, unknown> | RawFence[] | undefined;
     if (firstResultKeys === undefined && obj && typeof obj === 'object' && !Array.isArray(obj)) {
       firstResultKeys = Object.keys(obj);
     }
-    if (total === undefined && obj && typeof obj === 'object' && !Array.isArray(obj)) {
-      total = getTotalFromResult(obj);
+    if (totalNum === undefined && obj && typeof obj === 'object' && !Array.isArray(obj)) {
+      totalNum = getTotalFromResult(obj);
     }
     const list = extractFenceList(obj);
     allRaw.push(...list);
-    if (list.length < FENCE_PAGE_SIZE) break;
-    if (total != null && allRaw.length >= total) break;
+    const fetched = allRaw.length;
+    onProgress?.({
+      stage: 'fetch_page',
+      message: totalNum != null ? `Page ${pageNo}… (${fetched}/${totalNum} fences)` : `Page ${pageNo}… (${fetched} fences so far)`,
+      pageNo,
+      totalSoFar: fetched,
+      total: totalNum ?? undefined,
+    });
+    // Stop when we have all (result.total is total fence count) or empty page
+    if (list.length === 0) break;
+    if (totalNum != null && fetched >= totalNum) break;
     pageNo += 1;
-  } while (true);
+    if (pageNo <= FENCE_MAX_PAGES) await delay(FENCE_PAGE_DELAY_MS);
+  }
 
   /** Normalize API timestamp to ISO string; API often uses yyyy-MM-dd HH:mm:ss (UTC). */
   const toLastModified = (v: string | number | undefined): string | undefined => {
@@ -500,7 +544,7 @@ export async function listPlatformFences(
     const d = new Date(s);
     return Number.isFinite(d.getTime()) ? d.toISOString() : undefined;
   };
-  const fences: TracksolidPlatformFence[] = allRaw.map((f) => {
+  const mapped: TracksolidPlatformFence[] = allRaw.map((f) => {
     const lastModified =
       toLastModified(f.update_time) ??
       toLastModified(f.last_modified) ??
@@ -512,11 +556,17 @@ export async function listPlatformFences(
       type: (f.fence_type === 'circle' ? 'circle' : 'polygon') as 'circle' | 'polygon',
       color: f.fence_color ?? undefined,
       description: f.description ?? undefined,
-      geom: String(f.geom ?? ''),
+      geom: String(f.geom ?? f.coordinates ?? ''),
       radius: typeof f.radius === 'number' ? f.radius : Number(f.radius) || undefined,
       lastModified,
     };
   });
+  // API can return the same fence on multiple pages; dedupe by fenceId (keep last).
+  const byId = new Map<string, TracksolidPlatformFence>();
+  for (const f of mapped) {
+    byId.set(f.fenceId, f);
+  }
+  const fences = Array.from(byId.values());
   const resultKeys = fences.length === 0 ? firstResultKeys : undefined;
   return { fences, debug: lastDebug, resultKeys };
 }

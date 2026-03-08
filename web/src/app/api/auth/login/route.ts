@@ -14,8 +14,8 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Password is required' }, { status: 400 });
     }
 
-    const rows = await query<{ userid: string; email: string; password: string; firstname: string | null; surname: string | null; user_type: string | null }>(
-      'SELECT userid, email, password, firstname, surname, user_type FROM tbl_users WHERE LOWER(TRIM(email)) = $1',
+    const rows = await query<{ userid: string; email: string; password: string; firstname: string | null; surname: string | null; user_type: string | null; customer: string | null }>(
+      'SELECT userid, email, password, firstname, surname, user_type, customer FROM tbl_users WHERE LOWER(TRIM(email)) = $1',
       [email.trim().toLowerCase()]
     );
     const user = rows[0];
@@ -29,13 +29,23 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Invalid email or password' }, { status: 401 });
     }
 
+    const rawType = (user.user_type ?? '').trim();
+    const userType =
+      /super\s*admin/i.test(rawType) ? 'Super Admin'
+      : /^admin$/i.test(rawType) ? 'Admin'
+      : /^client$/i.test(rawType) ? 'Client'
+      : rawType || 'Admin';
+
+    const customer = userType === 'Client' ? ((user.customer ?? '').trim() || null) : null;
+
     return NextResponse.json({
       ok: true,
       user: {
         email: user.email,
-        userType: 'Super Admin' as const,
+        userType: userType as 'Super Admin' | 'Admin' | 'Client',
         firstname: user.firstname,
         surname: user.surname,
+        ...(customer != null && { customer }),
       },
     });
   } catch (err) {

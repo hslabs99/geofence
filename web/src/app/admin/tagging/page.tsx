@@ -502,23 +502,30 @@ export default function TaggingPage() {
               </p>
             </div>
             <div>
-              <div className="flex items-center justify-between">
+              <div className="flex items-center justify-between gap-2">
                 <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">
                   Devices
                 </label>
-                <button
-                  type="button"
-                  onClick={selectAllDevices}
-                  className="text-xs text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-400"
-                >
-                  {selectedDevices.size === devices.length ? 'Deselect all' : 'Select all'}
-                </button>
+                <div className="flex items-center gap-2">
+                  {!devicesLoading && devices.length > 0 && (
+                    <span className="text-xs text-zinc-500 dark:text-zinc-400">
+                      {selectedDevices.size} of {devices.length} selected
+                    </span>
+                  )}
+                  <button
+                    type="button"
+                    onClick={selectAllDevices}
+                    className="text-xs text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-400"
+                  >
+                    {selectedDevices.size === devices.length ? 'Deselect all' : 'Select all'}
+                  </button>
+                </div>
               </div>
               <div className="mt-2 max-h-48 overflow-y-auto rounded border border-zinc-200 bg-zinc-50 p-2 dark:border-zinc-600 dark:bg-zinc-800/50">
                 {devicesLoading ? (
                   <p className="text-sm text-zinc-500">Loading devices…</p>
                 ) : devices.length === 0 ? (
-                  <p className="text-sm text-zinc-500">No devices in tbl_devices.</p>
+                  <p className="text-sm text-zinc-500">No workers in tbl_vworkjobs.</p>
                 ) : (
                   <ul className="space-y-1">
                     {devices.map((d) => (

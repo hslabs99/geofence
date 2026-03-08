@@ -27,7 +27,9 @@ const emptyForm = () => ({
 
 function numOrEmpty(v: number | null | undefined): string {
   if (v == null) return '';
-  return String(v);
+  const n = Number(v);
+  if (Number.isNaN(n)) return '';
+  return n % 1 === 0 ? String(n) : n.toFixed(2).replace(/\.?0+$/, '');
 }
 
 export default function TemplateMinutesPage() {
@@ -41,6 +43,7 @@ export default function TemplateMinutesPage() {
   const [templates, setTemplates] = useState<string[]>([]);
   const [customersLoading, setCustomersLoading] = useState(false);
   const [templatesLoading, setTemplatesLoading] = useState(false);
+  const [totalMismatchInfo, setTotalMismatchInfo] = useState<string | null>(null);
 
   const isAdd = modal?.mode === 'add';
   const editing = modal?.mode === 'edit' ? modal.row : null;
@@ -110,20 +113,55 @@ export default function TemplateMinutesPage() {
   const closeForm = useCallback(() => {
     setModal(null);
     setSubmitError(null);
+    setTotalMismatchInfo(null);
     setForm(emptyForm());
   }, []);
+
+  const sumOfFour = (): number => {
+    const a = parseFloat(form.ToVineMins) || 0;
+    const b = parseFloat(form.InVineMins) || 0;
+    const c = parseFloat(form.ToWineMins) || 0;
+    const d = parseFloat(form.InWineMins) || 0;
+    return Math.round((a + b + c + d) * 100) / 100;
+  };
+
+  useEffect(() => {
+    if (form.TotalMins === '') {
+      setTotalMismatchInfo(null);
+      return;
+    }
+    const total = parseFloat(form.TotalMins);
+    if (Number.isNaN(total)) return;
+    const a = parseFloat(form.ToVineMins) || 0;
+    const b = parseFloat(form.InVineMins) || 0;
+    const c = parseFloat(form.ToWineMins) || 0;
+    const d = parseFloat(form.InWineMins) || 0;
+    const sum = Math.round((a + b + c + d) * 100) / 100;
+    if (Math.abs(total - sum) > 0.005) {
+      setTotalMismatchInfo(`Total (${form.TotalMins}) does not equal sum of the four (${sum.toFixed(2)}). You can keep your value.`);
+    } else {
+      setTotalMismatchInfo(null);
+    }
+  }, [form.ToVineMins, form.InVineMins, form.ToWineMins, form.InWineMins, form.TotalMins]);
+
+  const fillTotalFromSum = () => {
+    if (form.TotalMins !== '') return;
+    const sum = sumOfFour();
+    setForm((f) => ({ ...f, TotalMins: sum % 1 === 0 ? String(sum) : sum.toFixed(2).replace(/\.?0+$/, '') }));
+  };
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     setSubmitError(null);
+    const toNum = (s: string) => (s === '' ? null : Math.round(parseFloat(s) * 100) / 100);
     const payload = {
       Customer: form.Customer.trim() || null,
       Template: form.Template.trim() || null,
-      ToVineMins: form.ToVineMins === '' ? null : parseInt(form.ToVineMins, 10),
-      InVineMins: form.InVineMins === '' ? null : parseInt(form.InVineMins, 10),
-      ToWineMins: form.ToWineMins === '' ? null : parseInt(form.ToWineMins, 10),
-      InWineMins: form.InWineMins === '' ? null : parseInt(form.InWineMins, 10),
-      TotalMins: form.TotalMins === '' ? null : parseInt(form.TotalMins, 10),
+      ToVineMins: toNum(form.ToVineMins),
+      InVineMins: toNum(form.InVineMins),
+      ToWineMins: toNum(form.ToWineMins),
+      InWineMins: toNum(form.InWineMins),
+      TotalMins: toNum(form.TotalMins),
     };
     if (editing) {
       fetch(`/api/admin/templateminutes/${editing.id}`, {
@@ -222,11 +260,11 @@ export default function TemplateMinutesPage() {
                 <tr key={r.id} className="border-b border-zinc-100 dark:border-zinc-800 hover:bg-zinc-50 dark:hover:bg-zinc-800/50">
                   <td className="whitespace-nowrap px-3 py-2 text-zinc-700 dark:text-zinc-300">{r.Customer ?? '—'}</td>
                   <td className="whitespace-nowrap px-3 py-2 text-zinc-700 dark:text-zinc-300">{r.Template ?? '—'}</td>
-                  <td className="whitespace-nowrap px-3 py-2 tabular-nums text-zinc-700 dark:text-zinc-300">{r.ToVineMins ?? '—'}</td>
-                  <td className="whitespace-nowrap px-3 py-2 tabular-nums text-zinc-700 dark:text-zinc-300">{r.InVineMins ?? '—'}</td>
-                  <td className="whitespace-nowrap px-3 py-2 tabular-nums text-zinc-700 dark:text-zinc-300">{r.ToWineMins ?? '—'}</td>
-                  <td className="whitespace-nowrap px-3 py-2 tabular-nums text-zinc-700 dark:text-zinc-300">{r.InWineMins ?? '—'}</td>
-                  <td className="whitespace-nowrap px-3 py-2 tabular-nums font-medium text-zinc-900 dark:text-zinc-100">{r.TotalMins ?? '—'}</td>
+                  <td className="whitespace-nowrap px-3 py-2 text-right tabular-nums text-zinc-700 dark:text-zinc-300">{r.ToVineMins != null ? Number(r.ToVineMins).toFixed(2) : '—'}</td>
+                  <td className="whitespace-nowrap px-3 py-2 text-right tabular-nums text-zinc-700 dark:text-zinc-300">{r.InVineMins != null ? Number(r.InVineMins).toFixed(2) : '—'}</td>
+                  <td className="whitespace-nowrap px-3 py-2 text-right tabular-nums text-zinc-700 dark:text-zinc-300">{r.ToWineMins != null ? Number(r.ToWineMins).toFixed(2) : '—'}</td>
+                  <td className="whitespace-nowrap px-3 py-2 text-right tabular-nums text-zinc-700 dark:text-zinc-300">{r.InWineMins != null ? Number(r.InWineMins).toFixed(2) : '—'}</td>
+                  <td className="whitespace-nowrap px-3 py-2 text-right tabular-nums font-medium text-zinc-900 dark:text-zinc-100">{r.TotalMins != null ? Number(r.TotalMins).toFixed(2) : '—'}</td>
                   <td className="whitespace-nowrap px-3 py-2">
                     <button
                       type="button"
@@ -308,11 +346,96 @@ export default function TemplateMinutesPage() {
                   ))}
                 </select>
               </div>
-              {numInput('ToVineMins', 'To Vine (mins)')}
-              {numInput('InVineMins', 'In Vine (mins)')}
-              {numInput('ToWineMins', 'To Wine (mins)')}
-              {numInput('InWineMins', 'In Wine (mins)')}
-              {numInput('TotalMins', 'Total (mins)')}
+              {/* Graphical flow: Winery → Vineyard (load) → Winery (unload) */}
+              <div className="rounded-lg border border-zinc-200 bg-zinc-50/80 p-4 dark:border-zinc-600 dark:bg-zinc-800/50">
+                <p className="mb-3 text-xs font-medium uppercase tracking-wider text-zinc-500 dark:text-zinc-400">
+                  Minute limits (trip flow)
+                </p>
+                <div className="space-y-3">
+                  <div className="flex items-center gap-3">
+                    <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-amber-100 text-sm font-bold text-amber-800 dark:bg-amber-900/50 dark:text-amber-200" title="Drive to vineyard">→</div>
+                    <div className="min-w-0 flex-1">
+                      <label className="mb-0.5 block text-xs font-medium text-zinc-600 dark:text-zinc-400">To Vine (mins)</label>
+                      <p className="text-[11px] text-zinc-500 dark:text-zinc-500">Time driving from Winery to Vineyard</p>
+                    </div>
+                    <input
+                      type="number"
+                      min={0}
+                      step={0.01}
+                      value={form.ToVineMins}
+                      onChange={(e) => setForm((f) => ({ ...f, ToVineMins: e.target.value }))}
+                      className="w-24 shrink-0 rounded border border-zinc-300 bg-white px-2 py-1 text-right text-sm tabular-nums text-zinc-900 dark:border-zinc-500 dark:bg-white dark:text-zinc-900"
+                    />
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-emerald-100 text-xs font-semibold text-emerald-800 dark:bg-emerald-900/50 dark:text-emerald-200" title="Vineyard">V</div>
+                    <div className="min-w-0 flex-1">
+                      <label className="mb-0.5 block text-xs font-medium text-zinc-600 dark:text-zinc-400">In Vine (mins)</label>
+                      <p className="text-[11px] text-zinc-500 dark:text-zinc-500">Time spent inside Vineyard (loading)</p>
+                    </div>
+                    <input
+                      type="number"
+                      min={0}
+                      step={0.01}
+                      value={form.InVineMins}
+                      onChange={(e) => setForm((f) => ({ ...f, InVineMins: e.target.value }))}
+                      className="w-24 shrink-0 rounded border border-zinc-300 bg-white px-2 py-1 text-right text-sm tabular-nums text-zinc-900 dark:border-zinc-500 dark:bg-white dark:text-zinc-900"
+                    />
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-sky-100 text-sm font-bold text-sky-800 dark:bg-sky-900/50 dark:text-sky-200" title="Drive back to winery">←</div>
+                    <div className="min-w-0 flex-1">
+                      <label className="mb-0.5 block text-xs font-medium text-zinc-600 dark:text-zinc-400">To Wine (mins)</label>
+                      <p className="text-[11px] text-zinc-500 dark:text-zinc-500">Time travelling back to Winery</p>
+                    </div>
+                    <input
+                      type="number"
+                      min={0}
+                      step={0.01}
+                      value={form.ToWineMins}
+                      onChange={(e) => setForm((f) => ({ ...f, ToWineMins: e.target.value }))}
+                      className="w-24 shrink-0 rounded border border-zinc-300 bg-white px-2 py-1 text-right text-sm tabular-nums text-zinc-900 dark:border-zinc-500 dark:bg-white dark:text-zinc-900"
+                    />
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-amber-100 text-xs font-semibold text-amber-800 dark:bg-amber-900/50 dark:text-amber-200" title="Back at winery">W</div>
+                    <div className="min-w-0 flex-1">
+                      <label className="mb-0.5 block text-xs font-medium text-zinc-600 dark:text-zinc-400">In Wine (mins)</label>
+                      <p className="text-[11px] text-zinc-500 dark:text-zinc-500">Time spent at Winery (unloading)</p>
+                    </div>
+                    <input
+                      type="number"
+                      min={0}
+                      step={0.01}
+                      value={form.InWineMins}
+                      onChange={(e) => setForm((f) => ({ ...f, InWineMins: e.target.value }))}
+                      className="w-24 shrink-0 rounded border border-zinc-300 bg-white px-2 py-1 text-right text-sm tabular-nums text-zinc-900 dark:border-zinc-500 dark:bg-white dark:text-zinc-900"
+                    />
+                  </div>
+                  <div className="flex items-center gap-3">
+                    <div className="h-9 w-9 shrink-0" />
+                    <div className="min-w-0 flex-1">
+                      <label className="mb-0.5 block text-xs font-medium text-zinc-600 dark:text-zinc-400">Total (mins)</label>
+                      <p className="text-[11px] text-zinc-500 dark:text-zinc-500">Leave empty and click field to fill from sum of the four</p>
+                    </div>
+                    <input
+                      type="number"
+                      min={0}
+                      max={999.99}
+                      step={0.01}
+                      value={form.TotalMins}
+                      onFocus={fillTotalFromSum}
+                      onChange={(e) => setForm((f) => ({ ...f, TotalMins: e.target.value }))}
+                      className="w-24 shrink-0 rounded border border-zinc-300 bg-white px-2 py-1 text-right text-sm tabular-nums text-zinc-900 dark:border-zinc-500 dark:bg-white dark:text-zinc-900"
+                    />
+                  </div>
+                </div>
+                {totalMismatchInfo && (
+                  <div className="mt-3 rounded bg-blue-50 py-2 px-3 text-xs text-blue-800 dark:bg-blue-950/50 dark:text-blue-200" role="alert">
+                    {totalMismatchInfo}
+                  </div>
+                )}
+              </div>
               <div className="flex justify-end gap-2 pt-2">
                 <button type="button" onClick={closeForm} className="rounded bg-zinc-200 px-4 py-2 text-sm hover:bg-zinc-300 dark:bg-zinc-700 dark:hover:bg-zinc-600">
                   Cancel

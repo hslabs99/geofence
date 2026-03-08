@@ -21,10 +21,10 @@ const STEP_NUMS = [1, 2, 3, 4, 5] as const;
 
 const STEP_LABELS: Record<number, string> = {
   1: '1. Start',
-  2: '2. Arrive',
-  3: '3. Leave',
-  4: '4. Winery',
-  5: '5. End',
+  2: '2. Travel To Vineyard',
+  3: '3. Time In Vineyard',
+  4: '4. Travel To Winery',
+  5: '5. Unloading Winery',
 };
 
 /** Alternating background for the 5 step column groups (1,3,5 = A; 2,4 = B) for visual separation. */
@@ -147,7 +147,7 @@ export default function SummaryPage() {
   const [error, setError] = useState<string | null>(null);
   const [filterActualFrom, setFilterActualFrom] = useState('');
   const [filterActualTo, setFilterActualTo] = useState('');
-  const [filterCustomer, setFilterCustomer] = useState('');
+  // Customer is always taken from sidebar (clientCustomer); no local dropdown to avoid disconnect in admin/super view
   const [filterTemplate, setFilterTemplate] = useState('');
   const [filterTruckId, setFilterTruckId] = useState('');
   const [filterWorker, setFilterWorker] = useState('');
@@ -157,9 +157,11 @@ export default function SummaryPage() {
   const sortColumnsInitialized = useRef(false);
   const [sortSaveStatus, setSortSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const { viewMode, clientCustomer } = useViewMode();
-  /** In client view, customer filter is locked to menu value; otherwise use local filter. */
-  const effectiveCustomer = viewMode === 'client' ? clientCustomer : filterCustomer;
+  /** Customer always mirrors sidebar selection (single source of truth; avoids disconnect in admin/super). */
+  const effectiveCustomer = clientCustomer;
   const [summaryTab, setSummaryTab] = useState<'season' | 'by_day' | 'by_job'>('season');
+  const [filterWinery, setFilterWinery] = useState('');
+  const [filterVineyard, setFilterVineyard] = useState('');
   const [minsThresholds, setMinsThresholds] = useState<Record<string, string>>({
     '2': '', '3': '', '4': '', '5': '', travel: '', in_vineyard: '', in_winery: '', total: '',
   });
@@ -222,9 +224,37 @@ export default function SummaryPage() {
     return Array.from(set).sort();
   }, [rows, effectiveCustomer]);
 
-  /** Clear template when customer changes so we don't keep a template from another customer. */
+  /** Wineries (delivery_winery) only for the effective customer. */
+  const distinctWineries = useMemo(() => {
+    if (!effectiveCustomer.trim()) return [];
+    const set = new Set<string>();
+    for (const row of rows) {
+      const cust = row.Customer ?? row.customer;
+      if (cust == null || String(cust).trim() !== effectiveCustomer) continue;
+      const v = row.delivery_winery;
+      if (v != null && String(v).trim() !== '') set.add(String(v).trim());
+    }
+    return Array.from(set).sort();
+  }, [rows, effectiveCustomer]);
+
+  /** Vineyards (vineyard_name) only for the effective customer. */
+  const distinctVineyards = useMemo(() => {
+    if (!effectiveCustomer.trim()) return [];
+    const set = new Set<string>();
+    for (const row of rows) {
+      const cust = row.Customer ?? row.customer;
+      if (cust == null || String(cust).trim() !== effectiveCustomer) continue;
+      const v = row.vineyard_name;
+      if (v != null && String(v).trim() !== '') set.add(String(v).trim());
+    }
+    return Array.from(set).sort();
+  }, [rows, effectiveCustomer]);
+
+  /** Clear template, winery, vineyard when customer changes so we don't keep values from another customer. */
   useEffect(() => {
     setFilterTemplate('');
+    setFilterWinery('');
+    setFilterVineyard('');
   }, [effectiveCustomer]);
 
   /** When Customer + Template are selected, load minute limits from tbl_templateminutes (2=ToVine, 3=InVine, 4=ToWine, 5=InWine, travel=ToVine+ToWine, in_vineyard=InVine, in_winery=InWine, total=TotalMins). */
@@ -235,12 +265,14 @@ export default function SummaryPage() {
       .then((r) => r.json())
       .then((row) => {
         if (!row || row.error) return;
-        const toV = row.ToVineMins != null ? String(row.ToVineMins) : '';
-        const inV = row.InVineMins != null ? String(row.InVineMins) : '';
-        const toW = row.ToWineMins != null ? String(row.ToWineMins) : '';
-        const inW = row.InWineMins != null ? String(row.InWineMins) : '';
-        const travelVal = (row.ToVineMins != null && row.ToWineMins != null) ? String(row.ToVineMins + row.ToWineMins) : '';
-        const totalVal = row.TotalMins != null ? String(row.TotalMins) : '';
+        const toV = (row.ToVineMins ?? row.tovinemins) != null ? String(row.ToVineMins ?? row.tovinemins) : '';
+        const inV = (row.InVineMins ?? row.invinemins) != null ? String(row.InVineMins ?? row.invinemins) : '';
+        const toW = (row.ToWineMins ?? row.towinemins) != null ? String(row.ToWineMins ?? row.towinemins) : '';
+        const inW = (row.InWineMins ?? row.inwinemins) != null ? String(row.InWineMins ?? row.inwinemins) : '';
+        const tv = row.ToVineMins ?? row.tovinemins;
+        const tw = row.ToWineMins ?? row.towinemins;
+        const travelVal = (tv != null && tw != null) ? String(Number(tv) + Number(tw)) : '';
+        const totalVal = (row.TotalMins ?? row.totalmins) != null ? String(row.TotalMins ?? row.totalmins) : '';
         setMinsThresholds({
           '2': toV,
           '3': inV,
@@ -265,6 +297,14 @@ export default function SummaryPage() {
         const v = row.template;
         if (v == null || String(v).trim() !== filterTemplate) return false;
       }
+      if (filterWinery) {
+        const v = row.delivery_winery;
+        if (v == null || String(v).trim() !== filterWinery) return false;
+      }
+      if (filterVineyard) {
+        const v = row.vineyard_name;
+        if (v == null || String(v).trim() !== filterVineyard) return false;
+      }
       if (filterTruckId) {
         const v = row.truck_id;
         if (v == null || String(v).trim() !== filterTruckId) return false;
@@ -287,7 +327,7 @@ export default function SummaryPage() {
       }
       return true;
     });
-  }, [rows, effectiveCustomer, filterTemplate, filterTruckId, filterWorker, filterActualFrom, filterActualTo]);
+  }, [rows, effectiveCustomer, filterTemplate, filterWinery, filterVineyard, filterTruckId, filterWorker, filterActualFrom, filterActualTo]);
 
   /** Get YYYY-MM-DD from row actual_start_time for By Day rollup. */
   const getRowDate = (row: Row): string | null => {
@@ -366,7 +406,7 @@ export default function SummaryPage() {
     return out;
   }, [filteredRows, dayRange]);
 
-  /** Season (customer + template): one rollup over all matching jobs. Same metrics as daily. */
+  /** Season (customer + template + winery + vineyard): one rollup over all matching jobs. Same metrics as daily. */
   const seasonFilteredRows = useMemo(() => {
     return rows.filter((row) => {
       if (effectiveCustomer) {
@@ -377,9 +417,17 @@ export default function SummaryPage() {
         const v = row.template;
         if (v == null || String(v).trim() !== filterTemplate) return false;
       }
+      if (filterWinery) {
+        const v = row.delivery_winery;
+        if (v == null || String(v).trim() !== filterWinery) return false;
+      }
+      if (filterVineyard) {
+        const v = row.vineyard_name;
+        if (v == null || String(v).trim() !== filterVineyard) return false;
+      }
       return true;
     });
-  }, [rows, effectiveCustomer, filterTemplate]);
+  }, [rows, effectiveCustomer, filterTemplate, filterWinery, filterVineyard]);
 
   const fromValuesToQuad = (values: number[]): MinsQuad => {
     const valid = values.filter((v) => v != null && !Number.isNaN(v));
@@ -561,13 +609,22 @@ export default function SummaryPage() {
   const getThresholdNum = (key: string): number | null => {
     const s = minsThresholds[key]?.trim() ?? '';
     if (s === '') return null;
-    const n = parseInt(s, 10);
+    const n = parseFloat(s);
     return Number.isNaN(n) ? null : n;
   };
   const isMinsOverThreshold = (val: number | null, key: string): boolean => {
     const limit = getThresholdNum(key);
-    return val != null && limit != null && val > limit;
+    const numVal = val != null ? Number(val) : NaN;
+    return !Number.isNaN(numVal) && limit != null && numVal > limit;
   };
+  /** Threshold keys for step columns: 3 and 5 also check in_vineyard/in_winery so limits apply consistently. */
+  const getThresholdKeysForStep = (stepNum: number): string[] => {
+    if (stepNum === 3) return ['3', 'in_vineyard'];
+    if (stepNum === 5) return ['5', 'in_winery'];
+    return [String(stepNum)];
+  };
+  const isMinsOverThresholdForStepCol = (val: number | null, stepNum: number): boolean =>
+    getThresholdKeysForStep(stepNum).some((k) => isMinsOverThreshold(val, k));
   /** Threshold key for season/daily column: mins_2 -> '2', travel -> 'travel', etc. */
   const thresholdKey = (col: string) => (col.startsWith('mins_') ? col.replace('mins_', '') : col);
   const limitDisplay = (key: string) => {
@@ -576,6 +633,9 @@ export default function SummaryPage() {
   };
   const redIfOver = (val: number | null, key: string) =>
     isMinsOverThreshold(val, key) ? 'bg-red-200 text-red-900 dark:bg-red-900/40 dark:text-red-200' : '';
+  /** Red if over any threshold for this step column (used for step 3 and 5 to match 2 and 4). */
+  const redIfOverStepCol = (val: number | null, stepNum: number) =>
+    isMinsOverThresholdForStepCol(val, stepNum) ? 'bg-red-200 text-red-900 dark:bg-red-900/40 dark:text-red-200' : '';
 
   const dayClientView = summaryTab === 'by_day' && viewMode === 'client';
   const jobClientView = summaryTab === 'by_job' && viewMode === 'client';
@@ -597,17 +657,12 @@ export default function SummaryPage() {
           <div className="mb-4 flex flex-wrap items-end gap-4 rounded-lg border border-zinc-200 bg-white p-3 dark:border-zinc-700 dark:bg-zinc-900">
             <div>
               <label className="mb-1 block text-xs font-medium text-zinc-500">Customer</label>
-              <select
-                value={viewMode === 'client' ? clientCustomer : filterCustomer}
-                onChange={(e) => setFilterCustomer(e.target.value)}
-                disabled={viewMode === 'client'}
-                className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm disabled:cursor-not-allowed disabled:opacity-70 dark:border-zinc-600 dark:bg-zinc-800"
+              <div
+                title="Set in sidebar (Client view)"
+                className="rounded border border-zinc-200 bg-zinc-50 px-2 py-1.5 text-sm text-zinc-700 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-300"
               >
-                <option value="">— All —</option>
-                {distinctCustomers.map((c) => (
-                  <option key={c} value={c}>{c}</option>
-                ))}
-              </select>
+                {clientCustomer || '— All —'}
+              </div>
             </div>
             <div>
               <label className="mb-1 block text-xs font-medium text-zinc-500">Template</label>
@@ -620,6 +675,34 @@ export default function SummaryPage() {
                 <option value="">— All —</option>
                 {distinctTemplates.map((t) => (
                   <option key={t} value={t}>{t}</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="mb-1 block text-xs font-medium text-zinc-500">Winery</label>
+              <select
+                value={filterWinery}
+                onChange={(e) => setFilterWinery(e.target.value)}
+                disabled={!effectiveCustomer.trim()}
+                className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm disabled:cursor-not-allowed disabled:opacity-70 dark:border-zinc-600 dark:bg-zinc-800"
+              >
+                <option value="">— All —</option>
+                {distinctWineries.map((w) => (
+                  <option key={w} value={w}>{w}</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="mb-1 block text-xs font-medium text-zinc-500">Vineyard</label>
+              <select
+                value={filterVineyard}
+                onChange={(e) => setFilterVineyard(e.target.value)}
+                disabled={!effectiveCustomer.trim()}
+                className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm disabled:cursor-not-allowed disabled:opacity-70 dark:border-zinc-600 dark:bg-zinc-800"
+              >
+                <option value="">— All —</option>
+                {distinctVineyards.map((v) => (
+                  <option key={v} value={v}>{v}</option>
                 ))}
               </select>
             </div>
@@ -753,7 +836,7 @@ export default function SummaryPage() {
                     {(!seasonClientView ? (['2', '3', '4', '5', 'travel', 'in_vineyard', 'in_winery', 'total'] as const) : (['travel', 'in_vineyard', 'in_winery', 'total'] as const)).map((key) =>
                       (seasonClientView ? (['Total', 'Av'] as const) : (['Total', 'Max', 'Min', 'Av'] as const)).map((sub) => (
                         <th key={`limit-${key}-${sub}`} className="whitespace-nowrap border-r border-zinc-200 px-2 py-1 text-xs font-medium text-zinc-500 dark:border-zinc-700">
-                          {limitDisplay(key)}
+                          {sub === 'Av' ? limitDisplay(key) : '\u00A0'}
                         </th>
                       ))
                     )}
@@ -763,10 +846,10 @@ export default function SummaryPage() {
                     <th rowSpan={2} className="border-r border-zinc-200 px-3 py-2 text-xs font-medium text-zinc-500 dark:border-zinc-700">Jobs</th>
                     {!seasonClientView && (
                       <>
-                        <th colSpan={4} className={`border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[2]}`}>2. TO Vineyard Mins</th>
-                        <th colSpan={4} className={`border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[3]}`}>3. In Vineyard Mins</th>
-                        <th colSpan={4} className={`border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[4]}`}>4. TO Winery Mins</th>
-                        <th colSpan={4} className={`border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[5]}`}>5. End Mins</th>
+                        <th colSpan={4} className={`border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[2]}`}>2. Travel To Vineyard</th>
+                        <th colSpan={4} className={`border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[3]}`}>3. Time In Vineyard</th>
+                        <th colSpan={4} className={`border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[4]}`}>4. Travel To Winery</th>
+                        <th colSpan={4} className={`border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[5]}`}>5. Unloading Winery</th>
                       </>
                     )}
                     <th colSpan={seasonClientView ? 2 : 4} className="border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100">Travel</th>
@@ -807,10 +890,10 @@ export default function SummaryPage() {
                       </td>
                       {!seasonClientView && [seasonRollup.mins_2, seasonRollup.mins_3, seasonRollup.mins_4, seasonRollup.mins_5].map((q, i) =>
                         (['total', 'max', 'min', 'av'] as const).map((key) => {
-                          const colKey = `mins_${i + 2}` as 'mins_2' | 'mins_3' | 'mins_4' | 'mins_5';
-                          const redClass = key === 'av' ? redIfOver(q[key], thresholdKey(colKey)) : '';
+                          const stepNum = i + 2;
+                          const redClass = key === 'av' ? redIfOverStepCol(q[key], stepNum) : '';
                           return (
-                            <td key={`${i}-${key}`} className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 tabular-nums ${STEP_GROUP_BG[(i + 2) as 2 | 3 | 4 | 5]} ${redClass || 'text-zinc-600 dark:text-zinc-400 dark:border-zinc-700'}`}>
+                            <td key={`${i}-${key}`} className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 tabular-nums ${redClass ? redClass : `${STEP_GROUP_BG[(i + 2) as 2 | 3 | 4 | 5]} text-zinc-600 dark:text-zinc-400 dark:border-zinc-700`}`}>
                               {q[key]}
                             </td>
                           );
@@ -827,7 +910,7 @@ export default function SummaryPage() {
                       {(seasonClientView ? (['total', 'av'] as const) : (['total', 'max', 'min', 'av'] as const)).map((key) => {
                         const redClass = key === 'av' ? redIfOver(seasonRollup.mins_3[key], 'in_vineyard') : '';
                         return (
-                          <td key={`in_vineyard-${key}`} className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 tabular-nums ${STEP_GROUP_BG[3]} ${redClass || 'text-zinc-600 dark:text-zinc-400 dark:border-zinc-700'}`}>
+                          <td key={`in_vineyard-${key}`} className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 tabular-nums ${redClass ? redClass : `${STEP_GROUP_BG[3]} text-zinc-600 dark:text-zinc-400 dark:border-zinc-700`}`}>
                             {seasonRollup.mins_3[key]}
                           </td>
                         );
@@ -835,7 +918,7 @@ export default function SummaryPage() {
                       {(seasonClientView ? (['total', 'av'] as const) : (['total', 'max', 'min', 'av'] as const)).map((key) => {
                         const redClass = key === 'av' ? redIfOver(seasonRollup.mins_5[key], 'in_winery') : '';
                         return (
-                          <td key={`in_winery-${key}`} className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 tabular-nums ${STEP_GROUP_BG[5]} ${redClass || 'text-zinc-600 dark:text-zinc-400 dark:border-zinc-700'}`}>
+                          <td key={`in_winery-${key}`} className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 tabular-nums ${redClass ? redClass : `${STEP_GROUP_BG[5]} text-zinc-600 dark:text-zinc-400 dark:border-zinc-700`}`}>
                             {seasonRollup.mins_5[key]}
                           </td>
                         );
@@ -942,7 +1025,7 @@ export default function SummaryPage() {
                     {(dayClientView ? (['travel', 'in_vineyard', 'in_winery', 'total'] as const) : (['2', '3', '4', '5', 'travel', 'in_vineyard', 'in_winery', 'total'] as const)).map((key) =>
                       (dayClientView ? (['Total', 'Av'] as const) : (['Total', 'Max', 'Min', 'Av'] as const)).map((sub) => (
                         <th key={`limit-${key}-${sub}`} className="whitespace-nowrap border-r border-zinc-200 px-2 py-1 text-xs font-medium text-zinc-500 dark:border-zinc-700">
-                          {limitDisplay(key)}
+                          {sub === 'Av' ? limitDisplay(key) : '\u00A0'}
                         </th>
                       ))
                     )}
@@ -952,10 +1035,10 @@ export default function SummaryPage() {
                     <th rowSpan={2} className="border-r border-zinc-200 px-3 py-2 text-xs font-medium text-zinc-500 dark:border-zinc-700">Jobs</th>
                     {!dayClientView && (
                       <>
-                        <th colSpan={4} className={`border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[2]}`}>2. TO Vineyard Mins</th>
-                        <th colSpan={4} className={`border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[3]}`}>3. In Vineyard Mins</th>
-                        <th colSpan={4} className={`border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[4]}`}>4. TO Winery Mins</th>
-                        <th colSpan={4} className={`border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[5]}`}>5. End Mins</th>
+                        <th colSpan={4} className={`border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[2]}`}>2. Travel To Vineyard</th>
+                        <th colSpan={4} className={`border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[3]}`}>3. Time In Vineyard</th>
+                        <th colSpan={4} className={`border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[4]}`}>4. Travel To Winery</th>
+                        <th colSpan={4} className={`border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[5]}`}>5. Unloading Winery</th>
                       </>
                     )}
                     <th colSpan={dayClientView ? 2 : 4} className="border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100">Travel</th>
@@ -1010,10 +1093,10 @@ export default function SummaryPage() {
                         <td className="whitespace-nowrap border-r border-zinc-200 px-3 py-2 tabular-nums text-zinc-500 dark:border-zinc-700 dark:text-zinc-400">{r.jobs.length}</td>
                         {!dayClientView && [r.mins_2, r.mins_3, r.mins_4, r.mins_5].map((q, i) =>
                           (['total', 'max', 'min', 'av'] as const).map((key) => {
-                            const colKey = `mins_${i + 2}`;
-                            const redClass = key === 'av' ? redIfOver(q[key], thresholdKey(colKey)) : '';
+                            const stepNum = i + 2;
+                            const redClass = key === 'av' ? redIfOverStepCol(q[key], stepNum) : '';
                             return (
-                              <td key={`${i}-${key}`} className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 tabular-nums ${STEP_GROUP_BG[(i + 2) as 2 | 3 | 4 | 5]} ${redClass || 'text-zinc-600 dark:text-zinc-400 dark:border-zinc-700'}`}>
+                              <td key={`${i}-${key}`} className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 tabular-nums ${redClass ? redClass : `${STEP_GROUP_BG[(i + 2) as 2 | 3 | 4 | 5]} text-zinc-600 dark:text-zinc-400 dark:border-zinc-700`}`}>
                                 {q[key]}
                               </td>
                             );
@@ -1030,7 +1113,7 @@ export default function SummaryPage() {
                         {(dayClientView ? (['total', 'av'] as const) : (['total', 'max', 'min', 'av'] as const)).map((key) => {
                           const redClass = key === 'av' ? redIfOver(r.mins_3[key], 'in_vineyard') : '';
                           return (
-                            <td key={`in_vineyard-${key}`} className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 tabular-nums ${STEP_GROUP_BG[3]} ${redClass || 'text-zinc-600 dark:text-zinc-400 dark:border-zinc-700'}`}>
+                            <td key={`in_vineyard-${key}`} className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 tabular-nums ${redClass ? redClass : `${STEP_GROUP_BG[3]} text-zinc-600 dark:text-zinc-400 dark:border-zinc-700`}`}>
                               {r.mins_3[key]}
                             </td>
                           );
@@ -1038,7 +1121,7 @@ export default function SummaryPage() {
                         {(dayClientView ? (['total', 'av'] as const) : (['total', 'max', 'min', 'av'] as const)).map((key) => {
                           const redClass = key === 'av' ? redIfOver(r.mins_5[key], 'in_winery') : '';
                           return (
-                            <td key={`in_winery-${key}`} className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 tabular-nums ${STEP_GROUP_BG[5]} ${redClass || 'text-zinc-600 dark:text-zinc-400 dark:border-zinc-700'}`}>
+                            <td key={`in_winery-${key}`} className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 tabular-nums ${redClass ? redClass : `${STEP_GROUP_BG[5]} text-zinc-600 dark:text-zinc-400 dark:border-zinc-700`}`}>
                               {r.mins_5[key]}
                             </td>
                           );
@@ -1068,9 +1151,9 @@ export default function SummaryPage() {
                         {!dayClientView && [byDayStats.mins_2, byDayStats.mins_3, byDayStats.mins_4, byDayStats.mins_5].map((s, i) =>
                           (['total', 'max', 'min', 'av'] as const).map((key) => {
                             const val = key === metric ? (metric === 'total' ? s.total : metric === 'max' ? s.max : metric === 'min' ? s.min : s.av) : null;
-                            const redClass = metric === 'av' && val != null ? redIfOver(val, thresholdKey(`mins_${i + 2}`)) : '';
+                            const redClass = metric === 'av' && val != null ? redIfOverStepCol(val, i + 2) : '';
                             return (
-                              <td key={`${i}-${key}`} className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-xs ${STEP_GROUP_BG[(i + 2) as 2 | 3 | 4 | 5]} ${redClass} ${val != null && !redClass ? 'text-zinc-600 dark:text-zinc-400 dark:border-zinc-700' : val == null ? 'text-zinc-600 dark:text-zinc-400 dark:border-zinc-700' : ''}`}>
+                              <td key={`${i}-${key}`} className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-xs ${redClass ? redClass : `${STEP_GROUP_BG[(i + 2) as 2 | 3 | 4 | 5]} text-zinc-600 dark:text-zinc-400 dark:border-zinc-700`}`}>
                                 {key === metric ? (metric === 'total' ? s.total : metric === 'max' ? s.max : metric === 'min' ? s.min : s.av) : '—'}
                               </td>
                             );
@@ -1089,7 +1172,7 @@ export default function SummaryPage() {
                           const val = key === metric ? (metric === 'total' ? byDayStats.mins_3.total : byDayStats.mins_3.av) : null;
                           const redClass = metric === 'av' && val != null ? redIfOver(val, 'in_vineyard') : '';
                           return (
-                            <td key={`in_vineyard-${key}`} className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-xs ${STEP_GROUP_BG[3]} ${redClass} ${val != null && !redClass ? 'text-zinc-600 dark:text-zinc-400 dark:border-zinc-700' : val == null ? 'text-zinc-600 dark:text-zinc-400 dark:border-zinc-700' : ''}`}>
+                            <td key={`in_vineyard-${key}`} className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-xs ${redClass ? redClass : `${STEP_GROUP_BG[3]} text-zinc-600 dark:text-zinc-400 dark:border-zinc-700`}`}>
                               {key === metric ? (metric === 'total' ? byDayStats.mins_3.total : byDayStats.mins_3.av) : '—'}
                             </td>
                           );
@@ -1098,7 +1181,7 @@ export default function SummaryPage() {
                           const val = key === metric ? (metric === 'total' ? byDayStats.mins_5.total : byDayStats.mins_5.av) : null;
                           const redClass = metric === 'av' && val != null ? redIfOver(val, 'in_winery') : '';
                           return (
-                            <td key={`in_winery-${key}`} className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-xs ${STEP_GROUP_BG[5]} ${redClass} ${val != null && !redClass ? 'text-zinc-600 dark:text-zinc-400 dark:border-zinc-700' : val == null ? 'text-zinc-600 dark:text-zinc-400 dark:border-zinc-700' : ''}`}>
+                            <td key={`in_winery-${key}`} className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-xs ${redClass ? redClass : `${STEP_GROUP_BG[5]} text-zinc-600 dark:text-zinc-400 dark:border-zinc-700`}`}>
                               {key === metric ? (metric === 'total' ? byDayStats.mins_5.total : byDayStats.mins_5.av) : '—'}
                             </td>
                           );
@@ -1367,13 +1450,13 @@ export default function SummaryPage() {
                         const viaStr = formatCell(viaVal);
                         const isGps = viaStr.toLowerCase() === 'gps';
                         const mins = n >= 2 ? minsBetween(row, n - 1, n) : null;
-                        const minsOver = n >= 2 && isMinsOverThreshold(mins, String(n));
+                        const minsOver = n >= 2 && isMinsOverThresholdForStepCol(mins, n);
                         const groupBg = STEP_GROUP_BG[n];
                         return (
                           <React.Fragment key={n}>
                             {n >= 2 && (
                               <td
-                                className={`whitespace-nowrap px-3 py-2 tabular-nums ${groupBg} ${minsOver ? 'bg-red-200 text-red-900 dark:bg-red-900/40 dark:text-red-200' : 'text-zinc-500 dark:text-zinc-400'}`}
+                                className={`whitespace-nowrap px-3 py-2 tabular-nums ${minsOver ? 'bg-red-200 text-red-900 dark:bg-red-900/40 dark:text-red-200' : `${groupBg} text-zinc-500 dark:text-zinc-400`}`}
                               >
                                 {mins != null ? String(mins) : '—'}
                               </td>
@@ -1428,8 +1511,8 @@ export default function SummaryPage() {
           )}
           <p className="mt-3 text-zinc-500">
             {summaryTab === 'by_job'
-              ? `${sortedRows.length} row${sortedRows.length !== 1 ? 's' : ''}${(filterActualFrom || filterActualTo || filterTruckId || filterWorker.trim()) ? ` (filtered from ${rows.length})` : ''} · max 500 from API`
-              : `${rowsByDay.length} day${rowsByDay.length !== 1 ? 's' : ''} · ${filteredRows.length} job${filteredRows.length !== 1 ? 's' : ''}${(filterActualFrom || filterActualTo || filterTruckId || filterWorker.trim()) ? ` (filtered)` : ''}`}
+              ? `${sortedRows.length} row${sortedRows.length !== 1 ? 's' : ''}${(filterActualFrom || filterActualTo || filterTruckId || filterWorker.trim() || filterWinery || filterVineyard) ? ` (filtered from ${rows.length})` : ''} · max 500 from API`
+              : `${rowsByDay.length} day${rowsByDay.length !== 1 ? 's' : ''} · ${filteredRows.length} job${filteredRows.length !== 1 ? 's' : ''}${(filterActualFrom || filterActualTo || filterTruckId || filterWorker.trim() || filterWinery || filterVineyard) ? ` (filtered)` : ''}`}
           </p>
         </>
       )}

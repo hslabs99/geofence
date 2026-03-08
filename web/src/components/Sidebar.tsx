@@ -1,14 +1,21 @@
 'use client';
 
 import Link from 'next/link';
-import { usePathname } from 'next/navigation';
+import { usePathname, useRouter } from 'next/navigation';
 import { useEffect, useState } from 'react';
-import { useViewMode } from '@/contexts/ViewModeContext';
+import { GEODATA_USER_STORAGE_KEY, useViewMode } from '@/contexts/ViewModeContext';
 
 export default function Sidebar() {
   const pathname = usePathname();
-  const { viewMode, setViewMode, clientCustomer, setClientCustomer } = useViewMode();
+  const router = useRouter();
+  const { viewMode, setViewMode, clientCustomer, setClientCustomer, clientCustomerLocked, allowedViewModes, userType, refreshUser } = useViewMode();
   const [customers, setCustomers] = useState<string[]>([]);
+
+  function handleSignOut() {
+    if (typeof localStorage !== 'undefined') localStorage.removeItem(GEODATA_USER_STORAGE_KEY);
+    refreshUser();
+    router.push('/login');
+  }
 
   useEffect(() => {
     fetch('/api/vworkjobs/customers')
@@ -28,10 +35,13 @@ export default function Sidebar() {
         >
           Home
         </Link>
+        {allowedViewModes.length > 0 && (
         <div className="mt-2 px-1">
           <div className="mb-1 text-xs font-medium text-zinc-500 dark:text-zinc-400">View</div>
           <div className="flex flex-col gap-1">
-            {(['super', 'admin', 'client'] as const).map((mode) => (
+            {(['super', 'admin', 'client'] as const)
+              .filter((mode) => allowedViewModes.includes(mode))
+              .map((mode) => (
               <div key={mode}>
                 <label className="flex cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-sm hover:bg-zinc-100 dark:hover:bg-zinc-800">
                   <input
@@ -47,23 +57,36 @@ export default function Sidebar() {
                 </label>
                 {mode === 'client' && (
                   <div className="ml-5 mt-1 mb-1">
-                    <label className="mb-0.5 block text-xs font-medium text-zinc-500 dark:text-zinc-400">Customer</label>
-                    <select
-                      value={clientCustomer}
-                      onChange={(e) => setClientCustomer(e.target.value)}
-                      className="w-full rounded border border-zinc-300 bg-white px-2 py-1 text-sm dark:border-zinc-600 dark:bg-zinc-800"
-                    >
-                      <option value="">— Select —</option>
-                      {customers.map((c) => (
-                        <option key={c} value={c}>{c}</option>
-                      ))}
-                    </select>
+                    <label className="mb-0.5 block text-xs font-medium text-zinc-500 dark:text-zinc-400">
+                      Customer {clientCustomerLocked && '(locked)'}
+                    </label>
+                    {clientCustomerLocked ? (
+                      <select
+                        value={clientCustomer}
+                        disabled
+                        className="w-full rounded border border-zinc-300 bg-zinc-100 px-2 py-1 text-sm text-zinc-700 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-300"
+                      >
+                        <option value={clientCustomer || ''}>{clientCustomer || '—'}</option>
+                      </select>
+                    ) : (
+                      <select
+                        value={clientCustomer}
+                        onChange={(e) => setClientCustomer(e.target.value)}
+                        className="w-full rounded border border-zinc-300 bg-white px-2 py-1 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+                      >
+                        <option value="">— Select —</option>
+                        {customers.map((c) => (
+                          <option key={c} value={c}>{c}</option>
+                        ))}
+                      </select>
+                    )}
                   </div>
                 )}
               </div>
             ))}
           </div>
         </div>
+        )}
         <div className="my-1 border-t border-zinc-200 dark:border-zinc-700" />
         {viewMode === 'client' ? (
           <Link
@@ -80,20 +103,12 @@ export default function Sidebar() {
               Query
             </div>
             <Link
-              href="/query/vwork"
+              href="/query/summary"
               className={`rounded px-3 py-2 text-sm ${
-                pathname === '/query/vwork' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
+                pathname === '/query/summary' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
               }`}
             >
-              Vwork
-            </Link>
-            <Link
-              href="/query/gpsdata"
-              className={`rounded px-3 py-2 text-sm ${
-                pathname === '/query/gpsdata' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
-              }`}
-            >
-              GPS Tracking
+              Summary
             </Link>
             <Link
               href="/query/inspect"
@@ -104,12 +119,20 @@ export default function Sidebar() {
               Inspect
             </Link>
             <Link
-              href="/query/summary"
+              href="/query/gpsdata"
               className={`rounded px-3 py-2 text-sm ${
-                pathname === '/query/summary' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
+                pathname === '/query/gpsdata' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
               }`}
             >
-              Summary
+              GPS Tracking
+            </Link>
+            <Link
+              href="/query/vwork"
+              className={`rounded px-3 py-2 text-sm ${
+                pathname === '/query/vwork' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
+              }`}
+            >
+              Vwork
             </Link>
             <div className="my-1 border-t border-zinc-200 dark:border-zinc-700" />
             <div className="mt-2 rounded-md border-l-4 border-amber-500 bg-amber-50 px-3 py-1.5 text-xs font-bold uppercase tracking-wider text-amber-800 dark:border-amber-400 dark:bg-amber-950/50 dark:text-amber-200">
@@ -179,6 +202,18 @@ export default function Sidebar() {
             >
               API GPS Import
             </Link>
+          </>
+        )}
+        {userType && (
+          <>
+            <div className="my-1 border-t border-zinc-200 dark:border-zinc-700" />
+            <button
+              type="button"
+              onClick={handleSignOut}
+              className="rounded px-3 py-2 text-left text-sm text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800"
+            >
+              Sign out
+            </button>
           </>
         )}
       </nav>
