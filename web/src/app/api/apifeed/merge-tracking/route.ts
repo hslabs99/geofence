@@ -1,5 +1,10 @@
 import { NextResponse } from 'next/server';
-import { execute } from '@/lib/db';
+import { getClient } from '@/lib/db';
+
+function formatDateForDebug(d: Date): string {
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
+}
 
 const DELETE_SQL = `
   DELETE FROM tbl_tracking
@@ -86,50 +91,60 @@ export async function POST(request: Request) {
       return NextResponse.json({ ok: false, error: 'Invalid minTime or maxTime' }, { status: 400 });
     }
 
-    const params = [deviceName, minDate, maxDate];
+    // Bounds are UTC strings only; session set to UTC so no TZ shift. Never pass Date to DB.
+    const minStr = formatDateForDebug(minDate);
+    const maxStr = formatDateForDebug(maxDate);
+    const params = [deviceName, minStr, maxStr];
 
-    let deleted: number;
+    const client = await getClient();
+    let deleted = 0;
+    let apifeedRowsInRange = 0;
+    let inserted = 0;
     try {
-      deleted = await execute(DELETE_SQL, params);
+      await client.query('BEGIN');
+      await client.query("SET LOCAL timezone = 'UTC'");
+      const delRes = await client.query(DELETE_SQL, params);
+      deleted = delRes.rowCount ?? 0;
+      const countRes = await client.query(
+        'SELECT COUNT(*) AS count FROM tbl_apifeed a WHERE a.device_name = $1 AND a.position_time >= $2 AND a.position_time <= $3',
+        params
+      );
+      apifeedRowsInRange = parseInt((countRes.rows[0] as { count: string })?.count ?? '0', 10);
+      const insRes = await client.query(INSERT_SQL, params);
+      inserted = insRes.rowCount ?? 0;
+      await client.query('COMMIT');
     } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
       const message = err instanceof Error ? err.message : String(err);
       // eslint-disable-next-line no-console
-      console.error('[api/apifeed/merge-tracking] DELETE failed:', message);
+      console.error('[api/apifeed/merge-tracking] Error:', message);
+      const failedStep = message.includes('DELETE') ? 'delete' : message.includes('INSERT') ? 'insert' : 'query';
       return NextResponse.json(
         {
           ok: false,
           error: message,
-          failedStep: 'delete',
-          rawSql: DELETE_SQL,
+          failedStep,
+          rawSql: failedStep === 'delete' ? DELETE_SQL : INSERT_SQL,
           params: { deviceName, minTime, maxTime },
         },
         { status: 500 }
       );
-    }
-
-    let inserted: number;
-    try {
-      inserted = await execute(INSERT_SQL, params);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      // eslint-disable-next-line no-console
-      console.error('[api/apifeed/merge-tracking] INSERT failed:', message);
-      return NextResponse.json(
-        {
-          ok: false,
-          error: message,
-          failedStep: 'insert',
-          rawSql: INSERT_SQL,
-          params: { deviceName, minTime, maxTime },
-        },
-        { status: 500 }
-      );
+    } finally {
+      client.release();
     }
 
     return NextResponse.json({
       ok: true,
       deleted: Number(deleted),
       inserted: Number(inserted),
+      apifeedRowsInRange,
+      mergeDebug: {
+        deviceName,
+        minTime,
+        maxTime,
+        minDate: minDate.toISOString(),
+        maxDate: maxDate.toISOString(),
+      },
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

@@ -1,6 +1,8 @@
 'use client';
 
+import Link from 'next/link';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useSearchParams } from 'next/navigation';
 import { formatColumnLabel, formatDateNZ, computeColumnWidths } from '@/lib/utils';
 
 type Row = Record<string, unknown>;
@@ -63,8 +65,13 @@ export default function GpsDataPage() {
   const [dateFilterCol, setDateFilterCol] = useState<string>('');
   const [dateFrom, setDateFrom] = useState<string>('');
   const [dateTo, setDateTo] = useState<string>('');
+  const searchParams = useSearchParams();
   const [deviceNameFilter, setDeviceNameFilter] = useState<string>('');
   const [fenceNameFilter, setFenceNameFilter] = useState<string>('');
+  const [geofenceIdFilter, setGeofenceIdFilter] = useState<string>(() => {
+    const id = searchParams.get('geofenceId');
+    return (id != null && id !== '') ? id.trim() : '';
+  }); // from URL or filter bar; sent to API
   const [geofenceTypeFilter, setGeofenceTypeFilter] = useState<string>(''); // '' = All, 'ENTER', 'EXIT', 'entry_or_exit' = Enter or Exit
   const [headerSortColumn, setHeaderSortColumn] = useState<string | null>(null);
   const [headerSortDir, setHeaderSortDir] = useState<'asc' | 'desc'>('asc');
@@ -81,6 +88,14 @@ export default function GpsDataPage() {
     () => (rows.length > 0 ? Object.keys(rows[0]) : []),
     [rows],
   );
+
+  useEffect(() => {
+    const id = searchParams.get('geofenceId');
+    setGeofenceIdFilter((prev) => {
+      const next = (id != null && id !== '') ? id.trim() : '';
+      return next !== prev ? next : prev;
+    });
+  }, [searchParams]);
 
   useEffect(() => {
     if (apiColumns.length === 0 || columnOrderInitialized.current) return;
@@ -250,6 +265,7 @@ export default function GpsDataPage() {
       orderDir: apiOrderDir,
     });
     if (deviceNameFilter.trim()) params.set('device', deviceNameFilter.trim());
+    if (geofenceIdFilter.trim()) params.set('geofenceId', geofenceIdFilter.trim());
     if (geofenceTypeFilter) params.set('geofenceType', geofenceTypeFilter);
     fetch(`/api/gpsdata?${params}`)
       .then(async (res) => {
@@ -269,7 +285,7 @@ export default function GpsDataPage() {
       })
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false));
-  }, [apiOrderBy, apiOrderDir, deviceNameFilter, geofenceTypeFilter]);
+  }, [apiOrderBy, apiOrderDir, deviceNameFilter, geofenceIdFilter, geofenceTypeFilter]);
 
   useEffect(() => {
     fetchPage(0);
@@ -530,6 +546,17 @@ export default function GpsDataPage() {
                   <option key={name} value={name}>{name}</option>
                 ))}
               </select>
+            </div>
+            <div>
+              <label className="mb-1 block text-xs font-medium text-zinc-500">Fence ID</label>
+              <input
+                type="text"
+                value={geofenceIdFilter}
+                onChange={(e) => setGeofenceIdFilter(e.target.value)}
+                placeholder="— All —"
+                className="w-24 rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+                title="Filter by geofence_id (e.g. from GPS Mappings DataCount link)"
+              />
             </div>
             <div>
               <label className="mb-1 block text-xs font-medium text-zinc-500">Geofence type</label>

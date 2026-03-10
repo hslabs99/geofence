@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { query } from '@/lib/db';
-import { dateToLiteralUTC } from '@/lib/utils';
+import { dateToLiteral } from '@/lib/utils';
 
 /** Parse to YYYY-MM-DD HH:mm:ss — no timezone logic, use literal digits only. */
 function toTimestampLiteral(s: string | null): string | null {
@@ -22,11 +22,11 @@ function toTimestampLiteral(s: string | null): string | null {
   return t;
 }
 
-/** JSON serialization — no Date/toISOString; timestamps shown as stored. */
+/** JSON serialization — no UTC; dates as raw (local) so NZ-stored values display correctly. */
 function jsonSafe<T>(obj: T): T {
   if (obj === null || obj === undefined) return obj;
   if (typeof obj === 'bigint') return String(obj) as T;
-  if (typeof obj === 'object' && obj instanceof Date) return dateToLiteralUTC(obj) as T;
+  if (typeof obj === 'object' && obj instanceof Date) return dateToLiteral(obj) as T;
   if (Array.isArray(obj)) return obj.map(jsonSafe) as T;
   if (typeof obj === 'object') {
     const out: Record<string, unknown> = {};
@@ -81,7 +81,7 @@ export async function GET(request: Request) {
 
     const limitPlaceholder = params.length - 1;
     const offsetPlaceholder = params.length;
-    const sql = `SELECT t.device_name, g.fence_name, t.geofence_type, t.position_time_nz, t.position_time FROM tbl_tracking t LEFT JOIN tbl_geofences g ON g.fence_id = t.geofence_id WHERE ${whereClause} ORDER BY t.position_time_nz ASC LIMIT $${limitPlaceholder} OFFSET $${offsetPlaceholder}`;
+    const sql = `SELECT t.device_name, g.fence_name, t.geofence_type, to_char(t.position_time_nz, 'YYYY-MM-DD HH24:MI:SS') AS position_time_nz, to_char(t.position_time, 'YYYY-MM-DD HH24:MI:SS') AS position_time FROM tbl_tracking t LEFT JOIN tbl_geofences g ON g.fence_id = t.geofence_id WHERE ${whereClause} ORDER BY t.position_time_nz ASC LIMIT $${limitPlaceholder} OFFSET $${offsetPlaceholder}`;
 
     const rows = await query(sql, params);
 
@@ -89,7 +89,7 @@ export async function GET(request: Request) {
     const timePart = tsBefore
       ? `t.position_time_nz > ${esc(tsAfter)} AND t.position_time_nz < ${esc(tsBefore)}`
       : `t.position_time_nz > ${esc(tsAfter)}`;
-    const sqlCopyPaste = `SELECT t.device_name, g.fence_name, t.geofence_type, t.position_time_nz, t.position_time FROM tbl_tracking t LEFT JOIN tbl_geofences g ON g.fence_id = t.geofence_id WHERE t.device_name = ${esc(device.trim())} AND ${timePart}${geofenceTypeCondition} ORDER BY t.position_time_nz ASC LIMIT ${limit} OFFSET ${offset}`;
+    const sqlCopyPaste = `SELECT t.device_name, g.fence_name, t.geofence_type, to_char(t.position_time_nz, 'YYYY-MM-DD HH24:MI:SS') AS position_time_nz, to_char(t.position_time, 'YYYY-MM-DD HH24:MI:SS') AS position_time FROM tbl_tracking t LEFT JOIN tbl_geofences g ON g.fence_id = t.geofence_id WHERE t.device_name = ${esc(device.trim())} AND ${timePart}${geofenceTypeCondition} ORDER BY t.position_time_nz ASC LIMIT ${limit} OFFSET ${offset}`;
 
     return NextResponse.json({ rows: jsonSafe(rows), sql, sqlCopyPaste, total });
   } catch (err) {

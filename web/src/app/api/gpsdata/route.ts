@@ -1,12 +1,12 @@
 import { NextResponse } from 'next/server';
 import { query } from '@/lib/db';
-import { dateToLiteralUTC } from '@/lib/utils';
+import { dateToLiteral } from '@/lib/utils';
 
-/** JSON serialization — no Date/toISOString; timestamps shown as stored (raw). */
+/** JSON serialization — no UTC; dates as raw so NZ-stored values display correctly. */
 function jsonSafe<T>(obj: T): T {
   if (obj === null || obj === undefined) return obj;
   if (typeof obj === 'bigint') return String(obj) as T;
-  if (typeof obj === 'object' && obj instanceof Date) return dateToLiteralUTC(obj) as T;
+  if (typeof obj === 'object' && obj instanceof Date) return dateToLiteral(obj) as T;
   if (Array.isArray(obj)) return obj.map(jsonSafe) as T;
   if (typeof obj === 'object') {
     const out: Record<string, unknown> = {};
@@ -46,6 +46,8 @@ export async function GET(request: Request) {
       : 'position_time_nz';
     const orderDir = (searchParams.get('orderDir') ?? 'asc').toLowerCase() === 'desc' ? 'DESC' : 'ASC';
     const geofenceType = searchParams.get('geofenceType') ?? '';
+    const geofenceIdParam = searchParams.get('geofenceId');
+    const geofenceId = geofenceIdParam != null && geofenceIdParam !== '' ? parseInt(geofenceIdParam, 10) : null;
 
     const conditions: string[] = [];
     const params: unknown[] = [];
@@ -53,6 +55,10 @@ export async function GET(request: Request) {
     if (device && String(device).trim() !== '') {
       conditions.push(`t.device_name = $${idx++}`);
       params.push(String(device).trim());
+    }
+    if (geofenceId != null && !Number.isNaN(geofenceId)) {
+      conditions.push(`t.geofence_id = $${idx++}`);
+      params.push(geofenceId);
     }
     if (geofenceType === 'ENTER' || geofenceType === 'EXIT') {
       conditions.push(`t.geofence_type = $${idx++}`);

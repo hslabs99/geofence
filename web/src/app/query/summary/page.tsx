@@ -193,14 +193,46 @@ export default function SummaryPage() {
     return Array.from(set).sort();
   }, [rows]);
 
+  /** Distinct workers in the current summary result set: rows matching customer (and template if set), winery, vineyard, truck, date range — so dropdown only shows workers that exist in the filtered data. */
   const distinctWorkers = useMemo(() => {
     const set = new Set<string>();
     for (const row of rows) {
-      const v = row.worker;
-      if (v != null && String(v).trim() !== '') set.add(String(v).trim());
+      if (effectiveCustomer) {
+        const v = row.Customer ?? row.customer;
+        if (v == null || String(v).trim() !== effectiveCustomer) continue;
+      }
+      if (filterTemplate) {
+        const v = row.template;
+        if (v == null || String(v).trim() !== filterTemplate) continue;
+      }
+      if (filterWinery) {
+        const v = row.delivery_winery;
+        if (v == null || String(v).trim() !== filterWinery) continue;
+      }
+      if (filterVineyard) {
+        const v = row.vineyard_name;
+        if (v == null || String(v).trim() !== filterVineyard) continue;
+      }
+      if (filterTruckId) {
+        const v = row.truck_id;
+        if (v == null || String(v).trim() !== filterTruckId) continue;
+      }
+      if (filterActualFrom || filterActualTo) {
+        const v = row.actual_start_time;
+        if (v == null || v === '') continue;
+        const str = String(v).trim();
+        const datePart = str.match(/^(\d{4})-(\d{2})-(\d{2})/)?.[0] ?? '';
+        if (!datePart) continue;
+        const from = filterActualFrom ? filterActualFrom.slice(0, 10) : '';
+        const to = filterActualTo ? filterActualTo.slice(0, 10) : '';
+        if (from && datePart < from) continue;
+        if (to && datePart > to) continue;
+      }
+      const w = row.worker;
+      if (w != null && String(w).trim() !== '') set.add(String(w).trim());
     }
     return Array.from(set).sort();
-  }, [rows]);
+  }, [rows, effectiveCustomer, filterTemplate, filterWinery, filterVineyard, filterTruckId, filterActualFrom, filterActualTo]);
 
   const distinctCustomers = useMemo(() => {
     const set = new Set<string>();
@@ -250,12 +282,18 @@ export default function SummaryPage() {
     return Array.from(set).sort();
   }, [rows, effectiveCustomer]);
 
-  /** Clear template, winery, vineyard when customer changes so we don't keep values from another customer. */
+  /** Clear template, winery, vineyard, worker when customer changes so we don't keep values from another customer. */
   useEffect(() => {
     setFilterTemplate('');
     setFilterWinery('');
     setFilterVineyard('');
+    setFilterWorker('');
   }, [effectiveCustomer]);
+
+  /** Clear worker when template changes so dropdown only shows workers in the new result set. */
+  useEffect(() => {
+    setFilterWorker('');
+  }, [filterTemplate]);
 
   /** When Customer + Template are selected, load minute limits from tbl_templateminutes (2=ToVine, 3=InVine, 4=ToWine, 5=InWine, travel=ToVine+ToWine, in_vineyard=InVine, in_winery=InWine, total=TotalMins). */
   useEffect(() => {
@@ -739,13 +777,17 @@ export default function SummaryPage() {
             </div>
             <div>
               <label className="mb-1 block text-xs font-medium text-zinc-500">Worker</label>
-              <input
-                type="text"
-                placeholder="Filter by worker"
+              <select
                 value={filterWorker}
                 onChange={(e) => setFilterWorker(e.target.value)}
                 className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800"
-              />
+                title="Distinct workers in current result set (Customer, Template, Winery, Vineyard, Truck, Date)"
+              >
+                <option value="">— All —</option>
+                {distinctWorkers.map((w) => (
+                  <option key={w} value={w}>{w}</option>
+                ))}
+              </select>
             </div>
             <div>
               <label className="mb-1 block text-xs font-medium text-zinc-500">Sort 1</label>
@@ -1465,7 +1507,7 @@ export default function SummaryPage() {
                               {formatDateDDMM(actualVal)}
                             </td>
                             <td
-                              className={`whitespace-nowrap px-3 py-2 font-medium ${groupBg} ${isGps ? 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-200' : 'text-zinc-700 dark:text-zinc-300'}`}
+                              className={`whitespace-nowrap px-3 py-2 font-medium ${isGps ? 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-200' : `${groupBg} text-zinc-700 dark:text-zinc-300`}`}
                             >
                               {viaStr}
                             </td>

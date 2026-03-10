@@ -2,14 +2,66 @@
 
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { GEODATA_USER_STORAGE_KEY, useViewMode } from '@/contexts/ViewModeContext';
+
+type InspectHistoryEntry = {
+  job_id: string;
+  delivery_winery: string | null;
+  vineyard_name: string | null;
+  worker: string | null;
+  actual_start_time: string | null;
+  truck_id: string | null;
+};
+
+function buildInspectUrl(entry: InspectHistoryEntry): string {
+  const params = new URLSearchParams();
+  params.set('locateJobId', entry.job_id);
+  if (entry.truck_id) params.set('truckId', entry.truck_id);
+  const actualStart = entry.actual_start_time?.trim();
+  if (actualStart) {
+    const d = new Date(actualStart.includes('T') ? actualStart : actualStart.replace(' ', 'T'));
+    if (!Number.isNaN(d.getTime())) {
+      const pad = (n: number) => String(n).padStart(2, '0');
+      const from = new Date(d);
+      from.setDate(from.getDate() - 1);
+      params.set('actualFrom', `${from.getFullYear()}-${pad(from.getMonth() + 1)}-${pad(from.getDate())}`);
+      const to = new Date(d);
+      to.setDate(to.getDate() + 1);
+      params.set('actualTo', `${to.getFullYear()}-${pad(to.getMonth() + 1)}-${pad(to.getDate())}`);
+    }
+  }
+  return `/query/inspect?${params.toString()}`;
+}
 
 export default function Sidebar() {
   const pathname = usePathname();
   const router = useRouter();
   const { viewMode, setViewMode, clientCustomer, setClientCustomer, clientCustomerLocked, allowedViewModes, userType, refreshUser } = useViewMode();
   const [customers, setCustomers] = useState<string[]>([]);
+  const [inspectHistory, setInspectHistory] = useState<InspectHistoryEntry[]>([]);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const historyRef = useRef<HTMLDivElement>(null);
+
+  const fetchInspectHistory = useCallback(() => {
+    fetch('/api/inspect-history')
+      .then((r) => r.json())
+      .then((data) => setInspectHistory(data?.entries ?? []))
+      .catch(() => setInspectHistory([]));
+  }, []);
+
+  useEffect(() => {
+    fetchInspectHistory();
+  }, [fetchInspectHistory]);
+
+  useEffect(() => {
+    if (!historyOpen) return;
+    const close = (e: MouseEvent) => {
+      if (historyRef.current && !historyRef.current.contains(e.target as Node)) setHistoryOpen(false);
+    };
+    document.addEventListener('click', close);
+    return () => document.removeEventListener('click', close);
+  }, [historyOpen]);
 
   function handleSignOut() {
     if (typeof localStorage !== 'undefined') localStorage.removeItem(GEODATA_USER_STORAGE_KEY);
@@ -118,6 +170,53 @@ export default function Sidebar() {
             >
               Inspect
             </Link>
+            <div className="relative" ref={historyRef}>
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setHistoryOpen((o) => {
+                    if (!o) fetchInspectHistory();
+                    return !o;
+                  });
+                }}
+                className="w-full rounded px-3 py-1.5 text-left text-xs text-zinc-500 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800"
+              >
+                Recent jobs {inspectHistory.length > 0 ? `(${inspectHistory.length})` : ''}
+              </button>
+              {historyOpen && (
+                <div
+                  className="absolute left-full top-0 z-50 ml-1 min-w-[420px] max-w-[90vw] rounded-lg border border-zinc-200 bg-white py-1 shadow-lg dark:border-zinc-600 dark:bg-zinc-800"
+                  role="listbox"
+                >
+                  {inspectHistory.length === 0 ? (
+                    <div className="px-3 py-2 text-xs text-zinc-500 dark:text-zinc-400">No recent jobs</div>
+                  ) : (
+                    inspectHistory.map((entry) => (
+                      <button
+                        key={entry.job_id}
+                        type="button"
+                        role="option"
+                        onClick={() => {
+                          setHistoryOpen(false);
+                          router.push(buildInspectUrl(entry));
+                        }}
+                        className="w-full px-3 py-2 text-left text-xs hover:bg-zinc-100 dark:hover:bg-zinc-700"
+                      >
+                        <div className="font-medium text-zinc-900 dark:text-zinc-100">{entry.job_id}</div>
+                        <div className="mt-0.5 truncate text-zinc-600 dark:text-zinc-400">
+                          {[entry.delivery_winery, entry.vineyard_name].filter(Boolean).join(' · ') || '—'}
+                        </div>
+                        <div className="mt-0.5 flex flex-wrap gap-x-2 gap-y-0 text-zinc-500 dark:text-zinc-500">
+                          {entry.worker && <span>{entry.worker}</span>}
+                          {entry.actual_start_time && <span>{entry.actual_start_time}</span>}
+                        </div>
+                      </button>
+                    ))
+                  )}
+                </div>
+              )}
+            </div>
             <Link
               href="/query/gpsdata"
               className={`rounded px-3 py-2 text-sm ${

@@ -8,28 +8,21 @@ import { query } from '@/lib/db';
 export async function GET() {
   try {
     const [vworkResult, trackingResult] = await Promise.all([
-      query<{ max_actual_start: Date | string | null }>(
-        'SELECT MAX(actual_start_time) AS max_actual_start FROM tbl_vworkjobs WHERE actual_start_time IS NOT NULL'
+      query<{ max_actual_start: string | null }>(
+        `SELECT to_char(MAX(actual_start_time), 'YYYY-MM-DD HH24:MI:SS') AS max_actual_start FROM tbl_vworkjobs WHERE actual_start_time IS NOT NULL`
       ),
-      query<{ max_position_time_nz: Date | string | null }>(
-        'SELECT MAX(position_time_nz) AS max_position_time_nz FROM tbl_tracking WHERE position_time_nz IS NOT NULL'
+      query<{ max_position_time_nz: string | null }>(
+        `SELECT to_char(MAX(position_time_nz), 'YYYY-MM-DD HH24:MI:SS') AS max_position_time_nz FROM tbl_tracking WHERE position_time_nz IS NOT NULL`
       ),
     ]);
 
-    const rawVwork = vworkResult[0]?.max_actual_start;
-    const rawTracking = trackingResult[0]?.max_position_time_nz;
-
-    const toIso = (v: Date | string | null): string | null => {
-      if (v == null) return null;
-      if (typeof v === 'string') return v;
-      if (v instanceof Date) return v.toISOString();
-      return String(v);
-    };
+    const maxVwork = vworkResult[0]?.max_actual_start ?? null;
+    const maxTracking = trackingResult[0]?.max_position_time_nz ?? null;
 
     return NextResponse.json({
       ok: true,
-      maxVworkjobsActualStart: toIso(rawVwork),
-      maxTrackingPositionTimeNz: toIso(rawTracking),
+      maxVworkjobsActualStart: maxVwork,
+      maxTrackingPositionTimeNz: maxTracking,
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

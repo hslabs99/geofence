@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { query } from '@/lib/db';
-import { dateToLiteralUTC } from '@/lib/utils';
+import { dateToLiteral } from '@/lib/utils';
 
 /** Raw timestamp columns in tbl_vworkjobs: SELECT as to_char so API returns exact DB digits. Only columns that exist in tbl_vworkjobs (no gps_start_time/gps_end_time — those are not in this table). */
 const RAW_TIMESTAMP_COLS = [
@@ -11,11 +11,11 @@ const RAW_TIMESTAMP_COLS = [
 ] as const;
 const RAW_SELECT_FRAGMENT = RAW_TIMESTAMP_COLS.map((c) => `to_char(t.${c}, 'YYYY-MM-DD HH24:MI:SS') AS ${c}_raw`).join(', ');
 
-/** JSON serialization — no toISOString. */
+/** JSON serialization — no UTC; dates as raw so NZ-stored values display correctly. */
 function jsonSafe<T>(obj: T): T {
   if (obj === null || obj === undefined) return obj;
   if (typeof obj === 'bigint') return String(obj) as T;
-  if (typeof obj === 'object' && obj instanceof Date) return dateToLiteralUTC(obj) as T;
+  if (typeof obj === 'object' && obj instanceof Date) return dateToLiteral(obj) as T;
   if (Array.isArray(obj)) return obj.map(jsonSafe) as T;
   if (typeof obj === 'object') {
     const out: Record<string, unknown> = {};

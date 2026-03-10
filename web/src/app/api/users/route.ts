@@ -1,12 +1,12 @@
 import { NextResponse } from 'next/server';
 import { query, execute } from '@/lib/db';
-import { dateToLiteralUTC } from '@/lib/utils';
+import { dateToLiteral } from '@/lib/utils';
 import bcrypt from 'bcryptjs';
 
 function jsonSafe<T>(obj: T): T {
   if (obj === null || obj === undefined) return obj;
   if (typeof obj === 'bigint') return String(obj) as T;
-  if (typeof obj === 'object' && obj instanceof Date) return dateToLiteralUTC(obj) as T;
+  if (typeof obj === 'object' && obj instanceof Date) return dateToLiteral(obj) as T;
   if (Array.isArray(obj)) return obj.map(jsonSafe) as T;
   if (typeof obj === 'object') {
     const out: Record<string, unknown> = {};

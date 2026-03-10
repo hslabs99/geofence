@@ -1,10 +1,5 @@
 import { query } from '@/lib/db';
-
-/** Format a Date as YYYY-MM-DD HH:mm:ss using UTC components. Use only when DB returns Date; prefer to_char in SQL so value is already a string. Never use toISOString (it would shift times). */
-function formatDateAsRawLiteral(d: Date): string {
-  const pad = (n: number) => String(n).padStart(2, '0');
-  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
-}
+import { dateToLiteral } from '@/lib/utils';
 
 /** Same as tracking API: parse to YYYY-MM-DD HH:mm:ss only — no timezone in output. Handles Date (e.g. from DB) and strings; strips GMT+1300 etc. so PostgreSQL never sees them. */
 function normalizeTimestampString(s: string | Date | null): string | null {
@@ -158,7 +153,7 @@ async function getFirstTrackingInWindowWithDebug(
   let value: string | null = null;
   if (val != null) {
     if (typeof val === 'string') value = normalizeTimestampString(val) ?? val.slice(0, 19);
-    else if (val instanceof Date) value = formatDateAsRawLiteral(val);
+    else if (val instanceof Date) value = dateToLiteral(val);
     else value = String(val).slice(0, 19);
   }
   const rawId = rows[0]?.id;
@@ -255,7 +250,7 @@ export type DerivedStepsOptions = {
  *   - Meaning: job start = when driver left the winery (before arriving at vineyard).
  *   - May be absent if the job started after the driver had already left the winery fence.
  * Step 2 — Arrive vineyard: First Vineyard ENTER in window.
- * Step 3 — Leave vineyard: First Vineyard EXIT in window.
+ * Step 3 — Leave vineyard: First Vineyard EXIT after step 2 (so we don't pick an earlier exit before the enter).
  * Step 4 — Arrive winery: First Winery ENTER that (a) is in the data window and (b) is after max(step2, step3) if both exist; else only (a). Only step 5 (Winery EXIT) is subject to step 5 times.
  * Step 5 — Job end by GPS: VWork step 5 = step_5_completed_at (job completed in system). Only use GPS when Winery EXIT is strictly < VWork step 5 (gpsNorm < vworkStep5). IF VWork step 5 > step 4, AND we have a Winery EXIT that is > step 4, within the data window, and < VWork step 5, we use that Winery EXIT (driver left winery after returning from vineyard and forgot to end job). We take the FIRST such Winery EXIT (not the last), so we get the “forgot to end” exit, not the exit at job end. Search window capped at job end and at positionBefore (data window). In most jobs this does not apply (step5 null).
  *
@@ -286,7 +281,9 @@ async function fetchGpsStepCandidates(
       step2Value = step2Result.value;
       debug.vineyard.step2 = step2Result.debug;
       if (step2Result.value != null) candidates.step2 = { value: step2Result.value, trackingId: step2Result.trackingId };
-      const step3Result = await getFirstTrackingInWindowWithDebug(truckId, positionAfter, positionBefore, vineyardFenceIds, 'EXIT');
+      // Step 3 (Depart Vineyard): first Vineyard EXIT after step 2 (Enter Vineyard), so we don't pick an earlier exit
+      const step3After = step2Value ?? positionAfter;
+      const step3Result = await getFirstTrackingInWindowWithDebug(truckId, step3After, positionBefore, vineyardFenceIds, 'EXIT');
       step3Value = step3Result.value;
       debug.vineyard.step3 = step3Result.debug;
       if (step3Result.value != null) candidates.step3 = { value: step3Result.value, trackingId: step3Result.trackingId };

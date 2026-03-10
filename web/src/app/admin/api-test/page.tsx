@@ -52,6 +52,21 @@ interface FleetRow {
   error: string | null;
 }
 
+/** Return array of YYYY-MM-DD from fromDate to toDate inclusive. Uses UTC only (no session/local TZ). If from > to, returns [from]. */
+function getDatesInRange(fromDate: string, toDate: string): string[] {
+  const from = new Date(fromDate.trim().slice(0, 10));
+  const to = new Date(toDate.trim().slice(0, 10));
+  if (Number.isNaN(from.getTime()) || Number.isNaN(to.getTime())) return [fromDate.trim() || toDate.trim()].filter(Boolean);
+  if (from.getTime() > to.getTime()) return [fromDate.trim().slice(0, 10)];
+  const out: string[] = [];
+  const d = new Date(from);
+  while (d.getTime() <= to.getTime()) {
+    out.push(d.toISOString().slice(0, 10));
+    d.setUTCDate(d.getUTCDate() + 1);
+  }
+  return out;
+}
+
 function formatDebugPre(debug: TracksolidDebug): string {
   const params = debug.requestParamsRedacted;
   const bodySent = Object.keys(params)
@@ -96,9 +111,33 @@ export default function ApiTestPage() {
   const [trackLoading, setTrackLoading] = useState(false);
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const [saveMessage, setSaveMessage] = useState<string | null>(null);
+  const [importDebug, setImportDebug] = useState<{
+    deleteSql: string | null;
+    deleteParams: string[] | null;
+    skippedRows: Array<{ gpsTime: string; lat?: unknown; lng?: unknown; reason: string }> | null;
+    uniquePositionTimes?: number;
+    duplicatePositionTimeInPayload?: number;
+  } | null>(null);
   const [mergeStatus, setMergeStatus] = useState<'idle' | 'merging' | 'merged' | 'error'>('idle');
   const [mergeMessage, setMergeMessage] = useState<string | null>(null);
   const [mergeDebug, setMergeDebug] = useState<{ failedStep?: string; rawSql?: string } | null>(null);
+  const [mergeResult, setMergeResult] = useState<{
+    deviceName: string;
+    minTime: string;
+    maxTime: string;
+    deleted: number;
+    inserted: number;
+    apifeedRowsInRange?: number;
+    error?: string;
+  } | null>(null);
+  const [clearDebug, setClearDebug] = useState<{
+    deleteSqlApifeed: string;
+    deleteParamsApifeed: string[];
+    deleteSqlTracking: string;
+    deleteParamsTracking: string[];
+    deletedApifeed: number;
+    deletedTracking: number;
+  } | null>(null);
   const [copyFeedback, setCopyFeedback] = useState(false);
   const [endpoint, setEndpoint] = useState<string>('hk');
   const [apiTestTab, setApiTestTab] = useState<'devices' | 'fences'>('devices');
@@ -110,10 +149,14 @@ export default function ApiTestPage() {
   });
   const [step3Mode, setStep3Mode] = useState<'single' | 'fleet'>('single');
   const [step3IncludeTagging, setStep3IncludeTagging] = useState(true); // if false: fetch → apifeed → merge only (no position_time_nz/store_fences, no tagging)
+  const [fleetDateFrom, setFleetDateFrom] = useState(''); // YYYY-MM-DD; empty = use trackDate
+  const [fleetDateTo, setFleetDateTo] = useState(''); // YYYY-MM-DD; empty = use fleetDateFrom (single day)
   const [fleetRows, setFleetRows] = useState<FleetRow[]>([]);
   const [fleetRowsLoading, setFleetRowsLoading] = useState(false);
   const [fleetRowsError, setFleetRowsError] = useState<string | null>(null);
   const [fleetRunAllLoading, setFleetRunAllLoading] = useState(false);
+  const [fleetRunProgress, setFleetRunProgress] = useState<{ currentDay: number; totalDays: number; dateLabel: string } | null>(null);
+  const [fleetRunLog, setFleetRunLog] = useState<Array<{ day: string; device: string; minTime: string; maxTime: string; apiRows: number; inserted?: number }>>([]);
   const [refreshDevicesLoading, setRefreshDevicesLoading] = useState(false);
   const [refreshDevicesMessage, setRefreshDevicesMessage] = useState<string | null>(null);
   const [fencePrepStatus, setFencePrepStatus] = useState<'idle' | 'running' | 'done' | 'error'>('idle');
@@ -191,6 +234,7 @@ export default function ApiTestPage() {
     const deviceName = devices?.find((d) => d.imei === trackImei)?.deviceName ?? trackImei;
     setSaveStatus('saving');
     setSaveMessage(null);
+    setImportDebug(null);
     try {
       const res = await fetch('/api/apifeed/import', {
         method: 'POST',
@@ -208,6 +252,13 @@ export default function ApiTestPage() {
       if (data.deleted != null && data.deleted > 0) parts.push(`${data.deleted} existing rows deleted for range`);
       if (data.skipped) parts.push(`${data.skipped} skipped`);
       setSaveMessage(parts.join(' · ') + '.');
+      setImportDebug({
+        deleteSql: data.deleteSql ?? null,
+        deleteParams: Array.isArray(data.deleteParams) ? data.deleteParams : null,
+        skippedRows: Array.isArray(data.skippedRows) ? data.skippedRows : null,
+        uniquePositionTimes: typeof data.uniquePositionTimes === 'number' ? data.uniquePositionTimes : undefined,
+        duplicatePositionTimeInPayload: typeof data.duplicatePositionTimeInPayload === 'number' ? data.duplicatePositionTimeInPayload : undefined,
+      });
       setTimeout(() => {
         setSaveStatus('idle');
         setSaveMessage(null);
@@ -224,6 +275,7 @@ export default function ApiTestPage() {
     if (times.length === 0) {
       setMergeMessage('No valid times to merge');
       setMergeStatus('error');
+      setMergeResult(null);
       return;
     }
     const sorted = [...times].sort();
@@ -233,6 +285,7 @@ export default function ApiTestPage() {
     setMergeStatus('merging');
     setMergeMessage(null);
     setMergeDebug(null);
+    setMergeResult(null);
     try {
       const res = await fetch('/api/apifeed/merge-tracking', {
         method: 'POST',
@@ -248,19 +301,50 @@ export default function ApiTestPage() {
             ? { failedStep: data.failedStep, rawSql: data.rawSql }
             : null
         );
+        setMergeResult({
+          deviceName,
+          minTime,
+          maxTime,
+          deleted: 0,
+          inserted: 0,
+          apifeedRowsInRange: data.apifeedRowsInRange,
+          error: data.error ?? 'Merge failed',
+        });
         return;
       }
       setMergeStatus('merged');
-      setMergeMessage(`${data.inserted} rows merged into tbl_tracking${data.deleted ? ` (${data.deleted} old rows deleted)` : ''}.`);
+      const msg = [
+        `${data.inserted} rows merged into tbl_tracking`,
+        data.deleted != null && data.deleted > 0 ? ` (${data.deleted} old rows deleted)` : '',
+        typeof data.apifeedRowsInRange === 'number' ? ` · ${data.apifeedRowsInRange} rows in tbl_apifeed in range` : '',
+      ].join('');
+      setMergeMessage(msg + '.');
       setMergeDebug(null);
+      setMergeResult({
+        deviceName,
+        minTime,
+        maxTime,
+        deleted: Number(data.deleted) ?? 0,
+        inserted: Number(data.inserted) ?? 0,
+        apifeedRowsInRange: data.apifeedRowsInRange,
+      });
       setTimeout(() => {
         setMergeStatus('idle');
         setMergeMessage(null);
-      }, 4000);
+      }, 8000);
     } catch (e) {
       setMergeStatus('error');
-      setMergeMessage(e instanceof Error ? e.message : String(e));
+      const errMsg = e instanceof Error ? e.message : String(e);
+      setMergeMessage(errMsg);
       setMergeDebug(null);
+      setMergeResult({
+        deviceName,
+        minTime,
+        maxTime,
+        deleted: 0,
+        inserted: 0,
+        error: errMsg,
+      });
     }
   };
 
@@ -271,7 +355,7 @@ export default function ApiTestPage() {
   const resolveImei = (deviceName: string): string | null =>
     devices?.find((d) => d.deviceName === deviceName)?.imei ?? null;
 
-  const fetchTrackForDevice = async (deviceName: string): Promise<TrackPoint[] | null> => {
+  const fetchTrackForDevice = async (deviceName: string, dateOverride?: string): Promise<TrackPoint[] | null> => {
     const imei = fleetRows.find((r) => r.deviceName === deviceName)?.imei ?? resolveImei(deviceName);
     if (!imei?.trim()) {
       updateFleetRow(deviceName, {
@@ -281,11 +365,12 @@ export default function ApiTestPage() {
       return null;
     }
     updateFleetRow(deviceName, { getApiStatus: 'loading', error: null, imei: imei || null });
+    const date = dateOverride ?? trackDate;
     try {
       const params = new URLSearchParams({
         imei,
         endpoint,
-        date: trackDate,
+        date,
         deviceName,
       });
       const res = await fetch(`/api/tracksolid/track?${params}`);
@@ -347,12 +432,12 @@ export default function ApiTestPage() {
     }
   };
 
-  const mergeForDevice = async (deviceName: string, pointsOverride?: TrackPoint[] | null) => {
+  const mergeForDevice = async (deviceName: string, pointsOverride?: TrackPoint[] | null): Promise<{ inserted: number } | null> => {
     const row = fleetRows.find((r) => r.deviceName === deviceName);
     const points = pointsOverride ?? row?.points;
-    if (!points?.length) return;
+    if (!points?.length) return null;
     const times = points.map((p) => p.gpsTime).filter(Boolean) as string[];
-    if (times.length === 0) return;
+    if (times.length === 0) return null;
     const sorted = [...times].sort();
     const minTime = sorted[0];
     const maxTime = sorted[sorted.length - 1];
@@ -373,28 +458,31 @@ export default function ApiTestPage() {
           mergeStatus: 'error',
           error: data.error ?? 'Merge failed',
         });
-        return;
+        return null;
       }
       updateFleetRow(deviceName, { mergeStatus: 'done', error: null });
+      return { inserted: Number(data.inserted) ?? 0 };
     } catch (e) {
       updateFleetRow(deviceName, {
         mergeStatus: 'error',
         error: e instanceof Error ? e.message : String(e),
       });
+      return null;
     }
   };
 
   const TAG_GRACE_SECONDS = 300;
 
-  const tagForDevice = async (deviceName: string) => {
-    if (!trackDate?.trim()) return;
+  const tagForDevice = async (deviceName: string, dateOverride?: string) => {
+    const dateX = (dateOverride ?? trackDate)?.trim();
+    if (!dateX) return;
     updateFleetRow(deviceName, { tagStatus: 'merging', tagMessage: null });
     try {
       const res = await fetch('/api/admin/tagging/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          dateX: trackDate.trim(),
+          dateX,
           deviceNames: [deviceName],
           graceSeconds: TAG_GRACE_SECONDS,
         }),
@@ -457,45 +545,89 @@ export default function ApiTestPage() {
 
   const runAllForDate = async () => {
     if (!fleetRows.length) return;
+    const from = fleetDateFrom.trim() || trackDate;
+    const to = fleetDateTo.trim() || from;
+    const dates = getDatesInRange(from, to);
     setFleetRunAllLoading(true);
-    for (const row of fleetRows) {
-      const points = await fetchTrackForDevice(row.deviceName);
-      if (points?.length) {
-        await saveForDevice(row.deviceName, points);
-        await mergeForDevice(row.deviceName, points);
-      }
-    }
-    if (step3IncludeTagging) {
-      setFencePrepStatus('running');
-      setFencePrepError(null);
-      setFencePrepDurationMs(null);
-      setFencePrepPositionTimeNzMs(null);
-      setFencePrepStoreFencesMs(null);
-      const fencePrepStart = Date.now();
-      try {
-        const globalRes = await fetch('/api/admin/tracking/apply-position-time-nz-and-fences', { method: 'POST' });
-        const globalData = await globalRes.json();
-        const fencePrepDuration = Date.now() - fencePrepStart;
-        setFencePrepDurationMs(fencePrepDuration);
-        if (globalData.positionTimeNzMs != null) setFencePrepPositionTimeNzMs(globalData.positionTimeNzMs);
-        if (globalData.storeFencesMs != null) setFencePrepStoreFencesMs(globalData.storeFencesMs);
-        if (!globalData.ok) {
-          setFencePrepStatus('error');
-          setFencePrepError(globalData.error ?? 'Fence_Prep failed');
-          console.error('[runAll] position_time_nz + store_fences failed:', globalData.error);
-        } else {
-          setFencePrepStatus('done');
-        }
-      } catch (e) {
-        setFencePrepStatus('error');
-        setFencePrepError(e instanceof Error ? e.message : String(e));
-        setFencePrepDurationMs(Date.now() - fencePrepStart);
-      }
+    setFleetRunLog([]);
+    setFleetRunProgress({ currentDay: 0, totalDays: dates.length, dateLabel: dates[0] ?? '' });
+    for (let i = 0; i < dates.length; i++) {
+      const day = dates[i];
+      setFleetRunProgress({ currentDay: i + 1, totalDays: dates.length, dateLabel: day });
       for (const row of fleetRows) {
-        await tagForDevice(row.deviceName);
+        // Clear requested day first (raw YYYY-MM-DD; API uses UTC bounds). Avoids partial-day leftovers.
+        try {
+          const clearRes = await fetch('/api/apifeed/clear-for-device-date', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ deviceName: row.deviceName, date: day }),
+          });
+          const clearData = await clearRes.json();
+          if (!clearData.ok) {
+            updateFleetRow(row.deviceName, { saveStatus: 'error', error: clearData.error ?? 'Clear failed' });
+            continue;
+          }
+        } catch (e) {
+          updateFleetRow(row.deviceName, {
+            saveStatus: 'error',
+            error: e instanceof Error ? e.message : String(e),
+          });
+          continue;
+        }
+        const points = await fetchTrackForDevice(row.deviceName, day);
+        if (points?.length) {
+          await saveForDevice(row.deviceName, points);
+          const mergeResult = await mergeForDevice(row.deviceName, points);
+          const times = points.map((p) => p.gpsTime).filter(Boolean) as string[];
+          const sorted = [...times].sort();
+          const minTime = sorted[0] ?? '';
+          const maxTime = sorted[sorted.length - 1] ?? '';
+          setFleetRunLog((prev) => [
+            ...prev,
+            {
+              day,
+              device: row.deviceName,
+              minTime,
+              maxTime,
+              apiRows: points.length,
+              inserted: mergeResult?.inserted,
+            },
+          ]);
+        }
+      }
+      if (step3IncludeTagging) {
+        setFencePrepStatus('running');
+        setFencePrepError(null);
+        setFencePrepDurationMs(null);
+        setFencePrepPositionTimeNzMs(null);
+        setFencePrepStoreFencesMs(null);
+        const fencePrepStart = Date.now();
+        try {
+          const globalRes = await fetch('/api/admin/tracking/apply-position-time-nz-and-fences', { method: 'POST' });
+          const globalData = await globalRes.json();
+          const fencePrepDuration = Date.now() - fencePrepStart;
+          setFencePrepDurationMs(fencePrepDuration);
+          if (globalData.positionTimeNzMs != null) setFencePrepPositionTimeNzMs(globalData.positionTimeNzMs);
+          if (globalData.storeFencesMs != null) setFencePrepStoreFencesMs(globalData.storeFencesMs);
+          if (!globalData.ok) {
+            setFencePrepStatus('error');
+            setFencePrepError(globalData.error ?? 'Fence_Prep failed');
+            console.error('[runAll] position_time_nz + store_fences failed:', globalData.error);
+          } else {
+            setFencePrepStatus('done');
+          }
+        } catch (e) {
+          setFencePrepStatus('error');
+          setFencePrepError(e instanceof Error ? e.message : String(e));
+          setFencePrepDurationMs(Date.now() - fencePrepStart);
+        }
+        for (const row of fleetRows) {
+          await tagForDevice(row.deviceName, day);
+        }
       }
     }
     setFleetRunAllLoading(false);
+    setFleetRunProgress(null);
   };
 
   const refreshDevicesFromVworkjobs = async () => {
@@ -700,9 +832,40 @@ export default function ApiTestPage() {
     setMergeStatus('idle');
     setMergeMessage(null);
     setMergeDebug(null);
+    setImportDebug(null);
+    setMergeResult(null);
+    setClearDebug(null);
     setTrackLoading(true);
-    const deviceName = devices?.find((d) => d.imei === imei)?.deviceName ?? '';
+    const deviceName = devices?.find((d) => d.imei === imei)?.deviceName ?? imei;
     try {
+      // Stage 1a: Clear both tables for this device + date (ground zero) so we can debug each stage
+      if (trackDate && deviceName) {
+        const clearRes = await fetch('/api/apifeed/clear-for-device-date', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ deviceName, date: trackDate }),
+        });
+        const clearData = await clearRes.json();
+        if (!clearData.ok) {
+          setTrackError(clearData.error ?? 'Clear failed');
+          setTrackLoading(false);
+          return;
+        }
+        if (clearData.debug) {
+          setClearDebug({
+            deleteSqlApifeed: clearData.debug.deleteSqlApifeed ?? '',
+            deleteParamsApifeed: Array.isArray(clearData.debug.deleteParamsApifeed) ? clearData.debug.deleteParamsApifeed : [],
+            deleteSqlTracking: clearData.debug.deleteSqlTracking ?? '',
+            deleteParamsTracking: Array.isArray(clearData.debug.deleteParamsTracking) ? clearData.debug.deleteParamsTracking : [],
+            deletedApifeed: clearData.deletedApifeed ?? 0,
+            deletedTracking: clearData.deletedTracking ?? 0,
+          });
+        }
+        setSaveMessage(
+          `Stage 1: Cleared tbl_apifeed (${clearData.deletedApifeed}) and tbl_tracking (${clearData.deletedTracking}) for ${deviceName} ${trackDate}. Now fetching from API…`
+        );
+      }
+      // Stage 1b: Fetch from API only — no save, no merge
       const params = new URLSearchParams({
         imei,
         endpoint,
@@ -718,10 +881,17 @@ export default function ApiTestPage() {
         }
         setTrackError(errMsg);
         setTrackDebug(data.debug ?? null);
+        setTrackLoading(false);
         return;
       }
-      setTrackPoints(data.points ?? []);
+      const points = data.points ?? [];
+      setTrackPoints(points);
       setTrackDebug(data.debug ?? null);
+      setSaveMessage(
+        trackDate && deviceName
+          ? `Stage 1 done: ground zero + fetched ${points.length} points. Next: Stage 2 Save to database, then Stage 3 Merge to tbl_tracking.`
+          : null
+      );
     } catch (e) {
       setTrackError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -975,13 +1145,31 @@ export default function ApiTestPage() {
         {step3Mode === 'fleet' ? (
           <>
             <div className="mb-3 flex flex-wrap items-center gap-2">
-              <label className="text-sm font-medium text-zinc-700 dark:text-zinc-300">Date</label>
+              <label className="text-sm font-medium text-zinc-700 dark:text-zinc-300">From</label>
               <input
                 type="date"
-                value={trackDate}
-                onChange={(e) => setTrackDate(e.target.value)}
+                value={fleetDateFrom || trackDate}
+                onChange={(e) => setFleetDateFrom(e.target.value)}
                 className="rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+                title="Start of date range (defaults to Date below when empty)"
               />
+              <label className="text-sm font-medium text-zinc-700 dark:text-zinc-300">To</label>
+              <input
+                type="date"
+                value={fleetDateTo || fleetDateFrom || trackDate}
+                onChange={(e) => setFleetDateTo(e.target.value)}
+                className="rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+                title="End of date range (same as From = single day)"
+              />
+              {(() => {
+                const from = fleetDateFrom.trim() || trackDate;
+                const to = fleetDateTo.trim() || from;
+                const days = getDatesInRange(from, to);
+                return days.length > 1 ? (
+                  <span className="text-sm text-zinc-600 dark:text-zinc-400">{days.length} days</span>
+                ) : null;
+              })()}
+              <span className="text-zinc-400 dark:text-zinc-500">|</span>
               <button
                 type="button"
                 onClick={loadFleetDevices}
@@ -1006,9 +1194,44 @@ export default function ApiTestPage() {
                 className="rounded bg-emerald-700 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-800 disabled:opacity-50"
                 title={step3IncludeTagging ? 'Fetch → apifeed → Merge → position_time_nz + store_fences → Tag' : 'Fetch → apifeed → Merge to tbl_tracking only'}
               >
-                {fleetRunAllLoading ? 'Running all…' : step3IncludeTagging ? 'Run all (Fetch → apifeed → Merge → position_time_nz + store_fences → Tag)' : 'Run all (Fetch → apifeed → Merge to tbl_tracking only)'}
+                {fleetRunAllLoading && fleetRunProgress
+                  ? `Day ${fleetRunProgress.currentDay}/${fleetRunProgress.totalDays} (${fleetRunProgress.dateLabel})…`
+                  : fleetRunAllLoading
+                    ? 'Running all…'
+                    : step3IncludeTagging
+                      ? 'Run all (Fetch → apifeed → Merge → position_time_nz + store_fences → Tag)'
+                      : 'Run all (Fetch → apifeed → Merge to tbl_tracking only)'}
               </button>
             </div>
+            <p className="mb-2 text-xs text-zinc-500 dark:text-zinc-400">
+              Leave From/To empty to run for a single day (uses default date). Set From and To to reimport a date range; Run all loops over each day in range.
+            </p>
+            {fleetRunProgress && (
+              <div className="mb-3 rounded border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm font-medium text-emerald-800 dark:border-emerald-800 dark:bg-emerald-900/25 dark:text-emerald-200">
+                Processing day <strong>{fleetRunProgress.currentDay}</strong> of <strong>{fleetRunProgress.totalDays}</strong>: <span className="font-mono">{fleetRunProgress.dateLabel}</span>
+              </div>
+            )}
+            {fleetRunLog.length > 0 && (
+              <div className="mb-3 rounded border border-zinc-200 bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-800/50">
+                <p className="border-b border-zinc-200 px-3 py-1.5 text-xs font-medium text-zinc-500 dark:border-zinc-700 dark:text-zinc-400">
+                  Run log (day, device, min time, max time, API rows → tbl_tracking inserted)
+                </p>
+                <div className="max-h-48 overflow-auto px-3 py-2 font-mono text-xs text-zinc-700 dark:text-zinc-300">
+                  {fleetRunLog.map((entry, idx) => (
+                    <div key={idx} className="flex flex-wrap gap-x-3 gap-y-0.5 py-0.5">
+                      <span className="text-zinc-500 dark:text-zinc-400">{entry.day}</span>
+                      <span className="font-medium">{entry.device}</span>
+                      <span title="min position_time">min: {entry.minTime}</span>
+                      <span title="max position_time">max: {entry.maxTime}</span>
+                      <span>API: {entry.apiRows}</span>
+                      <span className="text-emerald-600 dark:text-emerald-400">
+                        → tbl_tracking: {entry.inserted ?? '—'}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
             {fleetRowsLoading ? (
               <p className="text-sm text-zinc-500 dark:text-zinc-400">Loading devices from tbl_devices…</p>
             ) : fleetRowsError ? (
@@ -1173,10 +1396,37 @@ export default function ApiTestPage() {
             onClick={fetchTrack}
             disabled={trackLoading || !trackImei.trim()}
             className="rounded bg-zinc-800 px-4 py-2 text-sm font-medium text-white hover:bg-zinc-700 disabled:opacity-50 dark:bg-zinc-700 dark:hover:bg-zinc-600"
+            title="Stage 1: Clear tbl_apifeed + tbl_tracking for this device/date, then fetch from API. Data shown below; no save or merge."
           >
-            {trackLoading ? 'Fetching…' : `Fetch GPS for ${trackDate || 'day'}`}
+            {trackLoading ? 'Fetching…' : `1. Fetch GPS for ${trackDate || 'day'}`}
           </button>
         </div>
+        <p className="mb-2 text-xs text-zinc-500 dark:text-zinc-400">
+          Run in order: <strong>1 Fetch GPS</strong> (clear + get API, show table) → <strong>2 Save to database</strong> (tbl_apifeed) → <strong>3 Merge to tbl_tracking</strong>.
+        </p>
+        {clearDebug && (
+          <div className="mb-4 rounded border-2 border-red-200 bg-red-50/90 p-3 dark:border-red-800 dark:bg-red-900/30">
+            <p className="mb-2 text-sm font-bold text-red-900 dark:text-red-100">
+              Stage 1: DELETE commands run (ground zero) — deleted tbl_apifeed: {clearDebug.deletedApifeed}, tbl_tracking: {clearDebug.deletedTracking}
+            </p>
+            <div className="space-y-3 text-xs">
+              <div>
+                <p className="mb-1 font-medium text-zinc-800 dark:text-zinc-200">tbl_apifeed:</p>
+                <pre className="overflow-auto rounded bg-white p-2 font-mono dark:bg-zinc-900">{clearDebug.deleteSqlApifeed}</pre>
+                <p className="mt-1 text-zinc-600 dark:text-zinc-400">
+                  Params: $1 = &quot;{clearDebug.deleteParamsApifeed[0] ?? ''}&quot;, $2 = &quot;{clearDebug.deleteParamsApifeed[1] ?? ''}&quot;, $3 = &quot;{clearDebug.deleteParamsApifeed[2] ?? ''}&quot;
+                </p>
+              </div>
+              <div>
+                <p className="mb-1 font-medium text-zinc-800 dark:text-zinc-200">tbl_tracking:</p>
+                <pre className="overflow-auto rounded bg-white p-2 font-mono dark:bg-zinc-900">{clearDebug.deleteSqlTracking}</pre>
+                <p className="mt-1 text-zinc-600 dark:text-zinc-400">
+                  Params: $1 = &quot;{clearDebug.deleteParamsTracking[0] ?? ''}&quot;, $2 = &quot;{clearDebug.deleteParamsTracking[1] ?? ''}&quot;, $3 = &quot;{clearDebug.deleteParamsTracking[2] ?? ''}&quot;
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
         {trackError && (
           <p className="mb-2 text-sm text-red-600 dark:text-red-400">{trackError}</p>
         )}
@@ -1202,16 +1452,18 @@ export default function ApiTestPage() {
                 onClick={saveToDatabase}
                 disabled={saveStatus === 'saving'}
                 className="rounded bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
+                title="Stage 2: Insert fetched points into tbl_apifeed only."
               >
-                {saveStatus === 'saving' ? 'Saving…' : 'Save to database'}
+                {saveStatus === 'saving' ? 'Saving…' : '2. Save to database'}
               </button>
               <button
                 type="button"
                 onClick={mergeToTracking}
                 disabled={mergeStatus === 'merging'}
                 className="rounded bg-blue-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-blue-700 disabled:opacity-50"
+                title="Stage 3: Copy from tbl_apifeed into tbl_tracking."
               >
-                {mergeStatus === 'merging' ? 'Merging…' : 'Merge to tbl_tracking'}
+                {mergeStatus === 'merging' ? 'Merging…' : '3. Merge to tbl_tracking'}
               </button>
             </div>
             {(saveMessage || mergeMessage) && (
@@ -1231,6 +1483,113 @@ export default function ApiTestPage() {
                   </pre>
                 )}
               </details>
+            )}
+            {mergeResult && (
+              <div className="mb-4 rounded border border-blue-200 bg-blue-50/80 p-3 dark:border-blue-800 dark:bg-blue-900/20">
+                <p className="mb-2 text-xs font-semibold uppercase text-blue-800 dark:text-blue-200">
+                  Merge to tbl_tracking — last result
+                </p>
+                <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-sm">
+                  <dt className="text-zinc-600 dark:text-zinc-400">Sent:</dt>
+                  <dd className="font-mono text-zinc-800 dark:text-zinc-200">
+                    deviceName = &quot;{mergeResult.deviceName}&quot;, minTime = &quot;{mergeResult.minTime}&quot;, maxTime = &quot;{mergeResult.maxTime}&quot;
+                  </dd>
+                  {typeof mergeResult.apifeedRowsInRange === 'number' && (
+                    <>
+                      <dt className="text-zinc-600 dark:text-zinc-400">tbl_apifeed rows in range:</dt>
+                      <dd className="font-mono font-semibold">{mergeResult.apifeedRowsInRange}</dd>
+                    </>
+                  )}
+                  <dt className="text-zinc-600 dark:text-zinc-400">Deleted from tbl_tracking:</dt>
+                  <dd className="font-mono font-semibold">{mergeResult.deleted}</dd>
+                  <dt className="text-zinc-600 dark:text-zinc-400">Inserted into tbl_tracking:</dt>
+                  <dd className="font-mono font-semibold">{mergeResult.inserted}</dd>
+                  {mergeResult.error && (
+                    <>
+                      <dt className="text-zinc-600 dark:text-zinc-400">Error:</dt>
+                      <dd className="text-red-600 dark:text-red-400">{mergeResult.error}</dd>
+                    </>
+                  )}
+                </dl>
+                {typeof mergeResult.apifeedRowsInRange === 'number' && mergeResult.apifeedRowsInRange > 0 && mergeResult.inserted === 0 && (
+                  <p className="mt-2 text-xs text-amber-700 dark:text-amber-300">
+                    Warning: {mergeResult.apifeedRowsInRange} rows in tbl_apifeed matched the range but 0 were inserted. Check device_name and position_time types/range.
+                  </p>
+                )}
+              </div>
+            )}
+            {importDebug && (importDebug.deleteSql || (importDebug.skippedRows?.length ?? 0) > 0 || importDebug.uniquePositionTimes != null) && (
+              <div className="mb-4 rounded border border-amber-200 bg-amber-50/80 p-3 dark:border-amber-800 dark:bg-amber-900/20">
+                <p className="mb-2 text-xs font-semibold uppercase text-amber-800 dark:text-amber-200">
+                  Import debug (from last Save to database)
+                </p>
+                {/* Skipped rows first so you see them immediately */}
+                {importDebug.skippedRows && importDebug.skippedRows.length > 0 && (
+                  <div className="mb-4">
+                    <p className="mb-2 text-sm font-bold text-amber-900 dark:text-amber-100">
+                      Skipped rows — {importDebug.skippedRows.length} rows not inserted (see below why)
+                    </p>
+                    <div className="max-h-80 overflow-auto rounded border-2 border-amber-400 dark:border-amber-600 bg-white dark:bg-zinc-900">
+                      <table className="w-full min-w-[640px] border-collapse text-xs">
+                        <thead className="sticky top-0 bg-amber-100 dark:bg-amber-900/50">
+                          <tr>
+                            <th className="border-b border-amber-300 px-2 py-1.5 text-left font-medium text-amber-900 dark:text-amber-100">
+                              gpsTime (raw)
+                            </th>
+                            <th className="border-b border-amber-300 px-2 py-1.5 text-left font-medium text-amber-900 dark:text-amber-100">
+                              lat
+                            </th>
+                            <th className="border-b border-amber-300 px-2 py-1.5 text-left font-medium text-amber-900 dark:text-amber-100">
+                              lng
+                            </th>
+                            <th className="border-b border-amber-300 px-2 py-1.5 text-left font-medium text-amber-900 dark:text-amber-100">
+                              Reason skipped
+                            </th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {importDebug.skippedRows.map((row, i) => (
+                            <tr key={i} className="border-b border-zinc-100 dark:border-zinc-800">
+                              <td className="whitespace-nowrap px-2 py-1.5 font-mono text-zinc-700 dark:text-zinc-300" title={row.gpsTime}>
+                                {row.gpsTime || '(empty)'}
+                              </td>
+                              <td className="whitespace-nowrap px-2 py-1.5 font-mono text-zinc-600 dark:text-zinc-400" title={typeof row.lat === 'number' ? String(row.lat) : JSON.stringify(row.lat)}>
+                                {row.lat !== undefined && row.lat !== null ? (typeof row.lat === 'number' ? row.lat : String(row.lat)) : '—'}
+                              </td>
+                              <td className="whitespace-nowrap px-2 py-1.5 font-mono text-zinc-600 dark:text-zinc-400" title={typeof row.lng === 'number' ? String(row.lng) : JSON.stringify(row.lng)}>
+                                {row.lng !== undefined && row.lng !== null ? (typeof row.lng === 'number' ? row.lng : String(row.lng)) : '—'}
+                              </td>
+                              <td className="px-2 py-1.5 text-amber-700 dark:text-amber-300">
+                                {row.reason}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )}
+                {importDebug.uniquePositionTimes != null && typeof importDebug.duplicatePositionTimeInPayload === 'number' && importDebug.duplicatePositionTimeInPayload > 0 && (
+                  <div className="mb-2">
+                    <p className="text-xs text-zinc-700 dark:text-zinc-300">
+                      <strong>Unique position_time in payload:</strong> {importDebug.uniquePositionTimes} · {importDebug.duplicatePositionTimeInPayload} duplicate timestamps in payload
+                    </p>
+                  </div>
+                )}
+                {importDebug.deleteSql && (
+                  <div className="mb-3">
+                    <p className="mb-1 text-xs font-medium text-zinc-700 dark:text-zinc-300">DELETE executed (then INSERT):</p>
+                    <pre className="max-h-32 overflow-auto whitespace-pre-wrap break-all rounded bg-white p-2 font-mono text-xs dark:bg-zinc-900">
+                      {importDebug.deleteSql}
+                    </pre>
+                    {importDebug.deleteParams && importDebug.deleteParams.length >= 3 && (
+                      <p className="mt-1 text-xs text-zinc-600 dark:text-zinc-400">
+                        Params: $1 = &quot;{importDebug.deleteParams[0]}&quot;, $2 = &quot;{importDebug.deleteParams[1]}&quot;, $3 = &quot;{importDebug.deleteParams[2]}&quot;
+                      </p>
+                    )}
+                  </div>
+                )}
+              </div>
             )}
             <div className="max-h-96 overflow-auto rounded border border-zinc-200 dark:border-zinc-700">
               <table className="w-full min-w-[360px] border-collapse text-sm">

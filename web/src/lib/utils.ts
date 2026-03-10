@@ -4,7 +4,7 @@ export function dateToLiteral(d: Date): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
-/** Serialize Date as YYYY-MM-DD HH:mm:ss using UTC components. Use when serializing DB timestamps so values are shown exactly as stored (no timezone adjustment). */
+/** Serialize Date as YYYY-MM-DD HH:mm:ss using UTC components. Do NOT use for NZ-stored timestamps — use dateToLiteral or return strings via to_char in SQL. */
 export function dateToLiteralUTC(d: Date): string {
   const pad = (n: number) => String(n).padStart(2, '0');
   return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;

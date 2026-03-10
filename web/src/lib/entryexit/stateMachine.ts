@@ -29,13 +29,13 @@ function normalizeFenceId(raw: string | number | null | undefined): string | nul
   return t === '' ? null : t;
 }
 
-/** position_time_nz from DB may be Date or string; normalize to YYYY-MM-DD HH:mm:ss. */
+/** position_time_nz from DB may be Date or string; normalize to YYYY-MM-DD HH:mm:ss (local, no UTC). */
 function normalizePositionTimeNz(raw: string | Date | null | undefined): string {
   if (raw == null) return '';
   if (typeof raw === 'string') return raw.trim();
   if (raw instanceof Date) {
     const pad = (n: number) => String(n).padStart(2, '0');
-    return `${raw.getUTCFullYear()}-${pad(raw.getUTCMonth() + 1)}-${pad(raw.getUTCDate())} ${pad(raw.getUTCHours())}:${pad(raw.getUTCMinutes())}:${pad(raw.getUTCSeconds())}`;
+    return `${raw.getFullYear()}-${pad(raw.getMonth() + 1)}-${pad(raw.getDate())} ${pad(raw.getHours())}:${pad(raw.getMinutes())}:${pad(raw.getSeconds())}`;
   }
   return String(raw);
 }

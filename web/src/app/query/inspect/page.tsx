@@ -117,6 +117,9 @@ function InspectContent() {
   const [gpsWindowOverride, setGpsWindowOverride] = useState<{ positionAfter: string; positionBefore: string } | null>(null);
   const [startLessMinutes, setStartLessMinutes] = useState(10);
   const [endPlusMinutes, setEndPlusMinutes] = useState(60);
+  /** Display-only: extra minutes before/after the Settings window for GPS data (does not affect step fetching). */
+  const [displayExpandBefore, setDisplayExpandBefore] = useState(0);
+  const [displayExpandAfter, setDisplayExpandAfter] = useState(0);
   const [derivedStepsDebug, setDerivedStepsDebug] = useState<Record<string, unknown> | null>(null);
   const [showDerivedStepsDebug, setShowDerivedStepsDebug] = useState(false);
   const [refetchStepsRunning, setRefetchStepsRunning] = useState(false);
@@ -463,6 +466,17 @@ function InspectContent() {
   }, [searchParams]);
 
   const paramToLocate = locateJobIdParam ?? jobIdParam;
+  /** Add this job to sidebar "Recent jobs" history when we landed with locateJobId/jobId. */
+  useEffect(() => {
+    const jobId = (paramToLocate ?? '').trim();
+    if (!jobId) return;
+    fetch('/api/inspect-history', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ job_id: jobId }),
+    }).catch(() => {});
+  }, [paramToLocate]);
+
   /** Only apply URL job selection on first load; don't re-apply after refetch so user can move around and retag without jumping back. */
   const appliedLocateParamRef = useRef<string | null>(null);
   useEffect(() => {
@@ -516,9 +530,14 @@ function InspectContent() {
     return '';
   }, [selectedRow]);
 
-  /** Retag the day of the selected job (ENTER/EXIT for that device), then refetch steps for the job. */
+  /** Retag from actual_start_time − 2h to actual_start_time + 24h (then refetch steps). Ensures we cover the job window, not just midnight-to-midnight of start day. */
   const retagDayAndRefetchSteps = useCallback(async () => {
-    if (!selectedRow || !deviceForTracking || !jobDateForTagging) return;
+    if (!selectedRow || !deviceForTracking || !actualStartTime?.trim()) return;
+    const startNorm = actualStartTime.trim();
+    const windowStart = addMinutesToTimestampAsNZ(startNorm, -120); // 2 hours before job start
+    const windowEnd = addMinutesToTimestampAsNZ(startNorm, 24 * 60); // 24 hours after job start
+    const tagDateFrom = windowStart.slice(0, 10); // YYYY-MM-DD
+    const tagDateTo = windowEnd.slice(0, 10);
     setRetagAndRefetchRunning(true);
     setDerivedStepsDebug(null);
     try {
@@ -526,8 +545,8 @@ function InspectContent() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          dateFrom: jobDateForTagging,
-          dateTo: jobDateForTagging,
+          dateFrom: tagDateFrom,
+          dateTo: tagDateTo,
           deviceNames: [deviceForTracking],
           graceSeconds: 300,
           bufferHours: 1,
@@ -560,7 +579,7 @@ function InspectContent() {
     } finally {
       setRetagAndRefetchRunning(false);
     }
-  }, [selectedRow, deviceForTracking, jobDateForTagging, startLessMinutes, endPlusMinutes, refetchVworkJobs]);
+  }, [selectedRow, deviceForTracking, actualStartTime, startLessMinutes, endPlusMinutes, refetchVworkJobs]);
 
   useEffect(() => {
     if (!deviceForTracking || !actualStartTime.trim()) {
@@ -569,15 +588,18 @@ function InspectContent() {
       setTrackingTotal(0);
       return;
     }
+    const abort = new AbortController();
     setTrackingLoading(true);
     const offset = (trackingPage - 1) * trackingPageSize;
     const useOverride = gpsWindowOverride != null;
+    const totalStartLess = startLessMinutes + (useOverride ? 0 : displayExpandBefore);
+    const totalEndPlus = endPlusMinutes + (useOverride ? 0 : displayExpandAfter);
     const positionAfter = useOverride
       ? gpsWindowOverride.positionAfter
-      : addMinutesToTimestampAsNZ(actualStartTime.trim(), -startLessMinutes);
+      : addMinutesToTimestampAsNZ(actualStartTime.trim(), -totalStartLess);
     const positionBefore = useOverride
       ? gpsWindowOverride.positionBefore
-      : (actualEndTime.trim() ? addMinutesToTimestampAsNZ(actualEndTime.trim(), endPlusMinutes) : null);
+      : (actualEndTime.trim() ? addMinutesToTimestampAsNZ(actualEndTime.trim(), totalEndPlus) : null);
     const params = new URLSearchParams({
       device: deviceForTracking,
       positionAfter,
@@ -591,7 +613,7 @@ function InspectContent() {
     if (effectiveView === 'entry_exit') {
       params.set('geofenceFilter', 'entry_or_exit');
     }
-    fetch(`/api/tracking?${params}`)
+    fetch(`/api/tracking?${params}`, { signal: abort.signal })
       .then(async (r) => {
         const data = await r.json().catch(() => ({}));
         if (r.ok && data != null && Array.isArray(data.rows)) {
@@ -600,10 +622,12 @@ function InspectContent() {
           setTrackingTotal(typeof data.total === 'number' ? data.total : 0);
         }
       })
-      .catch(() => {
+      .catch((err) => {
+        if (err?.name === 'AbortError') return;
         // Don't clear existing data on network error so we don't wipe the table
       })
       .finally(() => setTrackingLoading(false));
+    return () => abort.abort();
   }, [deviceForTracking, actualStartTime, actualEndTime, trackingPage, trackingPageSize, trackingTableView, startLessMinutes, endPlusMinutes, trackingRefreshKey, gpsWindowOverride]);
 
   useEffect(() => {
@@ -642,13 +666,50 @@ function InspectContent() {
     return out;
   }, [gpsMappings, vineyardName, deliveryWinery]);
 
-  /** SQL WHERE fragment (text only, for later use): fence_name IN ('mapA','mapB',...) from all relevant mappings. */
+  /** Names for IN: all gpsnames from mappings + original name when no mapping (direct). Vineyards and wineries may have 0, 1, or many mappings. */
+  const fenceNamesForInClause = useMemo(() => {
+    const vineyardMappings = relevantMappings.filter((m) => m.type === 'Vineyard');
+    const wineryMappings = relevantMappings.filter((m) => m.type === 'Winery');
+    const vineyardNames = vineyardMappings.length
+      ? vineyardMappings.map((m) => (m.gpsname ?? '').trim()).filter(Boolean)
+      : (vineyardName ? [vineyardName.trim()].filter(Boolean) : []);
+    const wineryNames = wineryMappings.length
+      ? wineryMappings.map((m) => (m.gpsname ?? '').trim()).filter(Boolean)
+      : (deliveryWinery ? [deliveryWinery.trim()].filter(Boolean) : []);
+    const names = [...new Set([...vineyardNames, ...wineryNames])].filter(Boolean);
+    return names;
+  }, [relevantMappings, vineyardName, deliveryWinery]);
+
+  /** SQL WHERE fragment (text only, for later use): fence_name IN ('mapA','mapB',...) including direct (original) names when no mapping. */
   const mappingFenceNameInClause = useMemo(() => {
-    const names = relevantMappings.map((m) => (m.gpsname ?? '').trim()).filter(Boolean);
-    if (names.length === 0) return '';
-    const escaped = names.map((n) => `'${String(n).replace(/'/g, "''")}'`);
+    if (fenceNamesForInClause.length === 0) return '';
+    const escaped = fenceNamesForInClause.map((n) => `'${String(n).replace(/'/g, "''")}'`);
     return `fence_name IN (${escaped.join(', ')})`;
-  }, [relevantMappings]);
+  }, [fenceNamesForInClause]);
+
+  /** One row per mapping (or one per type when no mapping — direct). So multiple Winery mappings show as multiple rows. */
+  const mappingTableRows = useMemo(() => {
+    const vineyardMappings = relevantMappings.filter((m) => m.type === 'Vineyard');
+    const wineryMappings = relevantMappings.filter((m) => m.type === 'Winery');
+    const rows: { type: string; original: string; result: string; toUse: string }[] = [];
+    if (vineyardMappings.length) {
+      vineyardMappings.forEach((m) => {
+        const gps = (m.gpsname ?? '').trim();
+        rows.push({ type: 'Vineyard', original: vineyardName || '—', result: gps || '—', toUse: gps || vineyardName || '—' });
+      });
+    } else if (vineyardName) {
+      rows.push({ type: 'Vineyard', original: vineyardName, result: '—', toUse: vineyardName });
+    }
+    if (wineryMappings.length) {
+      wineryMappings.forEach((m) => {
+        const gps = (m.gpsname ?? '').trim();
+        rows.push({ type: 'Winery', original: deliveryWinery || '—', result: gps || '—', toUse: gps || deliveryWinery || '—' });
+      });
+    } else if (deliveryWinery) {
+      rows.push({ type: 'Winery', original: deliveryWinery, result: '—', toUse: deliveryWinery });
+    }
+    return rows;
+  }, [relevantMappings, vineyardName, deliveryWinery]);
 
   const [sortSaveStatus, setSortSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const saveSortColumns = (cols: [string, string, string]) => {
@@ -1021,9 +1082,9 @@ function InspectContent() {
                 <button
                   type="button"
                   onClick={() => void retagDayAndRefetchSteps()}
-                  disabled={!selectedRow || !deviceForTracking || !jobDateForTagging || retagAndRefetchRunning || refetchStepsRunning}
+                  disabled={!selectedRow || !deviceForTracking || !actualStartTime?.trim() || retagAndRefetchRunning || refetchStepsRunning}
                   className="rounded bg-amber-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-amber-700 disabled:opacity-50 dark:bg-amber-700 dark:hover:bg-amber-600 dark:disabled:opacity-50"
-                  title="Run ENTER/EXIT tagging for the job's date and this device, then refetch GPS steps for the job. Use to test tagging logic quickly."
+                  title="Run ENTER/EXIT tagging from actual_start_time −2h to +24h for this device, then refetch GPS steps."
                 >
                   {retagAndRefetchRunning ? 'Retag + refetch…' : 'Retag day + refetch steps'}
                 </button>
@@ -1148,7 +1209,7 @@ function InspectContent() {
             </div>
           </section>
           <section className="mt-6 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900">
-            <table className="min-w-[20rem] text-left text-sm">
+                <table className="min-w-[20rem] text-left text-sm">
                   <thead>
                     <tr className="border-b border-zinc-200 dark:border-zinc-700">
                       <th className="px-2 py-1.5 font-medium text-zinc-500"></th>
@@ -1158,26 +1219,14 @@ function InspectContent() {
                     </tr>
                   </thead>
                   <tbody>
-                    <tr className="border-b border-zinc-100 dark:border-zinc-800">
-                      <td className="px-2 py-1.5 font-medium text-zinc-600 dark:text-zinc-400">Vineyard</td>
-                      <td className="px-2 py-1.5 text-zinc-700 dark:text-zinc-300">{vineyardName || '—'}</td>
-                      <td className="px-2 py-1.5 text-zinc-700 dark:text-zinc-300">
-                        {relevantMappings.find((m) => m.type === 'Vineyard')?.gpsname || '—'}
-                      </td>
-                      <td className="px-2 py-1.5 font-medium text-zinc-800 dark:text-zinc-200">
-                        {relevantMappings.find((m) => m.type === 'Vineyard')?.gpsname || vineyardName || '—'}
-                      </td>
-                    </tr>
-                    <tr className="border-b border-zinc-100 dark:border-zinc-800">
-                      <td className="px-2 py-1.5 font-medium text-zinc-600 dark:text-zinc-400">Winery</td>
-                      <td className="px-2 py-1.5 text-zinc-700 dark:text-zinc-300">{deliveryWinery || '—'}</td>
-                      <td className="px-2 py-1.5 text-zinc-700 dark:text-zinc-300">
-                        {relevantMappings.find((m) => m.type === 'Winery')?.gpsname || '—'}
-                      </td>
-                      <td className="px-2 py-1.5 font-medium text-zinc-800 dark:text-zinc-200">
-                        {relevantMappings.find((m) => m.type === 'Winery')?.gpsname || deliveryWinery || '—'}
-                      </td>
-                    </tr>
+                    {mappingTableRows.map((row, i) => (
+                      <tr key={`${row.type}-${i}`} className="border-b border-zinc-100 dark:border-zinc-800">
+                        <td className="px-2 py-1.5 font-medium text-zinc-600 dark:text-zinc-400">{row.type}</td>
+                        <td className="px-2 py-1.5 text-zinc-700 dark:text-zinc-300">{row.original}</td>
+                        <td className="px-2 py-1.5 text-zinc-700 dark:text-zinc-300">{row.result}</td>
+                        <td className="px-2 py-1.5 font-medium text-zinc-800 dark:text-zinc-200">{row.toUse}</td>
+                      </tr>
+                    ))}
                   </tbody>
                 </table>
             {mappingFenceNameInClause && (
@@ -1203,42 +1252,101 @@ function InspectContent() {
                   </button>
                 </>
               ) : (
-                <span className="text-sm text-zinc-500">
-                  Window: start −{startLessMinutes} min, end +{endPlusMinutes} min (Admin → Settings)
-                </span>
+                <>
+                  <span className="text-sm text-zinc-500">
+                    Window: start −{startLessMinutes + displayExpandBefore} min, end +{endPlusMinutes + displayExpandAfter} min
+                    {(displayExpandBefore > 0 || displayExpandAfter > 0) && (
+                      <span className="ml-1 text-zinc-400">(base from Settings + display expand; steps unchanged)</span>
+                    )}
+                  </span>
+                  <div className="flex flex-wrap items-center gap-3">
+                    <label className="flex items-center gap-2 text-sm text-zinc-600 dark:text-zinc-400">
+                      <span>Expand display before:</span>
+                      <input
+                        type="number"
+                        min={0}
+                        max={1440}
+                        value={displayExpandBefore}
+                        onChange={(e) => {
+                          const v = parseInt(e.target.value, 10);
+                          setDisplayExpandBefore(Number.isNaN(v) || v < 0 ? 0 : Math.min(1440, v));
+                        }}
+                        className="w-16 rounded border border-zinc-300 bg-white px-2 py-1 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+                        title="Extra minutes before job start for GPS display only. Click Refresh to apply."
+                      />
+                      <span className="text-zinc-500">min</span>
+                    </label>
+                    <label className="flex items-center gap-2 text-sm text-zinc-600 dark:text-zinc-400">
+                      <span>Expand display after:</span>
+                      <input
+                        type="number"
+                        min={0}
+                        max={1440}
+                        value={displayExpandAfter}
+                        onChange={(e) => {
+                          const v = parseInt(e.target.value, 10);
+                          setDisplayExpandAfter(Number.isNaN(v) || v < 0 ? 0 : Math.min(1440, v));
+                        }}
+                        className="w-16 rounded border border-zinc-300 bg-white px-2 py-1 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+                        title="Extra minutes after job end for GPS display only. Click Refresh to apply."
+                      />
+                      <span className="text-zinc-500">min</span>
+                    </label>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setTrackingTableView('raw');
+                        setTrackingPage(1);
+                        setTrackingRefreshKey((k) => k + 1);
+                      }}
+                      disabled={!deviceForTracking || !actualStartTime.trim() || trackingLoading}
+                      className="rounded bg-blue-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50 dark:bg-blue-700 dark:hover:bg-blue-600 dark:disabled:opacity-50"
+                      title="Refetch GPS data with current expand window (raw view)"
+                    >
+                      Refresh
+                    </button>
+                  </div>
+                </>
               )}
             </div>
             {!gpsWindowOverride && (
             <p className="mb-2 text-sm text-zinc-500">
-              position_time_nz &gt; actual_start_time − {startLessMinutes} min AND position_time_nz &lt; actual_end_time + {endPlusMinutes} min
+              position_time_nz &gt; actual_start_time − {startLessMinutes + displayExpandBefore} min AND position_time_nz &lt; actual_end_time + {endPlusMinutes + displayExpandAfter} min
             </p>
             )}
             {trackingLoading && <p className="text-sm text-zinc-500">Loading…</p>}
             {!trackingLoading && !deviceForTracking && <p className="text-sm text-zinc-500">Select a job with worker (device for GPS) to load tracking data.</p>}
             {!trackingLoading && deviceForTracking && !actualStartTime.trim() && <p className="text-sm text-zinc-500">Job has no actual_start_time.</p>}
-            {!trackingLoading && deviceForTracking && actualStartTime.trim() && trackingRows.length === 0 && (
-              <p className="text-sm text-zinc-500">No tracking rows for device={deviceForTracking} in window (actual_start − {startLessMinutes} min to actual_end + {endPlusMinutes} min).</p>
+            {!trackingLoading && deviceForTracking && actualStartTime.trim() && (
+              <>
+                <div className="mb-2 flex flex-wrap items-center gap-4">
+                  <span className="text-sm text-zinc-500">View</span>
+                  <div className="flex gap-1 rounded bg-zinc-100 p-0.5 dark:bg-zinc-800">
+                    <button
+                      type="button"
+                      onClick={() => setTrackingTableView('raw')}
+                      className={`rounded px-3 py-1.5 text-sm font-medium ${trackingTableView === 'raw' ? 'bg-white text-zinc-900 shadow dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100'}`}
+                    >
+                      Raw
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setTrackingTableView('entry_exit')}
+                      className={`rounded px-3 py-1.5 text-sm font-medium ${trackingTableView === 'entry_exit' ? 'bg-white text-zinc-900 shadow dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100'}`}
+                    >
+                      Entry/Exit
+                    </button>
+                  </div>
+                  {trackingRows.length === 0 && trackingTotal === 0 && (
+                    <span className="text-sm text-zinc-500">No rows in this view. Switch to Raw to see unfiltered tracking data.</span>
+                  )}
+                </div>
+            {trackingRows.length === 0 && trackingTotal === 0 && (
+              <p className="mb-2 text-sm text-zinc-500">No tracking rows for device={deviceForTracking} in window (actual_start − {startLessMinutes + displayExpandBefore} min to actual_end + {endPlusMinutes + displayExpandAfter} min).</p>
             )}
-                {!trackingLoading && (trackingRows.length > 0 || trackingTotal > 0) && (
+                {(trackingRows.length > 0 || trackingTotal > 0) && (
                   <>
                     <div className="mb-2 flex flex-wrap items-center gap-4">
-                      <span className="text-sm text-zinc-500">View</span>
-                      <div className="flex gap-1 rounded bg-zinc-100 p-0.5 dark:bg-zinc-800">
-                        <button
-                          type="button"
-                          onClick={() => setTrackingTableView('raw')}
-                          className={`rounded px-3 py-1.5 text-sm font-medium ${trackingTableView === 'raw' ? 'bg-white text-zinc-900 shadow dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100'}`}
-                        >
-                          Raw
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => setTrackingTableView('entry_exit')}
-                          className={`rounded px-3 py-1.5 text-sm font-medium ${trackingTableView === 'entry_exit' ? 'bg-white text-zinc-900 shadow dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100'}`}
-                        >
-                          Entry/Exit
-                        </button>
-                      </div>
                       <span className="text-sm text-zinc-500">
                         Showing {(trackingPage - 1) * trackingPageSize + 1}–{(trackingPage - 1) * trackingPageSize + trackingRows.length} of {trackingTotal}
                       </span>
@@ -1323,13 +1431,17 @@ function InspectContent() {
             {deviceForTracking && actualStartTime.trim() && (
               <pre className="mt-3 select-all rounded border border-zinc-200 bg-zinc-50 p-3 font-mono text-xs text-zinc-800 dark:border-zinc-600 dark:bg-zinc-800/50 dark:text-zinc-200" title="Copy and paste to run in your SQL editor (window in NZ for position_time_nz)">
                 {trackingSql || (() => {
-                const after = addMinutesToTimestampAsNZ(actualStartTime.trim(), -startLessMinutes);
-                const before = actualEndTime.trim() ? addMinutesToTimestampAsNZ(actualEndTime.trim(), endPlusMinutes) : null;
+                const totalStart = startLessMinutes + displayExpandBefore;
+                const totalEnd = endPlusMinutes + displayExpandAfter;
+                const after = addMinutesToTimestampAsNZ(actualStartTime.trim(), -totalStart);
+                const before = actualEndTime.trim() ? addMinutesToTimestampAsNZ(actualEndTime.trim(), totalEnd) : null;
                 let where = `t.device_name='${String(deviceForTracking).replace(/'/g, "''")}' AND t.position_time_nz>'${after.replace(/'/g, "''")}'`;
                 if (before) where += ` AND t.position_time_nz<'${before.replace(/'/g, "''")}'`;
                 return `SELECT t.id, t.device_name, g.fence_name, t.geofence_type, t.position_time_nz, t.position_time FROM tbl_tracking t LEFT JOIN tbl_geofences g ON g.fence_id = t.geofence_id WHERE ${where} ORDER BY t.position_time_nz ASC LIMIT 500`;
               })()}
               </pre>
+            )}
+              </>
             )}
           </section>
         </>
