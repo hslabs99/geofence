@@ -186,6 +186,14 @@ export type JobForDerivedSteps = {
   actual_end_time?: string | null;
   /** VWork step 5 (job completed in system). Use this for step 5 rule: only use GPS when Winery EXIT < this value. */
   step_5_completed_at?: string | null;
+  /** VWork-reported step 1 (job start). Used in cleanup: if step_1_completed_at > step2_gps we apply step1 = step2_gps - 20 min. */
+  step_1_completed_at?: string | null;
+  /** Manual overrides (Part 3): if set, trump GPS/VWork for that step. */
+  step1oride?: string | null;
+  step2oride?: string | null;
+  step3oride?: string | null;
+  step4oride?: string | null;
+  step5oride?: string | null;
 };
 
 /** Part 1: A single fetched GPS candidate (value + tracking id). No decision applied. */
@@ -232,7 +240,22 @@ export type DerivedStepsDebug = {
   };
 };
 
-export type DerivedStepsResultWithDebug = DerivedStepsResult & { debug: DerivedStepsDebug };
+/** After cleanup: when step1 vwork > step2 gps we set step1_actual = step2_gps - travel_min (step4−step3); Via = RULE. */
+export type Step1CleanupOverride = string | null;
+
+export type StepVia = 'GPS' | 'VW' | 'RULE' | 'ORIDE';
+
+export type DerivedStepsResultWithDebug = DerivedStepsResult & {
+  debug: DerivedStepsDebug;
+  /** Set when cleanup rule applied: step1_actual_time should be this value (step2_gps - 20 min). */
+  step1ActualOverride?: Step1CleanupOverride;
+  /** Per-step source (set after Part 3 apply orides). */
+  step1Via?: StepVia;
+  step2Via?: StepVia;
+  step3Via?: StepVia;
+  step4Via?: StepVia;
+  step5Via?: StepVia;
+};
 
 export type DerivedStepsOptions = {
   windowMinutes: number;
@@ -320,6 +343,93 @@ async function fetchGpsStepCandidates(
   return candidates;
 }
 
+/**
+ * Subtract minutes from a timestamp string (YYYY-MM-DD HH:mm:ss). In-memory only; naive date math.
+ * Used for cleanup rules (e.g. step1_actual = step2_gps - travel minutes).
+ */
+function subtractMinutesFromTimestamp(ts: string, minutes: number): string {
+  const normalized = normalizeTimestampString(ts);
+  if (!normalized) return ts;
+  const m = normalized.match(/^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2}):(\d{2})/);
+  if (!m) return ts;
+  const [, y, mo, d, h, min, s] = m.map(Number);
+  const ms = Date.UTC(y, mo - 1, d, h, min, s) - minutes * 60 * 1000;
+  const date = new Date(ms);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())}`;
+}
+
+/** Minutes from tsEarlier to tsLater (tsLater - tsEarlier). Naive date math. */
+function minutesBetween(tsEarlier: string, tsLater: string): number {
+  const a = normalizeTimestampString(tsEarlier);
+  const b = normalizeTimestampString(tsLater);
+  if (!a || !b) return 0;
+  const ma = a.match(/^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2}):(\d{2})/);
+  const mb = b.match(/^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2}):(\d{2})/);
+  if (!ma || !mb) return 0;
+  const msA = Date.UTC(Number(ma[1]), Number(ma[2]) - 1, Number(ma[3]), Number(ma[4]), Number(ma[5]), Number(ma[6]));
+  const msB = Date.UTC(Number(mb[1]), Number(mb[2]) - 1, Number(mb[3]), Number(mb[4]), Number(mb[5]), Number(mb[6]));
+  return Math.round((msB - msA) / (60 * 1000));
+}
+
+/**
+ * Cleanup rules run after GPS phase (after we have decided GPS vs VWork and populated final step values).
+ * Rule 1: If step1 VWork start > step2 GPS (vineyard arrive), we have impossible negative travel time.
+ *         Then set step1_actual = step2_gps - travel_minutes, where travel_minutes = step4_final - step3_final
+ *         (return leg: vineyard → winery). If step3/step4 missing, fall back to 20 minutes. Summary shows Via = RULE.
+ */
+function applyCleanupRules(
+  result: DerivedStepsResult,
+  job: JobForDerivedSteps
+): { result: DerivedStepsResult; step1ActualOverride: Step1CleanupOverride } {
+  let step1ActualOverride: Step1CleanupOverride = null;
+  const step1Vwork = job.step_1_completed_at != null ? normalizeTimestampString(job.step_1_completed_at as string) : null;
+  const step2Gps = result.step2 != null ? normalizeTimestampString(result.step2) : null;
+  if (step1Vwork != null && step2Gps != null && step1Vwork > step2Gps) {
+    const travelMinutes =
+      result.step3 != null && result.step4 != null
+        ? minutesBetween(result.step3, result.step4)
+        : 20;
+    const safeMinutes = Math.max(1, Math.min(120, travelMinutes));
+    step1ActualOverride = subtractMinutesFromTimestamp(step2Gps, safeMinutes);
+  }
+  return { result, step1ActualOverride };
+}
+
+/** Part 3: Apply manual overrides (orides). If job has stepNoride set, use it for that step and set via = ORIDE; otherwise keep result and set via from GPS/VW/RULE. */
+function applyOrides(
+  result: DerivedStepsResult,
+  job: JobForDerivedSteps,
+  step1ActualOverride: Step1CleanupOverride
+): { result: DerivedStepsResult; step1Via: StepVia; step2Via: StepVia; step3Via: StepVia; step4Via: StepVia; step5Via: StepVia } {
+  const orides = [
+    job.step1oride != null && String(job.step1oride).trim() !== '' ? normalizeTimestampString(String(job.step1oride).trim()) : null,
+    job.step2oride != null && String(job.step2oride).trim() !== '' ? normalizeTimestampString(String(job.step2oride).trim()) : null,
+    job.step3oride != null && String(job.step3oride).trim() !== '' ? normalizeTimestampString(String(job.step3oride).trim()) : null,
+    job.step4oride != null && String(job.step4oride).trim() !== '' ? normalizeTimestampString(String(job.step4oride).trim()) : null,
+    job.step5oride != null && String(job.step5oride).trim() !== '' ? normalizeTimestampString(String(job.step5oride).trim()) : null,
+  ];
+  const step1Final = orides[0] ?? step1ActualOverride ?? result.step1;
+  const step2Final = orides[1] ?? result.step2;
+  const step3Final = orides[2] ?? result.step3;
+  const step4Final = orides[3] ?? result.step4;
+  const step5Final = orides[4] ?? result.step5;
+  const out: DerivedStepsResult = {
+    ...result,
+    step1: step1Final,
+    step2: step2Final,
+    step3: step3Final,
+    step4: step4Final,
+    step5: step5Final,
+  };
+  const step1Via: StepVia = orides[0] != null ? 'ORIDE' : (step1ActualOverride != null ? 'RULE' : (result.step1 != null ? 'GPS' : 'VW'));
+  const step2Via: StepVia = orides[1] != null ? 'ORIDE' : (result.step2 != null ? 'GPS' : 'VW');
+  const step3Via: StepVia = orides[2] != null ? 'ORIDE' : (result.step3 != null ? 'GPS' : 'VW');
+  const step4Via: StepVia = orides[3] != null ? 'ORIDE' : (result.step4 != null ? 'GPS' : 'VW');
+  const step5Via: StepVia = orides[4] != null ? 'ORIDE' : (result.step5 != null ? 'GPS' : 'VW');
+  return { result: out, step1Via, step2Via, step3Via, step4Via, step5Via };
+}
+
 /** Part 2: Decide which date (VWork or GPS) gets used in final. Steps 1–4: if GPS exists use GPS else VWork. Step 5: use GPS only if GPS < VWork step 5. */
 function decideFinalSteps(candidates: FetchedGpsCandidates, job: JobForDerivedSteps): DerivedStepsResult {
   const result: DerivedStepsResult = {
@@ -362,8 +472,19 @@ export async function deriveGpsStepsForJob(
     vineyard: { type: 'Vineyard', vworkName: '', mappingsFound: [], fenceNamesInList: [], fenceIds: [], resolvedFenceNames: [] },
     winery: { type: 'Winery', vworkName: '', mappingsFound: [], fenceNamesInList: [], fenceIds: [], resolvedFenceNames: [] },
   };
-  if (!options.device || !options.positionAfter) return { ...emptyResult, debug };
+  if (!options.device || !options.positionAfter) return { ...emptyResult, debug, step1ActualOverride: null };
   const candidates = await fetchGpsStepCandidates(job, options, debug);
   const result = decideFinalSteps(candidates, job);
-  return { ...result, debug };
+  const { result: afterCleanup, step1ActualOverride } = applyCleanupRules(result, job);
+  const { result: afterOrides, step1Via, step2Via, step3Via, step4Via, step5Via } = applyOrides(afterCleanup, job, step1ActualOverride ?? null);
+  return {
+    ...afterOrides,
+    debug,
+    step1ActualOverride: step1ActualOverride ?? undefined,
+    step1Via,
+    step2Via,
+    step3Via,
+    step4Via,
+    step5Via,
+  };
 }

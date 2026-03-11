@@ -29,8 +29,6 @@ export default function GpsMappingsPage() {
   const [options, setOptions] = useState<Options | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [editing, setEditing] = useState<{ id: number; field: 'type' | 'vwname' | 'gpsname' } | null>(null);
-  const [editValue, setEditValue] = useState('');
   const [showAdd, setShowAdd] = useState(false);
   const [newRow, setNewRow] = useState({ type: '', vwname: '', gpsname: '' });
   const [saving, setSaving] = useState(false);
@@ -193,40 +191,6 @@ export default function GpsMappingsPage() {
         ? options?.vineyardNames ?? []
         : [];
 
-  const startEdit = (r: GpsMapping, field: 'type' | 'vwname' | 'gpsname') => {
-    setEditing({ id: r.id, field });
-    setEditValue(r[field] ?? '');
-  };
-
-  const cancelEdit = () => {
-    setEditing(null);
-    setEditValue('');
-  };
-
-  const saveEdit = async () => {
-    if (!editing) return;
-    setSaving(true);
-    try {
-      const res = await fetch(`/api/gpsmappings/${editing.id}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ [editing.field]: editValue }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error ?? res.statusText);
-      setRows((prev) =>
-        prev.map((r) =>
-          r.id === editing.id ? { ...r, [editing.field]: editValue.trim() } : r
-        )
-      );
-      cancelEdit();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Update failed');
-    } finally {
-      setSaving(false);
-    }
-  };
-
   const handleAdd = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newRow.type.trim() || !newRow.vwname.trim() || !newRow.gpsname.trim()) {
@@ -271,7 +235,6 @@ export default function GpsMappingsPage() {
   const startRowEdit = (r: GpsMapping) => {
     setEditingRowId(r.id);
     setEditRowValues({ type: r.type, vwname: r.vwname ?? '', gpsname: r.gpsname ?? '' });
-    cancelEdit();
   };
 
   const cancelRowEdit = () => {
@@ -323,37 +286,6 @@ export default function GpsMappingsPage() {
     setNewRow({ type: 'Vineyard', vwname: name.trim(), gpsname: '' });
     setShowAdd(true);
     cancelRowEdit();
-  };
-
-  const renderEditCell = (
-    r: GpsMapping,
-    field: 'type' | 'vwname' | 'gpsname',
-    opts: { options: string[]; placeholder?: string }
-  ) => {
-    if (editing?.id !== r.id || editing.field !== field) return null;
-    return (
-      <select
-        value={editValue}
-        onChange={(e) => setEditValue(e.target.value)}
-        onBlur={saveEdit}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter') saveEdit();
-          if (e.key === 'Escape') cancelEdit();
-        }}
-        autoFocus
-        className="min-w-[140px] rounded border border-blue-500 px-1.5 py-0.5 text-sm dark:bg-zinc-800 dark:text-zinc-100"
-      >
-        <option value="">{opts.placeholder ?? 'Select…'}</option>
-        {opts.options.map((v) => (
-          <option key={v} value={v}>
-            {v}
-          </option>
-        ))}
-        {!opts.options.includes(editValue) && editValue && (
-          <option value={editValue}>{editValue}</option>
-        )}
-      </select>
-    );
   };
 
   const editRowVwnameOptions =
@@ -476,7 +408,7 @@ export default function GpsMappingsPage() {
                 <colgroup>
                   <col className="w-12" />
                   <col className="w-20" />
-                  <col className="min-w-[7rem]" />
+                  <col className="min-w-[9.5rem]" />
                   <col className="min-w-[10rem]" />
                   <col className="w-14" />
                   <col className="min-w-[6rem]" />
@@ -522,154 +454,142 @@ export default function GpsMappingsPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {sortedRows.map((r) => {
-                    const isEditingRow = editingRowId === r.id;
-                    return (
-                      <tr
-                        key={r.id}
-                        className={`border-b border-zinc-100 dark:border-zinc-800 ${isEditingRow ? 'bg-blue-50/50 dark:bg-blue-900/20' : 'hover:bg-zinc-50 dark:hover:bg-zinc-800/50'}`}
-                      >
-                        <td className="whitespace-nowrap px-2 py-1.5 text-zinc-500 dark:text-zinc-400">{r.id}</td>
-                        {isEditingRow ? (
-                          <>
-                            <td className="px-2 py-1.5">
-                              <select
-                                value={editRowValues.type}
-                                onChange={(e) => setEditRowValues((v) => ({ ...v, type: e.target.value, vwname: '' }))}
-                                className="min-w-[72px] rounded border border-blue-500 px-1.5 py-0.5 text-xs dark:bg-zinc-800 dark:text-zinc-100"
-                              >
-                                {TYPE_OPTIONS.map((t) => (
-                                  <option key={t} value={t}>
-                                    {t}
-                                  </option>
-                                ))}
-                              </select>
-                            </td>
-                            <td className="px-2 py-1.5">
-                              <select
-                                value={editRowValues.vwname}
-                                onChange={(e) => setEditRowValues((v) => ({ ...v, vwname: e.target.value }))}
-                                disabled={!editRowValues.type}
-                                className="min-w-[100px] max-w-[120px] rounded border border-blue-500 px-1.5 py-0.5 text-xs dark:bg-zinc-800 dark:text-zinc-100 disabled:opacity-60"
-                              >
-                                <option value="">Select…</option>
-                                {editRowVwnameOptions.map((v) => (
-                                  <option key={v} value={v}>
-                                    {v}
-                                  </option>
-                                ))}
-                              </select>
-                            </td>
-                            <td className="px-2 py-1.5">
-                              <select
-                                value={editRowValues.gpsname}
-                                onChange={(e) => setEditRowValues((v) => ({ ...v, gpsname: e.target.value }))}
-                                className="min-w-[100px] max-w-[120px] rounded border border-blue-500 px-1.5 py-0.5 text-xs dark:bg-zinc-800 dark:text-zinc-100"
-                              >
-                                <option value="">Select…</option>
-                                {(options?.fenceNames ?? []).map((v) => (
-                                  <option key={v} value={v}>
-                                    {v}
-                                  </option>
-                                ))}
-                                {editRowValues.gpsname && !(options?.fenceNames ?? []).includes(editRowValues.gpsname) && (
-                                  <option value={editRowValues.gpsname}>{editRowValues.gpsname}</option>
-                                )}
-                              </select>
-                            </td>
-                            <td className="whitespace-nowrap px-2 py-1.5 text-zinc-500 dark:text-zinc-400 tabular-nums">
-                              {(() => {
-                                const name = (editRowValues.gpsname ?? '').trim();
-                                const fence = name && options?.trackingFences?.find((f) => (f.fence_name ?? '').trim() === name);
-                                const count = fence ? (options?.trackingCountByFenceId?.[fence.fence_id] ?? 0) : 0;
-                                return count;
-                              })()}
-                            </td>
-                            <td className="whitespace-nowrap px-2 py-1.5">
-                              <button
-                                type="button"
-                                onClick={saveRowEdit}
-                                disabled={saving}
-                                className="mr-1.5 text-emerald-600 hover:underline disabled:opacity-50 dark:text-emerald-400"
-                              >
-                                Save
-                              </button>
-                              <button
-                                type="button"
-                                onClick={cancelRowEdit}
-                                className="text-zinc-600 hover:underline dark:text-zinc-400"
-                              >
-                                Cancel
-                              </button>
-                            </td>
-                          </>
-                        ) : (
-                          <>
-                            <td
-                              className="cursor-pointer px-2 py-1.5 text-zinc-700 dark:text-zinc-300"
-                              onClick={() => startEdit(r, 'type')}
-                            >
-                              {renderEditCell(r, 'type', { options: [...TYPE_OPTIONS] }) ?? r.type}
-                            </td>
-                            <td
-                              className="max-w-[120px] truncate cursor-pointer px-2 py-1.5 text-zinc-700 dark:text-zinc-300"
-                              title={r.vwname}
-                              onClick={() => startEdit(r, 'vwname')}
-                            >
-                              {renderEditCell(r, 'vwname', {
-                                options: getVwnameOptionsForRow(r),
-                                placeholder: r.type ? 'Select…' : 'Set type first',
-                              }) ?? r.vwname}
-                            </td>
-                            <td
-                              className="max-w-[10rem] truncate cursor-pointer px-2 py-1.5 text-zinc-700 dark:text-zinc-300"
-                              title={r.gpsname}
-                              onClick={() => startEdit(r, 'gpsname')}
-                            >
-                              {renderEditCell(r, 'gpsname', {
-                                options: options?.fenceNames ?? [],
-                              }) ?? r.gpsname}
-                            </td>
-                            <td className="whitespace-nowrap px-2 py-1.5 text-zinc-500 dark:text-zinc-400 tabular-nums" title="tbl_tracking rows for this GPS fence">
-                              {getTrackingCountForRow(r)}
-                            </td>
-                            <td className="whitespace-nowrap px-2 py-1.5">
-                              <button
-                                type="button"
-                                onClick={() => startRowEdit(r)}
-                                disabled={saving}
-                                className="text-blue-600 hover:underline disabled:opacity-50 dark:text-blue-400"
-                              >
-                                Edit
-                              </button>
-                              <span className="mx-1 text-zinc-300 dark:text-zinc-600">|</span>
-                              <button
-                                type="button"
-                                onClick={() => handleClone(r)}
-                                disabled={saving}
-                                className="text-zinc-600 hover:underline disabled:opacity-50 dark:text-zinc-400"
-                              >
-                                Clone
-                              </button>
-                              <span className="mx-1 text-zinc-300 dark:text-zinc-600">|</span>
-                              <button
-                                type="button"
-                                onClick={() => handleDelete(r)}
-                                disabled={saving}
-                                className="text-red-600 hover:underline disabled:opacity-50 dark:text-red-400"
-                              >
-                                Delete
-                              </button>
-                            </td>
-                          </>
-                        )}
-                      </tr>
-                    );
-                  })}
+                  {sortedRows.map((r) => (
+                    <tr
+                      key={r.id}
+                      className="border-b border-zinc-100 dark:border-zinc-800 hover:bg-zinc-50 dark:hover:bg-zinc-800/50"
+                    >
+                      <td className="whitespace-nowrap px-2 py-1.5 text-zinc-500 dark:text-zinc-400">{r.id}</td>
+                      <td className="whitespace-nowrap px-2 py-1.5 text-zinc-700 dark:text-zinc-300">{r.type}</td>
+                      <td className="max-w-[9.5rem] truncate px-2 py-1.5 text-zinc-700 dark:text-zinc-300" title={r.vwname}>
+                        {r.vwname}
+                      </td>
+                      <td className="max-w-[10rem] truncate px-2 py-1.5 text-zinc-700 dark:text-zinc-300" title={r.gpsname}>
+                        {r.gpsname}
+                      </td>
+                      <td className="whitespace-nowrap px-2 py-1.5 text-zinc-500 dark:text-zinc-400 tabular-nums" title="tbl_tracking rows for this GPS fence">
+                        {getTrackingCountForRow(r)}
+                      </td>
+                      <td className="whitespace-nowrap px-2 py-1.5">
+                        <button
+                          type="button"
+                          onClick={() => startRowEdit(r)}
+                          disabled={saving}
+                          className="text-blue-600 hover:underline disabled:opacity-50 dark:text-blue-400"
+                        >
+                          Edit
+                        </button>
+                        <span className="mx-1 text-zinc-300 dark:text-zinc-600">|</span>
+                        <button
+                          type="button"
+                          onClick={() => handleClone(r)}
+                          disabled={saving}
+                          className="text-zinc-600 hover:underline disabled:opacity-50 dark:text-zinc-400"
+                        >
+                          Clone
+                        </button>
+                        <span className="mx-1 text-zinc-300 dark:text-zinc-600">|</span>
+                        <button
+                          type="button"
+                          onClick={() => handleDelete(r)}
+                          disabled={saving}
+                          className="text-red-600 hover:underline disabled:opacity-50 dark:text-red-400"
+                        >
+                          Delete
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
                 </tbody>
               </table>
             </div>
             {rows.length === 0 && <p className="p-3 text-zinc-500 text-xs">No rows yet. Add one above.</p>}
+
+            {editingRowId != null && (
+              <div
+                className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+                onClick={(e) => e.target === e.currentTarget && cancelRowEdit()}
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby="edit-mapping-title"
+              >
+                <div
+                  className="w-full max-w-lg rounded-lg border border-zinc-200 bg-white p-6 shadow-xl dark:border-zinc-700 dark:bg-zinc-900"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <h2 id="edit-mapping-title" className="mb-4 text-lg font-semibold text-zinc-900 dark:text-zinc-100">
+                    Edit mapping
+                  </h2>
+                  <div className="flex flex-col gap-4">
+                    <div>
+                      <label className="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">Type</label>
+                      <select
+                        value={editRowValues.type}
+                        onChange={(e) => setEditRowValues((v) => ({ ...v, type: e.target.value, vwname: '' }))}
+                        className="w-full min-w-0 rounded border border-zinc-300 px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+                      >
+                        {TYPE_OPTIONS.map((t) => (
+                          <option key={t} value={t}>
+                            {t}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <div>
+                      <label className="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">VW name</label>
+                      <select
+                        value={editRowValues.vwname}
+                        onChange={(e) => setEditRowValues((v) => ({ ...v, vwname: e.target.value }))}
+                        disabled={!editRowValues.type}
+                        className="w-full min-w-0 rounded border border-zinc-300 px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100 disabled:opacity-60"
+                      >
+                        <option value="">Select…</option>
+                        {editRowVwnameOptions.map((v) => (
+                          <option key={v} value={v}>
+                            {v}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <div>
+                      <label className="mb-1 block text-sm font-medium text-zinc-700 dark:text-zinc-300">GPS fence name</label>
+                      <select
+                        value={editRowValues.gpsname}
+                        onChange={(e) => setEditRowValues((v) => ({ ...v, gpsname: e.target.value }))}
+                        className="w-full min-w-0 rounded border border-zinc-300 px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+                      >
+                        <option value="">Select…</option>
+                        {(options?.fenceNames ?? []).map((v) => (
+                          <option key={v} value={v}>
+                            {v}
+                          </option>
+                        ))}
+                        {editRowValues.gpsname && !(options?.fenceNames ?? []).includes(editRowValues.gpsname) && (
+                          <option value={editRowValues.gpsname}>{editRowValues.gpsname}</option>
+                        )}
+                      </select>
+                    </div>
+                    <div className="flex justify-end gap-2 pt-2">
+                      <button
+                        type="button"
+                        onClick={cancelRowEdit}
+                        className="rounded border border-zinc-300 bg-white px-4 py-2 text-sm font-medium text-zinc-700 hover:bg-zinc-50 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        type="button"
+                        onClick={saveRowEdit}
+                        disabled={saving}
+                        className="rounded bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700 disabled:opacity-50 dark:bg-emerald-700 dark:hover:bg-emerald-600"
+                      >
+                        {saving ? 'Saving…' : 'Save'}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
 
           {/* Right: Mapping Issues (temp – no DB, computed from vworkjobs vs tracking/mappings) */}

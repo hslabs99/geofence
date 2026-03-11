@@ -192,13 +192,17 @@ export default function Sidebar() {
                   {inspectHistory.length === 0 ? (
                     <div className="px-3 py-2 text-xs text-zinc-500 dark:text-zinc-400">No recent jobs</div>
                   ) : (
-                    inspectHistory.map((entry) => (
+                    inspectHistory.map((entry, i) => (
                       <button
                         key={entry.job_id}
                         type="button"
                         role="option"
                         onClick={() => {
                           setHistoryOpen(false);
+                          setInspectHistory((prev) => {
+                            const rest = prev.filter((e) => String(e.job_id).trim() !== String(entry.job_id).trim());
+                            return [entry, ...rest];
+                          });
                           router.push(buildInspectUrl(entry));
                         }}
                         className="w-full px-3 py-2 text-left text-xs hover:bg-zinc-100 dark:hover:bg-zinc-700"
@@ -262,12 +266,20 @@ export default function Sidebar() {
               GPS Mappings
             </Link>
             <Link
+              href="/admin/data-checks"
+              className={`rounded px-3 py-2 text-sm ${
+                pathname === '/admin/data-checks' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
+              }`}
+            >
+              Data Checks
+            </Link>
+            <Link
               href="/admin/import-geofences"
               className={`rounded px-3 py-2 text-sm ${
                 pathname === '/admin/import-geofences' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
               }`}
             >
-              Import Geofences
+              GeoFences
             </Link>
             <Link
               href="/admin/tagging"

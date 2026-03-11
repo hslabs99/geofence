@@ -63,13 +63,22 @@ export async function GET(request: Request) {
       ? ` AND (t.geofence_type = 'ENTER' OR t.geofence_type = 'EXIT')`
       : '';
 
+    const fenceNames = searchParams.getAll('fenceNames').map((s) => s.trim()).filter(Boolean);
+
     const params: unknown[] = [device.trim(), tsAfter];
     let timeCondition = 't.position_time_nz > $2';
     if (tsBefore) {
       params.push(tsBefore);
       timeCondition += ' AND t.position_time_nz < $3';
     }
-    const whereClause = `t.device_name = $1 AND ${timeCondition}${geofenceTypeCondition}`;
+    let fenceCondition = '';
+    if (fenceNames.length > 0) {
+      const startIdx = params.length + 1;
+      fenceNames.forEach((_, i) => params.push(fenceNames[i]));
+      const placeholders = fenceNames.map((_, i) => `$${startIdx + i}`).join(', ');
+      fenceCondition = ` AND g.fence_name IN (${placeholders})`;
+    }
+    const whereClause = `t.device_name = $1 AND ${timeCondition}${fenceCondition}${geofenceTypeCondition}`;
     const countParams = [...params];
     params.push(limit, offset);
 
@@ -81,7 +90,7 @@ export async function GET(request: Request) {
 
     const limitPlaceholder = params.length - 1;
     const offsetPlaceholder = params.length;
-    const sql = `SELECT t.device_name, g.fence_name, t.geofence_type, to_char(t.position_time_nz, 'YYYY-MM-DD HH24:MI:SS') AS position_time_nz, to_char(t.position_time, 'YYYY-MM-DD HH24:MI:SS') AS position_time FROM tbl_tracking t LEFT JOIN tbl_geofences g ON g.fence_id = t.geofence_id WHERE ${whereClause} ORDER BY t.position_time_nz ASC LIMIT $${limitPlaceholder} OFFSET $${offsetPlaceholder}`;
+    const sql = `SELECT t.device_name, g.fence_name, t.geofence_type, to_char(t.position_time_nz, 'YYYY-MM-DD HH24:MI:SS') AS position_time_nz, to_char(t.position_time, 'YYYY-MM-DD HH24:MI:SS') AS position_time, t.lat, t.lon FROM tbl_tracking t LEFT JOIN tbl_geofences g ON g.fence_id = t.geofence_id WHERE ${whereClause} ORDER BY t.position_time_nz ASC LIMIT $${limitPlaceholder} OFFSET $${offsetPlaceholder}`;
 
     const rows = await query(sql, params);
 
@@ -89,7 +98,10 @@ export async function GET(request: Request) {
     const timePart = tsBefore
       ? `t.position_time_nz > ${esc(tsAfter)} AND t.position_time_nz < ${esc(tsBefore)}`
       : `t.position_time_nz > ${esc(tsAfter)}`;
-    const sqlCopyPaste = `SELECT t.device_name, g.fence_name, t.geofence_type, to_char(t.position_time_nz, 'YYYY-MM-DD HH24:MI:SS') AS position_time_nz, to_char(t.position_time, 'YYYY-MM-DD HH24:MI:SS') AS position_time FROM tbl_tracking t LEFT JOIN tbl_geofences g ON g.fence_id = t.geofence_id WHERE t.device_name = ${esc(device.trim())} AND ${timePart}${geofenceTypeCondition} ORDER BY t.position_time_nz ASC LIMIT ${limit} OFFSET ${offset}`;
+    const fencePart = fenceNames.length > 0
+      ? ` AND g.fence_name IN (${fenceNames.map((n) => esc(n)).join(', ')})`
+      : '';
+    const sqlCopyPaste = `SELECT t.device_name, g.fence_name, t.geofence_type, to_char(t.position_time_nz, 'YYYY-MM-DD HH24:MI:SS') AS position_time_nz, to_char(t.position_time, 'YYYY-MM-DD HH24:MI:SS') AS position_time, t.lat, t.lon FROM tbl_tracking t LEFT JOIN tbl_geofences g ON g.fence_id = t.geofence_id WHERE t.device_name = ${esc(device.trim())} AND ${timePart}${fencePart}${geofenceTypeCondition} ORDER BY t.position_time_nz ASC LIMIT ${limit} OFFSET ${offset}`;
 
     return NextResponse.json({ rows: jsonSafe(rows), sql, sqlCopyPaste, total });
   } catch (err) {

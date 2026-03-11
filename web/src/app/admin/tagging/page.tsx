@@ -44,6 +44,8 @@ interface LogRow {
   logdetails: string | null;
 }
 
+type FenceTaggingScope = 'unattempted' | 'all' | 'missed';
+
 function formatLogLine(ev: StreamEvent): string {
   switch (ev.stage) {
     case 'reset':
@@ -105,7 +107,7 @@ export default function TaggingPage() {
   const [fenceTaggingStatus, setFenceTaggingStatus] = useState<'idle' | 'running' | 'done' | 'error'>('idle');
   const [fenceTaggingLogs, setFenceTaggingLogs] = useState<string[]>([]);
   const [fenceTaggingError, setFenceTaggingError] = useState<string | null>(null);
-  const [fenceTaggingReprocessAll, setFenceTaggingReprocessAll] = useState(false);
+  const [fenceTaggingScope, setFenceTaggingScope] = useState<FenceTaggingScope>('unattempted');
 
   const loadEntryexitLogs = useCallback(async () => {
     setEntryexitLogsLoading(true);
@@ -146,8 +148,9 @@ export default function TaggingPage() {
       return;
     }
     setFenceTaggingStatus('running');
+    const scopeLabel = fenceTaggingScope === 'all' ? ' [reprocess all]' : fenceTaggingScope === 'missed' ? ' [reprocess missed only]' : '';
     setFenceTaggingLogs([
-      `Fence tagging for ${from} → ${to} (${dates.length} day(s))${fenceTaggingReprocessAll ? ' [reprocess all]' : ''}…`,
+      `Fence tagging for ${from} → ${to} (${dates.length} day(s))${scopeLabel}…`,
     ]);
     setFenceTaggingError(null);
     try {
@@ -157,7 +160,8 @@ export default function TaggingPage() {
         body: JSON.stringify({
           dateFrom: from,
           dateTo: to,
-          forceUpdate: fenceTaggingReprocessAll,
+          forceUpdate: fenceTaggingScope === 'all',
+          reprocessMissedOnly: fenceTaggingScope === 'missed',
         }),
       });
       if (!res.ok) {
@@ -516,19 +520,42 @@ export default function TaggingPage() {
         <p className="mb-3 text-xs text-zinc-600 dark:text-zinc-400">
           Once: set <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">position_time_nz</code> for the range (rows where it is null). Then run{' '}
           <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">store_fences_for_date</code> for each day in the range. Assigns <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">geofence_id</code> from{' '}
-          <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">tbl_geofences</code>. By default only rows not yet attempted; use the switch to reprocess all rows.
+          <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">tbl_geofences</code>. By default only rows not yet attempted; use scope to reprocess all or only missed rows (e.g. after adding a new geofence).
         </p>
         <div className="mb-3 flex flex-wrap items-center gap-4">
-          <label className="flex cursor-pointer items-center gap-2 text-sm text-zinc-700 dark:text-zinc-300">
-            <input
-              type="checkbox"
-              checked={fenceTaggingReprocessAll}
-              onChange={(e) => setFenceTaggingReprocessAll(e.target.checked)}
-              disabled={fenceTaggingStatus === 'running'}
-              className="rounded border-zinc-300 text-zinc-800 focus:ring-zinc-500 dark:border-zinc-600 dark:bg-zinc-700"
-            />
-            Reprocess all (include rows already attempted)
-          </label>
+          <fieldset className="flex flex-wrap items-center gap-4" disabled={fenceTaggingStatus === 'running'}>
+            <legend className="sr-only">Fence tagging scope</legend>
+            <label className="flex cursor-pointer items-center gap-2 text-sm text-zinc-700 dark:text-zinc-300">
+              <input
+                type="radio"
+                name="fenceTaggingScope"
+                checked={fenceTaggingScope === 'unattempted'}
+                onChange={() => setFenceTaggingScope('unattempted')}
+                className="border-zinc-300 text-zinc-800 focus:ring-zinc-500 dark:border-zinc-600 dark:bg-zinc-700"
+              />
+              Only unattempted
+            </label>
+            <label className="flex cursor-pointer items-center gap-2 text-sm text-zinc-700 dark:text-zinc-300">
+              <input
+                type="radio"
+                name="fenceTaggingScope"
+                checked={fenceTaggingScope === 'all'}
+                onChange={() => setFenceTaggingScope('all')}
+                className="border-zinc-300 text-zinc-800 focus:ring-zinc-500 dark:border-zinc-600 dark:bg-zinc-700"
+              />
+              Reprocess all (include rows already attempted)
+            </label>
+            <label className="flex cursor-pointer items-center gap-2 text-sm text-zinc-700 dark:text-zinc-300">
+              <input
+                type="radio"
+                name="fenceTaggingScope"
+                checked={fenceTaggingScope === 'missed'}
+                onChange={() => setFenceTaggingScope('missed')}
+                className="border-zinc-300 text-zinc-800 focus:ring-zinc-500 dark:border-zinc-600 dark:bg-zinc-700"
+              />
+              Reprocess missed only (attempted but missed — pick up new fence hits)
+            </label>
+          </fieldset>
         </div>
         <div className="flex flex-wrap items-center gap-3">
           <button

@@ -1491,6 +1491,7 @@ export default function SummaryPage() {
                         const viaVal = row[viaKey];
                         const viaStr = formatCell(viaVal);
                         const isGps = viaStr.toLowerCase() === 'gps';
+                        const isOride = viaStr.toUpperCase() === 'ORIDE';
                         const mins = n >= 2 ? minsBetween(row, n - 1, n) : null;
                         const minsOver = n >= 2 && isMinsOverThresholdForStepCol(mins, n);
                         const groupBg = STEP_GROUP_BG[n];
@@ -1507,7 +1508,7 @@ export default function SummaryPage() {
                               {formatDateDDMM(actualVal)}
                             </td>
                             <td
-                              className={`whitespace-nowrap px-3 py-2 font-medium ${isGps ? 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-200' : `${groupBg} text-zinc-700 dark:text-zinc-300`}`}
+                              className={`whitespace-nowrap px-3 py-2 font-medium ${isOride ? 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-200' : isGps ? 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-200' : `${groupBg} text-zinc-700 dark:text-zinc-300`}`}
                             >
                               {viaStr}
                             </td>

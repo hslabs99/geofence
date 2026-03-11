@@ -21,9 +21,12 @@ function streamLine(obj: Record<string, unknown>): string {
 }
 
 /**
- * POST: 1) Update position_time_nz once for the range. 2) Run store_fences_for_date(p_date, p_force_update) for each day.
+ * POST: 1) Update position_time_nz once for the range. 2) Run store_fences_for_date(p_date, p_only_unattempted, p_only_missed) for each day.
  * Streams NDJSON in real time: { type: 'position_time_nz', updated } then { type: 'day', date, updated, durationMs } per day, then { type: 'done', totalUpdated }.
- * Body: { dateFrom, dateTo, forceUpdate?: boolean }.
+ * Body: { dateFrom, dateTo, forceUpdate?: boolean, reprocessMissedOnly?: boolean }.
+ * - Default: only rows not yet attempted (p_only_unattempted=true, p_only_missed=false).
+ * - forceUpdate: reprocess all rows (p_only_unattempted=false, p_only_missed=false).
+ * - reprocessMissedOnly: only rows attempted but missed — for picking up new fence hits (p_only_unattempted=false, p_only_missed=true).
  */
 export async function POST(req: Request) {
   try {
@@ -31,6 +34,8 @@ export async function POST(req: Request) {
     const dateFrom = typeof body?.dateFrom === 'string' ? body.dateFrom.trim() : '';
     const dateTo = typeof body?.dateTo === 'string' ? body.dateTo.trim() : '';
     const forceUpdate = body?.forceUpdate === true;
+    const reprocessMissedOnly = body?.reprocessMissedOnly === true;
+    const onlyMissed = reprocessMissedOnly;
     if (!dateFrom || !dateTo) {
       return NextResponse.json(
         { ok: false, error: 'dateFrom and dateTo (YYYY-MM-DD) required' },
@@ -63,12 +68,12 @@ export async function POST(req: Request) {
           let totalUpdated = 0;
           for (const date of dates) {
             const startMs = Date.now();
-            const rows = await query<{ store_fences_for_date: number }>(
-              'SELECT store_fences_for_date($1::date, $2::boolean) AS store_fences_for_date',
-              [date, forceUpdate]
+            const rows = await query<{ store_fences_for_date_scoped: number }>(
+              'SELECT store_fences_for_date_scoped($1::date, $2::boolean, $3::boolean) AS store_fences_for_date_scoped',
+              [date, forceUpdate, onlyMissed]
             );
             const durationMs = Date.now() - startMs;
-            const updated = rows[0]?.store_fences_for_date ?? 0;
+            const updated = rows[0]?.store_fences_for_date_scoped ?? 0;
             totalUpdated += updated;
             controller.enqueue(
               encoder.encode(streamLine({ type: 'day', date, updated, durationMs }))

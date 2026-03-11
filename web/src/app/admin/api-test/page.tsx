@@ -52,6 +52,36 @@ interface FleetRow {
   error: string | null;
 }
 
+/** Parse gpsTime (API payload raw) to ms for ordering. Handles ISO and space-separated. */
+function parseGpsTimeMs(gpsTime: string): number {
+  const s = String(gpsTime ?? '').trim();
+  if (!s) return NaN;
+  const normalized = s.includes('T') ? s : s.replace(' ', 'T');
+  const d = new Date(normalized);
+  return d.getTime();
+}
+
+/** From API payload points (gpsTime = raw position_time), compute largest gap in minutes and the From/To raw times that bound it. */
+function largestGapFromPayload(points: TrackPoint[]): { largestGapMinutes: number; gapFrom: string; gapTo: string } | null {
+  const withTime = points
+    .map((p) => ({ gpsTime: p.gpsTime, ms: parseGpsTimeMs(p.gpsTime) }))
+    .filter((x) => !Number.isNaN(x.ms));
+  if (withTime.length < 2) return null;
+  withTime.sort((a, b) => a.ms - b.ms);
+  let maxGapMs = 0;
+  let gapFrom = '';
+  let gapTo = '';
+  for (let i = 1; i < withTime.length; i++) {
+    const gapMs = withTime[i].ms - withTime[i - 1].ms;
+    if (gapMs > maxGapMs) {
+      maxGapMs = gapMs;
+      gapFrom = withTime[i - 1].gpsTime;
+      gapTo = withTime[i].gpsTime;
+    }
+  }
+  return { largestGapMinutes: Math.round((maxGapMs / 60000) * 100) / 100, gapFrom, gapTo };
+}
+
 /** Return array of YYYY-MM-DD from fromDate to toDate inclusive. Uses UTC only (no session/local TZ). If from > to, returns [from]. */
 function getDatesInRange(fromDate: string, toDate: string): string[] {
   const from = new Date(fromDate.trim().slice(0, 10));
@@ -157,6 +187,22 @@ export default function ApiTestPage() {
   const [fleetRunAllLoading, setFleetRunAllLoading] = useState(false);
   const [fleetRunProgress, setFleetRunProgress] = useState<{ currentDay: number; totalDays: number; dateLabel: string } | null>(null);
   const [fleetRunLog, setFleetRunLog] = useState<Array<{ day: string; device: string; minTime: string; maxTime: string; apiRows: number; inserted?: number }>>([]);
+  const [singleDateFrom, setSingleDateFrom] = useState(''); // YYYY-MM-DD; empty = use trackDate
+  const [singleDateTo, setSingleDateTo] = useState(''); // YYYY-MM-DD; empty = use singleDateFrom or trackDate
+  const [singleDeviceDayLog, setSingleDeviceDayLog] = useState<Array<{
+    date: string;
+    apiCount: number;
+    apifeedCount: number;
+    trackingCount: number;
+    largestGapMinutes: number | null;
+    gapFrom: string | null;
+    gapTo: string | null;
+    apiRequestSummary: string;
+    rawPayload: string | null;
+  }>>([]);
+  const [singleDeviceRawPayloadModal, setSingleDeviceRawPayloadModal] = useState<{ date: string; device: string; payload: string } | null>(null);
+  const [singleDeviceRunLoading, setSingleDeviceRunLoading] = useState(false);
+  const [singleDeviceRunProgress, setSingleDeviceRunProgress] = useState<{ currentDay: number; totalDays: number; dateLabel: string } | null>(null);
   const [refreshDevicesLoading, setRefreshDevicesLoading] = useState(false);
   const [refreshDevicesMessage, setRefreshDevicesMessage] = useState<string | null>(null);
   const [fencePrepStatus, setFencePrepStatus] = useState<'idle' | 'running' | 'done' | 'error'>('idle');
@@ -346,6 +392,96 @@ export default function ApiTestPage() {
         error: errMsg,
       });
     }
+  };
+
+  /** Single device: run clear → fetch → save → merge for each day in [singleDateFrom, singleDateTo]; build day log table. */
+  const runSingleDeviceRange = async () => {
+    if (!trackImei.trim()) return;
+    const deviceName = devices?.find((d) => d.imei === trackImei)?.deviceName ?? trackImei;
+    const imei = trackImei.trim();
+    const from = singleDateFrom.trim() || trackDate;
+    const to = singleDateTo.trim() || singleDateFrom.trim() || trackDate;
+    const dates = getDatesInRange(from, to);
+    setSingleDeviceRunLoading(true);
+    setSingleDeviceDayLog([]);
+    setSingleDeviceRunProgress({ currentDay: 0, totalDays: dates.length, dateLabel: dates[0] ?? '' });
+    const log: Array<{
+      date: string;
+      apiCount: number;
+      apifeedCount: number;
+      trackingCount: number;
+      largestGapMinutes: number | null;
+      gapFrom: string | null;
+      gapTo: string | null;
+      apiRequestSummary: string;
+      rawPayload: string | null;
+    }> = [];
+    for (let i = 0; i < dates.length; i++) {
+      const day = dates[i];
+      setSingleDeviceRunProgress({ currentDay: i + 1, totalDays: dates.length, dateLabel: day });
+      const trackParams = new URLSearchParams({ imei, endpoint, date: day, deviceName });
+      const actualRequestUrl = `/api/tracksolid/track?${trackParams.toString()}`;
+      try {
+        const clearRes = await fetch('/api/apifeed/clear-for-device-date', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ deviceName, date: day }),
+        });
+        const clearData = await clearRes.json();
+        if (!clearData.ok) {
+          log.push({ date: day, apiCount: 0, apifeedCount: 0, trackingCount: 0, largestGapMinutes: null, gapFrom: null, gapTo: null, apiRequestSummary: actualRequestUrl, rawPayload: null });
+          setSingleDeviceDayLog([...log]);
+          continue;
+        }
+        const trackRes = await fetch(actualRequestUrl);
+        const trackData = await trackRes.json();
+        const getTrackStep = trackData.debug?.steps?.find((s: { step: string }) => s.step === 'getTrack');
+        const rawPayload: string | null = (getTrackStep?.debug?.responseBody != null && typeof getTrackStep.debug.responseBody === 'string')
+          ? getTrackStep.debug.responseBody
+          : null;
+        const points: TrackPoint[] = trackData.ok ? (trackData.points ?? []) : [];
+        const apiCount = points.length;
+        let apifeedCount = 0;
+        let trackingCount = 0;
+        const gapInfo = largestGapFromPayload(points);
+        if (points.length > 0) {
+          const saveRes = await fetch('/api/apifeed/import', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ deviceName, imei, points }),
+          });
+          const saveData = await saveRes.json();
+          if (saveData.ok) apifeedCount = Number(saveData.inserted) ?? 0;
+          const times = points.map((p) => p.gpsTime).filter(Boolean) as string[];
+          if (times.length > 0) {
+            const sorted = [...times].sort();
+            const mergeRes = await fetch('/api/apifeed/merge-tracking', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ deviceName, minTime: sorted[0], maxTime: sorted[sorted.length - 1] }),
+            });
+            const mergeData = await mergeRes.json();
+            if (mergeData.ok) trackingCount = Number(mergeData.inserted) ?? 0;
+          }
+        }
+        log.push({
+          date: day,
+          apiCount,
+          apifeedCount,
+          trackingCount,
+          largestGapMinutes: gapInfo?.largestGapMinutes ?? null,
+          gapFrom: gapInfo?.gapFrom ?? null,
+          gapTo: gapInfo?.gapTo ?? null,
+          apiRequestSummary: actualRequestUrl,
+          rawPayload,
+        });
+      } catch {
+        log.push({ date: day, apiCount: 0, apifeedCount: 0, trackingCount: 0, largestGapMinutes: null, gapFrom: null, gapTo: null, apiRequestSummary: actualRequestUrl, rawPayload: null });
+      }
+      setSingleDeviceDayLog([...log]);
+    }
+    setSingleDeviceRunLoading(false);
+    setSingleDeviceRunProgress(null);
   };
 
   const updateFleetRow = (deviceName: string, upd: Partial<FleetRow>) => {
@@ -837,13 +973,14 @@ export default function ApiTestPage() {
     setClearDebug(null);
     setTrackLoading(true);
     const deviceName = devices?.find((d) => d.imei === imei)?.deviceName ?? imei;
+    const effectiveDate = singleDateFrom.trim() || trackDate;
     try {
       // Stage 1a: Clear both tables for this device + date (ground zero) so we can debug each stage
-      if (trackDate && deviceName) {
+      if (effectiveDate && deviceName) {
         const clearRes = await fetch('/api/apifeed/clear-for-device-date', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ deviceName, date: trackDate }),
+          body: JSON.stringify({ deviceName, date: effectiveDate }),
         });
         const clearData = await clearRes.json();
         if (!clearData.ok) {
@@ -862,14 +999,14 @@ export default function ApiTestPage() {
           });
         }
         setSaveMessage(
-          `Stage 1: Cleared tbl_apifeed (${clearData.deletedApifeed}) and tbl_tracking (${clearData.deletedTracking}) for ${deviceName} ${trackDate}. Now fetching from API…`
+          `Stage 1: Cleared tbl_apifeed (${clearData.deletedApifeed}) and tbl_tracking (${clearData.deletedTracking}) for ${deviceName} ${effectiveDate}. Now fetching from API…`
         );
       }
       // Stage 1b: Fetch from API only — no save, no merge
       const params = new URLSearchParams({
         imei,
         endpoint,
-        ...(trackDate ? { date: trackDate } : { period: 'last24h' }),
+        ...(effectiveDate ? { date: effectiveDate } : { period: 'last24h' }),
         ...(deviceName && { deviceName }),
       });
       const res = await fetch(`/api/tracksolid/track?${params}`);
@@ -888,7 +1025,7 @@ export default function ApiTestPage() {
       setTrackPoints(points);
       setTrackDebug(data.debug ?? null);
       setSaveMessage(
-        trackDate && deviceName
+        effectiveDate && deviceName
           ? `Stage 1 done: ground zero + fetched ${points.length} points. Next: Stage 2 Save to database, then Stage 3 Merge to tbl_tracking.`
           : null
       );
@@ -1382,15 +1519,30 @@ export default function ApiTestPage() {
               </option>
             ))}
           </select>
-          <label className="ml-2 text-sm font-medium text-zinc-700 dark:text-zinc-300">
-            Date
-          </label>
+          <label className="ml-2 text-sm font-medium text-zinc-700 dark:text-zinc-300">From</label>
           <input
             type="date"
-            value={trackDate}
-            onChange={(e) => setTrackDate(e.target.value)}
+            value={singleDateFrom || trackDate}
+            onChange={(e) => setSingleDateFrom(e.target.value)}
             className="rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+            title="Start of range (day 00:00:00 UTC)"
           />
+          <label className="text-sm font-medium text-zinc-700 dark:text-zinc-300">To</label>
+          <input
+            type="date"
+            value={singleDateTo || singleDateFrom || trackDate}
+            onChange={(e) => setSingleDateTo(e.target.value)}
+            className="rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+            title="End of range (day 23:59:59 UTC, inclusive)"
+          />
+          {(() => {
+            const from = singleDateFrom.trim() || trackDate;
+            const to = singleDateTo.trim() || singleDateFrom.trim() || trackDate;
+            const days = getDatesInRange(from, to);
+            return days.length > 1 ? (
+              <span className="text-sm text-zinc-500 dark:text-zinc-400">{days.length} days</span>
+            ) : null;
+          })()}
           <button
             type="button"
             onClick={fetchTrack}
@@ -1398,12 +1550,122 @@ export default function ApiTestPage() {
             className="rounded bg-zinc-800 px-4 py-2 text-sm font-medium text-white hover:bg-zinc-700 disabled:opacity-50 dark:bg-zinc-700 dark:hover:bg-zinc-600"
             title="Stage 1: Clear tbl_apifeed + tbl_tracking for this device/date, then fetch from API. Data shown below; no save or merge."
           >
-            {trackLoading ? 'Fetching…' : `1. Fetch GPS for ${trackDate || 'day'}`}
+            {trackLoading ? 'Fetching…' : `1. Fetch GPS for ${singleDateFrom || trackDate || 'day'}`}
+          </button>
+          <button
+            type="button"
+            onClick={runSingleDeviceRange}
+            disabled={singleDeviceRunLoading || !trackImei.trim()}
+            className="rounded bg-emerald-700 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-800 disabled:opacity-50 dark:bg-emerald-600 dark:hover:bg-emerald-700"
+            title="For each day in range (From 00:00:00 to To 23:59:59 inclusive): clear → fetch → save to apifeed → merge to tbl_tracking. Fills the day log table below."
+          >
+            {singleDeviceRunLoading && singleDeviceRunProgress
+              ? `Day ${singleDeviceRunProgress.currentDay}/${singleDeviceRunProgress.totalDays} (${singleDeviceRunProgress.dateLabel})…`
+              : singleDeviceRunLoading
+                ? 'Running…'
+                : 'Run import for range'}
           </button>
         </div>
         <p className="mb-2 text-xs text-zinc-500 dark:text-zinc-400">
-          Run in order: <strong>1 Fetch GPS</strong> (clear + get API, show table) → <strong>2 Save to database</strong> (tbl_apifeed) → <strong>3 Merge to tbl_tracking</strong>.
+          From/To inclusive (day 00:00:00 UTC to day 23:59:59 UTC). Single-day: <strong>1 Fetch GPS</strong> → <strong>2 Save</strong> → <strong>3 Merge</strong>. Range: use <strong>Run import for range</strong> to clear → fetch → save → merge each day and fill the table below.
         </p>
+        {singleDeviceRunProgress && (
+          <div className="mb-3 rounded border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm font-medium text-emerald-800 dark:border-emerald-800 dark:bg-emerald-900/25 dark:text-emerald-200">
+            Processing day <strong>{singleDeviceRunProgress.currentDay}</strong> of <strong>{singleDeviceRunProgress.totalDays}</strong>: <span className="font-mono">{singleDeviceRunProgress.dateLabel}</span>
+          </div>
+        )}
+        {singleDeviceDayLog.length > 0 && (
+          <div className="mb-4 rounded border border-zinc-200 bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-800/50">
+            <p className="border-b border-zinc-200 px-3 py-1.5 text-xs font-medium text-zinc-500 dark:border-zinc-700 dark:text-zinc-400">
+              Day log — API Date, API count, API FEED count, Tbl Tracking count; Largest gap (from API payload raw gpsTime) and From/To to find why tbl_tracking has gaps
+            </p>
+            <div className="overflow-x-auto">
+              <table className="w-full min-w-[880px] border-collapse text-sm">
+                <thead>
+                  <tr className="border-b border-zinc-200 bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-800">
+                    <th className="px-3 py-2 text-left font-medium text-zinc-700 dark:text-zinc-300">API Date</th>
+                    <th className="px-3 py-2 text-right font-medium text-zinc-700 dark:text-zinc-300">API count</th>
+                    <th className="px-3 py-2 text-right font-medium text-zinc-700 dark:text-zinc-300">API FEED Count</th>
+                    <th className="px-3 py-2 text-right font-medium text-zinc-700 dark:text-zinc-300">Tbl Tracking Count</th>
+                    <th className="px-3 py-2 text-right font-medium text-zinc-700 dark:text-zinc-300" title="Largest gap between consecutive points in API payload (minutes)">Largest Gap (min)</th>
+                    <th className="px-3 py-2 text-left font-medium text-zinc-700 dark:text-zinc-300" title="Last point before largest gap (raw gpsTime from API)">From</th>
+                    <th className="px-3 py-2 text-left font-medium text-zinc-700 dark:text-zinc-300" title="First point after largest gap (raw gpsTime from API)">To</th>
+                    <th className="px-3 py-2 text-left font-medium text-zinc-700 dark:text-zinc-300" title="Actual request URL sent (query params as sent)">Request URL</th>
+                    <th className="px-3 py-2 text-left font-medium text-zinc-700 dark:text-zinc-300">Raw payload</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {singleDeviceDayLog.map((row, idx) => (
+                    <tr key={idx} className="border-b border-zinc-100 dark:border-zinc-800">
+                      <td className="px-3 py-2 font-mono text-zinc-900 dark:text-zinc-100">{row.date}</td>
+                      <td className="px-3 py-2 text-right font-mono text-zinc-800 dark:text-zinc-200">{row.apiCount}</td>
+                      <td className="px-3 py-2 text-right font-mono text-zinc-800 dark:text-zinc-200">{row.apifeedCount}</td>
+                      <td className="px-3 py-2 text-right font-mono text-zinc-800 dark:text-zinc-200">{row.trackingCount}</td>
+                      <td className="px-3 py-2 text-right font-mono text-zinc-800 dark:text-zinc-200">
+                        {row.largestGapMinutes != null ? row.largestGapMinutes : '—'}
+                      </td>
+                      <td className="max-w-[180px] truncate px-3 py-2 font-mono text-xs text-zinc-700 dark:text-zinc-300" title={row.gapFrom ?? undefined}>
+                        {row.gapFrom ?? '—'}
+                      </td>
+                      <td className="max-w-[180px] truncate px-3 py-2 font-mono text-xs text-zinc-700 dark:text-zinc-300" title={row.gapTo ?? undefined}>
+                        {row.gapTo ?? '—'}
+                      </td>
+                      <td className="min-w-[420px] whitespace-nowrap px-3 py-2 font-mono text-xs text-zinc-700 dark:text-zinc-300">
+                        {row.apiRequestSummary}
+                      </td>
+                      <td className="px-3 py-2">
+                        {row.rawPayload != null ? (
+                          <button
+                            type="button"
+                            onClick={() => setSingleDeviceRawPayloadModal({ date: row.date, device: devices?.find((d) => d.imei === trackImei)?.deviceName ?? trackImei, payload: row.rawPayload! })}
+                            className="rounded border border-zinc-400 bg-white px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-100 dark:border-zinc-500 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700"
+                          >
+                            View raw
+                          </button>
+                        ) : (
+                          <span className="text-zinc-400 dark:text-zinc-500">—</span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+        {singleDeviceRawPayloadModal && (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="raw-payload-modal-title"
+            onClick={(e) => e.target === e.currentTarget && setSingleDeviceRawPayloadModal(null)}
+          >
+            <div
+              className="flex max-h-[90vh] w-full max-w-4xl flex-col overflow-hidden rounded-lg border border-zinc-200 bg-white shadow-xl dark:border-zinc-700 dark:bg-zinc-900"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="flex items-center justify-between border-b border-zinc-200 px-4 py-3 dark:border-zinc-700">
+                <h3 id="raw-payload-modal-title" className="text-lg font-medium text-zinc-900 dark:text-zinc-100">
+                  Raw API payload — {singleDeviceRawPayloadModal.date}, {singleDeviceRawPayloadModal.device}
+                </h3>
+                <button
+                  type="button"
+                  onClick={() => setSingleDeviceRawPayloadModal(null)}
+                  className="rounded p-1 text-zinc-500 hover:bg-zinc-100 hover:text-zinc-700 dark:hover:bg-zinc-800 dark:hover:text-zinc-300"
+                  aria-label="Close"
+                >
+                  ✕
+                </button>
+              </div>
+              <div className="min-h-0 flex-1 overflow-auto p-4">
+                <pre className="whitespace-pre-wrap break-all rounded border border-zinc-200 bg-zinc-50 p-3 font-mono text-xs text-zinc-800 dark:border-zinc-700 dark:bg-zinc-800/50 dark:text-zinc-200">
+                  {singleDeviceRawPayloadModal.payload}
+                </pre>
+              </div>
+            </div>
+          </div>
+        )}
         {clearDebug && (
           <div className="mb-4 rounded border-2 border-red-200 bg-red-50/90 p-3 dark:border-red-800 dark:bg-red-900/30">
             <p className="mb-2 text-sm font-bold text-red-900 dark:text-red-100">

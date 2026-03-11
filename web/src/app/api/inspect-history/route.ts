@@ -3,7 +3,7 @@ import { query, execute } from '@/lib/db';
 
 const MAX_HISTORY = 10;
 
-/** GET: Last 10 inspect history entries with job details from tbl_vworkjobs (for dropdown display and Inspect URL). */
+/** GET: Last 10 inspect history entries (one per job_id, most recent first) with job details from tbl_vworkjobs. */
 export async function GET() {
   try {
     const rows = await query<{
@@ -14,15 +14,20 @@ export async function GET() {
       actual_start_time: string | null;
       truck_id: string | null;
     }>(
-      `SELECT h.job_id,
-              v.delivery_winery,
-              v.vineyard_name,
-              v.worker,
-              to_char(v.actual_start_time, 'YYYY-MM-DD HH24:MI:SS') AS actual_start_time,
-              v.truck_id::text AS truck_id
-       FROM tbl_inspect_history h
-       LEFT JOIN tbl_vworkjobs v ON v.job_id::text = h.job_id
-       ORDER BY h.created_at DESC
+      `SELECT * FROM (
+         SELECT DISTINCT ON (h.job_id)
+                h.job_id,
+                v.delivery_winery,
+                v.vineyard_name,
+                v.worker,
+                to_char(v.actual_start_time, 'YYYY-MM-DD HH24:MI:SS') AS actual_start_time,
+                v.truck_id::text AS truck_id,
+                h.created_at
+         FROM tbl_inspect_history h
+         LEFT JOIN tbl_vworkjobs v ON v.job_id::text = h.job_id
+         ORDER BY h.job_id, h.created_at DESC
+       ) t
+       ORDER BY created_at DESC
        LIMIT ${MAX_HISTORY}`
     );
     return NextResponse.json({ entries: rows });

@@ -104,6 +104,12 @@ export async function GET(request: Request) {
       actual_start_time: (pick('actual_start_time', 'Actual_Start_Time') as string | null) ?? undefined,
       actual_end_time: (pick('actual_end_time', 'Actual_End_Time') as string | null) ?? undefined,
       step_5_completed_at: (pick('step_5_completed_at', 'Step_5_Completed_At') as string | null) ?? undefined,
+      step_1_completed_at: (pick('step_1_completed_at', 'Step_1_Completed_At') as string | null) ?? undefined,
+      step1oride: (pick('step1oride', 'Step1oride') as string | null) ?? undefined,
+      step2oride: (pick('step2oride', 'Step2oride') as string | null) ?? undefined,
+      step3oride: (pick('step3oride', 'Step3oride') as string | null) ?? undefined,
+      step4oride: (pick('step4oride', 'Step4oride') as string | null) ?? undefined,
+      step5oride: (pick('step5oride', 'Step5oride') as string | null) ?? undefined,
     };
 
     /** Use worker (tbl_vwork.worker = tbl_tracking.device_name) for GPS scan; fallback to request device. */
@@ -147,20 +153,34 @@ export async function GET(request: Request) {
             jobId,
           ]
         );
+        const step1Actual = result.step1 ?? (job.step_1_completed_at as string | null) ?? null;
+        const step1Via = result.step1Via ?? (result.step1ActualOverride != null ? 'RULE' : (result.step1 != null ? 'GPS' : 'VW'));
         await execute(
           `UPDATE tbl_vworkjobs SET
-            step_1_actual_time = COALESCE(step_1_gps_completed_at, step_1_completed_at),
-            step_1_via = CASE WHEN step_1_gps_completed_at IS NOT NULL THEN 'GPS' ELSE 'VW' END,
-            step_2_actual_time = COALESCE(step_2_gps_completed_at, step_2_completed_at),
-            step_2_via = CASE WHEN step_2_gps_completed_at IS NOT NULL THEN 'GPS' ELSE 'VW' END,
-            step_3_actual_time = COALESCE(step_3_gps_completed_at, step_3_completed_at),
-            step_3_via = CASE WHEN step_3_gps_completed_at IS NOT NULL THEN 'GPS' ELSE 'VW' END,
-            step_4_actual_time = COALESCE(step_4_gps_completed_at, step_4_completed_at),
-            step_4_via = CASE WHEN step_4_gps_completed_at IS NOT NULL THEN 'GPS' ELSE 'VW' END,
-            step_5_actual_time = COALESCE(step_5_gps_completed_at, step_5_completed_at),
-            step_5_via = CASE WHEN step_5_gps_completed_at IS NOT NULL THEN 'GPS' ELSE 'VW' END
-          WHERE job_id::text = $1`,
-          [jobId]
+            step_1_actual_time = $1::timestamp,
+            step_1_via = $2,
+            step_2_actual_time = $3::timestamp,
+            step_2_via = $4,
+            step_3_actual_time = $5::timestamp,
+            step_3_via = $6,
+            step_4_actual_time = $7::timestamp,
+            step_4_via = $8,
+            step_5_actual_time = $9::timestamp,
+            step_5_via = $10
+          WHERE job_id::text = $11`,
+          [
+            step1Actual,
+            step1Via,
+            result.step2 ?? null,
+            result.step2Via ?? 'VW',
+            result.step3 ?? null,
+            result.step3Via ?? 'VW',
+            result.step4 ?? null,
+            result.step4Via ?? 'VW',
+            result.step5 ?? null,
+            result.step5Via ?? 'VW',
+            jobId,
+          ]
         );
         try {
           await execute(

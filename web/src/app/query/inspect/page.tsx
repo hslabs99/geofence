@@ -44,6 +44,19 @@ function normalizeForCompare(v: unknown): string | null {
   return null;
 }
 
+/** Minutes from prev to curr (curr - prev). Inspect UI only; returns null if either missing. */
+function minutesBetweenInspect(prev: unknown, curr: unknown): number | null {
+  const a = normalizeForCompare(prev);
+  const b = normalizeForCompare(curr);
+  if (!a || !b) return null;
+  const ma = a.match(/^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2}):(\d{2})/);
+  const mb = b.match(/^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2}):(\d{2})/);
+  if (!ma || !mb) return null;
+  const msA = Date.UTC(Number(ma[1]), Number(ma[2]) - 1, Number(ma[3]), Number(ma[4]), Number(ma[5]), Number(ma[6]));
+  const msB = Date.UTC(Number(mb[1]), Number(mb[2]) - 1, Number(mb[3]), Number(mb[4]), Number(mb[5]), Number(mb[6]));
+  return Math.round((msB - msA) / 60000);
+}
+
 function compare(a: unknown, b: unknown, col: string): number {
   const va = a == null ? '' : a;
   const vb = b == null ? '' : b;
@@ -125,6 +138,12 @@ function InspectContent() {
   const [refetchStepsRunning, setRefetchStepsRunning] = useState(false);
   const [retagAndRefetchRunning, setRetagAndRefetchRunning] = useState(false);
   const [trackingRefreshKey, setTrackingRefreshKey] = useState(0);
+  /** Manual overrides (oride) per step + comment; synced from selectedRow when it changes. */
+  const [stepOverrides, setStepOverrides] = useState<{ step1oride: string; step2oride: string; step3oride: string; step4oride: string; step5oride: string }>({
+    step1oride: '', step2oride: '', step3oride: '', step4oride: '', step5oride: '',
+  });
+  const [steporidecomment, setSteporidecomment] = useState('');
+  const [saveOverridesStatus, setSaveOverridesStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const apiColumns = useMemo(
     () => (rows.length > 0 ? Object.keys(rows[0]) : []),
     [rows],
@@ -287,8 +306,24 @@ function InspectContent() {
       .catch(() => setGpsMappings([]));
   }, []);
 
+  /** Initial load: when we have locateJobId + actualFrom/actualTo, fetch the full date range so the job is in the result set. */
+  const initialFetchQuery = (() => {
+    const locate = searchParams.get('locateJobId') ?? searchParams.get('jobId');
+    const from = searchParams.get('actualFrom') ?? '';
+    const to = searchParams.get('actualTo') ?? '';
+    const fromOk = /^\d{4}-\d{2}-\d{2}$/.test(from);
+    const toOk = /^\d{4}-\d{2}-\d{2}$/.test(to);
+    if (locate && fromOk && toOk) {
+      return `dateFrom=${encodeURIComponent(from)}&dateTo=${encodeURIComponent(to)}`;
+    }
+    if (locate && fromOk) return `dateFrom=${encodeURIComponent(from)}&dateTo=${encodeURIComponent(from)}`;
+    if (locate && toOk) return `dateFrom=${encodeURIComponent(to)}&dateTo=${encodeURIComponent(to)}`;
+    return null;
+  })();
+
   useEffect(() => {
-    fetch('/api/vworkjobs')
+    const url = initialFetchQuery ? `/api/vworkjobs?${initialFetchQuery}` : '/api/vworkjobs';
+    fetch(url)
       .then(async (res) => {
         const data = await res.json();
         if (!res.ok) {
@@ -304,7 +339,7 @@ function InspectContent() {
       })
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false));
-  }, []);
+  }, [initialFetchQuery]);
 
   const refetchVworkJobs = useCallback((): Promise<void> => {
     return fetch('/api/vworkjobs')
@@ -477,22 +512,32 @@ function InspectContent() {
     }).catch(() => {});
   }, [paramToLocate]);
 
-  /** Only apply URL job selection on first load; don't re-apply after refetch so user can move around and retag without jumping back. */
-  const appliedLocateParamRef = useRef<string | null>(null);
+  /** When user manually clicks a different row (not the located job), stop re-applying locate on sortedRows changes. */
+  const userClearedLocateRef = useRef(false);
   useEffect(() => {
-    if (!paramToLocate || sortedRows.length === 0) return;
-    if (appliedLocateParamRef.current === paramToLocate) return;
-    const idx = sortedRows.findIndex((r) => String(r.job_id ?? '') === paramToLocate.trim());
+    if (!paramToLocate) userClearedLocateRef.current = false;
+  }, [paramToLocate]);
+
+  /** Hyperlink arrival: apply filters first (URL effect above), then after data + sort are ready, locate the job. Re-run whenever sortedRows changes so when sort/column config loads we re-locate; stop once user has selected a different row. */
+  useEffect(() => {
+    if (!paramToLocate || loading || sortedRows.length === 0 || userClearedLocateRef.current) return;
+    const want = paramToLocate.trim();
+    const idx = sortedRows.findIndex((r) => String(r.job_id ?? '').trim() === want);
     if (idx >= 0) {
       setSelectedRowIndex(idx);
-      appliedLocateParamRef.current = paramToLocate;
     }
-  }, [paramToLocate, sortedRows]);
+  }, [paramToLocate, loading, sortedRows]);
 
+  /** Scroll to the located job row once it's rendered (paramToLocate = locateJobId or jobId from URL). */
   useEffect(() => {
-    if (!locateJobIdParam || selectedRowIndex < 0) return;
-    selectedRowRef.current?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
-  }, [locateJobIdParam, selectedRowIndex]);
+    if (!paramToLocate || selectedRowIndex < 0) return;
+    const selectedRowForScroll = sortedRows[selectedRowIndex];
+    if (!selectedRowForScroll || String(selectedRowForScroll.job_id ?? '').trim() !== paramToLocate.trim()) return;
+    const raf = requestAnimationFrame(() => {
+      selectedRowRef.current?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [paramToLocate, selectedRowIndex, sortedRows]);
 
   const STEP_ROWS = [
     { nameKey: 'step_1_name', completedKey: 'step_1_completed_at', actualTimeKey: 'step_1_actual_time' },
@@ -501,6 +546,23 @@ function InspectContent() {
     { nameKey: 'step_4_name', completedKey: 'step_4_completed_at', actualTimeKey: 'step_4_actual_time' },
     { nameKey: 'step_5_name', completedKey: 'step_5_completed_at', actualTimeKey: 'step_5_actual_time' },
   ] as const;
+
+  /** Sync override state from selected job (from API/DB). */
+  useEffect(() => {
+    if (!selectedRow) return;
+    const raw = (key: string) => {
+      const v = selectedRow[key] ?? (selectedRow as Row)[key];
+      return v != null && v !== '' ? String(v).trim() : '';
+    };
+    setStepOverrides({
+      step1oride: raw('step1oride'),
+      step2oride: raw('step2oride'),
+      step3oride: raw('step3oride'),
+      step4oride: raw('step4oride'),
+      step5oride: raw('step5oride'),
+    });
+    setSteporidecomment(raw('steporidecomment'));
+  }, [selectedRow?.job_id]);
 
   const vineyardName = selectedRow ? String(selectedRow.vineyard_name ?? '') : '';
   const deliveryWinery = selectedRow ? String(selectedRow.delivery_winery ?? '') : '';
@@ -514,6 +576,38 @@ function InspectContent() {
   const actualEndTime = selectedRow
     ? String(selectedRow.actual_end_time ?? selectedRow.gps_end_time ?? '')
     : '';
+
+  const vineyardTrim = (vineyardName ?? '').trim();
+  const wineryTrim = (deliveryWinery ?? '').trim();
+
+  /** All rows in tbl_gpsmappings that match this job's vineyard or winery (vwname or gpsname match; trimmed). */
+  const relevantMappings = useMemo(() => {
+    const out: { type: string; vwname: string; gpsname: string }[] = [];
+    for (const m of gpsMappings) {
+      const vw = (m.vwname ?? '').trim();
+      const gps = (m.gpsname ?? '').trim();
+      if (m.type === 'Vineyard' && vineyardTrim && (vw === vineyardTrim || gps === vineyardTrim)) {
+        out.push(m);
+      } else if (m.type === 'Winery' && wineryTrim && (vw === wineryTrim || gps === wineryTrim)) {
+        out.push(m);
+      }
+    }
+    return out;
+  }, [gpsMappings, vineyardTrim, wineryTrim]);
+
+  /** All fence names for SQL IN: every vwname and gpsname from relevant mappings, plus job vineyard/winery when no mapping. */
+  const fenceNamesForInClause = useMemo(() => {
+    const set = new Set<string>();
+    for (const m of relevantMappings) {
+      const vw = (m.vwname ?? '').trim();
+      const gps = (m.gpsname ?? '').trim();
+      if (vw) set.add(vw);
+      if (gps) set.add(gps);
+    }
+    if (vineyardTrim && !relevantMappings.some((m) => m.type === 'Vineyard')) set.add(vineyardTrim);
+    if (wineryTrim && !relevantMappings.some((m) => m.type === 'Winery')) set.add(wineryTrim);
+    return [...set].filter(Boolean);
+  }, [relevantMappings, vineyardTrim, wineryTrim]);
 
   /** Extract YYYY-MM-DD from job's actual_start_time (or similar timestamp) for tagging. */
   const jobDateForTagging = useMemo(() => {
@@ -609,6 +703,7 @@ function InspectContent() {
     if (positionBefore) {
       params.set('positionBefore', positionBefore);
     }
+    // Display: do not filter by job/mapping geofences — show all device movement in the time window. Steps logic (refetch, derived-steps) still uses job + mappings and is unchanged.
     const effectiveView = useOverride ? 'raw' : trackingTableView;
     if (effectiveView === 'entry_exit') {
       params.set('geofenceFilter', 'entry_or_exit');
@@ -652,34 +747,6 @@ function InspectContent() {
     setTrackingRefreshKey((k) => k + 1);
   }, [actualEndTime, endPlusMinutes]);
 
-  const relevantMappings = useMemo(() => {
-    const out: { type: string; vwname: string; gpsname: string }[] = [];
-    for (const m of gpsMappings) {
-      const vw = (m.vwname ?? '').trim();
-      const gps = (m.gpsname ?? '').trim();
-      if (m.type === 'Vineyard' && vineyardName && (vw === vineyardName || gps === vineyardName)) {
-        out.push(m);
-      } else if ((m.type === 'Winery') && deliveryWinery && (vw === deliveryWinery || gps === deliveryWinery)) {
-        out.push(m);
-      }
-    }
-    return out;
-  }, [gpsMappings, vineyardName, deliveryWinery]);
-
-  /** Names for IN: all gpsnames from mappings + original name when no mapping (direct). Vineyards and wineries may have 0, 1, or many mappings. */
-  const fenceNamesForInClause = useMemo(() => {
-    const vineyardMappings = relevantMappings.filter((m) => m.type === 'Vineyard');
-    const wineryMappings = relevantMappings.filter((m) => m.type === 'Winery');
-    const vineyardNames = vineyardMappings.length
-      ? vineyardMappings.map((m) => (m.gpsname ?? '').trim()).filter(Boolean)
-      : (vineyardName ? [vineyardName.trim()].filter(Boolean) : []);
-    const wineryNames = wineryMappings.length
-      ? wineryMappings.map((m) => (m.gpsname ?? '').trim()).filter(Boolean)
-      : (deliveryWinery ? [deliveryWinery.trim()].filter(Boolean) : []);
-    const names = [...new Set([...vineyardNames, ...wineryNames])].filter(Boolean);
-    return names;
-  }, [relevantMappings, vineyardName, deliveryWinery]);
-
   /** SQL WHERE fragment (text only, for later use): fence_name IN ('mapA','mapB',...) including direct (original) names when no mapping. */
   const mappingFenceNameInClause = useMemo(() => {
     if (fenceNamesForInClause.length === 0) return '';
@@ -687,7 +754,7 @@ function InspectContent() {
     return `fence_name IN (${escaped.join(', ')})`;
   }, [fenceNamesForInClause]);
 
-  /** One row per mapping (or one per type when no mapping — direct). So multiple Winery mappings show as multiple rows. */
+  /** One row per mapping (or one per type when no mapping — direct). Multiple Vineyard/Winery mappings each get a row. */
   const mappingTableRows = useMemo(() => {
     const vineyardMappings = relevantMappings.filter((m) => m.type === 'Vineyard');
     const wineryMappings = relevantMappings.filter((m) => m.type === 'Winery');
@@ -695,21 +762,21 @@ function InspectContent() {
     if (vineyardMappings.length) {
       vineyardMappings.forEach((m) => {
         const gps = (m.gpsname ?? '').trim();
-        rows.push({ type: 'Vineyard', original: vineyardName || '—', result: gps || '—', toUse: gps || vineyardName || '—' });
+        rows.push({ type: 'Vineyard', original: vineyardTrim || '—', result: gps || '—', toUse: gps || vineyardTrim || '—' });
       });
-    } else if (vineyardName) {
-      rows.push({ type: 'Vineyard', original: vineyardName, result: '—', toUse: vineyardName });
+    } else if (vineyardTrim) {
+      rows.push({ type: 'Vineyard', original: vineyardTrim, result: '—', toUse: vineyardTrim });
     }
     if (wineryMappings.length) {
       wineryMappings.forEach((m) => {
         const gps = (m.gpsname ?? '').trim();
-        rows.push({ type: 'Winery', original: deliveryWinery || '—', result: gps || '—', toUse: gps || deliveryWinery || '—' });
+        rows.push({ type: 'Winery', original: wineryTrim || '—', result: gps || '—', toUse: gps || wineryTrim || '—' });
       });
-    } else if (deliveryWinery) {
-      rows.push({ type: 'Winery', original: deliveryWinery, result: '—', toUse: deliveryWinery });
+    } else if (wineryTrim) {
+      rows.push({ type: 'Winery', original: wineryTrim, result: '—', toUse: wineryTrim });
     }
     return rows;
-  }, [relevantMappings, vineyardName, deliveryWinery]);
+  }, [relevantMappings, vineyardTrim, wineryTrim]);
 
   const [sortSaveStatus, setSortSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const saveSortColumns = (cols: [string, string, string]) => {
@@ -755,15 +822,29 @@ function InspectContent() {
     return String(v);
   }, []);
 
-  /** GPS table: format enter_time, outer_time as dd/mm/yy hh:mm:ss (same as vwork grid), no time adjustment. */
+  /** GPS table: format enter_time, outer_time as dd/mm/yy hh:mm:ss (same as vwork grid), no time adjustment. Lat/lon as number. */
   const formatGpsCell = useCallback((v: unknown): string => {
     if (v == null || v === '') return '—';
     if (isIsoDateString(v)) return formatDateNZ(String(v));
+    if (typeof v === 'number' && !Number.isNaN(v)) return String(v);
     return String(v);
   }, []);
 
   const TRACKING_DATE_COLS = new Set(['position_time', 'position_time_nz']);
-  const TRACKING_DISPLAY_COLUMNS = ['device_name', 'fence_name', 'geofence_type', 'position_time_nz', 'position_time'] as const;
+  const TRACKING_DISPLAY_COLUMNS = ['device_name', 'fence_name', 'geofence_type', 'position_time_nz', 'position_time', 'lat', 'lon'] as const;
+
+  /** Haversine distance in meters between two WGS84 (lat, lon) points. Returns null if either point is invalid. */
+  const haversineMeters = useCallback((lat1: number, lon1: number, lat2: number, lon2: number): number | null => {
+    if (!Number.isFinite(lat1) || !Number.isFinite(lon1) || !Number.isFinite(lat2) || !Number.isFinite(lon2)) return null;
+    const R = 6371000;
+    const dLat = ((lat2 - lat1) * Math.PI) / 180;
+    const dLon = ((lon2 - lon1) * Math.PI) / 180;
+    const a =
+      Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+      Math.cos((lat1 * Math.PI) / 180) * Math.cos((lat2 * Math.PI) / 180) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    return R * c;
+  }, []);
   const sortedTrackingRows = useMemo(() => {
     const cols = trackingSortCol ? [trackingSortCol] : [];
     if (cols.length === 0) return trackingRows;
@@ -1058,7 +1139,13 @@ function InspectContent() {
                   <tr
                     key={i}
                     ref={i === selectedRowIndex ? selectedRowRef : undefined}
-                    onClick={() => setSelectedRowIndex(i)}
+                    onClick={() => {
+                      setSelectedRowIndex(i);
+                      const jobId = String(row.job_id ?? '').trim();
+                      if (paramToLocate && jobId !== paramToLocate.trim()) {
+                        userClearedLocateRef.current = true;
+                      }
+                    }}
                     className={`cursor-pointer border-b border-zinc-100 dark:border-zinc-800 hover:bg-zinc-50 dark:hover:bg-zinc-800/50 ${selectedRowIndex === i ? 'bg-blue-100 dark:bg-blue-900/40' : ''}`}
                   >
                     {columns.map((col) => (
@@ -1099,9 +1186,9 @@ function InspectContent() {
                 </button>
               </div>
             </div>
-            <table className="w-full min-w-[48rem] text-left text-sm table-fixed">
+            <table className="w-full min-w-[56rem] text-left text-sm table-fixed">
               <colgroup>
-                <col style={{ width: '14rem' }} /><col style={{ width: '12rem' }} /><col style={{ width: '6rem' }} /><col style={{ width: '6rem' }} /><col style={{ width: '12rem' }} /><col style={{ width: '5rem' }} />
+                <col style={{ width: '14rem' }} /><col style={{ width: '12rem' }} /><col style={{ width: '6rem' }} /><col style={{ width: '6rem' }} /><col style={{ width: '14rem' }} /><col style={{ width: '12rem' }} /><col style={{ width: '5rem' }} />
               </colgroup>
               <thead>
                 <tr className="border-b border-zinc-200 dark:border-zinc-700">
@@ -1110,21 +1197,24 @@ function InspectContent() {
                   </th>
                   <th className="px-2 py-1.5 font-medium text-zinc-500">GPS Step Data</th>
                   <th className="px-2 py-1.5 font-medium text-zinc-500">GPS Row</th>
+                  <th className="px-2 py-1.5 font-medium text-zinc-500">Manual Overrides</th>
                   <th className="px-2 py-1.5 font-medium text-zinc-500">Final Step Data</th>
                   <th className="px-2 py-1.5 font-medium text-zinc-500">Details</th>
                 </tr>
                 <tr className="border-b border-zinc-200 dark:border-zinc-700">
                   <th className="px-2 py-1.5 font-medium text-zinc-500">Step Name</th>
                   <th className="px-2 py-1.5 font-medium text-zinc-500">Step Completed</th>
+                  <th className="px-2 py-1.5 font-medium text-zinc-500">Step Completed</th>
                   <th className="px-2 py-1.5 font-medium text-zinc-500">—</th>
-                  <th className="px-2 py-1.5 font-medium text-zinc-500">—</th>
-                  <th className="px-2 py-1.5 font-medium text-zinc-500">—</th>
+                  <th className="px-2 py-1.5 font-medium text-zinc-500">Step Completed</th>
+                  <th className="px-2 py-1.5 font-medium text-zinc-500">Step Completed</th>
                   <th className="px-2 py-1.5 font-medium text-zinc-500">—</th>
                 </tr>
               </thead>
               <tbody>
                 {STEP_ROWS.map(({ nameKey, completedKey, actualTimeKey }, i) => {
                   const n = i + 1;
+                  const orideKey = `step${n}oride` as keyof typeof stepOverrides;
                   const gpsCompletedKey = `step_${n}_gps_completed_at` as keyof Row;
                   const gpsCompletedKeyAlt = `Step_${n}_GPS_completed_at` as keyof Row;
                   const gpsIdKey = `step${n}_gps_id` as keyof Row;
@@ -1133,8 +1223,11 @@ function InspectContent() {
                   const gpsStepDisplay = gpsStepValue != null && gpsStepValue !== '' ? formatDateNZ(String(gpsStepValue)) : '—';
                   const gpsRowId = selectedRow?.[gpsIdKey] ?? selectedRow?.[gpsIdKeyAlt];
                   const gpsRowDisplay = gpsRowId != null && gpsRowId !== '' ? String(gpsRowId) : '—';
-                  let finalValue: unknown = selectedRow?.[actualTimeKey] ?? selectedRow?.[completedKey];
-                  if (n === 5 && selectedRow) {
+                  const vworkValue = selectedRow?.[completedKey];
+                  const orideValue = stepOverrides[orideKey] ?? '';
+                  /** Final = oride if set, else existing actual/completed logic. */
+                  let finalValue: unknown = orideValue ? orideValue : (selectedRow?.[actualTimeKey] ?? selectedRow?.[completedKey]);
+                  if (n === 5 && selectedRow && !orideValue) {
                     const vworkStep5 = selectedRow.step_5_completed_at ?? selectedRow.Step_5_completed_at;
                     if (gpsStepValue != null && gpsStepValue !== '' && vworkStep5 != null && vworkStep5 !== '') {
                       const gpsNorm = normalizeForCompare(gpsStepValue);
@@ -1149,6 +1242,24 @@ function InspectContent() {
                   const gpsClickable = gpsStepValue != null && gpsStepValue !== '';
                   const finalClickable = finalValue != null && finalValue !== '';
                   const clickableClass = 'cursor-pointer underline decoration-dotted hover:bg-zinc-100 dark:hover:bg-zinc-800';
+                  /** Previous step values for minutes (only when n >= 2). */
+                  const vworkPrev = n >= 2 ? (selectedRow?.[`step_${n - 1}_completed_at`] ?? selectedRow?.[`Step_${n - 1}_completed_at`]) : null;
+                  const gpsPrev = n >= 2 ? (selectedRow?.[`step_${n - 1}_gps_completed_at`] ?? selectedRow?.[`Step_${n - 1}_GPS_completed_at`]) : null;
+                  const oridePrev = n >= 2 ? (stepOverrides[`step${n - 1}oride` as keyof typeof stepOverrides] ?? '') : '';
+                  const prevFinalVal = n >= 2 ? (oridePrev || (selectedRow?.[`step_${n - 1}_actual_time`] ?? selectedRow?.[`step_${n - 1}_completed_at`] ?? selectedRow?.[`Step_${n - 1}_actual_time`] ?? selectedRow?.[`Step_${n - 1}_completed_at`])) : null;
+                  const vworkMins = n >= 2 ? minutesBetweenInspect(vworkPrev, vworkValue) : null;
+                  const gpsMins = n >= 2 ? minutesBetweenInspect(gpsPrev, gpsStepValue) : null;
+                  const orideMins = n >= 2 ? minutesBetweenInspect(oridePrev || null, orideValue || null) : null;
+                  const finalMins = n >= 2 ? minutesBetweenInspect(prevFinalVal, finalValue) : null;
+                  /** To datetime-local value YYYY-MM-DDTHH:mm from timestamp string. */
+                  const toDatetimeLocal = (v: unknown): string => {
+                    if (v == null || v === '') return '';
+                    const s = String(v).trim().replace(/\s+(?:GMT|UTC)[+-]\d{3,4}.*$/i, '').trim();
+                    const m = s.match(/^(\d{4})-(\d{2})-(\d{2})[T\s](\d{2})?:?(\d{2})?/);
+                    if (!m) return '';
+                    return `${m[1]}-${m[2]}-${m[3]}T${(m[4] ?? '00').padStart(2, '0')}:${(m[5] ?? '00').padStart(2, '0')}`;
+                  };
+                  const fromDatetimeLocal = (v: string): string => (v ? `${v.replace('T', ' ')}:00` : '');
                   return (
                   <tr key={i} className="border-b border-zinc-100 dark:border-zinc-800">
                     <td className="whitespace-nowrap px-2 py-1.5 text-zinc-700 dark:text-zinc-300">
@@ -1159,27 +1270,135 @@ function InspectContent() {
                       onClick={vworkClickable ? () => focusGpsOnStepTime(selectedRow![completedKey]) : undefined}
                       title={vworkClickable ? 'Show GPS raw around this time (step −2 min to job end +60)' : undefined}
                     >
-                      {selectedRow ? formatCell(selectedRow[completedKey]) : '—'}
+                      <span className="inline-flex items-baseline gap-1.5">
+                        {selectedRow ? formatCell(selectedRow[completedKey]) : '—'}
+                        {vworkMins != null && <span className="text-xs text-zinc-500 dark:text-zinc-400 tabular-nums">{vworkMins} min</span>}
+                      </span>
                     </td>
                     <td
                       className={`whitespace-nowrap px-2 py-1.5 text-zinc-400 dark:text-zinc-500 ${gpsClickable ? clickableClass : ''}`}
                       onClick={gpsClickable ? () => focusGpsOnStepTime(gpsStepValue) : undefined}
                       title={gpsClickable ? 'Show GPS raw around this time (step −2 min to job end +60)' : undefined}
                     >
-                      {gpsStepDisplay}
+                      <span className="inline-flex items-baseline gap-1.5">
+                        {gpsStepDisplay}
+                        {gpsMins != null && <span className="text-xs text-zinc-500 dark:text-zinc-400 tabular-nums">{gpsMins} min</span>}
+                      </span>
                     </td>
                     <td className="whitespace-nowrap px-2 py-1.5 text-zinc-400 dark:text-zinc-500 font-mono text-xs" title={gpsRowId != null && gpsRowId !== '' ? `tbl_tracking.id = ${gpsRowId}` : undefined}>{gpsRowDisplay}</td>
+                    <td className="whitespace-nowrap px-2 py-1.5">
+                      <div className="flex flex-wrap items-center gap-1">
+                        <div className="flex items-center gap-1.5">
+                          <input
+                            type="datetime-local"
+                            value={orideValue ? toDatetimeLocal(orideValue) : ''}
+                            onChange={(e) => setStepOverrides((prev) => ({ ...prev, [orideKey]: fromDatetimeLocal(e.target.value) }))}
+                            className={`w-[10.8rem] rounded border px-1.5 py-0.5 text-xs ${orideValue ? 'border-zinc-400 bg-white text-zinc-900 font-semibold dark:border-zinc-500 dark:bg-zinc-800 dark:text-zinc-100' : 'border-zinc-200 bg-zinc-50 text-zinc-400 placeholder:text-zinc-400 dark:border-zinc-600 dark:bg-zinc-800/50 dark:text-zinc-500 dark:placeholder:text-zinc-500'}`}
+                            title="Manual override for this step"
+                          />
+                          {orideMins != null && <span className="text-xs text-zinc-500 dark:text-zinc-400 tabular-nums whitespace-nowrap">{orideMins} min</span>}
+                        </div>
+                        <span className="flex gap-0.5">
+                          <button
+                            type="button"
+                            onClick={() => setStepOverrides((prev) => ({ ...prev, [orideKey]: vworkValue != null && vworkValue !== '' ? String(vworkValue).trim().slice(0, 19) : '' }))}
+                            className="rounded border border-zinc-300 bg-zinc-100 px-1.5 py-0.5 text-xs font-medium text-zinc-700 hover:bg-zinc-200 dark:border-zinc-600 dark:bg-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-600"
+                            title="Copy from Vwork"
+                          >
+                            V
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setStepOverrides((prev) => ({ ...prev, [orideKey]: gpsStepValue != null && gpsStepValue !== '' ? String(gpsStepValue).trim().slice(0, 19) : '' }))}
+                            className="rounded border border-zinc-300 bg-zinc-100 px-1.5 py-0.5 text-xs font-medium text-zinc-700 hover:bg-zinc-200 dark:border-zinc-600 dark:bg-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-600"
+                            title="Copy from GPS"
+                          >
+                            G
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setStepOverrides((prev) => ({ ...prev, [orideKey]: '' }))}
+                            className="rounded border border-zinc-300 bg-zinc-100 px-1.5 py-0.5 text-xs font-medium text-zinc-700 hover:bg-zinc-200 dark:border-zinc-600 dark:bg-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-600"
+                            title="Clear override"
+                          >
+                            X
+                          </button>
+                        </span>
+                      </div>
+                    </td>
                     <td
-                      className={`whitespace-nowrap px-2 py-1.5 text-zinc-700 dark:text-zinc-300 ${finalClickable ? clickableClass : ''}`}
+                      className={`whitespace-nowrap px-2 py-1.5 ${finalValue != null && finalValue !== '' ? 'font-semibold text-zinc-900 dark:text-zinc-100' : 'text-zinc-400 dark:text-zinc-500'} ${finalClickable ? clickableClass : ''}`}
                       onClick={finalClickable ? () => focusGpsOnStepTime(finalValue) : undefined}
                       title={finalClickable ? 'Show GPS raw around this time (step −2 min to job end +60)' : undefined}
                     >
-                      {finalDisplay}
+                      <span className="inline-flex items-baseline gap-1.5">
+                        {finalDisplay}
+                        {finalMins != null && <span className="text-xs text-zinc-500 dark:text-zinc-400 tabular-nums">{finalMins} min</span>}
+                      </span>
                     </td>
                     <td className="whitespace-nowrap px-2 py-1.5 text-zinc-400 dark:text-zinc-500">—</td>
                   </tr>
                 );})}
               </tbody>
+              <tfoot>
+                <tr>
+                  <td colSpan={4} className="px-2 py-1.5" />
+                  <td className="align-top px-2 py-1.5">
+                    <label className="mb-1 block text-xs font-medium text-zinc-500">Comment (what you changed)</label>
+                    <textarea
+                      value={steporidecomment}
+                      onChange={(e) => setSteporidecomment(e.target.value)}
+                      placeholder="Optional note about manual overrides…"
+                      rows={2}
+                      className="mb-2 w-full min-w-[12rem] rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+                    />
+                    <button
+                      type="button"
+                      disabled={!selectedRow?.job_id || saveOverridesStatus === 'saving'}
+                      onClick={async () => {
+                        if (!selectedRow?.job_id) return;
+                        setSaveOverridesStatus('saving');
+                        try {
+                          const res = await fetch('/api/vworkjobs/step-overrides', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                              job_id: String(selectedRow.job_id),
+                              step1oride: stepOverrides.step1oride || null,
+                              step2oride: stepOverrides.step2oride || null,
+                              step3oride: stepOverrides.step3oride || null,
+                              step4oride: stepOverrides.step4oride || null,
+                              step5oride: stepOverrides.step5oride || null,
+                              steporidecomment: steporidecomment || null,
+                            }),
+                          });
+                          if (!res.ok) {
+                            const data = await res.json().catch(() => ({}));
+                            throw new Error(data?.error ?? res.statusText);
+                          }
+                          // Re-run steps so actuals/via update (e.g. when orides cleared, Summary shows GPS/VW not ORIDE).
+                          await runFetchStepsForJobs({
+                            jobs: [selectedRow],
+                            startLessMinutes,
+                            endPlusMinutes,
+                          });
+                          await refetchVworkJobs();
+                          setSaveOverridesStatus('saved');
+                        } catch (e) {
+                          setSaveOverridesStatus('error');
+                          console.error('[Save step overrides]', e);
+                        } finally {
+                          setTimeout(() => setSaveOverridesStatus('idle'), 2000);
+                        }
+                      }}
+                      className="w-fit rounded bg-green-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-green-700 disabled:opacity-50 dark:bg-green-700 dark:hover:bg-green-600"
+                    >
+                      {saveOverridesStatus === 'saving' ? 'Saving…' : saveOverridesStatus === 'saved' ? 'Saved ✓' : saveOverridesStatus === 'error' ? 'Save failed' : 'Save'}
+                    </button>
+                  </td>
+                  <td colSpan={2} className="px-2 py-1.5" />
+                </tr>
+              </tfoot>
             </table>
             <div className="mt-4 rounded border border-zinc-200 bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-800/50">
               <div className="border-b border-zinc-200 px-3 py-2 text-sm font-medium text-zinc-700 dark:border-zinc-700 dark:text-zinc-300">
@@ -1411,18 +1630,52 @@ function InspectContent() {
                                 {formatColumnLabel(col)}
                               </th>
                             ))}
+                            <th className="whitespace-nowrap px-2 py-1.5 font-medium text-zinc-700 dark:text-zinc-300">
+                              Distance (m)
+                            </th>
+                            <th className="whitespace-nowrap px-2 py-1.5 font-medium text-zinc-700 dark:text-zinc-300">
+                              Map
+                            </th>
                           </tr>
                         </thead>
                         <tbody>
-                          {sortedTrackingRows.map((row, i) => (
+                          {sortedTrackingRows.map((row, i) => {
+                            const lat = row.lat != null ? Number(row.lat) : NaN;
+                            const lon = row.lon != null ? Number(row.lon) : NaN;
+                            const hasCoords = !Number.isNaN(lat) && !Number.isNaN(lon);
+                            const prev = i > 0 ? sortedTrackingRows[i - 1] : null;
+                            const prevLat = prev && prev.lat != null ? Number(prev.lat) : NaN;
+                            const prevLon = prev && prev.lon != null ? Number(prev.lon) : NaN;
+                            const distanceM = prev && Number.isFinite(prevLat) && Number.isFinite(prevLon) && hasCoords
+                              ? haversineMeters(prevLat, prevLon, lat, lon)
+                              : null;
+                            return (
                             <tr key={i} className="border-t border-zinc-100 dark:border-zinc-800">
                               {TRACKING_DISPLAY_COLUMNS.map((col) => (
                                 <td key={col} className="whitespace-nowrap px-2 py-1.5 text-zinc-600 dark:text-zinc-400">
                                   {formatGpsCell(row[col])}
                                 </td>
                               ))}
+                              <td className="whitespace-nowrap px-2 py-1.5 text-zinc-600 dark:text-zinc-400 tabular-nums">
+                                {distanceM != null ? `${Math.round(distanceM)}` : '—'}
+                              </td>
+                              <td className="whitespace-nowrap px-2 py-1.5">
+                                {hasCoords ? (
+                                  <a
+                                    href={`https://www.google.com/maps?q=${lat},${lon}`}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="text-blue-600 underline hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300"
+                                  >
+                                    View
+                                  </a>
+                                ) : (
+                                  <span className="text-zinc-400">—</span>
+                                )}
+                              </td>
                             </tr>
-                          ))}
+                            );
+                          })}
                         </tbody>
                       </table>
                     </div>
@@ -1435,9 +1688,10 @@ function InspectContent() {
                 const totalEnd = endPlusMinutes + displayExpandAfter;
                 const after = addMinutesToTimestampAsNZ(actualStartTime.trim(), -totalStart);
                 const before = actualEndTime.trim() ? addMinutesToTimestampAsNZ(actualEndTime.trim(), totalEnd) : null;
-                let where = `t.device_name='${String(deviceForTracking).replace(/'/g, "''")}' AND t.position_time_nz>'${after.replace(/'/g, "''")}'`;
-                if (before) where += ` AND t.position_time_nz<'${before.replace(/'/g, "''")}'`;
-                return `SELECT t.id, t.device_name, g.fence_name, t.geofence_type, t.position_time_nz, t.position_time FROM tbl_tracking t LEFT JOIN tbl_geofences g ON g.fence_id = t.geofence_id WHERE ${where} ORDER BY t.position_time_nz ASC LIMIT 500`;
+                const esc = (s: string) => `'${String(s).replace(/'/g, "''")}'`;
+                let where = `t.device_name=${esc(deviceForTracking)} AND t.position_time_nz>${esc(after)}`;
+                if (before) where += ` AND t.position_time_nz<${esc(before)}`;
+                return `SELECT t.id, t.device_name, g.fence_name, t.geofence_type, t.position_time_nz, t.position_time, t.lat, t.lon FROM tbl_tracking t LEFT JOIN tbl_geofences g ON g.fence_id = t.geofence_id WHERE ${where} ORDER BY t.position_time_nz ASC LIMIT 500`;
               })()}
               </pre>
             )}

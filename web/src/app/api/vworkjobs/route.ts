@@ -8,6 +8,7 @@ const RAW_TIMESTAMP_COLS = [
   'step_1_completed_at', 'step_2_completed_at', 'step_3_completed_at', 'step_4_completed_at', 'step_5_completed_at',
   'step_1_gps_completed_at', 'step_2_gps_completed_at', 'step_3_gps_completed_at', 'step_4_gps_completed_at', 'step_5_gps_completed_at',
   'step_1_actual_time', 'step_2_actual_time', 'step_3_actual_time', 'step_4_actual_time', 'step_5_actual_time',
+  'step1oride', 'step2oride', 'step3oride', 'step4oride', 'step5oride',
 ] as const;
 const RAW_SELECT_FRAGMENT = RAW_TIMESTAMP_COLS.map((c) => `to_char(t.${c}, 'YYYY-MM-DD HH24:MI:SS') AS ${c}_raw`).join(', ');
 
@@ -31,15 +32,23 @@ export async function GET(request: Request) {
   try {
     const { searchParams } = new URL(request.url);
     const dateParam = searchParams.get('date');
+    const dateFromParam = searchParams.get('dateFrom');
+    const dateToParam = searchParams.get('dateTo');
     const stepsFetchedParam = searchParams.get('stepsFetched');
 
     let rows: unknown[];
-    const debug: { date?: string; stepsFetchedFilter?: string; stepsFetchedFilterApplied: boolean; stepsFetchedFilterSkipped?: boolean; whereHint?: string } = { stepsFetchedFilterApplied: false };
-    if (dateParam || stepsFetchedParam === 'false' || stepsFetchedParam === 'true') {
+    const debug: { date?: string; dateFrom?: string; dateTo?: string; stepsFetchedFilter?: string; stepsFetchedFilterApplied: boolean; stepsFetchedFilterSkipped?: boolean; whereHint?: string } = { stepsFetchedFilterApplied: false };
+    if (dateParam || dateFromParam || dateToParam || stepsFetchedParam === 'false' || stepsFetchedParam === 'true') {
       const conditions: string[] = [];
       const values: unknown[] = [];
       let idx = 1;
-      if (dateParam && /^\d{4}-\d{2}-\d{2}$/.test(dateParam)) {
+      if (dateFromParam && dateToParam && /^\d{4}-\d{2}-\d{2}$/.test(dateFromParam) && /^\d{4}-\d{2}-\d{2}$/.test(dateToParam)) {
+        conditions.push(`(actual_start_time >= $${idx}::date AND actual_start_time < $${idx + 1}::date + interval '1 day')`);
+        values.push(dateFromParam, dateToParam);
+        idx += 2;
+        debug.dateFrom = dateFromParam;
+        debug.dateTo = dateToParam;
+      } else if (dateParam && /^\d{4}-\d{2}-\d{2}$/.test(dateParam)) {
         conditions.push(`(actual_start_time >= $${idx}::timestamp AND actual_start_time < $${idx}::timestamp + interval '1 day')`);
         values.push(`${dateParam}T00:00:00`);
         idx++;
@@ -66,7 +75,11 @@ export async function GET(request: Request) {
           const dateOnlyConditions: string[] = [];
           const dateOnlyValues: unknown[] = [];
           let i = 1;
-          if (dateParam && /^\d{4}-\d{2}-\d{2}$/.test(dateParam)) {
+          if (dateFromParam && dateToParam && /^\d{4}-\d{2}-\d{2}$/.test(dateFromParam) && /^\d{4}-\d{2}-\d{2}$/.test(dateToParam)) {
+            dateOnlyConditions.push(`(actual_start_time >= $${i}::date AND actual_start_time < $${i + 1}::date + interval '1 day')`);
+            dateOnlyValues.push(dateFromParam, dateToParam);
+            i += 2;
+          } else if (dateParam && /^\d{4}-\d{2}-\d{2}$/.test(dateParam)) {
             dateOnlyConditions.push(`(actual_start_time >= $${i}::timestamp AND actual_start_time < $${i}::timestamp + interval '1 day')`);
             dateOnlyValues.push(`${dateParam}T00:00:00`);
           }
