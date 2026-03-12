@@ -53,7 +53,7 @@ export async function GET(
   try {
     const { id } = await params;
     const userid = id;
-    const rows = await query('SELECT * FROM tbl_users WHERE userid = $1', [userid]);
+    const rows = await query<Record<string, unknown>>('SELECT * FROM tbl_users WHERE userid = $1', [userid]);
     const user = rows[0];
     if (!user) return NextResponse.json({ error: 'User not found' }, { status: 404 });
     return NextResponse.json({ user: mapUserRow(user) });
@@ -106,7 +106,7 @@ export async function PUT(
       `UPDATE tbl_users SET ${setClause} WHERE userid = $${values.length}`,
       values
     );
-    const rows = await query('SELECT * FROM tbl_users WHERE userid = $1', [userid]);
+    const rows = await query<Record<string, unknown>>('SELECT * FROM tbl_users WHERE userid = $1', [userid]);
     const user = rows[0];
     if (!user) return NextResponse.json({ error: 'User not found after update' }, { status: 404 });
     return NextResponse.json({ user: jsonSafe(user) });

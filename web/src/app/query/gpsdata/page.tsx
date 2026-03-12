@@ -1,7 +1,7 @@
 'use client';
 
 import Link from 'next/link';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'next/navigation';
 import { formatColumnLabel, formatDateNZ, computeColumnWidths } from '@/lib/utils';
 
@@ -53,7 +53,7 @@ function mergeColumnOrder(apiColumns: string[], saved: string[] | null): string[
   return ordered;
 }
 
-export default function GpsDataPage() {
+function GpsDataContent() {
   const [rows, setRows] = useState<Row[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -694,5 +694,13 @@ export default function GpsDataPage() {
         {debugInfo !== null && <pre className="mt-2 overflow-auto rounded bg-zinc-100 p-2 text-xs dark:bg-zinc-800">{JSON.stringify(debugInfo, null, 2)}</pre>}
       </section>
     </div>
+  );
+}
+
+export default function GpsDataPage() {
+  return (
+    <Suspense fallback={<div className="flex min-h-[200px] items-center justify-center p-6 text-zinc-500">Loading…</div>}>
+      <GpsDataContent />
+    </Suspense>
   );
 }
