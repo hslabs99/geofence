@@ -243,7 +243,7 @@ export type DerivedStepsDebug = {
 /** After cleanup: when step1 vwork > step2 gps we set step1_actual = step2_gps - travel_min (step4−step3); Via = RULE. */
 export type Step1CleanupOverride = string | null;
 
-export type StepVia = 'GPS' | 'VW' | 'RULE' | 'ORIDE';
+export type StepVia = 'GPS' | 'VW' | 'RULE' | 'ORIDE' | 'VineFence+';
 
 export type DerivedStepsResultWithDebug = DerivedStepsResult & {
   debug: DerivedStepsDebug;

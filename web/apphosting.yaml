@@ -27,3 +27,16 @@ env:
   - variable: PGPASSWORD
     secret: PG_PASSWORD
     availability: [RUNTIME]
+  # TrackSolid API (Import GPS data > Fetch devices). Set via: firebase apphosting:secrets:set TRACKSOLID_*
+  - variable: TRACKSOLID_APP_KEY
+    secret: TRACKSOLID_APP_KEY
+    availability: [RUNTIME]
+  - variable: TRACKSOLID_APP_SECRET
+    secret: TRACKSOLID_APP_SECRET
+    availability: [RUNTIME]
+  - variable: TRACKSOLID_ACCOUNT
+    secret: TRACKSOLID_ACCOUNT
+    availability: [RUNTIME]
+  - variable: TRACKSOLID_PASSWORD_MD5
+    secret: TRACKSOLID_PASSWORD_MD5
+    availability: [RUNTIME]

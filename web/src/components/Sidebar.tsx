@@ -258,6 +258,14 @@ export default function Sidebar() {
               AutoRuns
             </Link>
             <Link
+              href="/admin/logs"
+              className={`rounded px-3 py-2 text-sm ${
+                pathname === '/admin/logs' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
+              }`}
+            >
+              Logs
+            </Link>
+            <Link
               href="/admin/gps-mappings"
               className={`rounded px-3 py-2 text-sm ${
                 pathname === '/admin/gps-mappings' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
@@ -290,12 +298,12 @@ export default function Sidebar() {
               Tagging
             </Link>
             <Link
-              href="/admin/template-minutes"
+              href="/admin/winery-minutes"
               className={`rounded px-3 py-2 text-sm ${
-                pathname === '/admin/template-minutes' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
+                pathname === '/admin/winery-minutes' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
               }`}
             >
-              Template Minutes
+              Winery Minutes
             </Link>
             <Link
               href="/admin/settings"

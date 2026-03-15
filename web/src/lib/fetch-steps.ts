@@ -77,6 +77,8 @@ export type RunFetchStepsResult = {
 /**
  * Run derived-steps (with writeBack) for each job. Single code path for both
  * "fetch steps for date" (many jobs) and "refetch this job" (one job, force).
+ * Each call clears GPS step fields 1–5 and final steps first, then runs part 1 (standard fence)
+ * and part 2 (Steps2 buffered vineyard fence if step 2/3 missing). Used by Inspect, Tagging, API test.
  */
 export async function runFetchStepsForJobs(options: RunFetchStepsOptions): Promise<RunFetchStepsResult> {
   const { jobs, startLessMinutes, endPlusMinutes, onProgress } = options;

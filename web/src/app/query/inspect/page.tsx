@@ -12,7 +12,7 @@ const COLUMN_ORDER_TABLE = 'tbl_vworkjobs_inspect';
 const SORT_SETTING_TYPE = 'System';
 const SORT_SETTING_NAME = 'Inspectsort';
 
-const PRIORITY_COLUMNS = ['job_id', 'planned_start_time', 'worker', 'truck_id', 'truck_rego'];
+const PRIORITY_COLUMNS = ['job_id', 'planned_start_time', 'worker', 'trailermode', 'truck_id', 'truck_rego'];
 
 const DATE_COLUMNS = new Set([
   'planned_start_time', 'actual_start_time', 'actual_end_time', 'gps_start_time', 'gps_end_time',
@@ -105,6 +105,7 @@ function InspectContent() {
   const [filterCustomer, setFilterCustomer] = useState<string>('');
   const [filterTemplate, setFilterTemplate] = useState<string>('');
   const [filterTruckId, setFilterTruckId] = useState<string>('');
+  const [filterTrailermode, setFilterTrailermode] = useState<string>('');
   const [filterJobId, setFilterJobId] = useState<string>('');
   const [filterPlannedFrom, setFilterPlannedFrom] = useState<string>('');
   const [filterPlannedTo, setFilterPlannedTo] = useState<string>('');
@@ -135,6 +136,7 @@ function InspectContent() {
   const [displayExpandAfter, setDisplayExpandAfter] = useState(0);
   const [derivedStepsDebug, setDerivedStepsDebug] = useState<Record<string, unknown> | null>(null);
   const [showDerivedStepsDebug, setShowDerivedStepsDebug] = useState(false);
+  const [showMappingSection, setShowMappingSection] = useState(false);
   const [refetchStepsRunning, setRefetchStepsRunning] = useState(false);
   const [retagAndRefetchRunning, setRetagAndRefetchRunning] = useState(false);
   const [trackingRefreshKey, setTrackingRefreshKey] = useState(0);
@@ -359,6 +361,15 @@ function InspectContent() {
     return Array.from(set).sort();
   }, [rows]);
 
+  const distinctTrailermodes = useMemo(() => {
+    const set = new Set<string>();
+    for (const row of rows) {
+      const v = row.trailermode;
+      if (v != null && String(v).trim() !== '') set.add(String(v).trim());
+    }
+    return Array.from(set).sort();
+  }, [rows]);
+
   const distinctJobIds = useMemo(() => {
     const set = new Set<string>();
     for (const row of rows) {
@@ -407,6 +418,10 @@ function InspectContent() {
         const v = row.truck_id;
         if (v == null || String(v).trim() !== filterTruckId) return false;
       }
+      if (filterTrailermode) {
+        const v = row.trailermode;
+        if (v == null || String(v).trim() !== filterTrailermode) return false;
+      }
       if (filterJobId.trim()) {
         const v = row.job_id;
         const s = v != null ? String(v).trim().toLowerCase() : '';
@@ -446,7 +461,7 @@ function InspectContent() {
       }
       return true;
     });
-  }, [rows, filterCustomer, filterTemplate, filterTruckId, filterJobId, filterPlannedFrom, filterPlannedTo, filterActualFrom, filterActualTo, dateFilterCol, dateFrom, dateTo]);
+  }, [rows, filterCustomer, filterTemplate, filterTruckId, filterTrailermode, filterJobId, filterPlannedFrom, filterPlannedTo, filterActualFrom, filterActualTo, dateFilterCol, dateFrom, dateTo]);
 
   const sortedRows = useMemo(() => {
     const [c1, c2, c3] = sortColumns;
@@ -1057,6 +1072,20 @@ function InspectContent() {
                           ))}
                         </select>
                       )}
+                      {col === 'trailermode' && (
+                        <select
+                          value={filterTrailermode}
+                          onChange={(e) => setFilterTrailermode(e.target.value)}
+                          onClick={(e) => e.stopPropagation()}
+                          className="w-full max-w-full rounded border border-zinc-300 bg-white px-1.5 py-1 text-xs dark:border-zinc-600 dark:bg-zinc-800"
+                          title="Filter by trailermode (TT)"
+                        >
+                          <option value="">— All —</option>
+                          {distinctTrailermodes.map((t) => (
+                            <option key={t} value={t}>{t}</option>
+                          ))}
+                        </select>
+                      )}
                       {col === 'job_id' && (
                         <input
                           type="text"
@@ -1129,7 +1158,7 @@ function InspectContent() {
                       className={`cursor-grab select-none whitespace-nowrap bg-zinc-100 px-3 py-2 font-medium text-zinc-900 hover:bg-zinc-200 dark:bg-zinc-800 dark:text-zinc-100 dark:hover:bg-zinc-700 ${dropTargetCol === col ? 'bg-blue-200 dark:bg-blue-800' : ''} ${dragCol === col ? 'opacity-60' : ''}`}
                       title="Drag to reorder · Use Sort dropdowns above"
                     >
-                      {formatColumnLabel(col)}
+                      {col === 'trailermode' ? 'TT' : formatColumnLabel(col)}
                     </th>
                   ))}
                 </tr>
@@ -1160,9 +1189,19 @@ function InspectContent() {
           </div>
           <p className="mt-3 text-zinc-500">
             {sortedRows.length} row{sortedRows.length !== 1 ? 's' : ''}
-            {(filterCustomer || filterTemplate || filterTruckId || filterJobId.trim() || filterPlannedFrom || filterPlannedTo || filterActualFrom || filterActualTo || dateFilterCol) && ` (filtered from ${rows.length})`} · max 500 from API · click row to select
+            {(filterCustomer || filterTemplate || filterTruckId || filterTrailermode || filterJobId.trim() || filterPlannedFrom || filterPlannedTo || filterActualFrom || filterActualTo || dateFilterCol) && ` (filtered from ${rows.length})`} · max 500 from API · click row to select
           </p>
           <section className="mt-6 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900">
+            {selectedRow && (
+              <div className="mb-3">
+                <span className="text-xs font-medium text-zinc-500 dark:text-zinc-400">CalcNotes: </span>
+                <span className="text-sm text-zinc-800 dark:text-zinc-200">
+                  {(selectedRow.calcnotes ?? selectedRow.calc_notes ?? selectedRow.CalcNotes ?? '') !== ''
+                    ? String(selectedRow.calcnotes ?? selectedRow.calc_notes ?? selectedRow.CalcNotes ?? '').trim()
+                    : '—'}
+                </span>
+              </div>
+            )}
             <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
               <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">Step details</h2>
               <div className="flex flex-wrap items-center gap-2">
@@ -1344,57 +1383,61 @@ function InspectContent() {
                 <tr>
                   <td colSpan={4} className="px-2 py-1.5" />
                   <td className="align-top px-2 py-1.5">
-                    <label className="mb-1 block text-xs font-medium text-zinc-500">Comment (what you changed)</label>
-                    <textarea
-                      value={steporidecomment}
-                      onChange={(e) => setSteporidecomment(e.target.value)}
-                      placeholder="Optional note about manual overrides…"
-                      rows={2}
-                      className="mb-2 w-full min-w-[12rem] rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800"
-                    />
-                    <button
-                      type="button"
-                      disabled={!selectedRow?.job_id || saveOverridesStatus === 'saving'}
-                      onClick={async () => {
-                        if (!selectedRow?.job_id) return;
-                        setSaveOverridesStatus('saving');
-                        try {
-                          const res = await fetch('/api/vworkjobs/step-overrides', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({
-                              job_id: String(selectedRow.job_id),
-                              step1oride: stepOverrides.step1oride || null,
-                              step2oride: stepOverrides.step2oride || null,
-                              step3oride: stepOverrides.step3oride || null,
-                              step4oride: stepOverrides.step4oride || null,
-                              step5oride: stepOverrides.step5oride || null,
-                              steporidecomment: steporidecomment || null,
-                            }),
-                          });
-                          if (!res.ok) {
-                            const data = await res.json().catch(() => ({}));
-                            throw new Error(data?.error ?? res.statusText);
+                    <div className="flex items-end gap-2">
+                      <div className="min-w-0 flex-1">
+                        <label className="mb-1 block text-xs font-medium text-zinc-500">Comment (what you changed)</label>
+                        <textarea
+                          value={steporidecomment}
+                          onChange={(e) => setSteporidecomment(e.target.value)}
+                          placeholder="Optional note about manual overrides…"
+                          rows={2}
+                          className="w-full min-w-[12rem] rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+                        />
+                      </div>
+                      <button
+                        type="button"
+                        disabled={!selectedRow?.job_id || saveOverridesStatus === 'saving'}
+                        onClick={async () => {
+                          if (!selectedRow?.job_id) return;
+                          setSaveOverridesStatus('saving');
+                          try {
+                            const res = await fetch('/api/vworkjobs/step-overrides', {
+                              method: 'POST',
+                              headers: { 'Content-Type': 'application/json' },
+                              body: JSON.stringify({
+                                job_id: String(selectedRow.job_id),
+                                step1oride: stepOverrides.step1oride || null,
+                                step2oride: stepOverrides.step2oride || null,
+                                step3oride: stepOverrides.step3oride || null,
+                                step4oride: stepOverrides.step4oride || null,
+                                step5oride: stepOverrides.step5oride || null,
+                                steporidecomment: steporidecomment || null,
+                              }),
+                            });
+                            if (!res.ok) {
+                              const data = await res.json().catch(() => ({}));
+                              throw new Error(data?.error ?? res.statusText);
+                            }
+                            // Re-run steps so actuals/via update (e.g. when orides cleared, Summary shows GPS/VW not ORIDE).
+                            await runFetchStepsForJobs({
+                              jobs: [selectedRow],
+                              startLessMinutes,
+                              endPlusMinutes,
+                            });
+                            await refetchVworkJobs();
+                            setSaveOverridesStatus('saved');
+                          } catch (e) {
+                            setSaveOverridesStatus('error');
+                            console.error('[Save step overrides]', e);
+                          } finally {
+                            setTimeout(() => setSaveOverridesStatus('idle'), 2000);
                           }
-                          // Re-run steps so actuals/via update (e.g. when orides cleared, Summary shows GPS/VW not ORIDE).
-                          await runFetchStepsForJobs({
-                            jobs: [selectedRow],
-                            startLessMinutes,
-                            endPlusMinutes,
-                          });
-                          await refetchVworkJobs();
-                          setSaveOverridesStatus('saved');
-                        } catch (e) {
-                          setSaveOverridesStatus('error');
-                          console.error('[Save step overrides]', e);
-                        } finally {
-                          setTimeout(() => setSaveOverridesStatus('idle'), 2000);
-                        }
-                      }}
-                      className="w-fit rounded bg-green-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-green-700 disabled:opacity-50 dark:bg-green-700 dark:hover:bg-green-600"
-                    >
-                      {saveOverridesStatus === 'saving' ? 'Saving…' : saveOverridesStatus === 'saved' ? 'Saved ✓' : saveOverridesStatus === 'error' ? 'Save failed' : 'Save'}
-                    </button>
+                        }}
+                        className="shrink-0 rounded bg-green-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-green-700 disabled:opacity-50 dark:bg-green-700 dark:hover:bg-green-600"
+                      >
+                        {saveOverridesStatus === 'saving' ? 'Saving…' : saveOverridesStatus === 'saved' ? 'Saved ✓' : saveOverridesStatus === 'error' ? 'Save failed' : 'Save'}
+                      </button>
+                    </div>
                   </td>
                   <td colSpan={2} className="px-2 py-1.5" />
                 </tr>
@@ -1402,11 +1445,11 @@ function InspectContent() {
             </table>
             <div className="mt-4 rounded border border-zinc-200 bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-800/50">
               <div className="border-b border-zinc-200 px-3 py-2 text-sm font-medium text-zinc-700 dark:border-zinc-700 dark:text-zinc-300">
-                Log (fence IDs, mappings, tracking lookups)
+                Log
               </div>
               {derivedStepsDebug == null ? (
                 <p className="px-3 py-4 text-sm text-zinc-500 dark:text-zinc-400">
-                  Use &quot;Refetch steps (this job)&quot; to re-run GPS steps for the selected job (force: runs even if already fetched). For batch by date, use Admin → API GPS Import → Step 4.
+                  Refetch steps to see log.
                 </p>
               ) : (
                 <>
@@ -1427,7 +1470,17 @@ function InspectContent() {
               )}
             </div>
           </section>
-          <section className="mt-6 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900">
+          <section className="mt-6 rounded-lg border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900">
+            <button
+              type="button"
+              onClick={() => setShowMappingSection((v) => !v)}
+              className="flex w-full items-center justify-between px-4 py-3 text-left text-sm font-medium text-zinc-700 dark:text-zinc-300"
+            >
+              <span>Mapping</span>
+              <span>{showMappingSection ? '▼ Hide' : '▶ Show'}</span>
+            </button>
+            {showMappingSection && (
+              <div className="border-t border-zinc-200 p-4 dark:border-zinc-700">
                 <table className="min-w-[20rem] text-left text-sm">
                   <thead>
                     <tr className="border-b border-zinc-200 dark:border-zinc-700">
@@ -1448,10 +1501,12 @@ function InspectContent() {
                     ))}
                   </tbody>
                 </table>
-            {mappingFenceNameInClause && (
-              <p className="mt-3 text-xs text-zinc-500">
-                For later (tbl_tracking / fence filter): <code className="select-all rounded bg-zinc-100 px-1 py-0.5 dark:bg-zinc-800">{mappingFenceNameInClause}</code>
-              </p>
+                {mappingFenceNameInClause && (
+                  <p className="mt-3 text-xs text-zinc-500">
+                    For later (tbl_tracking / fence filter): <code className="select-all rounded bg-zinc-100 px-1 py-0.5 dark:bg-zinc-800">{mappingFenceNameInClause}</code>
+                  </p>
+                )}
+              </div>
             )}
           </section>
           <section className="mt-6 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900">

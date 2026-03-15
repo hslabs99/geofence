@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { query, execute } from '@/lib/db';
 import { deriveGpsStepsForJob, type JobForDerivedSteps } from '@/lib/derived-steps';
+import { runSteps2Query } from '@/lib/steps2-query';
 
 /** Recursively convert BigInt to number (or string if too large) so JSON.stringify works. */
 function sanitizeForJson<T>(value: T): T {
@@ -117,12 +118,65 @@ export async function GET(request: Request) {
       ? String(job.worker).trim()
       : device.trim());
 
-    const result = await deriveGpsStepsForJob(job, {
+    // When writing back, clear GPS step fields 1–5 and final (actual/via) first so we start from VWork only.
+    // Otherwise a previous run (e.g. VineFence+) leaves step2/step3 populated and Steps2 never runs again.
+    if (writeBack) {
+      await execute(
+        `UPDATE tbl_vworkjobs SET
+          Step_1_GPS_completed_at = NULL, Step1_gps_id = NULL,
+          Step_2_GPS_completed_at = NULL, Step2_gps_id = NULL,
+          Step_3_GPS_completed_at = NULL, Step3_gps_id = NULL,
+          Step_4_GPS_completed_at = NULL, Step4_gps_id = NULL,
+          Step_5_GPS_completed_at = NULL, Step5_gps_id = NULL,
+          step_1_actual_time = NULL, step_1_via = NULL,
+          step_2_actual_time = NULL, step_2_via = NULL,
+          step_3_actual_time = NULL, step_3_via = NULL,
+          step_4_actual_time = NULL, step_4_via = NULL,
+          step_5_actual_time = NULL, step_5_via = NULL
+        WHERE job_id::text = $1`,
+        [jobId]
+      );
+    }
+
+    let result = await deriveGpsStepsForJob(job, {
       windowMinutes,
       device: deviceForTracking,
       positionAfter: positionAfter.trim(),
       positionBefore: positionBefore?.trim() || null,
     });
+
+    // If step 2 or 3 missing and we will write back, try Steps2 (buffered vineyard fence); if exactly one stay, use it and set VineFence+.
+    const vineyardName = job.vineyard_name ? String(job.vineyard_name).trim() : '';
+    if (writeBack && vineyardName && (result.step2 == null || result.step3 == null)) {
+      const mappings = await query<{ vwname: string | null; gpsname: string | null }>(
+        "SELECT vwname, gpsname FROM tbl_gpsmappings WHERE type = 'Vineyard' AND (TRIM(COALESCE(vwname,'')) = $1 OR TRIM(COALESCE(gpsname,'')) = $1)",
+        [vineyardName]
+      );
+      const fenceNames: string[] = [vineyardName];
+      for (const m of mappings) {
+        const gps = (m.gpsname ?? '').trim();
+        if (gps && !fenceNames.includes(gps)) fenceNames.push(gps);
+      }
+      if (fenceNames.length > 0) {
+        const steps2Rows = await runSteps2Query(
+          deviceForTracking,
+          positionAfter.trim(),
+          positionBefore?.trim() || positionAfter.trim(),
+          fenceNames,
+          10
+        );
+        const stays = steps2Rows.filter((r) => Number(r.duration_seconds) >= 300);
+        if (stays.length === 1) {
+          result = {
+            ...result,
+            step2: stays[0].enter_time,
+            step3: stays[0].exit_time,
+            step2Via: 'VineFence+',
+            step3Via: 'VineFence+',
+          };
+        }
+      }
+    }
 
     if (writeBack) {
       try {
@@ -189,6 +243,13 @@ export async function GET(request: Request) {
           );
         } catch {
           /* steps_fetched / steps_fetched_when columns may not exist yet */
+        }
+        if (result.step2Via === 'VineFence+' || result.step3Via === 'VineFence+') {
+          await execute(
+            `UPDATE tbl_vworkjobs SET calcnotes = COALESCE(TRIM(calcnotes) || ' ', '') || 'VineFence+:'
+             WHERE job_id::text = $1`,
+            [jobId]
+          );
         }
       } catch (writeErr) {
         const wMsg = writeErr instanceof Error ? writeErr.message : String(writeErr);
