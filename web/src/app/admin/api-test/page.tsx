@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useEffect, useRef } from 'react';
-import { runFetchStepsForJobs } from '@/lib/fetch-steps';
+import { runFetchStepsForJobs, type FetchStepsLogEntry } from '@/lib/fetch-steps';
 
 const ENDPOINT_OPTIONS: { value: string; label: string; url: string }[] = [
   { value: 'global', label: 'Global', url: 'http://open.10000track.com/route/rest' },
@@ -203,6 +203,7 @@ export default function ApiTestPage() {
   const [singleDeviceRawPayloadModal, setSingleDeviceRawPayloadModal] = useState<{ date: string; device: string; payload: string } | null>(null);
   const [singleDeviceRunLoading, setSingleDeviceRunLoading] = useState(false);
   const [singleDeviceRunProgress, setSingleDeviceRunProgress] = useState<{ currentDay: number; totalDays: number; dateLabel: string } | null>(null);
+  const [gpsFetchLog, setGpsFetchLog] = useState<Array<{ date: string; device: string; url: string }>>([]);
   const [refreshDevicesLoading, setRefreshDevicesLoading] = useState(false);
   const [refreshDevicesMessage, setRefreshDevicesMessage] = useState<string | null>(null);
   const [fencePrepStatus, setFencePrepStatus] = useState<'idle' | 'running' | 'done' | 'error'>('idle');
@@ -222,7 +223,7 @@ export default function ApiTestPage() {
   const [step4Force, setStep4Force] = useState(false);
   const [step4Running, setStep4Running] = useState(false);
   const [step4Progress, setStep4Progress] = useState<{ current: number; total: number } | null>(null);
-  const [step4Log, setStep4Log] = useState<{ job_id: string; status: 'ok' | 'skip' | 'error'; message?: string }[]>([]);
+  const [step4Log, setStep4Log] = useState<FetchStepsLogEntry[]>([]);
   const [step4Error, setStep4Error] = useState<string | null>(null);
   const [step4Debug, setStep4Debug] = useState<{
     jobCount: number;
@@ -272,6 +273,17 @@ export default function ApiTestPage() {
       setMaxDates(null);
     } finally {
       setMaxDatesLoading(false);
+    }
+  };
+
+  /** Once after a GPS import batch (merge to tbl_tracking): backfill position_time_nz where null. */
+  const fillPositionTimeNzNullsAfterImport = async () => {
+    try {
+      const res = await fetch('/api/admin/tracking/fill-position-time-nz-nulls', { method: 'POST' });
+      const data = await res.json();
+      if (!data.ok) console.error('[fill-position-time-nz-nulls]', data.error ?? res.statusText);
+    } catch (e) {
+      console.error('[fill-position-time-nz-nulls]', e);
     }
   };
 
@@ -374,6 +386,7 @@ export default function ApiTestPage() {
         inserted: Number(data.inserted) ?? 0,
         apifeedRowsInRange: data.apifeedRowsInRange,
       });
+      await fillPositionTimeNzNullsAfterImport();
       setTimeout(() => {
         setMergeStatus('idle');
         setMergeMessage(null);
@@ -421,6 +434,7 @@ export default function ApiTestPage() {
       setSingleDeviceRunProgress({ currentDay: i + 1, totalDays: dates.length, dateLabel: day });
       const trackParams = new URLSearchParams({ imei, endpoint, date: day, deviceName });
       const actualRequestUrl = `/api/tracksolid/track?${trackParams.toString()}`;
+      setGpsFetchLog((prev) => [...prev, { date: day, device: deviceName, url: actualRequestUrl }]);
       try {
         const clearRes = await fetch('/api/apifeed/clear-for-device-date', {
           method: 'POST',
@@ -480,6 +494,7 @@ export default function ApiTestPage() {
       }
       setSingleDeviceDayLog([...log]);
     }
+    await fillPositionTimeNzNullsAfterImport();
     setSingleDeviceRunLoading(false);
     setSingleDeviceRunProgress(null);
   };
@@ -502,14 +517,16 @@ export default function ApiTestPage() {
     }
     updateFleetRow(deviceName, { getApiStatus: 'loading', error: null, imei: imei || null });
     const date = dateOverride ?? trackDate;
+    const params = new URLSearchParams({
+      imei,
+      endpoint,
+      date,
+      deviceName,
+    });
+    const trackUrl = `/api/tracksolid/track?${params.toString()}`;
+    setGpsFetchLog((prev) => [...prev, { date, device: deviceName, url: trackUrl }]);
     try {
-      const params = new URLSearchParams({
-        imei,
-        endpoint,
-        date,
-        deviceName,
-      });
-      const res = await fetch(`/api/tracksolid/track?${params}`);
+      const res = await fetch(trackUrl);
       const data = await res.json();
       if (!data.ok) {
         updateFleetRow(deviceName, {
@@ -762,6 +779,7 @@ export default function ApiTestPage() {
         }
       }
     }
+    await fillPositionTimeNzNullsAfterImport();
     setFleetRunAllLoading(false);
     setFleetRunProgress(null);
   };
@@ -789,7 +807,7 @@ export default function ApiTestPage() {
     }
   };
 
-  /** Fetch GPS steps for jobs on trackDate. If !step4Force, only jobs with steps_fetched=false; if step4Force, all jobs for date. Uses single runFetchStepsForJobs from lib. */
+  /** Fetch GPS steps for jobs on trackDate. If !step4Force, only jobs with steps_fetched=false; if step4Force, all jobs for date. Uses runFetchStepsForJobs (derived-steps + Steps+ when needed). */
   const runStep4FetchGpsSteps = async () => {
     if (!trackDate?.trim()) return;
     setStep4Error(null);
@@ -823,6 +841,7 @@ export default function ApiTestPage() {
         jobs,
         startLessMinutes: step4StartLessMinutes,
         endPlusMinutes: step4EndPlusMinutes,
+        jobDateForLog: trackDate,
         onProgress: (current, total, log) => {
           setStep4Progress({ current, total });
           setStep4Log(log);
@@ -974,6 +993,14 @@ export default function ApiTestPage() {
     setTrackLoading(true);
     const deviceName = devices?.find((d) => d.imei === imei)?.deviceName ?? imei;
     const effectiveDate = singleDateFrom.trim() || trackDate;
+    const trackParams = new URLSearchParams({
+      imei,
+      endpoint,
+      ...(effectiveDate ? { date: effectiveDate } : { period: 'last24h' }),
+      ...(deviceName && { deviceName }),
+    });
+    const trackUrl = `/api/tracksolid/track?${trackParams.toString()}`;
+    setGpsFetchLog((prev) => [...prev, { date: effectiveDate || '(no date)', device: deviceName, url: trackUrl }]);
     try {
       // Stage 1a: Clear both tables for this device + date (ground zero) so we can debug each stage
       if (effectiveDate && deviceName) {
@@ -1003,13 +1030,7 @@ export default function ApiTestPage() {
         );
       }
       // Stage 1b: Fetch from API only — no save, no merge
-      const params = new URLSearchParams({
-        imei,
-        endpoint,
-        ...(effectiveDate ? { date: effectiveDate } : { period: 'last24h' }),
-        ...(deviceName && { deviceName }),
-      });
-      const res = await fetch(`/api/tracksolid/track?${params}`);
+      const res = await fetch(trackUrl);
       const data = await res.json();
       if (!data.ok) {
         let errMsg = data.error ?? 'Request failed';
@@ -1129,11 +1150,11 @@ export default function ApiTestPage() {
           </div>
         )}
         {devices && (
-          <div className="mt-4">
-            <p className="mb-2 text-sm font-medium text-zinc-700 dark:text-zinc-300">
-              Count: {devices.length}
-            </p>
-            <div className="max-h-96 overflow-auto rounded border border-zinc-200 dark:border-zinc-700">
+          <details className="mt-4 group">
+            <summary className="cursor-pointer list-none text-sm font-medium text-zinc-700 dark:text-zinc-300">
+              Device list ({devices.length}) – click to expand
+            </summary>
+            <div className="mt-2 max-h-48 overflow-auto rounded border border-zinc-200 dark:border-zinc-700">
               <table className="w-full min-w-[320px] border-collapse text-sm">
                 <thead className="sticky top-0 bg-zinc-100 dark:bg-zinc-800">
                   <tr>
@@ -1162,55 +1183,101 @@ export default function ApiTestPage() {
                 </tbody>
               </table>
             </div>
-          </div>
+          </details>
         )}
         {devicesDebug && (
-          <div className="mt-4 rounded border border-zinc-200 bg-zinc-50 p-3 dark:border-zinc-700 dark:bg-zinc-800/50">
-            <p className="mb-2 text-xs font-medium uppercase text-zinc-500 dark:text-zinc-400">
-              Debug – request & response (every step)
-            </p>
-            {'steps' in devicesDebug ? (
-              <>
-                {devicesDebug.steps.map(({ step, debug }, i) => (
-                  <div key={i} className="mb-4 last:mb-0">
-                    <p className="mb-1 font-medium text-zinc-700 dark:text-zinc-300">
-                      Step {i + 1}: {step}
-                    </p>
-                    <pre className="max-h-80 overflow-auto whitespace-pre-wrap break-all rounded bg-white p-2 font-mono text-xs dark:bg-zinc-900">
-                      {debug != null ? formatDebugPre(debug) : '(cached – no request sent)'}
-                    </pre>
-                  </div>
-                ))}
-                <button
-                  type="button"
-                  onClick={() => copyDebugPayload(devicesDebug)}
-                  className="mt-2 rounded border border-zinc-300 bg-white px-2 py-1 text-xs hover:bg-zinc-100 dark:border-zinc-600 dark:bg-zinc-800 dark:hover:bg-zinc-700"
-                >
-                  {copyFeedback ? 'Copied!' : 'Copy for tech support'}
-                </button>
-              </>
-            ) : (
-              <>
-                <pre className="max-h-96 overflow-auto whitespace-pre-wrap break-all rounded bg-white p-2 font-mono text-xs dark:bg-zinc-900">
-                  {formatDebugPre(devicesDebug)}
-                </pre>
-                <button
-                  type="button"
-                  onClick={() => copyDebugPayload(devicesDebug)}
-                  className="mt-2 rounded border border-zinc-300 bg-white px-2 py-1 text-xs hover:bg-zinc-100 dark:border-zinc-600 dark:bg-zinc-800 dark:hover:bg-zinc-700"
-                >
-                  {copyFeedback ? 'Copied!' : 'Copy for tech support'}
-                </button>
-              </>
-            )}
-          </div>
+          <details className="mt-4 group">
+            <summary className="cursor-pointer list-none text-xs font-medium uppercase text-zinc-500 dark:text-zinc-400">
+              Debug – request & response (every step) – click to expand
+            </summary>
+            <div className="mt-2 rounded border border-zinc-200 bg-zinc-50 p-3 dark:border-zinc-700 dark:bg-zinc-800/50">
+              {'steps' in devicesDebug ? (
+                <>
+                  {devicesDebug.steps.map(({ step, debug }, i) => (
+                    <div key={i} className="mb-4 last:mb-0">
+                      <p className="mb-1 font-medium text-zinc-700 dark:text-zinc-300">
+                        Step {i + 1}: {step}
+                      </p>
+                      <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-all rounded bg-white p-2 font-mono text-xs dark:bg-zinc-900">
+                        {debug != null ? formatDebugPre(debug) : '(cached – no request sent)'}
+                      </pre>
+                    </div>
+                  ))}
+                  <button
+                    type="button"
+                    onClick={() => copyDebugPayload(devicesDebug)}
+                    className="mt-2 rounded border border-zinc-300 bg-white px-2 py-1 text-xs hover:bg-zinc-100 dark:border-zinc-600 dark:bg-zinc-800 dark:hover:bg-zinc-700"
+                  >
+                    {copyFeedback ? 'Copied!' : 'Copy for tech support'}
+                  </button>
+                </>
+              ) : (
+                <>
+                  <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-all rounded bg-white p-2 font-mono text-xs dark:bg-zinc-900">
+                    {formatDebugPre(devicesDebug)}
+                  </pre>
+                  <button
+                    type="button"
+                    onClick={() => copyDebugPayload(devicesDebug)}
+                    className="mt-2 rounded border border-zinc-300 bg-white px-2 py-1 text-xs hover:bg-zinc-100 dark:border-zinc-600 dark:bg-zinc-800 dark:hover:bg-zinc-700"
+                  >
+                    {copyFeedback ? 'Copied!' : 'Copy for tech support'}
+                  </button>
+                </>
+              )}
+            </div>
+          </details>
         )}
       </section>
 
       <section className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900">
-        <h2 className="mb-3 text-lg font-medium text-zinc-800 dark:text-zinc-200">
-          Step 3: GPS for day
-        </h2>
+        <div className="mb-3 flex flex-wrap items-start gap-4">
+          <div className="min-w-0 shrink-0 max-w-xs">
+            <h2 className="text-lg font-medium text-zinc-800 dark:text-zinc-200">
+              Step 3: GPS for day
+            </h2>
+            <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+              Endpoint: <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">GET /api/tracksolid/track</code>
+              {' · '}
+              Args: <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">imei</code>, <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">endpoint</code>, <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">date</code> (or <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">period=last24h</code>), <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">deviceName</code>
+            </p>
+            {trackImei && (singleDateFrom.trim() || trackDate) && (
+              <p className="mt-1 text-xs font-mono text-zinc-600 dark:text-zinc-300 break-all">
+                Next call: /api/tracksolid/track?imei={encodeURIComponent(trackImei)}&endpoint={encodeURIComponent(endpoint)}&date={singleDateFrom.trim() || trackDate}&deviceName={encodeURIComponent(devices?.find((d) => d.imei === trackImei)?.deviceName ?? trackImei)}
+              </p>
+            )}
+          </div>
+          <div className="min-w-80 flex-1">
+            <div className="flex items-center justify-between border-b border-zinc-200 pb-1 dark:border-zinc-700">
+              <span className="text-xs font-medium text-zinc-500 dark:text-zinc-400">Fetch log (Date, Device, URL)</span>
+              {gpsFetchLog.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => setGpsFetchLog([])}
+                  className="rounded border border-zinc-300 bg-white px-2 py-0.5 text-xs hover:bg-zinc-100 dark:border-zinc-600 dark:bg-zinc-800 dark:hover:bg-zinc-700"
+                >
+                  Clear
+                </button>
+              )}
+            </div>
+            <div className="mt-1 max-h-64 overflow-auto rounded border border-zinc-200 bg-zinc-50 px-2 py-1.5 font-mono text-xs text-zinc-700 dark:border-zinc-700 dark:bg-zinc-800/50 dark:text-zinc-300">
+              {gpsFetchLog.length === 0 ? (
+                <span className="text-zinc-400 dark:text-zinc-500">No calls yet. Use Fetch GPS or Run import to log.</span>
+              ) : (
+                gpsFetchLog.map((entry, idx) => (
+                  <div key={idx} className="border-b border-zinc-100 py-1 last:border-0 dark:border-zinc-700">
+                    <span className="font-medium text-zinc-800 dark:text-zinc-200">{entry.date}</span>
+                    {' · '}
+                    <span className="text-zinc-700 dark:text-zinc-300">{entry.device}</span>
+                    <div className="mt-0.5 break-all text-zinc-600 dark:text-zinc-400" title={entry.url}>
+                      {entry.url}
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
         <p className="mb-3 text-sm text-zinc-600 dark:text-zinc-400">
           Pick a device and date, or run all devices (fleet) for one date. A row is written to tbl_logs per fetch (logtype=APIfetch). Run Step 2 first so the token is cached.
         </p>
@@ -1513,11 +1580,13 @@ export default function ApiTestPage() {
             className="rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-800"
           >
             <option value="">{devices?.length ? 'Select device…' : 'Fetch devices first'}</option>
-            {devices?.map((d) => (
-              <option key={d.imei} value={d.imei}>
-                {d.deviceName ?? d.imei}
-              </option>
-            ))}
+            {[...(devices ?? [])]
+              .sort((a, b) => (a.deviceName ?? a.imei ?? '').localeCompare(b.deviceName ?? b.imei ?? '', undefined, { sensitivity: 'base' }))
+              .map((d) => (
+                <option key={d.imei} value={d.imei}>
+                  {d.deviceName ?? d.imei}
+                </option>
+              ))}
           </select>
           <label className="ml-2 text-sm font-medium text-zinc-700 dark:text-zinc-300">From</label>
           <input
@@ -2044,7 +2113,20 @@ export default function ApiTestPage() {
             <div className="font-medium text-zinc-600 dark:text-zinc-400">Last run: {step4Log.length} jobs</div>
             {step4Log.slice(-20).map((entry, idx) => (
               <div key={idx} className={entry.status === 'error' ? 'text-red-600 dark:text-red-400' : entry.status === 'skip' ? 'text-amber-600 dark:text-amber-400' : 'text-zinc-700 dark:text-zinc-300'}>
-                {entry.job_id} — {entry.status}{entry.message ? `: ${entry.message}` : ''}
+                <div>
+                  {entry.jobDate ? `${entry.jobDate} ` : ''}
+                  {entry.job_id} — {entry.status}
+                  {entry.message ? `: ${entry.message}` : ''}
+                </div>
+                {entry.status === 'ok' && entry.stepVias?.length === 5 && (
+                  <div className="ml-2 text-zinc-600 dark:text-zinc-400">
+                    {entry.stepVias.map((via, si) => (
+                      <div key={si}>
+                        step {si + 1}: {via}
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             ))}
           </div>

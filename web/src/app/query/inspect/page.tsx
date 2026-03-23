@@ -343,15 +343,6 @@ function InspectContent() {
       .finally(() => setLoading(false));
   }, [initialFetchQuery]);
 
-  const refetchVworkJobs = useCallback((): Promise<void> => {
-    return fetch('/api/vworkjobs')
-      .then((res) => res.json().then((data) => ({ ok: res.ok, data })))
-      .then(({ ok, data }) => {
-        if (ok && data?.rows) setRows(data.rows);
-      })
-      .catch(() => {});
-  }, []);
-
   const distinctTruckIds = useMemo(() => {
     const set = new Set<string>();
     for (const row of rows) {
@@ -491,7 +482,6 @@ function InspectContent() {
         startLessMinutes,
         endPlusMinutes,
       });
-      await refetchVworkJobs();
       if (result.lastResult != null && typeof result.lastResult === 'object') {
         const d = (result.lastResult as { debug?: Record<string, unknown> }).debug;
         setDerivedStepsDebug(d != null ? { ...d, _singleJob: true } : { _singleJob: true, fullResponse: result.lastResult });
@@ -500,7 +490,7 @@ function InspectContent() {
     } finally {
       setRefetchStepsRunning(false);
     }
-  }, [selectedRow, startLessMinutes, endPlusMinutes, refetchVworkJobs]);
+  }, [selectedRow, startLessMinutes, endPlusMinutes]);
 
   /** Apply URL params (from Summary link): truck, actual from/to. If locateJobId, do not set job filter so list shows jobs before/after. */
   useEffect(() => {
@@ -678,7 +668,6 @@ function InspectContent() {
         startLessMinutes,
         endPlusMinutes,
       });
-      await refetchVworkJobs();
       setTrackingRefreshKey((k) => k + 1);
       if (result.lastResult != null && typeof result.lastResult === 'object') {
         const d = (result.lastResult as { debug?: Record<string, unknown> }).debug;
@@ -688,7 +677,7 @@ function InspectContent() {
     } finally {
       setRetagAndRefetchRunning(false);
     }
-  }, [selectedRow, deviceForTracking, actualStartTime, startLessMinutes, endPlusMinutes, refetchVworkJobs]);
+  }, [selectedRow, deviceForTracking, actualStartTime, startLessMinutes, endPlusMinutes]);
 
   useEffect(() => {
     if (!deviceForTracking || !actualStartTime.trim()) {
@@ -1424,7 +1413,6 @@ function InspectContent() {
                               startLessMinutes,
                               endPlusMinutes,
                             });
-                            await refetchVworkJobs();
                             setSaveOverridesStatus('saved');
                           } catch (e) {
                             setSaveOverridesStatus('error');

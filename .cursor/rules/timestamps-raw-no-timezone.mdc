@@ -3,23 +3,30 @@ description: Timestamps are raw — no timezone conversion, ever
 alwaysApply: true
 ---
 
-# Timestamps: Raw Only, No Timezone Logic
+# Timestamps: Raw Only, No Timezone Logic — NEVER ALTER API DATA
 
-**All timestamps in this project are raw.** We do not want any timezone conversion, session timezone, or "smart" date handling. Store and use times exactly as the source provides them.
+**All timestamps in this project are raw and verbatim.** We do NOT alter data for timezones. We do NOT convert API timestamps to "local" or "UTC" for storage. What we get from the API must arrive in `position_time` 100% as we get it. If we receive any timezone information (from geofence API or our own API), ignore it; treat all dates and times as verbatim. Nothing should ever be adjusted.
+
+The only exception: one small piece of code populates `position_time_nz` via SQL UPDATE (e.g. `position_time + interval '13 hours'`). That is the only derivation. We never alter API → `position_time`.
 
 ## Rules
 
-1. **Never convert** API/source timestamps to "local" or "UTC" for storage. Store the literal date/time string or value.
-2. **Never rely on** `session timezone`, `SET timezone`, or server/local TZ when *interpreting* timestamps for display or comparison — only use `SET timezone = 'UTC'` when we must run a query so that *string* bounds (e.g. `'2026-03-08 00:00:00'`) are interpreted as that exact moment, not shifted by the server.
-3. **Never pass** a JavaScript `Date` object to the DB for `position_time` (or similar columns). Pass the **string** in the format the source uses (e.g. `YYYY-MM-DD HH:mm:ss`) so the DB stores those digits verbatim.
-4. **Parsing only:** If we parse an API string (e.g. `gpsTime`) into a `Date` for in-memory logic, that is only for validation or ordering. When writing to the DB, send the **original string** or a string formatted from that moment in the same nominal "time" (e.g. UTC string from `formatDateForDebug(utcDate)`), and run the write in a UTC session so nothing is shifted.
+1. **Never alter** API/source timestamps. Store the **literal** date/time string. No conversion, no "Z", no interpretation.
+2. **Never rely on** `session timezone`, `SET timezone`, or server/local TZ when *interpreting* timestamps for display or comparison — only use `SET timezone = 'UTC'` when we must run a query so that *string* bounds are interpreted as that exact moment, not shifted.
+3. **Never pass** a JavaScript `Date` object to the DB for `position_time`. Pass the **exact string** from the source so the DB stores it verbatim.
+4. **Parsing only for validation:** If we parse an API string (e.g. `gpsTime`) into a `Date`, that is only to skip invalid rows. When writing to the DB, send the **original string** only. Never use the parsed Date to format what we store.
 
 ## Why
 
-Timezone "help" has caused stored times to be shifted (e.g. +13 hours). We have stated many times: all times are raw. This rule exists so that is always in context.
+Timezone "help" has caused stored times to be shifted and data to disappear (e.g. rows visible in JSON debug not in DB). We never alter. This rule exists so that is always in context.
+
+## Enforcement (do not bypass)
+
+- **Runtime guard:** All values for `position_time` from API data must go through `@/lib/verbatim-time`: `positionTimeForStorage(apiString)` and `positionTimeBoundForQuery(apiString)`. Passing a `Date` throws. See `web/src/lib/verbatim-time.ts`.
+- **Check script:** Run `npm run check:verbatim` (in `web/`) to scan apifeed and tracksolid for forbidden patterns. Run before merge / in CI.
+- **Doc:** Full rules and pipeline: `web/docs/VERBATIM_TIMES.md`.
 
 ## Concrete
 
-- **DO:** INSERT `position_time` as a string like `'2026-03-08 02:33:50'` and run the INSERT in a client with `SET LOCAL timezone = 'UTC'` so the string is stored as-is.
-- **DON'T:** Pass a `Date` to the DB for timestamp columns (driver/session can convert and shift).
-- **DON'T:** Add logic that "converts to UTC" or "converts to local" for storage. Store what the API gives.
+- **DO:** Use `positionTimeForStorage(apiString)` for every value written to `position_time` from API. Use `positionTimeBoundForQuery(string)` for min/max bounds. INSERT with `SET LOCAL timezone = 'UTC'`.
+- **DON'T:** Pass a `Date` to the DB for `position_time`. Don't use `formatDateForDebug`, `toISOString()`, or `getUTC*()` to produce `position_time` from API data. Don't convert to UTC, append Z, or interpret timezone.

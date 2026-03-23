@@ -1,6 +1,11 @@
 import { NextResponse } from 'next/server';
 import { getClient } from '@/lib/db';
 
+/**
+ * VERBATIM TIMES — This route builds delete bounds from the REQUEST date (YYYY-MM-DD) only.
+ * FORBIDDEN: Do NOT use this function or any Date formatting for API-sourced timestamps (gpsTime).
+ * For API data, use positionTimeForStorage / positionTimeBoundForQuery from @/lib/verbatim-time only.
+ */
 function formatDateForDebug(d: Date): string {
   const pad = (n: number) => String(n).padStart(2, '0');
   return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;

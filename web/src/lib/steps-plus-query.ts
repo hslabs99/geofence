@@ -1,18 +1,22 @@
 /**
- * Shared Steps2 (buffered-fence stays) query. Used by /api/inspect/steps2 and by derived-steps route
- * when step 2/3 are missing (VineFence+ fallback). Read-only.
+ * Steps+ — buffered-vineyard geofence stay detection (not VWork steps 1–5).
+ *
+ * Project term **Steps+** means: expand vineyard fence polygons by N metres (PostGIS ST_Buffer),
+ * then find contiguous inside-segments from tbl_tracking. Used when standard step 2/3 derivation
+ * misses the vineyard (see /api/tracking/derived-steps). The HTTP path `/api/inspect/steps2` is a
+ * legacy name; same logic lives here.
  */
 
 import { query } from '@/lib/db';
 
-export type Steps2SegmentRow = {
+export type StepsPlusSegmentRow = {
   fence_name: string;
   enter_time: string;
   exit_time: string;
   duration_seconds: string | number;
 };
 
-const STEPS2_SQL = `
+const STEPS_PLUS_SQL = `
   WITH pts AS (
     SELECT t.position_time_nz AS t, t.lon, t.lat
     FROM tbl_tracking t
@@ -60,16 +64,16 @@ const STEPS2_SQL = `
   FROM segments
 `;
 
-/** Run buffered-fence stays query. Returns all segments (caller filters >= 300s or single row). */
-export async function runSteps2Query(
+/** Run Steps+ buffered-fence stays query. Returns all segments (caller filters duration / single stay). */
+export async function runStepsPlusQuery(
   device: string,
   startTime: string,
   endTime: string,
   fenceNames: string[],
   bufferMeters: number = 10
-): Promise<Steps2SegmentRow[]> {
+): Promise<StepsPlusSegmentRow[]> {
   if (!device || !startTime || !endTime || fenceNames.length === 0) return [];
-  const rows = await query<Steps2SegmentRow>(STEPS2_SQL, [
+  const rows = await query<StepsPlusSegmentRow>(STEPS_PLUS_SQL, [
     device,
     startTime,
     endTime,

@@ -5,6 +5,7 @@ export type WineryMinutesRow = {
   id: number;
   Customer: string | null;
   Template: string | null;
+  vineyardgroup: string | null;
   Winery: string | null;
   TT: string | null;
   ToVineMins: number | null;
@@ -14,22 +15,27 @@ export type WineryMinutesRow = {
   TotalMins: number | null;
 };
 
-const SELECT_COLS = `id, "Customer", "Template", "Winery", "TT", "ToVineMins", "InVineMins", "ToWineMins", "InWineMins", "TotalMins"`;
+const SELECT_COLS = `id, "Customer", "Template", vineyardgroup, "Winery", "TT", "ToVineMins", "InVineMins", "ToWineMins", "InWineMins", "TotalMins"`;
 
-/** GET: list all rows; or rows for customer when ?customer=X; or single row when ?customer=X&template=Y&winery=Z */
+/** GET: list all rows; or rows for customer when ?customer=X; or single row when ?customer=X&template=Y&winery=Z&vineyard_group=W (vineyard_group optional for single row). */
 export async function GET(request: Request) {
   try {
     const { searchParams } = new URL(request.url);
     const customer = searchParams.get('customer')?.trim() ?? '';
     const template = searchParams.get('template')?.trim() ?? '';
+    const vineyardGroup = searchParams.get('vineyard_group')?.trim() ?? '';
     const winery = searchParams.get('winery')?.trim() ?? '';
 
     if (customer && template && winery) {
       const rows = await query<WineryMinutesRow>(
-        `SELECT ${SELECT_COLS} FROM tbl_wineryminutes
-         WHERE trim("Customer") = $1 AND trim(COALESCE("Template", '')) = $2 AND trim("Winery") = $3
-         LIMIT 1`,
-        [customer, template, winery]
+        vineyardGroup
+          ? `SELECT ${SELECT_COLS} FROM tbl_wineryminutes
+             WHERE trim("Customer") = $1 AND trim(COALESCE("Template", '')) = $2 AND trim(COALESCE(vineyardgroup, '')) = $3 AND trim("Winery") = $4
+             LIMIT 1`
+          : `SELECT ${SELECT_COLS} FROM tbl_wineryminutes
+             WHERE trim("Customer") = $1 AND trim(COALESCE("Template", '')) = $2 AND (trim(COALESCE(vineyardgroup, '')) = '' OR vineyardgroup IS NULL) AND trim("Winery") = $3
+             LIMIT 1`,
+        vineyardGroup ? [customer, template, vineyardGroup, winery] : [customer, template, winery]
       );
       return NextResponse.json(rows[0] ?? null);
     }
@@ -39,7 +45,7 @@ export async function GET(request: Request) {
         const rows = await query<WineryMinutesRow>(
           `SELECT ${SELECT_COLS} FROM tbl_wineryminutes
            WHERE trim("Customer") = $1 AND trim(COALESCE("Template", '')) = $2
-           ORDER BY "Winery", "TT"`,
+           ORDER BY vineyardgroup, "Winery", "TT"`,
           [customer, template]
         );
         return NextResponse.json({ rows });
@@ -47,7 +53,7 @@ export async function GET(request: Request) {
       const rows = await query<WineryMinutesRow>(
         `SELECT ${SELECT_COLS} FROM tbl_wineryminutes
          WHERE trim("Customer") = $1
-         ORDER BY "Template", "Winery", "TT"`,
+         ORDER BY "Template", vineyardgroup, "Winery", "TT"`,
         [customer]
       );
       return NextResponse.json({ rows });
@@ -55,7 +61,7 @@ export async function GET(request: Request) {
 
     const rows = await query<WineryMinutesRow>(
       `SELECT ${SELECT_COLS} FROM tbl_wineryminutes
-       ORDER BY "Customer", "Template", "Winery"`
+       ORDER BY "Customer", "Template", vineyardgroup, "Winery"`
     );
     return NextResponse.json({ rows });
   } catch (err) {
@@ -70,6 +76,7 @@ export async function POST(request: Request) {
     const body = await request.json();
     const Customer = (body.Customer ?? body.customer ?? '').trim() || null;
     const Template = (body.Template ?? body.template ?? '').trim() || null;
+    const vineyardgroup = (body.vineyardgroup ?? body.Vineyard_Group ?? body.vineyard_group ?? '').trim() || null;
     const Winery = (body.Winery ?? body.winery ?? '').trim() || null;
     const TT = (body.TT ?? body.tt ?? '').trim() || null;
     if (TT !== null && TT !== '' && TT !== 'T' && TT !== 'TT' && TT !== 'TTT') {
@@ -82,10 +89,10 @@ export async function POST(request: Request) {
     const TotalMins = body.TotalMins != null ? Number(body.TotalMins) : null;
 
     const result = await query<{ id: number }>(
-      `INSERT INTO tbl_wineryminutes ("Customer", "Template", "Winery", "TT", "ToVineMins", "InVineMins", "ToWineMins", "InWineMins", "TotalMins")
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      `INSERT INTO tbl_wineryminutes ("Customer", "Template", vineyardgroup, "Winery", "TT", "ToVineMins", "InVineMins", "ToWineMins", "InWineMins", "TotalMins")
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
        RETURNING id`,
-      [Customer, Template, Winery, TT, ToVineMins, InVineMins, ToWineMins, InWineMins, TotalMins]
+      [Customer, Template, vineyardgroup, Winery, TT, ToVineMins, InVineMins, ToWineMins, InWineMins, TotalMins]
     );
     const id = result[0]?.id;
     if (id == null) return NextResponse.json({ error: 'Insert failed' }, { status: 500 });

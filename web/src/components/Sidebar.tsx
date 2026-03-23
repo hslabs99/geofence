@@ -2,8 +2,11 @@
 
 import Link from 'next/link';
 import { usePathname, useRouter } from 'next/navigation';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { GEODATA_USER_STORAGE_KEY, useViewMode } from '@/contexts/ViewModeContext';
+import { useSummaryHistory } from '@/contexts/SummaryHistoryContext';
+import { listSummaryHistory } from '@/lib/summary-history-storage';
 
 type InspectHistoryEntry = {
   job_id: string;
@@ -34,6 +37,118 @@ function buildInspectUrl(entry: InspectHistoryEntry): string {
   return `/query/inspect?${params.toString()}`;
 }
 
+/** Renders in document.body so it stacks above <main> and is not clipped by sidebar overflow. */
+function SidebarFlyoutPortal({
+  open,
+  anchorRef,
+  contentRef,
+  children,
+}: {
+  open: boolean;
+  anchorRef: React.RefObject<HTMLElement | null>;
+  contentRef: React.RefObject<HTMLDivElement | null>;
+  children: React.ReactNode;
+}) {
+  const [pos, setPos] = useState({ top: 0, left: 0 });
+
+  useLayoutEffect(() => {
+    if (!open || !anchorRef.current) return;
+    const update = () => {
+      const el = anchorRef.current;
+      if (!el) return;
+      const r = el.getBoundingClientRect();
+      const gap = 6;
+      let left = r.right + gap;
+      const minW = 420;
+      if (left + minW > window.innerWidth - 8) {
+        left = Math.max(8, r.left - minW - gap);
+      }
+      setPos({ top: Math.max(8, r.top), left });
+    };
+    update();
+    window.addEventListener('scroll', update, true);
+    window.addEventListener('resize', update);
+    return () => {
+      window.removeEventListener('scroll', update, true);
+      window.removeEventListener('resize', update);
+    };
+  }, [open, anchorRef]);
+
+  if (!open || typeof document === 'undefined') return null;
+
+  return createPortal(
+    <div
+      ref={contentRef}
+      className="fixed z-[10000] max-h-[min(80vh,480px)] overflow-y-auto rounded-lg border border-zinc-200 bg-white py-1 shadow-xl dark:border-zinc-600 dark:bg-zinc-800"
+      style={{
+        top: pos.top,
+        left: pos.left,
+        minWidth: 420,
+        maxWidth: 'min(90vw, 560px)',
+      }}
+      role="listbox"
+    >
+      {children}
+    </div>,
+    document.body
+  );
+}
+
+function RecentViewsDropdown({
+  containerRef,
+  flyoutRef,
+  open,
+  onToggle,
+  onClose,
+}: {
+  containerRef: React.RefObject<HTMLDivElement | null>;
+  flyoutRef: React.RefObject<HTMLDivElement | null>;
+  open: boolean;
+  onToggle: () => void;
+  onClose: () => void;
+}) {
+  const router = useRouter();
+  const { historyVersion } = useSummaryHistory();
+  const entries = useMemo(() => listSummaryHistory(), [historyVersion]);
+  return (
+    <div className="relative" ref={containerRef}>
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation();
+          onToggle();
+        }}
+        className="w-full rounded px-3 py-1.5 text-left text-xs text-zinc-500 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800"
+      >
+        Recent views {entries.length > 0 ? `(${entries.length})` : ''}
+      </button>
+      <SidebarFlyoutPortal open={open} anchorRef={containerRef} contentRef={flyoutRef}>
+        {entries.length === 0 ? (
+          <div className="px-3 py-2 text-xs text-zinc-500 dark:text-zinc-400">
+            Leave Summary with filters set, then open another page — your view is saved here.
+          </div>
+        ) : (
+          entries.map((e) => (
+            <button
+              key={e.id}
+              type="button"
+              role="option"
+              title={e.label}
+              onClick={() => {
+                onClose();
+                router.push(`/query/summary?sh=${encodeURIComponent(e.id)}`);
+              }}
+              className="w-full px-3 py-2 text-left text-xs hover:bg-zinc-100 dark:hover:bg-zinc-700"
+            >
+              <div className="text-zinc-900 dark:text-zinc-100">{e.label}</div>
+            </button>
+          ))
+        )}
+      </SidebarFlyoutPortal>
+    </div>
+  );
+}
+
 export default function Sidebar() {
   const pathname = usePathname();
   const router = useRouter();
@@ -41,7 +156,11 @@ export default function Sidebar() {
   const [customers, setCustomers] = useState<string[]>([]);
   const [inspectHistory, setInspectHistory] = useState<InspectHistoryEntry[]>([]);
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [recentViewsOpen, setRecentViewsOpen] = useState(false);
   const historyRef = useRef<HTMLDivElement>(null);
+  const recentViewsRef = useRef<HTMLDivElement>(null);
+  const recentViewsFlyoutRef = useRef<HTMLDivElement>(null);
+  const inspectFlyoutRef = useRef<HTMLDivElement>(null);
 
   const fetchInspectHistory = useCallback(() => {
     fetch('/api/inspect-history')
@@ -55,13 +174,19 @@ export default function Sidebar() {
   }, [fetchInspectHistory]);
 
   useEffect(() => {
-    if (!historyOpen) return;
+    if (!historyOpen && !recentViewsOpen) return;
     const close = (e: MouseEvent) => {
-      if (historyRef.current && !historyRef.current.contains(e.target as Node)) setHistoryOpen(false);
+      const t = e.target as Node;
+      if (historyRef.current?.contains(t)) return;
+      if (recentViewsRef.current?.contains(t)) return;
+      if (inspectFlyoutRef.current?.contains(t)) return;
+      if (recentViewsFlyoutRef.current?.contains(t)) return;
+      setHistoryOpen(false);
+      setRecentViewsOpen(false);
     };
     document.addEventListener('click', close);
     return () => document.removeEventListener('click', close);
-  }, [historyOpen]);
+  }, [historyOpen, recentViewsOpen]);
 
   function handleSignOut() {
     if (typeof localStorage !== 'undefined') localStorage.removeItem(GEODATA_USER_STORAGE_KEY);
@@ -77,8 +202,8 @@ export default function Sidebar() {
   }, []);
 
   return (
-    <aside className="w-56 shrink-0 border-r border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-900">
-      <nav className="flex flex-col gap-1 p-3">
+    <aside className="flex min-h-screen w-56 shrink-0 flex-col border-r border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-900">
+      <nav className="flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto overflow-x-hidden p-3">
         <Link
           href="/"
           className={`rounded px-3 py-2 text-sm font-medium ${
@@ -107,48 +232,60 @@ export default function Sidebar() {
                     {mode === 'super' ? 'Super' : mode === 'admin' ? 'Admin' : 'Client'}
                   </span>
                 </label>
-                {mode === 'client' && (
-                  <div className="ml-5 mt-1 mb-1">
-                    <label className="mb-0.5 block text-xs font-medium text-zinc-500 dark:text-zinc-400">
-                      Customer {clientCustomerLocked && '(locked)'}
-                    </label>
-                    {clientCustomerLocked ? (
-                      <select
-                        value={clientCustomer}
-                        disabled
-                        className="w-full rounded border border-zinc-300 bg-zinc-100 px-2 py-1 text-sm text-zinc-700 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-300"
-                      >
-                        <option value={clientCustomer || ''}>{clientCustomer || '—'}</option>
-                      </select>
-                    ) : (
-                      <select
-                        value={clientCustomer}
-                        onChange={(e) => setClientCustomer(e.target.value)}
-                        className="w-full rounded border border-zinc-300 bg-white px-2 py-1 text-sm dark:border-zinc-600 dark:bg-zinc-800"
-                      >
-                        <option value="">— Select —</option>
-                        {customers.map((c) => (
-                          <option key={c} value={c}>{c}</option>
-                        ))}
-                      </select>
-                    )}
-                  </div>
-                )}
               </div>
             ))}
           </div>
+          {/* Customer filter: show in both Admin and Client view so both can filter by client. */}
+          {(viewMode === 'admin' || viewMode === 'client') && (
+            <div className="mt-2 ml-1">
+              <label className="mb-0.5 block text-xs font-medium text-zinc-500 dark:text-zinc-400">
+                Customer {clientCustomerLocked && '(locked)'}
+              </label>
+              {clientCustomerLocked ? (
+                <select
+                  value={clientCustomer}
+                  disabled
+                  className="w-full rounded border border-zinc-300 bg-zinc-100 px-2 py-1 text-sm text-zinc-700 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-300"
+                >
+                  <option value={clientCustomer || ''}>{clientCustomer || '—'}</option>
+                </select>
+              ) : (
+                <select
+                  value={clientCustomer}
+                  onChange={(e) => setClientCustomer(e.target.value)}
+                  className="w-full rounded border border-zinc-300 bg-white px-2 py-1 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+                >
+                  <option value="">— Select —</option>
+                  {customers.map((c) => (
+                    <option key={c} value={c}>{c}</option>
+                  ))}
+                </select>
+              )}
+            </div>
+          )}
         </div>
         )}
         <div className="my-1 border-t border-zinc-200 dark:border-zinc-700" />
         {viewMode === 'client' ? (
-          <Link
-            href="/query/summary"
-            className={`rounded px-3 py-2 text-sm ${
-              pathname === '/query/summary' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
-            }`}
-          >
-            Summary
-          </Link>
+          <>
+            <Link
+              href="/query/summary"
+              className={`rounded px-3 py-2 text-sm ${
+                pathname === '/query/summary' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
+              }`}
+            >
+              Summary
+            </Link>
+            {userType && (
+              <RecentViewsDropdown
+                containerRef={recentViewsRef}
+                flyoutRef={recentViewsFlyoutRef}
+                open={recentViewsOpen}
+                onToggle={() => setRecentViewsOpen((o) => !o)}
+                onClose={() => setRecentViewsOpen(false)}
+              />
+            )}
+          </>
         ) : (
           <>
             <div className="mt-2 rounded-md border-l-4 border-blue-500 bg-blue-50 px-3 py-1.5 text-xs font-bold uppercase tracking-wider text-blue-800 dark:border-blue-400 dark:bg-blue-950/50 dark:text-blue-200">
@@ -162,6 +299,15 @@ export default function Sidebar() {
             >
               Summary
             </Link>
+            {userType && (
+              <RecentViewsDropdown
+                containerRef={recentViewsRef}
+                flyoutRef={recentViewsFlyoutRef}
+                open={recentViewsOpen}
+                onToggle={() => setRecentViewsOpen((o) => !o)}
+                onClose={() => setRecentViewsOpen(false)}
+              />
+            )}
             <Link
               href="/query/inspect"
               className={`rounded px-3 py-2 text-sm ${
@@ -184,42 +330,37 @@ export default function Sidebar() {
               >
                 Recent jobs {inspectHistory.length > 0 ? `(${inspectHistory.length})` : ''}
               </button>
-              {historyOpen && (
-                <div
-                  className="absolute left-full top-0 z-50 ml-1 min-w-[420px] max-w-[90vw] rounded-lg border border-zinc-200 bg-white py-1 shadow-lg dark:border-zinc-600 dark:bg-zinc-800"
-                  role="listbox"
-                >
-                  {inspectHistory.length === 0 ? (
-                    <div className="px-3 py-2 text-xs text-zinc-500 dark:text-zinc-400">No recent jobs</div>
-                  ) : (
-                    inspectHistory.map((entry, i) => (
-                      <button
-                        key={entry.job_id}
-                        type="button"
-                        role="option"
-                        onClick={() => {
-                          setHistoryOpen(false);
-                          setInspectHistory((prev) => {
-                            const rest = prev.filter((e) => String(e.job_id).trim() !== String(entry.job_id).trim());
-                            return [entry, ...rest];
-                          });
-                          router.push(buildInspectUrl(entry));
-                        }}
-                        className="w-full px-3 py-2 text-left text-xs hover:bg-zinc-100 dark:hover:bg-zinc-700"
-                      >
-                        <div className="font-medium text-zinc-900 dark:text-zinc-100">{entry.job_id}</div>
-                        <div className="mt-0.5 truncate text-zinc-600 dark:text-zinc-400">
-                          {[entry.delivery_winery, entry.vineyard_name].filter(Boolean).join(' · ') || '—'}
-                        </div>
-                        <div className="mt-0.5 flex flex-wrap gap-x-2 gap-y-0 text-zinc-500 dark:text-zinc-500">
-                          {entry.worker && <span>{entry.worker}</span>}
-                          {entry.actual_start_time && <span>{entry.actual_start_time}</span>}
-                        </div>
-                      </button>
-                    ))
-                  )}
-                </div>
-              )}
+              <SidebarFlyoutPortal open={historyOpen} anchorRef={historyRef} contentRef={inspectFlyoutRef}>
+                {inspectHistory.length === 0 ? (
+                  <div className="px-3 py-2 text-xs text-zinc-500 dark:text-zinc-400">No recent jobs</div>
+                ) : (
+                  inspectHistory.map((entry) => (
+                    <button
+                      key={entry.job_id}
+                      type="button"
+                      role="option"
+                      onClick={() => {
+                        setHistoryOpen(false);
+                        setInspectHistory((prev) => {
+                          const rest = prev.filter((e) => String(e.job_id).trim() !== String(entry.job_id).trim());
+                          return [entry, ...rest];
+                        });
+                        router.push(buildInspectUrl(entry));
+                      }}
+                      className="w-full px-3 py-2 text-left text-xs hover:bg-zinc-100 dark:hover:bg-zinc-700"
+                    >
+                      <div className="font-medium text-zinc-900 dark:text-zinc-100">{entry.job_id}</div>
+                      <div className="mt-0.5 truncate text-zinc-600 dark:text-zinc-400">
+                        {[entry.delivery_winery, entry.vineyard_name].filter(Boolean).join(' · ') || '—'}
+                      </div>
+                      <div className="mt-0.5 flex flex-wrap gap-x-2 gap-y-0 text-zinc-500 dark:text-zinc-500">
+                        {entry.worker && <span>{entry.worker}</span>}
+                        {entry.actual_start_time && <span>{entry.actual_start_time}</span>}
+                      </div>
+                    </button>
+                  ))
+                )}
+              </SidebarFlyoutPortal>
             </div>
             <Link
               href="/query/gpsdata"
@@ -323,19 +464,18 @@ export default function Sidebar() {
             </Link>
           </>
         )}
-        {userType && (
-          <>
-            <div className="my-1 border-t border-zinc-200 dark:border-zinc-700" />
-            <button
-              type="button"
-              onClick={handleSignOut}
-              className="rounded px-3 py-2 text-left text-sm text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800"
-            >
-              Sign out
-            </button>
-          </>
-        )}
       </nav>
+      {userType && (
+        <div className="shrink-0 border-t border-zinc-200 p-3 dark:border-zinc-700">
+          <button
+            type="button"
+            onClick={handleSignOut}
+            className="w-full rounded px-3 py-2 text-left text-sm text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800"
+          >
+            Sign out
+          </button>
+        </div>
+      )}
     </aside>
   );
 }

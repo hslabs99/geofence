@@ -349,6 +349,12 @@ export async function listDevices(
   };
 }
 
+/**
+ * VERBATIM TIMES — NEVER ALTER.
+ * gpsTime is the raw string from the TrackSolid API. We pass it through as-is (String(p.gpsTime ?? '')).
+ * Do NOT parse, format, or apply timezone. Downstream code stores it literally in position_time.
+ * If the API ever returns timezone info (e.g. +13:00), ignore it; treat all dates/times as verbatim.
+ */
 export interface TrackPoint {
   lat: number;
   lng: number;
@@ -373,13 +379,17 @@ export async function getTrackForDevice(
     end_time: endTime,
   };
   const out = await post(params, config, { method: 'jimi.device.track.list' }, baseUrl);
-  const list = (Array.isArray(out.result) ? out.result : []) as Array<{ lat?: number; lng?: number; gpsTime?: string }>;
+  const list = (Array.isArray(out.result) ? out.result : []) as Array<Record<string, unknown>>;
   return {
-    points: list.map((p) => ({
-      lat: Number(p.lat) || 0,
-      lng: Number(p.lng) || 0,
-      gpsTime: String(p.gpsTime ?? ''),
-    })),
+    points: list.map((p) => {
+      const raw = p as { lat?: number; lng?: number; gpsTime?: string; gps_time?: string; position_time?: string; time?: string };
+      const timeVal = raw.gpsTime ?? raw.gps_time ?? raw.position_time ?? raw.time ?? '';
+      return {
+        lat: Number(raw.lat) || 0,
+        lng: Number(raw.lng) || 0,
+        gpsTime: String(timeVal),
+      };
+    }),
     debug: out._debug,
   };
 }

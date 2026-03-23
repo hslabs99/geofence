@@ -1,6 +1,7 @@
 'use client';
 
-import { useState, useEffect, useCallback } from 'react';
+import { Suspense, useState, useEffect, useCallback } from 'react';
+import { useSearchParams } from 'next/navigation';
 
 type SummaryRow = {
   report_date: string;
@@ -57,6 +58,14 @@ type WineMappRow = {
   id: number;
   oldvworkname: string;
   newvworkname: string;
+  created_at: string;
+};
+
+type VineyardGroupRow = {
+  id: number;
+  winery_name: string | null;
+  vineyard_name: string;
+  vineyard_group: string;
   created_at: string;
 };
 
@@ -147,10 +156,55 @@ function sortSummary(rows: SummaryRow[], sortBy1: SortKey, sortBy2: SortKey, dir
   });
 }
 
-type DataChecksTab = 'gps-gaps' | 'winery-fixes' | 'varied';
+type GpsIntegrityLogEntry = {
+  date: string;
+  device: string;
+  outcomes: ('true' | 'not found')[];
+  sampleTimes: string[];
+};
 
-export default function DataChecksPage() {
-  const [activeTab, setActiveTab] = useState<DataChecksTab>('gps-gaps');
+type GpsIntegrityCell =
+  | { status: 'no_data' }
+  | {
+      status: 'data';
+      firstOk: boolean;
+      lastOk: boolean;
+      countOk: boolean;
+      firstTime: string;
+      lastTime: string;
+      apiCount: number;
+      dbCount: number;
+      dbFirstTime: string | null;
+      dbLastTime: string | null;
+    };
+
+type GpsIntegrityGridResponse = {
+  dates: string[];
+  devices: string[];
+  rows: Array<{ date: string; cells: GpsIntegrityCell[] }>;
+};
+
+type DataChecksTab = 'gps-gaps' | 'winery-fixes' | 'varied' | 'gps-integrity' | 'vineyard-mappings';
+
+function DataChecksPageContent() {
+  const searchParams = useSearchParams();
+  const tabParam = searchParams.get('tab');
+  const [activeTab, setActiveTab] = useState<DataChecksTab>(() => {
+    if (tabParam === 'vineyard-mappings') return 'vineyard-mappings';
+    if (tabParam === 'gps-integrity') return 'gps-integrity';
+    if (tabParam === 'winery-fixes') return 'winery-fixes';
+    if (tabParam === 'varied') return 'varied';
+    if (tabParam === 'gps-gaps') return 'gps-gaps';
+    return 'gps-gaps';
+  });
+
+  useEffect(() => {
+    if (tabParam === 'vineyard-mappings') setActiveTab('vineyard-mappings');
+    else if (tabParam === 'gps-integrity') setActiveTab('gps-integrity');
+    else if (tabParam === 'winery-fixes') setActiveTab('winery-fixes');
+    else if (tabParam === 'varied') setActiveTab('varied');
+    else if (tabParam === 'gps-gaps') setActiveTab('gps-gaps');
+  }, [tabParam]);
   const [minGapMinutes, setMinGapMinutes] = useState<string>('60');
   const [dateFrom, setDateFrom] = useState<string>('');
   const [dateTo, setDateTo] = useState<string>('');
@@ -185,6 +239,33 @@ export default function DataChecksPage() {
   const [setTrailerLoading, setSetTrailerLoading] = useState(false);
   const [setTrailerError, setSetTrailerError] = useState<string | null>(null);
   const [setTrailerResult, setSetTrailerResult] = useState<{ updatedTT: number; updatedT: number; totalUpdated: number } | null>(null);
+
+  // Varied tab: Update Vineyard_Group (also used in vineyard-mappings tab)
+  const [vineyardGroupLoading, setVineyardGroupLoading] = useState(false);
+  const [vineyardGroupError, setVineyardGroupError] = useState<string | null>(null);
+  const [vineyardGroupResult, setVineyardGroupResult] = useState<{ setToNa: number; matched: number; totalRows: number } | null>(null);
+
+  // Vineyard Mappings tab (tab 4)
+  const [vgRows, setVgRows] = useState<VineyardGroupRow[]>([]);
+  const [vgLoading, setVgLoading] = useState(false);
+  const [vgError, setVgError] = useState<string | null>(null);
+  const [vgSaving, setVgSaving] = useState(false);
+  const [vgDeliveryWineries, setVgDeliveryWineries] = useState<string[]>([]);
+  const [vgVineyardNames, setVgVineyardNames] = useState<string[]>([]);
+  const [vgNewWinery, setVgNewWinery] = useState('');
+  const [vgNewVineyard, setVgNewVineyard] = useState('');
+  const [vgNewGroup, setVgNewGroup] = useState('');
+  const [vgEditingId, setVgEditingId] = useState<number | null>(null);
+  const [vgEditWinery, setVgEditWinery] = useState('');
+  const [vgEditVineyard, setVgEditVineyard] = useState('');
+  const [vgEditGroup, setVgEditGroup] = useState('');
+
+  // GPS Integrity Check tab (tab 4): grid = rows (dates) × columns (devices), 1st row check vs tbl_tracking.position_time
+  const [gpsIntegrityFrom, setGpsIntegrityFrom] = useState('');
+  const [gpsIntegrityTo, setGpsIntegrityTo] = useState('');
+  const [gpsIntegrityLoading, setGpsIntegrityLoading] = useState(false);
+  const [gpsIntegrityError, setGpsIntegrityError] = useState<string | null>(null);
+  const [gpsIntegrityGrid, setGpsIntegrityGrid] = useState<GpsIntegrityGridResponse | null>(null);
 
   const fetchWineMapp = useCallback(() => {
     setWineMappLoading(true);
@@ -376,9 +457,156 @@ export default function DataChecksPage() {
       .finally(() => setSetTrailerLoading(false));
   };
 
+  const runUpdateVineyardGroup = () => {
+    setVineyardGroupError(null);
+    setVineyardGroupResult(null);
+    setVineyardGroupLoading(true);
+    fetch('/api/admin/data-checks/update-vineyard-group', { method: 'POST' })
+      .then((r) => {
+        if (!r.ok) return r.json().then((d) => Promise.reject(new Error(d?.error ?? r.statusText)));
+        return r.json();
+      })
+      .then((data: { ok: boolean; setToNa: number; matched: number; totalRows: number }) => {
+        setVineyardGroupResult({
+          setToNa: data.setToNa,
+          matched: data.matched,
+          totalRows: data.totalRows ?? 0,
+        });
+      })
+      .catch((e) => setVineyardGroupError(e instanceof Error ? e.message : String(e)))
+      .finally(() => setVineyardGroupLoading(false));
+  };
+
+  const fetchVgRows = useCallback(() => {
+    setVgLoading(true);
+    setVgError(null);
+    fetch('/api/admin/vineyardgroups')
+      .then((r) => {
+        if (!r.ok) return r.json().then((d) => Promise.reject(new Error(d?.error ?? r.statusText)));
+        return r.json();
+      })
+      .then((data: { rows: VineyardGroupRow[] }) => setVgRows(data.rows ?? []))
+      .catch((e) => setVgError(e instanceof Error ? e.message : String(e)))
+      .finally(() => setVgLoading(false));
+  }, []);
+
+  const fetchVgOptions = useCallback(() => {
+    fetch('/api/admin/vineyardgroups/options')
+      .then((r) => {
+        if (!r.ok) return r.json().then((d) => Promise.reject(new Error(d?.error ?? r.statusText)));
+        return r.json();
+      })
+      .then((data: { deliveryWineries?: string[]; vineyardNames?: string[] }) => {
+        setVgDeliveryWineries(data.deliveryWineries ?? []);
+        setVgVineyardNames(data.vineyardNames ?? []);
+      })
+      .catch(() => {
+        setVgDeliveryWineries([]);
+        setVgVineyardNames([]);
+      });
+  }, []);
+
+  useEffect(() => {
+    if (activeTab === 'vineyard-mappings') {
+      fetchVgRows();
+      fetchVgOptions();
+    }
+  }, [activeTab, fetchVgRows, fetchVgOptions]);
+
+  const createVgRow = () => {
+    const vineyard = vgNewVineyard.trim();
+    const group = vgNewGroup.trim();
+    if (!vineyard || !group) {
+      setVgError('Vineyard name and group are required.');
+      return;
+    }
+    setVgError(null);
+    setVgSaving(true);
+    fetch('/api/admin/vineyardgroups', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        winery_name: vgNewWinery.trim() || null,
+        vineyard_name: vineyard,
+        vineyard_group: group,
+      }),
+    })
+      .then((r) => {
+        if (!r.ok) return r.json().then((d) => Promise.reject(new Error(d?.error ?? r.statusText)));
+        return r.json();
+      })
+      .then(() => {
+        setVgNewWinery('');
+        setVgNewVineyard('');
+        setVgNewGroup('');
+        fetchVgRows();
+      })
+      .catch((e) => setVgError(e instanceof Error ? e.message : String(e)))
+      .finally(() => setVgSaving(false));
+  };
+
+  const updateVgRow = (id: number) => {
+    const vineyard = vgEditVineyard.trim();
+    const group = vgEditGroup.trim();
+    if (!vineyard || !group) {
+      setVgError('Vineyard name and group are required.');
+      return;
+    }
+    setVgError(null);
+    setVgSaving(true);
+    fetch(`/api/admin/vineyardgroups/${id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        winery_name: vgEditWinery.trim() || null,
+        vineyard_name: vineyard,
+        vineyard_group: group,
+      }),
+    })
+      .then((r) => {
+        if (!r.ok) return r.json().then((d) => Promise.reject(new Error(d?.error ?? r.statusText)));
+        return r.json();
+      })
+      .then(() => {
+        setVgEditingId(null);
+        fetchVgRows();
+      })
+      .catch((e) => setVgError(e instanceof Error ? e.message : String(e)))
+      .finally(() => setVgSaving(false));
+  };
+
+  const deleteVgRow = (id: number) => {
+    if (!confirm('Delete this vineyard mapping?')) return;
+    setVgError(null);
+    setVgSaving(true);
+    fetch(`/api/admin/vineyardgroups/${id}`, { method: 'DELETE' })
+      .then((r) => {
+        if (!r.ok) return r.json().then((d) => Promise.reject(new Error(d?.error ?? r.statusText)));
+        return r.json();
+      })
+      .then(() => fetchVgRows())
+      .catch((e) => setVgError(e instanceof Error ? e.message : String(e)))
+      .finally(() => setVgSaving(false));
+  };
+
+  const startEditVg = (row: VineyardGroupRow) => {
+    setVgEditingId(row.id);
+    setVgEditWinery(row.winery_name ?? '');
+    setVgEditVineyard(row.vineyard_name);
+    setVgEditGroup(row.vineyard_group);
+  };
+
+  const cloneVgRow = (row: VineyardGroupRow) => {
+    setVgEditingId(null);
+    setVgNewWinery(row.winery_name ?? '');
+    setVgNewVineyard(row.vineyard_name);
+    setVgNewGroup(row.vineyard_group);
+    setVgError(null);
+  };
+
   return (
-    <div className="min-h-screen bg-zinc-50 dark:bg-zinc-950">
-      <div className="mx-auto max-w-6xl px-4 py-8">
+    <div className="min-h-screen min-w-0 bg-zinc-50 dark:bg-zinc-950">
+      <div className="w-full min-w-0 px-4 py-8 text-left">
         <h1 className="text-2xl font-semibold text-zinc-900 dark:text-zinc-100">Data Checks</h1>
         <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
           Scan and report on data quality (tbl_tracking).
@@ -405,6 +633,20 @@ export default function DataChecksPage() {
             className={`rounded-t px-4 py-2 text-sm font-medium ${activeTab === 'varied' ? 'border border-b-0 border-zinc-200 bg-white text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'}`}
           >
             3. Varied
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveTab('gps-integrity')}
+            className={`rounded-t px-4 py-2 text-sm font-medium ${activeTab === 'gps-integrity' ? 'border border-b-0 border-zinc-200 bg-white text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'}`}
+          >
+            4. GPS Integrity Check
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveTab('vineyard-mappings')}
+            className={`rounded-t px-4 py-2 text-sm font-medium ${activeTab === 'vineyard-mappings' ? 'border border-b-0 border-zinc-200 bg-white text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'}`}
+          >
+            5. Vineyard Mappings
           </button>
         </div>
 
@@ -1015,7 +1257,345 @@ export default function DataChecksPage() {
           )}
         </section>
         )}
+
+        {activeTab === 'gps-integrity' && (
+        <section className="mt-0 min-w-0 max-w-full rounded-b-lg border border-zinc-200 border-t-0 bg-white p-6 shadow-sm dark:border-zinc-700 dark:bg-zinc-900">
+          <h2 className="text-lg font-medium text-zinc-900 dark:text-zinc-100">GPS Integrity Check</h2>
+          <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
+            Rows = dates, columns = all devices (HK). Each cell: 3 checks vs <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">tbl_tracking.position_time</code> — 1st time, last time, row count (API vs DB). Green = pass, red = fail, — = no API data.
+          </p>
+          <div className="mt-4 flex flex-wrap items-end gap-4">
+            <label className="flex flex-col gap-1">
+              <span className="text-xs font-medium text-zinc-500 dark:text-zinc-400">From</span>
+              <input
+                type="date"
+                value={gpsIntegrityFrom}
+                onChange={(e) => setGpsIntegrityFrom(e.target.value)}
+                className="w-40 rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+              />
+            </label>
+            <label className="flex flex-col gap-1">
+              <span className="text-xs font-medium text-zinc-500 dark:text-zinc-400">To</span>
+              <input
+                type="date"
+                value={gpsIntegrityTo}
+                onChange={(e) => setGpsIntegrityTo(e.target.value)}
+                className="w-40 rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+              />
+            </label>
+            <button
+              type="button"
+              onClick={() => {
+                setGpsIntegrityError(null);
+                setGpsIntegrityGrid(null);
+                if (!gpsIntegrityFrom || !gpsIntegrityTo) {
+                  setGpsIntegrityError('From and To dates required');
+                  return;
+                }
+                setGpsIntegrityLoading(true);
+                fetch('/api/admin/data-checks/gps-integrity', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    dateFrom: gpsIntegrityFrom,
+                    dateTo: gpsIntegrityTo,
+                    grid: true,
+                  }),
+                })
+                  .then((r) => {
+                    if (!r.ok) return r.json().then((d) => Promise.reject(new Error(d?.error ?? r.statusText)));
+                    return r.json();
+                  })
+                  .then((data: GpsIntegrityGridResponse) => setGpsIntegrityGrid(data))
+                  .catch((e) => setGpsIntegrityError(e instanceof Error ? e.message : String(e)))
+                  .finally(() => setGpsIntegrityLoading(false));
+              }}
+              disabled={gpsIntegrityLoading}
+              className="rounded bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50 dark:bg-blue-700 dark:hover:bg-blue-600"
+            >
+              {gpsIntegrityLoading ? 'Running…' : 'Run check'}
+            </button>
+          </div>
+          {gpsIntegrityError && (
+            <div className="mt-4 rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-800 dark:bg-red-950/50 dark:text-red-200">
+              {gpsIntegrityError}
+            </div>
+          )}
+          {gpsIntegrityGrid && gpsIntegrityGrid.rows.length > 0 && (
+            <div className="mt-4">
+              <p className="mb-2 text-xs text-zinc-500 dark:text-zinc-400">
+                Each cell shows 1st time, last time, and row count (or API/DB when mismatch). Green = pass, red = fail. — = no API data.
+              </p>
+              <div className="max-w-full overflow-x-auto rounded border border-zinc-200 dark:border-zinc-700">
+                <table className="w-max min-w-full border-collapse text-left text-sm">
+                  <thead>
+                    <tr className="border-b border-zinc-200 bg-zinc-100/80 dark:border-zinc-700 dark:bg-zinc-800/80">
+                      <th className="sticky left-0 z-10 border-r border-zinc-200 bg-zinc-100/80 px-2 py-2 font-medium text-zinc-700 dark:border-zinc-700 dark:bg-zinc-800/80 dark:text-zinc-300">Date</th>
+                      {gpsIntegrityGrid.devices.map((d) => (
+                        <th key={d} className="px-2 py-2 font-medium text-zinc-700 dark:text-zinc-300">{d}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {gpsIntegrityGrid.rows.map((row) => (
+                      <tr key={row.date} className="border-b border-zinc-100 dark:border-zinc-700">
+                        <td className="sticky left-0 z-10 border-r border-zinc-200 bg-white px-2 py-1.5 font-mono text-xs text-zinc-700 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300">
+                          {row.date}
+                        </td>
+                        {row.cells.map((cell, j) => {
+                          if (cell.status === 'no_data') {
+                            return (
+                              <td key={j} className="px-2 py-1.5 text-center text-zinc-400 dark:text-zinc-500">
+                                —
+                              </td>
+                            );
+                          }
+                          const title = `1st: ${cell.firstTime} | Last: ${cell.lastTime} | API: ${cell.apiCount} DB: ${cell.dbCount}`;
+                          const firstText = cell.firstOk ? cell.firstTime : `${cell.firstTime} (${cell.dbFirstTime ?? ''})`;
+                          const lastText = cell.lastOk ? cell.lastTime : `${cell.lastTime} (${cell.dbLastTime ?? ''})`;
+                          const countText = cell.countOk ? String(cell.apiCount) : `${cell.apiCount} / (${cell.dbCount})`;
+                          return (
+                            <td key={j} className="px-2 py-1.5 font-mono text-xs" title={title}>
+                              <div className="flex flex-col gap-0.5">
+                                <span className={cell.firstOk ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-600 dark:text-red-400'} title="1st in DB">{firstText}</span>
+                                <span className={cell.lastOk ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-600 dark:text-red-400'} title="Last in DB">{lastText}</span>
+                                <span className={cell.countOk ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-600 dark:text-red-400'} title="API vs DB row count">{countText}</span>
+                              </div>
+                            </td>
+                          );
+                        })}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+        </section>
+        )}
+
+        {activeTab === 'vineyard-mappings' && (
+        <section className="mt-0 rounded-b-lg border border-zinc-200 border-t-0 bg-white p-6 shadow-sm dark:border-zinc-700 dark:bg-zinc-900">
+          <h2 className="text-lg font-medium text-zinc-900 dark:text-zinc-100">Vineyard Mappings</h2>
+          <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
+            Map vineyard names to groups in <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">tbl_vineyardgroups</code>. Winery from <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">tbl_vworkjobs.delivery_winery</code>; vineyard name and group are free text with suggestions from vworkjobs.
+          </p>
+
+          <div className="mt-4 flex flex-wrap items-end gap-4 rounded border border-zinc-200 bg-zinc-50/50 p-4 dark:border-zinc-700 dark:bg-zinc-800/30">
+            <label className="flex flex-col gap-1">
+              <span className="text-xs font-medium text-zinc-500 dark:text-zinc-400">Winery name</span>
+              <select
+                value={vgNewWinery}
+                onChange={(e) => setVgNewWinery(e.target.value)}
+                className="w-48 rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+              >
+                <option value="">— Select —</option>
+                {vgDeliveryWineries.map((w) => (
+                  <option key={w} value={w}>{w}</option>
+                ))}
+              </select>
+            </label>
+            <label className="flex flex-col gap-1">
+              <span className="text-xs font-medium text-zinc-500 dark:text-zinc-400">Vineyard name</span>
+              <input
+                type="text"
+                list="vg-new-vineyard-list"
+                value={vgNewVineyard}
+                onChange={(e) => setVgNewVineyard(e.target.value)}
+                placeholder="Type or pick from list"
+                className="w-48 rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+              />
+              <datalist id="vg-new-vineyard-list">
+                {vgVineyardNames.map((v) => (
+                  <option key={v} value={v} />
+                ))}
+              </datalist>
+            </label>
+            <label className="flex flex-col gap-1">
+              <span className="text-xs font-medium text-zinc-500 dark:text-zinc-400">Group</span>
+              <input
+                type="text"
+                value={vgNewGroup}
+                onChange={(e) => setVgNewGroup(e.target.value)}
+                placeholder="Free text"
+                className="w-40 rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+              />
+            </label>
+            <button
+              type="button"
+              onClick={createVgRow}
+              disabled={vgSaving}
+              className="rounded bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50 dark:bg-blue-700 dark:hover:bg-blue-600"
+            >
+              {vgSaving ? 'Saving…' : 'Add'}
+            </button>
+          </div>
+
+          {vgError && (
+            <div className="mt-4 rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-800 dark:bg-red-950/50 dark:text-red-200">
+              {vgError}
+            </div>
+          )}
+
+          <div className="mt-6">
+            {vgLoading ? (
+              <p className="text-sm text-zinc-500 dark:text-zinc-400">Loading…</p>
+            ) : (
+              <div className="overflow-x-auto rounded border border-zinc-200 dark:border-zinc-700">
+                <table className="w-full min-w-[520px] border-collapse text-left text-sm">
+                  <thead>
+                    <tr className="border-b border-zinc-200 bg-zinc-100/80 dark:border-zinc-700 dark:bg-zinc-800/80">
+                      <th className="px-3 py-2 font-medium text-zinc-700 dark:text-zinc-300">Winery</th>
+                      <th className="px-3 py-2 font-medium text-zinc-700 dark:text-zinc-300">Vineyard</th>
+                      <th className="px-3 py-2 font-medium text-zinc-700 dark:text-zinc-300">Group</th>
+                      <th className="px-3 py-2 font-medium text-zinc-700 dark:text-zinc-300 text-right">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {vgRows.length === 0 ? (
+                      <tr>
+                        <td colSpan={4} className="px-3 py-4 text-center text-zinc-500 dark:text-zinc-400">
+                          No mappings yet. Add one above.
+                        </td>
+                      </tr>
+                    ) : (
+                      vgRows.map((row) => (
+                        <tr key={row.id} className="border-b border-zinc-100 dark:border-zinc-800">
+                          {vgEditingId === row.id ? (
+                            <>
+                              <td className="px-3 py-2">
+                                <select
+                                  value={vgEditWinery}
+                                  onChange={(e) => setVgEditWinery(e.target.value)}
+                                  className="w-full rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+                                >
+                                  <option value="">—</option>
+                                  {vgDeliveryWineries.map((w) => (
+                                    <option key={w} value={w}>{w}</option>
+                                  ))}
+                                </select>
+                              </td>
+                              <td className="px-3 py-2">
+                                <input
+                                  type="text"
+                                  list={`vg-edit-vineyard-${row.id}`}
+                                  value={vgEditVineyard}
+                                  onChange={(e) => setVgEditVineyard(e.target.value)}
+                                  className="w-full rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+                                />
+                                <datalist id={`vg-edit-vineyard-${row.id}`}>
+                                  {vgVineyardNames.map((v) => (
+                                    <option key={v} value={v} />
+                                  ))}
+                                </datalist>
+                              </td>
+                              <td className="px-3 py-2">
+                                <input
+                                  type="text"
+                                  value={vgEditGroup}
+                                  onChange={(e) => setVgEditGroup(e.target.value)}
+                                  className="w-full rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+                                />
+                              </td>
+                              <td className="px-3 py-2 text-right">
+                                <button
+                                  type="button"
+                                  onClick={() => updateVgRow(row.id)}
+                                  disabled={vgSaving}
+                                  className="mr-2 rounded bg-emerald-600 px-2 py-1 text-xs font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
+                                >
+                                  Save
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setVgEditingId(null)}
+                                  className="rounded border border-zinc-300 bg-white px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-100 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700"
+                                >
+                                  Cancel
+                                </button>
+                              </td>
+                            </>
+                          ) : (
+                            <>
+                              <td className="px-3 py-2 text-zinc-900 dark:text-zinc-100">{row.winery_name ?? '—'}</td>
+                              <td className="px-3 py-2 text-zinc-900 dark:text-zinc-100">{row.vineyard_name}</td>
+                              <td className="px-3 py-2 text-zinc-900 dark:text-zinc-100">{row.vineyard_group}</td>
+                              <td className="px-3 py-2 text-right">
+                                <button
+                                  type="button"
+                                  onClick={() => startEditVg(row)}
+                                  disabled={vgSaving}
+                                  className="mr-2 rounded border border-zinc-300 bg-white px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-100 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700"
+                                >
+                                  Edit
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => cloneVgRow(row)}
+                                  disabled={vgSaving}
+                                  className="mr-2 rounded border border-zinc-300 bg-white px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-100 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700"
+                                  title="Copy this row into the Add form"
+                                >
+                                  Clone
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => deleteVgRow(row.id)}
+                                  disabled={vgSaving}
+                                  className="rounded border border-red-200 bg-white px-2 py-1 text-xs font-medium text-red-700 hover:bg-red-50 dark:border-red-800 dark:bg-zinc-800 dark:text-red-300 dark:hover:bg-red-950/30"
+                                >
+                                  Delete
+                                </button>
+                              </td>
+                            </>
+                          )}
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+
+          <div className="mt-8 border-t border-zinc-200 pt-6 dark:border-zinc-700">
+            <h3 className="text-base font-medium text-zinc-900 dark:text-zinc-100">Update Vineyard_Group</h3>
+            <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
+              Set all <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">tbl_vworkjobs.vineyard_group</code> to <strong>NA</strong>, then set rows that match <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">tbl_vineyardgroups</code> (winery + vineyard) to the mapped <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">vineyard_group</code>. Run <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">add_vineyard_group_tbl_vworkjobs.sql</code> once if the column is missing.
+            </p>
+            <div className="mt-4">
+              <button
+                type="button"
+                onClick={runUpdateVineyardGroup}
+                disabled={vineyardGroupLoading}
+                className="rounded bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50 dark:bg-blue-700 dark:hover:bg-blue-600"
+                title="SET vineyard_group = 'NA' for all, then set from tbl_vineyardgroups where delivery_winery/vineyard_name match"
+              >
+                {vineyardGroupLoading ? 'Running…' : 'Update Vineyard_Group'}
+              </button>
+            </div>
+            {vineyardGroupResult != null && (
+              <div className="mt-4 rounded border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-800 dark:border-emerald-800 dark:bg-emerald-950/50 dark:text-emerald-200">
+                Set {vineyardGroupResult.setToNa} row(s) to NA; {vineyardGroupResult.matched} row(s) updated from tbl_vineyardgroups (total vwork rows: {vineyardGroupResult.totalRows}).
+              </div>
+            )}
+            {vineyardGroupError && (
+              <div className="mt-4 rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-800 dark:bg-red-950/50 dark:text-red-200">
+                {vineyardGroupError}
+              </div>
+            )}
+          </div>
+        </section>
+        )}
       </div>
     </div>
+  );
+}
+
+export default function DataChecksPage() {
+  return (
+    <Suspense fallback={<div className="min-h-screen bg-zinc-50 dark:bg-zinc-950 flex items-center justify-center"><p className="text-zinc-500 dark:text-zinc-400">Loading…</p></div>}>
+      <DataChecksPageContent />
+    </Suspense>
   );
 }

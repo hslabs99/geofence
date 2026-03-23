@@ -5,6 +5,7 @@ type WineryMinutesRow = {
   id: number;
   Customer: string | null;
   Template: string | null;
+  vineyardgroup: string | null;
   Winery: string | null;
   TT: string | null;
   ToVineMins: number | null;
@@ -14,7 +15,7 @@ type WineryMinutesRow = {
   TotalMins: number | null;
 };
 
-const SELECT_COLS = `id, "Customer", "Template", "Winery", "TT", "ToVineMins", "InVineMins", "ToWineMins", "InWineMins", "TotalMins"`;
+const SELECT_COLS = `id, "Customer", "Template", vineyardgroup, "Winery", "TT", "ToVineMins", "InVineMins", "ToWineMins", "InWineMins", "TotalMins"`;
 
 /** GET: single record by id */
 export async function GET(
@@ -51,6 +52,7 @@ export async function PUT(
     const body = await request.json();
     const Customer = (body.Customer ?? body.customer ?? '').trim() || null;
     const Template = (body.Template ?? body.template ?? '').trim() || null;
+    const vineyardgroup = (body.vineyardgroup ?? body.Vineyard_Group ?? body.vineyard_group ?? '').trim() || null;
     const Winery = (body.Winery ?? body.winery ?? '').trim() || null;
     const TT = (body.TT ?? body.tt ?? '').trim() || null;
     if (TT !== null && TT !== '' && TT !== 'T' && TT !== 'TT' && TT !== 'TTT') {
@@ -64,9 +66,9 @@ export async function PUT(
 
     const n = await execute(
       `UPDATE tbl_wineryminutes
-       SET "Customer" = $1, "Template" = $2, "Winery" = $3, "TT" = $4, "ToVineMins" = $5, "InVineMins" = $6, "ToWineMins" = $7, "InWineMins" = $8, "TotalMins" = $9
-       WHERE id = $10`,
-      [Customer, Template, Winery, TT, ToVineMins, InVineMins, ToWineMins, InWineMins, TotalMins, idNum]
+       SET "Customer" = $1, "Template" = $2, vineyardgroup = $3, "Winery" = $4, "TT" = $5, "ToVineMins" = $6, "InVineMins" = $7, "ToWineMins" = $8, "InWineMins" = $9, "TotalMins" = $10
+       WHERE id = $11`,
+      [Customer, Template, vineyardgroup, Winery, TT, ToVineMins, InVineMins, ToWineMins, InWineMins, TotalMins, idNum]
     );
     if (n === 0) return NextResponse.json({ error: 'Not found' }, { status: 404 });
     return NextResponse.json({ ok: true });

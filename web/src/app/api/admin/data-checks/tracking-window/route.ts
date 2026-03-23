@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server';
 import { getClient } from '@/lib/db';
 
 /**
+ * Read-only: returns tbl_tracking rows. position_time is stored verbatim from API — we never alter it.
  * GET: Return tbl_tracking rows for a device in a position_time window:
  * from - 5 minutes to to + 90 minutes (so you can scroll a larger data set after the gap).
  * Params: device (required), from (position_time YYYY-MM-DD HH:mm:ss), to (position_time YYYY-MM-DD HH:mm:ss).

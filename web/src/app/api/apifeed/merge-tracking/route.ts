@@ -1,11 +1,13 @@
 import { NextResponse } from 'next/server';
 import { getClient } from '@/lib/db';
+import { positionTimeBoundForQuery } from '@/lib/verbatim-time';
 
-function formatDateForDebug(d: Date): string {
-  const pad = (n: number) => String(n).padStart(2, '0');
-  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
-}
-
+/**
+ * VERBATIM TIMES — NEVER ALTER.
+ * We copy position_time from tbl_apifeed to tbl_tracking. Bounds MUST come from positionTimeBoundForQuery
+ * (raw strings from the API flow). FORBIDDEN: Date, formatDateForDebug, toISOString, getUTC*, timezone conversion.
+ * See web/docs/VERBATIM_TIMES.md
+ */
 const DELETE_SQL = `
   DELETE FROM tbl_tracking
   WHERE device_name = $1
@@ -14,6 +16,7 @@ const DELETE_SQL = `
 `;
 
 // Column order matches gpsdata insert (src/db.ts): device_no..address, then created_at, apirow
+// a.position_time is copied verbatim — we never alter API data.
 const INSERT_SQL = `
   INSERT INTO tbl_tracking (
     device_no,
@@ -76,24 +79,16 @@ export async function POST(request: Request) {
       maxTime?: string;
     };
     const deviceName = body?.deviceName?.trim();
-    const minTime = body?.minTime?.trim();
-    const maxTime = body?.maxTime?.trim();
-    if (!deviceName || !minTime || !maxTime) {
+    const minTime = body?.minTime;
+    const maxTime = body?.maxTime;
+    if (!deviceName || minTime == null || maxTime == null) {
       return NextResponse.json(
-        { ok: false, error: 'deviceName, minTime and maxTime required' },
+        { ok: false, error: 'deviceName, minTime and maxTime required (raw API strings)' },
         { status: 400 }
       );
     }
-
-    const minDate = new Date(minTime.includes('T') ? minTime : `${minTime.replace(' ', 'T')}Z`);
-    const maxDate = new Date(maxTime.includes('T') ? maxTime : `${maxTime.replace(' ', 'T')}Z`);
-    if (Number.isNaN(minDate.getTime()) || Number.isNaN(maxDate.getTime())) {
-      return NextResponse.json({ ok: false, error: 'Invalid minTime or maxTime' }, { status: 400 });
-    }
-
-    // Bounds are UTC strings only; session set to UTC so no TZ shift. Never pass Date to DB.
-    const minStr = formatDateForDebug(minDate);
-    const maxStr = formatDateForDebug(maxDate);
+    const minStr = positionTimeBoundForQuery(minTime);
+    const maxStr = positionTimeBoundForQuery(maxTime);
     const params = [deviceName, minStr, maxStr];
 
     const client = await getClient();
@@ -142,8 +137,6 @@ export async function POST(request: Request) {
         deviceName,
         minTime,
         maxTime,
-        minDate: minDate.toISOString(),
-        maxDate: maxDate.toISOString(),
       },
     });
   } catch (err) {

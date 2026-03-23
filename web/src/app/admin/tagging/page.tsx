@@ -89,6 +89,14 @@ function dateRange(fromDate: string, toDate: string): string[] {
   return out;
 }
 
+function getJobField(j: Record<string, unknown>, ...keys: string[]): string {
+  for (const k of keys) {
+    const v = j[k];
+    if (v != null && v !== '') return String(v).trim();
+  }
+  return '';
+}
+
 export default function TaggingPage() {
   const [dateFrom, setDateFrom] = useState(DEFAULT_DATE);
   const [dateTo, setDateTo] = useState(DEFAULT_DATE);
@@ -97,6 +105,8 @@ export default function TaggingPage() {
   const [stepsEndPlusMinutes, setStepsEndPlusMinutes] = useState(60);
   const [graceSeconds, setGraceSeconds] = useState(300);
   const [runStatus, setRunStatus] = useState<'idle' | 'running' | 'done' | 'error'>('idle');
+  /** When true, the in-progress run is Steps-only (not full tagging). */
+  const [stepsOnlyRunActive, setStepsOnlyRunActive] = useState(false);
   const [streamLogs, setStreamLogs] = useState<string[]>([]);
   const [currentStage, setCurrentStage] = useState<string>('');
   const [summary, setSummary] = useState<RunSummary | null>(null);
@@ -247,6 +257,7 @@ export default function TaggingPage() {
     const to = dateTo.trim();
     if (!from || !to || dateRange(from, to).length === 0) return;
     setRunStatus('running');
+    setStepsOnlyRunActive(false);
     setStreamLogs([]);
     setCurrentStage('Applying position_time_nz and store_fences…');
     setSummary(null);
@@ -356,6 +367,95 @@ export default function TaggingPage() {
     }
   };
 
+  /** Derived-steps for one calendar day (vworkjobs + runFetchStepsForJobs). */
+  const runStepsForDate = async (
+    date: string,
+    dayIndex: number,
+    totalDays: number,
+    appendLog: (line: string) => void
+  ): Promise<void> => {
+    setCurrentStage(`${date}: Steps (${dayIndex + 1}/${totalDays})`);
+    appendLog(`=== ${date}: Steps ===`);
+    const stepsUrl = stepsForce
+      ? `/api/vworkjobs?date=${encodeURIComponent(date)}`
+      : `/api/vworkjobs?date=${encodeURIComponent(date)}&stepsFetched=false`;
+    const stepsRes = await fetch(stepsUrl);
+    const stepsData = await stepsRes.json();
+    if (!stepsRes.ok) {
+      appendLog(`[Error] Steps job list: ${stepsData?.error ?? stepsRes.status}`);
+      return;
+    }
+    const jobs: Record<string, unknown>[] = stepsData.rows ?? [];
+    appendLog(`  Jobs for ${date}: ${jobs.length}`);
+    jobs.forEach((job) => {
+      const jobId = job.job_id != null ? String(job.job_id) : '?';
+      const worker =
+        getJobField(job, 'worker', 'Worker') || getJobField(job, 'truck_id', 'Truck_ID') || '—';
+      appendLog(`  Job ${jobId} (${worker})`);
+    });
+    if (jobs.length > 0) {
+      const result = await runFetchStepsForJobs({
+        jobs,
+        startLessMinutes: stepsStartLessMinutes,
+        endPlusMinutes: stepsEndPlusMinutes,
+        jobDateForLog: date,
+        onProgress: (current, total, log) => {
+          const last = log[log.length - 1];
+          if (!last) return;
+          appendLog(
+            `    ${current}/${total} ${last.job_id} — ${last.status}${last.message ? `: ${last.message}` : ''}`
+          );
+          if (last.status === 'ok' && last.stepVias?.length === 5) {
+            const day = last.jobDate ?? date;
+            last.stepVias.forEach((via, si) => {
+              appendLog(`      ${day} job ${last.job_id} step ${si + 1}: ${via}`);
+            });
+          }
+        },
+      });
+      const okCount = result.log.filter((e) => e.status === 'ok').length;
+      const errCount = result.log.filter((e) => e.status === 'error').length;
+      appendLog(`  Steps set: ${okCount} ok, ${errCount} error`);
+    }
+  };
+
+  /** After new GPS mappings only Steps need refreshing; skips ENTER/EXIT tagging. */
+  const runStepsOnlyForRange = async () => {
+    const from = dateFrom.trim();
+    const to = dateTo.trim();
+    if (!from || !to) return;
+    const dates = dateRange(from, to);
+    if (dates.length === 0) {
+      setRunError('Date from must be ≤ date to');
+      return;
+    }
+    setRunStatus('running');
+    setStepsOnlyRunActive(true);
+    setStreamLogs([]);
+    setSummary(null);
+    setRunError(null);
+
+    const appendLog = (line: string) => {
+      setStreamLogs((prev) => [...prev, line]);
+    };
+
+    try {
+      appendLog(`Steps only (no ENTER/EXIT) for ${from} → ${to} (${dates.length} day(s))…`);
+      for (let d = 0; d < dates.length; d++) {
+        await runStepsForDate(dates[d]!, d, dates.length, appendLog);
+      }
+      appendLog('Steps-only run complete.');
+      setCurrentStage('Complete');
+      setRunStatus('done');
+    } catch (err) {
+      setRunError(err instanceof Error ? err.message : String(err));
+      setRunStatus('error');
+      setCurrentStage('');
+    } finally {
+      setStepsOnlyRunActive(false);
+    }
+  };
+
   const runTagsAndSteps = async () => {
     const from = dateFrom.trim();
     const to = dateTo.trim();
@@ -366,6 +466,7 @@ export default function TaggingPage() {
       return;
     }
     setRunStatus('running');
+    setStepsOnlyRunActive(false);
     setStreamLogs([]);
     setSummary(null);
     setRunError(null);
@@ -376,7 +477,7 @@ export default function TaggingPage() {
 
     try {
       for (let d = 0; d < dates.length; d++) {
-        const date = dates[d];
+        const date = dates[d]!;
         setCurrentStage(`${date}: devices + Tag Enter/Exit (${d + 1}/${dates.length})`);
         appendLog(`=== ${date}: Tag Enter/Exit ===`);
 
@@ -452,45 +553,7 @@ export default function TaggingPage() {
           }
         }
 
-        setCurrentStage(`${date}: Steps (${d + 1}/${dates.length})`);
-        appendLog(`=== ${date}: Steps ===`);
-        const stepsUrl = stepsForce
-          ? `/api/vworkjobs?date=${encodeURIComponent(date)}`
-          : `/api/vworkjobs?date=${encodeURIComponent(date)}&stepsFetched=false`;
-        const stepsRes = await fetch(stepsUrl);
-        const stepsData = await stepsRes.json();
-        if (!stepsRes.ok) {
-          appendLog(`[Error] Steps job list: ${stepsData?.error ?? stepsRes.status}`);
-          continue;
-        }
-        const jobs: Record<string, unknown>[] = stepsData.rows ?? [];
-        appendLog(`  Jobs for ${date}: ${jobs.length}`);
-        const getJob = (j: Record<string, unknown>, ...keys: string[]): string => {
-          for (const k of keys) {
-            const v = j[k];
-            if (v != null && v !== '') return String(v).trim();
-          }
-          return '';
-        };
-        jobs.forEach((job) => {
-          const jobId = job.job_id != null ? String(job.job_id) : '?';
-          const worker = getJob(job, 'worker', 'Worker') || getJob(job, 'truck_id', 'Truck_ID') || '—';
-          appendLog(`  Job ${jobId} (${worker})`);
-        });
-        if (jobs.length > 0) {
-          const result = await runFetchStepsForJobs({
-            jobs,
-            startLessMinutes: stepsStartLessMinutes,
-            endPlusMinutes: stepsEndPlusMinutes,
-            onProgress: (current, total, log) => {
-              const last = log[log.length - 1];
-              if (last) appendLog(`    ${current}/${total} ${last.job_id} — ${last.status}${last.message ? `: ${last.message}` : ''}`);
-            },
-          });
-          const okCount = result.log.filter((e) => e.status === 'ok').length;
-          const errCount = result.log.filter((e) => e.status === 'error').length;
-          appendLog(`  Steps set: ${okCount} ok, ${errCount} error`);
-        }
+        await runStepsForDate(date, d, dates.length, appendLog);
       }
       setCurrentStage('Complete');
       setRunStatus('done');
@@ -700,9 +763,23 @@ export default function TaggingPage() {
               >
                 {runStatus === 'running' ? 'Running…' : 'Tag Enter/Exit and Steps'}
               </button>
+              <button
+                type="button"
+                onClick={runStepsOnlyForRange}
+                disabled={
+                  runStatus === 'running' ||
+                  !dateFrom ||
+                  !dateTo ||
+                  dateRange(dateFrom, dateTo).length === 0
+                }
+                className="rounded border border-blue-600 bg-white px-4 py-2 text-sm font-medium text-blue-700 hover:bg-blue-50 disabled:opacity-50 dark:border-blue-500 dark:bg-zinc-900 dark:text-blue-300 dark:hover:bg-blue-950/40"
+                title="Same Steps pipeline as above, but skips ENTER/EXIT tagging. Use after new GPS fence mappings when only derived steps need refreshing."
+              >
+                {runStatus === 'running' && stepsOnlyRunActive ? 'Running steps…' : 'Rerun Steps only'}
+              </button>
             </div>
             <p className="text-xs text-zinc-500 dark:text-zinc-400">
-              Run tagging: fetches devices from tbl_tracking for the range, then tags ENTER/EXIT. Tag Enter/Exit and Steps: for each day, gets devices for that day from tbl_tracking and runs Enter/Exit then Steps (vworkjobs). Device lists appear in the log. Run Fence tagging above first if needed.
+              Run tagging: fetches devices from tbl_tracking for the range, then tags ENTER/EXIT. Tag Enter/Exit and Steps: for each day, gets devices for that day from tbl_tracking and runs Enter/Exit then Steps (vworkjobs); the same derived-steps pipeline as Inspect, including <strong>Steps+</strong> (buffered vineyard) when step 2/3 are still missing. <strong>Rerun Steps only</strong> uses the same date range and Steps options (force, window) but does not call tagging — for example after new mappings when tracking tags are already correct. Device lists appear in the log. Run Fence tagging above first if needed.
             </p>
           </div>
         </section>

@@ -1,6 +1,5 @@
 'use client';
 
-import Link from 'next/link';
 import { useEffect, useState } from 'react';
 
 type GpsMapping = {
@@ -8,6 +7,16 @@ type GpsMapping = {
   type: string;
   vwname: string;
   gpsname: string;
+};
+
+type TrackingRow = {
+  device_name: string;
+  position_time: string | null;
+  position_time_nz: string | null;
+  fence_name: string | null;
+  geofence_type: string | null;
+  lat: number | null;
+  lon: number | null;
 };
 
 type GeofenceRow = { fence_id: number; fence_name: string };
@@ -42,6 +51,11 @@ export default function GpsMappingsPage() {
   /** Mappings table sort */
   const [mappingsSortKey, setMappingsSortKey] = useState<'id' | 'type' | 'vwname' | 'gpsname' | 'count' | null>(null);
   const [mappingsSortDir, setMappingsSortDir] = useState<'asc' | 'desc'>('asc');
+  /** In-page tbl_tracking: when user clicks a data count, load rows here (no navigation) */
+  const [trackingFence, setTrackingFence] = useState<{ fence_id: number; fence_name: string } | null>(null);
+  const [trackingRows, setTrackingRows] = useState<TrackingRow[]>([]);
+  const [trackingLoading, setTrackingLoading] = useState(false);
+  const [trackingError, setTrackingError] = useState<string | null>(null);
 
   const vwnameOptions = newRow.type === 'Winery'
     ? options?.deliveryWineries ?? []
@@ -92,10 +106,33 @@ export default function GpsMappingsPage() {
           !fenceTag(f.fence_name) &&
           (options?.trackingCountByFenceId?.[f.fence_id] ?? 0) > 0
       )
-      .map((f) => ({ fence_name: f.fence_name!, count: options?.trackingCountByFenceId?.[f.fence_id] ?? 0 }));
+      .map((f) => ({
+        fence_id: f.fence_id,
+        fence_name: f.fence_name!,
+        count: options?.trackingCountByFenceId?.[f.fence_id] ?? 0,
+      }));
     list.sort((a, b) => a.fence_name.localeCompare(b.fence_name));
     return list;
   })();
+
+  const openTrackingForFence = (fence_id: number, fence_name: string) => {
+    setTrackingFence({ fence_id, fence_name });
+    setTrackingError(null);
+    setTrackingRows([]);
+    setTrackingLoading(true);
+    fetch(`/api/gpsmappings/tracking-by-fence?fenceId=${encodeURIComponent(fence_id)}`)
+      .then((r) => {
+        if (!r.ok) return r.json().then((d) => Promise.reject(new Error(d?.error ?? r.statusText)));
+        return r.json();
+      })
+      .then((data: { rows: TrackingRow[] }) => {
+        setTrackingRows(data.rows ?? []);
+      })
+      .catch((e) => {
+        setTrackingError(e instanceof Error ? e.message : String(e));
+      })
+      .finally(() => setTrackingLoading(false));
+  };
 
   // For "Add mapping" form: all GPS fence names, or only unlinked with data > 0
   const allGpsFenceNames = (() => {
@@ -467,8 +504,25 @@ export default function GpsMappingsPage() {
                       <td className="max-w-[10rem] truncate px-2 py-1.5 text-zinc-700 dark:text-zinc-300" title={r.gpsname}>
                         {r.gpsname}
                       </td>
-                      <td className="whitespace-nowrap px-2 py-1.5 text-zinc-500 dark:text-zinc-400 tabular-nums" title="tbl_tracking rows for this GPS fence">
-                        {getTrackingCountForRow(r)}
+                      <td className="whitespace-nowrap px-2 py-1.5 text-zinc-500 dark:text-zinc-400 tabular-nums" title="Click to load tbl_tracking rows below">
+                        {(() => {
+                          const count = getTrackingCountForRow(r);
+                          const fence = (r.gpsname ?? '').trim() && options?.trackingFences
+                            ? options.trackingFences.find((f) => (f.fence_name ?? '').trim() === (r.gpsname ?? '').trim())
+                            : null;
+                          if (count > 0 && fence) {
+                            return (
+                              <button
+                                type="button"
+                                onClick={() => openTrackingForFence(fence.fence_id, fence.fence_name ?? r.gpsname ?? '')}
+                                className="text-blue-600 underline hover:no-underline dark:text-blue-400"
+                              >
+                                {count}
+                              </button>
+                            );
+                          }
+                          return count;
+                        })()}
                       </td>
                       <td className="whitespace-nowrap px-2 py-1.5">
                         <button
@@ -656,10 +710,16 @@ export default function GpsMappingsPage() {
                   <p className="text-xs text-zinc-500 dark:text-zinc-400">None</p>
                 ) : (
                   <ul className="max-h-40 overflow-y-auto text-xs text-zinc-700 dark:text-zinc-300">
-                    {unlinkedTrackingFences.map(({ fence_name, count }) => (
+                    {unlinkedTrackingFences.map(({ fence_id, fence_name, count }) => (
                       <li key={fence_name} className="flex items-baseline justify-between gap-2 py-0.5" title={fence_name}>
                         <span className="truncate min-w-0">{fence_name}</span>
-                        <span className="flex-shrink-0 tabular-nums text-zinc-500 dark:text-zinc-400">{count}</span>
+                        <button
+                          type="button"
+                          onClick={() => openTrackingForFence(fence_id, fence_name)}
+                          className="flex-shrink-0 tabular-nums text-blue-600 underline hover:no-underline dark:text-blue-400"
+                        >
+                          {count}
+                        </button>
                       </li>
                     ))}
                   </ul>
@@ -681,7 +741,7 @@ export default function GpsMappingsPage() {
             <p className="px-3 py-1 text-xs text-zinc-500 dark:text-zinc-400">
               <code className="rounded bg-zinc-100 px-0.5 dark:bg-zinc-800">tbl_vworkjobs</code>
             </p>
-            <ul className="max-h-64 overflow-y-auto px-3 pb-3 text-xs text-zinc-700 dark:text-zinc-300">
+            <ul className="max-h-[32rem] overflow-y-auto px-3 pb-3 text-xs text-zinc-700 dark:text-zinc-300">
               {(options?.deliveryWineries ?? []).map((name) => (
                 <li key={name} className="flex items-baseline gap-1 py-0.5 min-w-0" title={`Click to add mapping: ${name}`}>
                   <button
@@ -710,7 +770,7 @@ export default function GpsMappingsPage() {
             <p className="px-3 py-1 text-xs text-zinc-500 dark:text-zinc-400">
               <code className="rounded bg-zinc-100 px-0.5 dark:bg-zinc-800">tbl_vworkjobs</code>
             </p>
-            <ul className="max-h-64 overflow-y-auto px-3 pb-3 text-xs text-zinc-700 dark:text-zinc-300">
+            <ul className="max-h-[64rem] overflow-y-auto px-3 pb-3 text-xs text-zinc-700 dark:text-zinc-300">
               {(options?.vineyardNames ?? []).map((name) => (
                 <li key={name} className="flex items-baseline gap-1 py-0.5 min-w-0" title={`Click to add mapping: ${name}`}>
                   <button
@@ -772,13 +832,14 @@ export default function GpsMappingsPage() {
                           {!tag && <span className="text-zinc-400 dark:text-zinc-500">—</span>}
                         </td>
                         <td className="whitespace-nowrap px-2 py-1.5 text-right tabular-nums">
-                          <Link
-                            href={`/query/gpsdata?geofenceId=${encodeURIComponent(f.fence_id)}`}
+                          <button
+                            type="button"
+                            onClick={() => openTrackingForFence(f.fence_id, f.fence_name ?? '')}
                             className="text-blue-600 underline hover:no-underline dark:text-blue-400"
-                            title={`View ${dataCount} tbl_tracking rows for this fence in GPS Tracking`}
+                            title="Load tbl_tracking rows in table below"
                           >
                             {dataCount}
-                          </Link>
+                          </button>
                         </td>
                       </tr>
                     );
@@ -792,6 +853,83 @@ export default function GpsMappingsPage() {
               </p>
             )}
           </div>
+
+          {/* In-page tbl_tracking table (when a data count was clicked) */}
+          {trackingFence && (
+            <div className="mt-6 w-full rounded-lg border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900">
+              <div className="flex items-center justify-between border-b border-zinc-200 px-3 py-2 dark:border-zinc-700">
+                <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
+                  tbl_tracking: {trackingFence.fence_name} (fence_id {trackingFence.fence_id})
+                </h2>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setTrackingFence(null);
+                    setTrackingRows([]);
+                    setTrackingError(null);
+                  }}
+                  className="rounded border border-zinc-300 px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-100 dark:border-zinc-600 dark:text-zinc-300 dark:hover:bg-zinc-800"
+                >
+                  Close
+                </button>
+              </div>
+              {trackingLoading && (
+                <p className="p-3 text-xs text-zinc-500 dark:text-zinc-400">Loading…</p>
+              )}
+              {trackingError && (
+                <p className="p-3 text-sm text-red-600 dark:text-red-400">{trackingError}</p>
+              )}
+              {!trackingLoading && !trackingError && trackingRows.length === 0 && (
+                <p className="p-3 text-xs text-zinc-500 dark:text-zinc-400">No rows</p>
+              )}
+              {!trackingLoading && !trackingError && trackingRows.length > 0 && (
+                <div className="overflow-x-auto max-h-[28rem] overflow-y-auto">
+                  <table className="min-w-full border-collapse text-left text-xs">
+                    <thead className="sticky top-0 bg-zinc-100 dark:bg-zinc-800">
+                      <tr className="border-b border-zinc-200 dark:border-zinc-700">
+                        <th className="px-2 py-1.5 font-medium text-zinc-700 dark:text-zinc-300">position_time</th>
+                        <th className="px-2 py-1.5 font-medium text-zinc-700 dark:text-zinc-300">position_time_nz</th>
+                        <th className="px-2 py-1.5 font-medium text-zinc-700 dark:text-zinc-300">device_name</th>
+                        <th className="px-2 py-1.5 font-medium text-zinc-700 dark:text-zinc-300">fence_name</th>
+                        <th className="px-2 py-1.5 font-medium text-zinc-700 dark:text-zinc-300">geofence_type</th>
+                        <th className="px-2 py-1.5 font-medium text-zinc-700 dark:text-zinc-300 text-right">lat</th>
+                        <th className="px-2 py-1.5 font-medium text-zinc-700 dark:text-zinc-300 text-right">lon</th>
+                        <th className="px-2 py-1.5 font-medium text-zinc-700 dark:text-zinc-300 text-center">Map</th>
+                      </tr>
+                    </thead>
+                    <tbody className="text-zinc-700 dark:text-zinc-300">
+                      {trackingRows.map((r, i) => (
+                        <tr key={i} className="border-b border-zinc-100 dark:border-zinc-800 hover:bg-zinc-50 dark:hover:bg-zinc-800/50">
+                          <td className="whitespace-nowrap px-2 py-1 font-mono text-zinc-800 dark:text-zinc-200">{r.position_time ?? '—'}</td>
+                          <td className="whitespace-nowrap px-2 py-1 font-mono text-zinc-800 dark:text-zinc-200">{r.position_time_nz ?? '—'}</td>
+                          <td className="whitespace-nowrap px-2 py-1">{r.device_name ?? '—'}</td>
+                          <td className="whitespace-nowrap px-2 py-1">{r.fence_name ?? '—'}</td>
+                          <td className="whitespace-nowrap px-2 py-1">{r.geofence_type ?? '—'}</td>
+                          <td className="whitespace-nowrap px-2 py-1 text-right font-mono text-zinc-600 dark:text-zinc-400">{r.lat != null ? r.lat : '—'}</td>
+                          <td className="whitespace-nowrap px-2 py-1 text-right font-mono text-zinc-600 dark:text-zinc-400">{r.lon != null ? r.lon : '—'}</td>
+                          <td className="whitespace-nowrap px-2 py-1 text-center">
+                            {r.lat != null && r.lon != null ? (
+                              <a
+                                href={`https://www.google.com/maps?q=${r.lat},${r.lon}`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="text-blue-600 dark:text-blue-400 hover:underline"
+                                title={`Open ${r.lat}, ${r.lon} in Google Maps`}
+                              >
+                                Map
+                              </a>
+                            ) : (
+                              '—'
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       )}
     </div>

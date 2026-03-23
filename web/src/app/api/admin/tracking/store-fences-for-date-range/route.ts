@@ -1,6 +1,11 @@
 import { NextResponse } from 'next/server';
 import { execute, query } from '@/lib/db';
 
+/**
+ * VERBATIM TIMES — position_time_nz is the only derived time.
+ * We do NOT alter position_time (that stays exactly as from the API). Here we only run a SQL UPDATE
+ * to set position_time_nz = position_time + interval '13 hours' for display. Never alter API timestamps.
+ */
 /** YYYY-MM-DD list from fromDate to toDate inclusive. Uses local date only (no UTC). */
 function dateRange(fromDate: string, toDate: string): string[] {
   const from = new Date(fromDate + 'T00:00:00');

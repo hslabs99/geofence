@@ -1,3 +1,7 @@
+/**
+ * Derive VWork **job steps 1–5** from tbl_tracking ENTER/EXIT and business rules.
+ * **Steps+** (buffered vineyard polygon fallback for missing step 2/3) runs in `/api/tracking/derived-steps`, not in this module.
+ */
 import { query } from '@/lib/db';
 import { dateToLiteral } from '@/lib/utils';
 

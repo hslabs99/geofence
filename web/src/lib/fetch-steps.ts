@@ -57,6 +57,10 @@ export type FetchStepsLogEntry = {
   job_id: string;
   status: 'ok' | 'skip' | 'error';
   message?: string;
+  /** When status === 'ok': how each job step 1–5 was chosen (VW, GPS, GPS+, Manual, Rule). */
+  stepVias?: string[];
+  /** Optional calendar date (YYYY-MM-DD) for bulk logs, e.g. tagging day. */
+  jobDate?: string;
 };
 
 export type RunFetchStepsOptions = {
@@ -64,6 +68,8 @@ export type RunFetchStepsOptions = {
   jobs: FetchStepsJob[];
   startLessMinutes: number;
   endPlusMinutes: number;
+  /** Shown in per-step log lines alongside job_id (e.g. vworkjobs date for tagging). */
+  jobDateForLog?: string;
   /** Called after each job with (currentIndex1Based, total, logSoFar). */
   onProgress?: (current: number, total: number, log: FetchStepsLogEntry[]) => void;
 };
@@ -78,10 +84,49 @@ export type RunFetchStepsResult = {
  * Run derived-steps (with writeBack) for each job. Single code path for both
  * "fetch steps for date" (many jobs) and "refetch this job" (one job, force).
  * Each call clears GPS step fields 1–5 and final steps first, then runs part 1 (standard fence)
- * and part 2 (Steps2 buffered vineyard fence if step 2/3 missing). Used by Inspect, Tagging, API test.
+ * and **Steps+** (buffered vineyard fence) if VWork step 2 or 3 is still missing — not to be confused
+ * with job steps 1–5. Used by Inspect, Tagging, API test.
  */
+
+/** Map API `stepNVia` to short log labels (Steps+ → GPS+, overrides → Manual). */
+export function mapApiStepViaToDisplay(code: string | undefined | null): string {
+  const s = code != null ? String(code).trim() : '';
+  switch (s) {
+    case 'VW':
+      return 'VW';
+    case 'GPS':
+      return 'GPS';
+    case 'VineFence+':
+      return 'GPS+';
+    case 'ORIDE':
+      return 'Manual';
+    case 'RULE':
+      return 'Rule';
+    default:
+      return s || '—';
+  }
+}
+
+/** Build five display labels from `/api/tracking/derived-steps` JSON (matches write-back fallbacks). */
+function stepViasDisplayFromResult(o: Record<string, unknown>): string[] {
+  const explicit = (n: 1 | 2 | 3 | 4 | 5): string | undefined => {
+    const v = o[`step${n}Via`];
+    return v != null && String(v).trim() !== '' ? String(v).trim() : undefined;
+  };
+  const inf1 =
+    o.step1ActualOverride != null ? 'RULE' : o.step1 != null ? 'GPS' : 'VW';
+  const infN = (n: 2 | 3 | 4 | 5) => (o[`step${n}`] != null ? 'GPS' : 'VW');
+  return [
+    mapApiStepViaToDisplay(explicit(1) ?? inf1),
+    mapApiStepViaToDisplay(explicit(2) ?? infN(2)),
+    mapApiStepViaToDisplay(explicit(3) ?? infN(3)),
+    mapApiStepViaToDisplay(explicit(4) ?? infN(4)),
+    mapApiStepViaToDisplay(explicit(5) ?? infN(5)),
+  ];
+}
+
 export async function runFetchStepsForJobs(options: RunFetchStepsOptions): Promise<RunFetchStepsResult> {
-  const { jobs, startLessMinutes, endPlusMinutes, onProgress } = options;
+  const { jobs, startLessMinutes, endPlusMinutes, jobDateForLog, onProgress } = options;
   const log: FetchStepsLogEntry[] = [];
   let lastResult: unknown;
 
@@ -104,27 +149,42 @@ export async function runFetchStepsForJobs(options: RunFetchStepsOptions): Promi
       get(job, 'gps_end_time', 'Gps_End_Time');
 
     if (!device || !actualStart) {
-      log.push({ job_id: jobIdStr || '?', status: 'skip', message: 'no worker (device_name) or actual_start_time' });
+      log.push({
+        job_id: jobIdStr || '?',
+        status: 'skip',
+        message: 'no worker (device_name) or actual_start_time',
+        jobDate: jobDateForLog,
+      });
     } else {
       const positionAfter = addMinutesToTimestampAsNZ(actualStart, -startLessMinutes);
       const positionBefore = actualEnd ? addMinutesToTimestampAsNZ(actualEnd, endPlusMinutes) : '';
-      const params = new URLSearchParams({ jobId: jobIdStr, device, positionAfter });
+      const params = new URLSearchParams({
+        jobId: jobIdStr,
+        device,
+        positionAfter,
+        startLessMinutes: String(startLessMinutes),
+        endPlusMinutes: String(endPlusMinutes),
+      });
       if (positionBefore) params.set('positionBefore', positionBefore);
       params.set('writeBack', '1');
       try {
         const r = await fetch(`/api/tracking/derived-steps?${params}`);
         const result = await r.json().catch(() => ({}));
         lastResult = result;
+        const rec = result && typeof result === 'object' && !Array.isArray(result) ? (result as Record<string, unknown>) : {};
         log.push({
           job_id: jobIdStr || '?',
           status: r.ok ? 'ok' : 'error',
-          message: r.ok ? undefined : (result?.error ?? String(r.status)),
+          message: r.ok ? undefined : (rec.error != null ? String(rec.error) : String(r.status)),
+          stepVias: r.ok ? stepViasDisplayFromResult(rec) : undefined,
+          jobDate: jobDateForLog,
         });
       } catch (e) {
         log.push({
           job_id: jobIdStr || '?',
           status: 'error',
           message: e instanceof Error ? e.message : String(e),
+          jobDate: jobDateForLog,
         });
       }
     }

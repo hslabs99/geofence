@@ -1,28 +1,47 @@
 import { NextResponse } from 'next/server';
 import { getClient } from '@/lib/db';
+import { positionTimeForStorage, positionTimeBoundForQuery } from '@/lib/verbatim-time';
 
+/**
+ * VERBATIM TIMES — NEVER ALTER API DATA FOR TIMEZONES.
+ * What we get from the API (gpsTime) must arrive in position_time 100% as received.
+ * All position_time values MUST go through positionTimeForStorage( rawString ) — never pass a Date.
+ * FORBIDDEN: formatDateForDebug, toISOString, getUTC*, appending Z, any timezone conversion.
+ * See web/docs/VERBATIM_TIMES.md
+ */
 const SOURCE = 'tracksolid';
 const BATCH_SIZE = 500;
 
-/** Format Date for debug display (UTC). */
-function formatDateForDebug(d: Date): string {
-  const pad = (n: number) => String(n).padStart(2, '0');
-  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
-}
-
 /**
- * Parse gpsTime for insert. Returns the Date or null with a reason for debugging.
+ * Validate gpsTime is a parseable timestamp. Used only to skip invalid rows.
+ * We never use the parsed Date for storage — position_time is stored as the raw string.
  */
 function parsePositionTimeWithReason(
   gpsTime: string
-): { date: Date } | { reason: string } {
-  const raw = gpsTime;
+): { ok: true } | { reason: string } {
   const s = String(gpsTime ?? '').trim();
   if (!s) return { reason: 'empty or whitespace' };
-  const normalized = s.includes('T') ? s : `${s.replace(' ', 'T')}Z`;
+  // Accept space or T; do not append Z — we only check parseability
+  const normalized = s.includes('T') ? s : s.replace(' ', 'T');
   const d = new Date(normalized);
   if (Number.isNaN(d.getTime())) return { reason: `invalid date (normalized: "${normalized}")` };
-  return { date: d };
+  return { ok: true };
+}
+
+/** Derive day bounds from raw timestamp strings. No timezone conversion. */
+function dayBoundsFromRawTimes(rawTimes: string[]): { dayStartStr: string; dayEndStr: string } {
+  if (rawTimes.length === 0) return { dayStartStr: '1970-01-01 00:00:00', dayEndStr: '1970-01-01 23:59:59' };
+  const sorted = [...rawTimes].sort();
+  const minStr = sorted[0];
+  const maxStr = sorted[sorted.length - 1];
+  const looksLikeDate = (s: string) => /^\d{4}-\d{2}-\d{2}/.test(s);
+  if (looksLikeDate(minStr) && looksLikeDate(maxStr)) {
+    return {
+      dayStartStr: `${minStr.slice(0, 10)} 00:00:00`,
+      dayEndStr: `${maxStr.slice(0, 10)} 23:59:59`,
+    };
+  }
+  return { dayStartStr: minStr, dayEndStr: maxStr };
 }
 
 export async function POST(request: Request) {
@@ -42,22 +61,22 @@ export async function POST(request: Request) {
       return NextResponse.json({ ok: false, error: 'points array required and non-empty' }, { status: 400 });
     }
 
-    const rows: { positionTime: Date; location: string; payloadJson: string }[] = [];
+    const rows: { positionTimeRaw: string; location: string; payloadJson: string }[] = [];
     const skippedRows: { gpsTime: string; lat: unknown; lng: unknown; reason: string }[] = [];
     const imeiVal = imei ?? null;
     for (const p of points) {
-      const parsed = parsePositionTimeWithReason(p.gpsTime);
-      if ('reason' in parsed) {
+      const raw = positionTimeForStorage(p.gpsTime ?? '');
+      if (!raw) {
         skippedRows.push({
           gpsTime: String(p.gpsTime ?? ''),
           lat: p.lat,
           lng: p.lng,
-          reason: parsed.reason,
+          reason: 'empty or whitespace',
         });
         continue;
       }
       rows.push({
-        positionTime: parsed.date,
+        positionTimeRaw: raw,
         location: `${Number(p.lat) ?? 0},${Number(p.lng) ?? 0}`,
         payloadJson: JSON.stringify({ lat: p.lat, lng: p.lng, gpsTime: p.gpsTime }),
       });
@@ -79,41 +98,22 @@ export async function POST(request: Request) {
       });
     }
 
-    const minTime = new Date(Math.min(...rows.map((r) => r.positionTime.getTime())));
-    const maxTime = new Date(Math.max(...rows.map((r) => r.positionTime.getTime())));
-    // Delete full UTC day so range is 00:00:00–23:59:59, not just min/max of points
-    const dayStart = new Date(Date.UTC(
-      minTime.getUTCFullYear(),
-      minTime.getUTCMonth(),
-      minTime.getUTCDate(),
-      0,
-      0,
-      0
-    ));
-    const dayEnd = new Date(Date.UTC(
-      minTime.getUTCFullYear(),
-      minTime.getUTCMonth(),
-      minTime.getUTCDate(),
-      23,
-      59,
-      59
-    ));
+    const rawTimes = rows.map((r) => r.positionTimeRaw);
+    const { dayStartStr, dayEndStr } = dayBoundsFromRawTimes(rawTimes);
+    const dayStartForDb = positionTimeBoundForQuery(dayStartStr);
+    const dayEndForDb = positionTimeBoundForQuery(dayEndStr);
 
     // Detect duplicate position_time (same device) — if DB has UNIQUE(device_name, position_time), only first per time would persist
-    const positionTimeKeys = new Set(rows.map((r) => r.positionTime.getTime()));
+    const positionTimeKeys = new Set(rawTimes);
     const uniquePositionTimes = positionTimeKeys.size;
     const duplicatePositionTimeCount = rows.length - uniquePositionTimes;
-
-    // Bounds and position_time are UTC strings only; session set to UTC so no TZ shift. Never pass Date to DB.
-    const dayStartStr = formatDateForDebug(dayStart);
-    const dayEndStr = formatDateForDebug(dayEnd);
     let deleted: number;
     let inserted = 0;
     const client = await getClient();
     try {
       await client.query('BEGIN');
       await client.query("SET LOCAL timezone = 'UTC'");
-      const res = await client.query(DELETE_SQL, [deviceName, dayStartStr, dayEndStr]);
+      const res = await client.query(DELETE_SQL, [deviceName, dayStartForDb, dayEndForDb]);
       deleted = res.rowCount ?? 0;
       for (let i = 0; i < rows.length; i += BATCH_SIZE) {
         const batch = rows.slice(i, i + BATCH_SIZE);
@@ -122,7 +122,8 @@ export async function POST(request: Request) {
         let paramIdx = 1;
         for (const r of batch) {
           placeholders.push(`($${paramIdx}, $${paramIdx + 1}, $${paramIdx + 2}, $${paramIdx + 3}, $${paramIdx + 4}, $${paramIdx + 5}::jsonb, now())`);
-          values.push(deviceName, imeiVal, r.location, formatDateForDebug(r.positionTime), SOURCE, r.payloadJson);
+          // position_time = raw API string only. NEVER alter for timezone or re-format.
+          values.push(deviceName, imeiVal, r.location, r.positionTimeRaw, SOURCE, r.payloadJson);
           paramIdx += 6;
         }
         const insRes = await client.query(
@@ -148,7 +149,7 @@ export async function POST(request: Request) {
       uniquePositionTimes,
       duplicatePositionTimeInPayload: duplicatePositionTimeCount,
       deleteSql: DELETE_SQL,
-      deleteParams: [deviceName, formatDateForDebug(dayStart), formatDateForDebug(dayEnd)],
+      deleteParams: [deviceName, dayStartForDb, dayEndForDb],
       skippedRows: skippedRows.slice(0, 1500),
     });
   } catch (err) {

@@ -8,6 +8,7 @@ type WineryMinutesRow = {
   id: number;
   Customer: string | null;
   Template: string | null;
+  vineyardgroup: string | null;
   Winery: string | null;
   TT: string | null;
   ToVineMins: number | null;
@@ -22,6 +23,7 @@ type ModalState = { mode: 'add' } | { mode: 'edit'; row: WineryMinutesRow };
 const emptyForm = () => ({
   Customer: '',
   Template: '',
+  vineyardgroup: '',
   Winery: '',
   TT: '' as '' | 'T' | 'TT' | 'TTT',
   ToVineMins: '',
@@ -47,6 +49,7 @@ export default function WineryMinutesPage() {
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [customers, setCustomers] = useState<string[]>([]);
   const [templates, setTemplates] = useState<string[]>([]);
+  const [vineyardGroups, setVineyardGroups] = useState<string[]>([]);
   const [wineries, setWineries] = useState<string[]>([]);
   const [templatesAll, setTemplatesAll] = useState<string[]>([]);
   const [wineriesAll, setWineriesAll] = useState<string[]>([]);
@@ -118,6 +121,12 @@ export default function WineryMinutesPage() {
       .then((data) => setWineriesAll(data?.rows ?? []))
       .catch(() => setWineriesAll([]));
   }, []);
+  useEffect(() => {
+    fetch('/api/admin/wineryminutes/vineyard-groups')
+      .then((r) => r.json())
+      .then((data) => setVineyardGroups(data?.rows ?? []))
+      .catch(() => setVineyardGroups([]));
+  }, []);
 
   useEffect(() => {
     if (modal == null) return;
@@ -140,6 +149,7 @@ export default function WineryMinutesPage() {
     setForm({
       Customer: row.Customer ?? '',
       Template: row.Template ?? '',
+      vineyardgroup: row.vineyardgroup ?? '',
       Winery: row.Winery ?? '',
       TT: (row.TT === 'T' || row.TT === 'TT' || row.TT === 'TTT' ? row.TT : '') as '' | 'T' | 'TT' | 'TTT',
       ToVineMins: numOrEmpty(row.ToVineMins),
@@ -156,6 +166,7 @@ export default function WineryMinutesPage() {
     setForm({
       Customer: row.Customer ?? '',
       Template: row.Template ?? '',
+      vineyardgroup: row.vineyardgroup ?? '',
       Winery: row.Winery ?? '',
       TT: (row.TT === 'T' || row.TT === 'TT' || row.TT === 'TTT' ? row.TT : '') as '' | 'T' | 'TT' | 'TTT',
       ToVineMins: numOrEmpty(row.ToVineMins),
@@ -214,6 +225,7 @@ export default function WineryMinutesPage() {
     const payload = {
       Customer: form.Customer.trim() || null,
       Template: form.Template.trim() || null,
+      vineyardgroup: form.vineyardgroup.trim() || null,
       Winery: form.Winery.trim() || null,
       TT: (form.TT === 'T' || form.TT === 'TT' || form.TT === 'TTT' ? form.TT : null) as string | null,
       ToVineMins: toNum(form.ToVineMins),
@@ -252,7 +264,7 @@ export default function WineryMinutesPage() {
   };
 
   const handleDelete = (row: WineryMinutesRow) => {
-    if (!confirm(`Delete winery minutes for ${row.Customer ?? ''} / ${row.Template ?? ''} / ${row.Winery ?? ''}?`)) return;
+    if (!confirm(`Delete winery minutes for ${row.Customer ?? ''} / ${row.Template ?? ''} / ${row.vineyardgroup ?? ''} / ${row.Winery ?? ''}?`)) return;
     fetch(`/api/admin/wineryminutes/${row.id}`, { method: 'DELETE' })
       .then(async (r) => {
         const data = await r.json();
@@ -290,6 +302,7 @@ export default function WineryMinutesPage() {
               <tr className="border-b border-zinc-200 bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-800">
                 <th className="px-3 py-2 font-medium text-zinc-900 dark:text-zinc-100">Customer</th>
                 <th className="px-3 py-2 font-medium text-zinc-900 dark:text-zinc-100">Template</th>
+                <th className="px-3 py-2 font-medium text-zinc-900 dark:text-zinc-100">Vineyard group</th>
                 <th className="px-3 py-2 font-medium text-zinc-900 dark:text-zinc-100">Winery</th>
                 <th className="px-3 py-2 font-medium text-zinc-900 dark:text-zinc-100">TT</th>
                 <th className="px-3 py-2 font-medium text-zinc-900 dark:text-zinc-100">To Vine</th>
@@ -304,11 +317,13 @@ export default function WineryMinutesPage() {
               {rows.map((r) => {
                 const customerNotInList = r.Customer != null && r.Customer !== '' && !customers.includes(r.Customer);
                 const templateNotInList = r.Template != null && r.Template !== '' && !templatesAll.includes(r.Template);
+                const vgNotInList = r.vineyardgroup != null && r.vineyardgroup !== '' && !vineyardGroups.includes(r.vineyardgroup);
                 const wineryNotInList = r.Winery != null && r.Winery !== '' && !wineriesAll.includes(r.Winery);
                 return (
                 <tr key={r.id} className="border-b border-zinc-100 dark:border-zinc-800 hover:bg-zinc-50 dark:hover:bg-zinc-800/50">
                   <td className={`whitespace-nowrap px-3 py-2 ${customerNotInList ? 'font-bold text-red-600 dark:text-red-400' : 'text-zinc-700 dark:text-zinc-300'}`}>{r.Customer ?? '—'}</td>
                   <td className={`whitespace-nowrap px-3 py-2 ${templateNotInList ? 'font-bold text-red-600 dark:text-red-400' : 'text-zinc-700 dark:text-zinc-300'}`}>{r.Template ?? '—'}</td>
+                  <td className={`whitespace-nowrap px-3 py-2 ${vgNotInList ? 'font-bold text-red-600 dark:text-red-400' : 'text-zinc-700 dark:text-zinc-300'}`}>{r.vineyardgroup ?? '—'}</td>
                   <td className={`whitespace-nowrap px-3 py-2 ${wineryNotInList ? 'font-bold text-red-600 dark:text-red-400' : 'text-zinc-700 dark:text-zinc-300'}`}>{r.Winery ?? '—'}</td>
                   <td className="whitespace-nowrap px-3 py-2 text-zinc-700 dark:text-zinc-300">{r.TT ?? '—'}</td>
                   <td className="whitespace-nowrap px-3 py-2 text-right tabular-nums text-zinc-700 dark:text-zinc-300">{r.ToVineMins != null ? Number(r.ToVineMins).toFixed(2) : '—'}</td>
@@ -383,7 +398,7 @@ export default function WineryMinutesPage() {
                 </div>
                 <select
                   value={form.Customer}
-                  onChange={(e) => setForm((f) => ({ ...f, Customer: e.target.value, Template: '', Winery: '' }))}
+                  onChange={(e) => setForm((f) => ({ ...f, Customer: e.target.value, Template: '', vineyardgroup: '', Winery: '' }))}
                   className={`w-full rounded border px-2 py-1.5 text-sm dark:bg-zinc-800 ${
                     form.Customer && !customers.includes(form.Customer)
                       ? 'border-red-400 text-red-600 dark:border-red-500 dark:text-red-400'
@@ -403,7 +418,7 @@ export default function WineryMinutesPage() {
                 <label className="mb-1 block text-xs font-medium text-zinc-500">Template</label>
                 <select
                   value={form.Template}
-                  onChange={(e) => setForm((f) => ({ ...f, Template: e.target.value, Winery: '' }))}
+                  onChange={(e) => setForm((f) => ({ ...f, Template: e.target.value, vineyardgroup: '', Winery: '' }))}
                   disabled={!form.Customer}
                   className={`w-full rounded border px-2 py-1.5 text-sm dark:bg-zinc-800 disabled:opacity-70 ${
                     form.Template && !templates.includes(form.Template)
@@ -419,6 +434,28 @@ export default function WineryMinutesPage() {
                     <option key={t} value={t}>{t}</option>
                   ))}
                 </select>
+              </div>
+              <div>
+                <label className="mb-1 block text-xs font-medium text-zinc-500">Vineyard group</label>
+                <input
+                  type="text"
+                  list="vineyardgroup-datalist"
+                  value={form.vineyardgroup}
+                  onChange={(e) => setForm((f) => ({ ...f, vineyardgroup: e.target.value }))}
+                  disabled={!form.Customer}
+                  placeholder="Type or pick from list"
+                  className={`w-full rounded border px-2 py-1.5 text-sm dark:bg-zinc-800 disabled:opacity-70 ${
+                    form.vineyardgroup && !vineyardGroups.includes(form.vineyardgroup)
+                      ? 'border-amber-400 text-zinc-700 dark:border-amber-500 dark:text-zinc-200'
+                      : 'border-zinc-300 dark:border-zinc-600 dark:text-zinc-100'
+                  }`}
+                />
+                <datalist id="vineyardgroup-datalist">
+                  {vineyardGroups.map((g) => (
+                    <option key={g} value={g} />
+                  ))}
+                </datalist>
+                <p className="mt-0.5 text-[11px] text-zinc-500 dark:text-zinc-500">Free text or pick from tbl_vworkjobs.vineyard_group</p>
               </div>
               <div>
                 <div className="mb-1 flex items-center justify-between">

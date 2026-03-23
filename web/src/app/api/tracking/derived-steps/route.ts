@@ -1,7 +1,8 @@
 import { NextResponse } from 'next/server';
 import { query, execute } from '@/lib/db';
+import { addMinutesToTimestampAsNZ } from '@/lib/fetch-steps';
 import { deriveGpsStepsForJob, type JobForDerivedSteps } from '@/lib/derived-steps';
-import { runSteps2Query } from '@/lib/steps2-query';
+import { runStepsPlusQuery } from '@/lib/steps-plus-query';
 
 /** Recursively convert BigInt to number (or string if too large) so JSON.stringify works. */
 function sanitizeForJson<T>(value: T): T {
@@ -118,8 +119,34 @@ export async function GET(request: Request) {
       ? String(job.worker).trim()
       : device.trim());
 
+    /**
+     * Window end for derivation + Steps+ (buffered vineyard). Client may omit positionBefore when the job
+     * row has no actual_end (bulk tagging); without a real upper bound, runFetchSteps used to pass nothing
+     * and Steps+ used positionAfter as both bounds → empty SQL window. Recompute from DB row + endPlusMinutes.
+     */
+    const endPlusMinutes = Math.min(1440, Math.max(0, parseInt(searchParams.get('endPlusMinutes') ?? '60', 10) || 60));
+    const pickTrim = (...keys: string[]): string => {
+      for (const k of keys) {
+        const v = row[k];
+        if (v != null && String(v).trim() !== '') return String(v).trim();
+      }
+      return '';
+    };
+    let effectivePositionBefore: string | null = positionBefore?.trim() || null;
+    if (!effectivePositionBefore) {
+      const end = pickTrim('actual_end_time', 'Actual_End_Time', 'gps_end_time', 'Gps_End_Time');
+      if (end) {
+        effectivePositionBefore = addMinutesToTimestampAsNZ(end, endPlusMinutes);
+      } else {
+        const start = pickTrim('actual_start_time', 'Actual_Start_Time', 'planned_start_time', 'Planned_Start_Time');
+        if (start) {
+          effectivePositionBefore = addMinutesToTimestampAsNZ(start, 24 * 60 + endPlusMinutes);
+        }
+      }
+    }
+
     // When writing back, clear GPS step fields 1–5 and final (actual/via) first so we start from VWork only.
-    // Otherwise a previous run (e.g. VineFence+) leaves step2/step3 populated and Steps2 never runs again.
+    // Otherwise a previous run (e.g. VineFence+ / Steps+) leaves step2/step3 populated and Steps+ never runs again.
     if (writeBack) {
       await execute(
         `UPDATE tbl_vworkjobs SET
@@ -142,10 +169,10 @@ export async function GET(request: Request) {
       windowMinutes,
       device: deviceForTracking,
       positionAfter: positionAfter.trim(),
-      positionBefore: positionBefore?.trim() || null,
+      positionBefore: effectivePositionBefore,
     });
 
-    // If step 2 or 3 missing and we will write back, try Steps2 (buffered vineyard fence); if exactly one stay, use it and set VineFence+.
+    // Steps+ (buffered vineyard fence): if standard derivation still misses VWork step 2 or 3, try expanded polygons.
     const vineyardName = job.vineyard_name ? String(job.vineyard_name).trim() : '';
     if (writeBack && vineyardName && (result.step2 == null || result.step3 == null)) {
       const mappings = await query<{ vwname: string | null; gpsname: string | null }>(
@@ -158,14 +185,16 @@ export async function GET(request: Request) {
         if (gps && !fenceNames.includes(gps)) fenceNames.push(gps);
       }
       if (fenceNames.length > 0) {
-        const steps2Rows = await runSteps2Query(
+        const stepsPlusEnd =
+          effectivePositionBefore ?? addMinutesToTimestampAsNZ(positionAfter.trim(), 24 * 60);
+        const stepsPlusRows = await runStepsPlusQuery(
           deviceForTracking,
           positionAfter.trim(),
-          positionBefore?.trim() || positionAfter.trim(),
+          stepsPlusEnd,
           fenceNames,
           10
         );
-        const stays = steps2Rows.filter((r) => Number(r.duration_seconds) >= 300);
+        const stays = stepsPlusRows.filter((r) => Number(r.duration_seconds) >= 300);
         if (stays.length === 1) {
           result = {
             ...result,

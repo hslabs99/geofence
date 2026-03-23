@@ -1,7 +1,6 @@
 /**
- * POST /api/inspect/steps2/apply
- * Apply a single Steps2 result to a job: set step_2_actual_time, step_3_actual_time, step_2_via, step_3_via,
- * and append to tbl_vworkjobs.calcnotes "VineFence+:" so the row is marked as subject to expanded vine fence.
+ * POST /api/inspect/steps2/apply — apply a **Steps+** stay to VWork step 2/3 fields (legacy path name "steps2").
+ * Sets step_2_actual_time, step_3_actual_time, step_2_via, step_3_via, and appends "VineFence+:" to calcnotes.
  * Body: { jobId: string, enter_time: string, exit_time: string }
  */
 

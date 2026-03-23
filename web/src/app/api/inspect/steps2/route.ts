@@ -1,12 +1,12 @@
 /**
- * POST /api/inspect/steps2
+ * POST /api/inspect/steps2 — **Steps+** preview (legacy path name "steps2"; not VWork steps 1–5).
  * Buffered-fence stays for device/window/fences. Read-only; does not update any table.
  * Body: { device, startTime, endTime, fenceNames: string[], bufferMeters?: number }
  * Returns: { fenceNamesIn, stays, maxTimePerFence } where stays = segments >= 300s.
  */
 
 import { NextResponse } from 'next/server';
-import { runSteps2Query } from '@/lib/steps2-query';
+import { runStepsPlusQuery } from '@/lib/steps-plus-query';
 
 /** Normalize to YYYY-MM-DD HH:mm:ss for DB (same idea as tracking API). */
 function toTimestampLiteral(s: string | null): string | null {
@@ -48,7 +48,7 @@ export async function POST(request: Request) {
       );
     }
 
-    const rows = await runSteps2Query(device, startTime, endTime, fenceNames, bufferMeters);
+    const rows = await runStepsPlusQuery(device, startTime, endTime, fenceNames, bufferMeters);
 
     const duration = (r: { duration_seconds: string | number }) => Number(r.duration_seconds);
     const stays = rows.filter((r) => duration(r) >= 300);

@@ -1,8 +1,11 @@
 'use client';
 
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { Suspense, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
+import { useRouter, useSearchParams } from 'next/navigation';
 import { useViewMode } from '@/contexts/ViewModeContext';
+import { useSummaryHistory } from '@/contexts/SummaryHistoryContext';
+import { getSummaryHistoryEntry, type SummaryHistoryPayload } from '@/lib/summary-history-storage';
 
 type Row = Record<string, unknown>;
 
@@ -27,6 +30,7 @@ const BY_JOB_LEAD_COLUMNS = [
   { key: 'limits_breached', label: 'Limits' },
   { key: 'delivery_winery', label: 'Winery' },
   { key: 'vineyard_name', label: 'Vineyard' },
+  { key: 'vineyard_group', label: 'Vineyard group' },
 ] as const;
 
 const STEP_NUMS = [1, 2, 3, 4, 5] as const;
@@ -129,32 +133,49 @@ function sortValueFor(row: Row, key: string): unknown {
   return row[key];
 }
 
-/** Build Inspect URL to locate this job in the list (date range ±1 day, truck) so jobs before/after are visible. */
-function inspectUrlForRow(row: Row): string {
+/** Same date window as Inspect uses for `actualFrom` / `actualTo` (UI bounds only; not stored job timestamps). */
+function inspectJumpMetaForRow(row: Row): {
+  jobId: string;
+  truckId: string;
+  actualFrom: string;
+  actualTo: string;
+} | null {
   const jobId = row.job_id != null ? String(row.job_id).trim() : '';
+  if (!jobId) return null;
   const truckId = row.truck_id != null ? String(row.truck_id).trim() : '';
   const actualStartRaw =
     row.actual_start_time ?? row.step_1_actual_time ?? row.step_1_gps_completed_at ?? row.step_1_completed_at ?? '';
   const actualStart = actualStartRaw ? String(actualStartRaw).trim() : '';
-  const params = new URLSearchParams();
-  if (jobId) params.set('locateJobId', jobId);
-  if (truckId) params.set('truckId', truckId);
+  let actualFrom = '';
+  let actualTo = '';
   if (actualStart) {
     const d = new Date(actualStart.includes('T') ? actualStart : actualStart.replace(' ', 'T'));
     if (!Number.isNaN(d.getTime())) {
       const pad = (n: number) => String(n).padStart(2, '0');
       const from = new Date(d);
       from.setDate(from.getDate() - 1);
-      params.set('actualFrom', `${from.getFullYear()}-${pad(from.getMonth() + 1)}-${pad(from.getDate())}`);
+      actualFrom = `${from.getFullYear()}-${pad(from.getMonth() + 1)}-${pad(from.getDate())}`;
       const to = new Date(d);
       to.setDate(to.getDate() + 1);
-      params.set('actualTo', `${to.getFullYear()}-${pad(to.getMonth() + 1)}-${pad(to.getDate())}`);
+      actualTo = `${to.getFullYear()}-${pad(to.getMonth() + 1)}-${pad(to.getDate())}`;
     }
   }
+  return { jobId, truckId, actualFrom, actualTo };
+}
+
+/** Build Inspect URL to locate this job in the list (date range ±1 day, truck) so jobs before/after are visible. */
+function inspectUrlForRow(row: Row): string {
+  const meta = inspectJumpMetaForRow(row);
+  if (!meta) return '/query/inspect';
+  const params = new URLSearchParams();
+  params.set('locateJobId', meta.jobId);
+  if (meta.truckId) params.set('truckId', meta.truckId);
+  if (meta.actualFrom) params.set('actualFrom', meta.actualFrom);
+  if (meta.actualTo) params.set('actualTo', meta.actualTo);
   return `/query/inspect?${params.toString()}`;
 }
 
-export default function SummaryPage() {
+function SummaryPageInner() {
   const [rows, setRows] = useState<Row[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -170,11 +191,18 @@ export default function SummaryPage() {
   const [sortColumns, setSortColumns] = useState<[string, string, string]>(['', '', '']);
   const sortColumnsInitialized = useRef(false);
   const [sortSaveStatus, setSortSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
-  const { viewMode, clientCustomer } = useViewMode();
+  const { viewMode, clientCustomer, setClientCustomer, clientCustomerLocked } = useViewMode();
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const { registerSummarySnapshot, registerPendingInspectForHistory } = useSummaryHistory();
+  /** Used when applying session restore (layout runs before locked state is wrong on first paint). */
+  const clientCustomerLockedRef = useRef(clientCustomerLocked);
+  clientCustomerLockedRef.current = clientCustomerLocked;
   /** Customer always mirrors sidebar selection (single source of truth; avoids disconnect in admin/super). */
   const effectiveCustomer = clientCustomer;
   const [summaryTab, setSummaryTab] = useState<'season' | 'by_day' | 'by_job'>('season');
   const [filterWinery, setFilterWinery] = useState('');
+  const [filterVineyardGroup, setFilterVineyardGroup] = useState('');
   const [filterVineyard, setFilterVineyard] = useState('');
   const [splitByLimits, setSplitByLimits] = useState(false);
   const [minsThresholds, setMinsThresholds] = useState<Record<string, string>>({
@@ -188,6 +216,7 @@ export default function SummaryPage() {
     id: number;
     Customer?: string | null;
     Template?: string | null;
+    vineyardgroup?: string | null;
     Winery?: string | null;
     TT?: string | null;
     ToVineMins?: number | null;
@@ -201,9 +230,105 @@ export default function SummaryPage() {
   const [selectedTimeLimitRowId, setSelectedTimeLimitRowId] = useState<number | null>(null);
   /** Show/hide the Time Limits table (can get in the way). */
   const [showLimitsTable, setShowLimitsTable] = useState(true);
+  const [jobsPage, setJobsPage] = useState(0);
+  const [jobsPageSize] = useState(500);
+  const [totalJobsFromApi, setTotalJobsFromApi] = useState(0);
+
+  /** After sidebar history restore (?sh=): suppress jobs reset + cascade wipes (same as Client hydrate). */
+  const jobsPageResetSuppressCountRef = useRef(0);
+  const skipCustomerCascadeRef = useRef(false);
+  const skipTemplateCascadeRef = useRef(false);
+  const appliedHistoryIdRef = useRef<string | null>(null);
+  /** After ?sh= restore: scroll/highlight this job row once it appears in By Job. */
+  const pendingScrollToJobIdRef = useRef<string | null>(null);
+  const [focusHighlightJobId, setFocusHighlightJobId] = useState<string | null>(null);
+  /** Scroll parent for By Job table (`max-h-[70vh] overflow-auto`); `scrollIntoView` on the row is unreliable here. */
+  const byJobTableScrollRef = useRef<HTMLDivElement | null>(null);
+  /** Avoid treating context filling `'' → customer` (Client refreshUser) as a user customer change. */
+  const prevEffectiveCustomerForCascadeRef = useRef<string | null>(null);
+  /** Avoid first template effect run wiping winery after programmatic restore. */
+  const prevFilterTemplateForCascadeRef = useRef<string | null>(null);
+
+  const shParam = searchParams.get('sh');
+
+  useLayoutEffect(() => {
+    const id = shParam?.trim() ?? '';
+    if (!id) {
+      appliedHistoryIdRef.current = null;
+      pendingScrollToJobIdRef.current = null;
+      return;
+    }
+    if (appliedHistoryIdRef.current === id) return;
+    const entry = getSummaryHistoryEntry(id);
+    if (!entry) {
+      router.replace('/query/summary');
+      return;
+    }
+    appliedHistoryIdRef.current = id;
+    jobsPageResetSuppressCountRef.current = clientCustomerLockedRef.current ? 2 : 1;
+    skipCustomerCascadeRef.current = true;
+    skipTemplateCascadeRef.current = true;
+    const s = entry.payload;
+    if (!clientCustomerLockedRef.current && s.clientCustomer !== undefined) {
+      setClientCustomer(s.clientCustomer);
+    }
+    setFilterActualFrom(s.filterActualFrom ?? '');
+    setFilterActualTo(s.filterActualTo ?? '');
+    setFilterTemplate(s.filterTemplate ?? '');
+    setFilterTruckId(s.filterTruckId ?? '');
+    setFilterWorker(s.filterWorker ?? '');
+    setFilterTrailermode(s.filterTrailermode ?? '');
+    setSummaryTab(s.summaryTab ?? 'season');
+    setFilterWinery(s.filterWinery ?? '');
+    setFilterVineyardGroup(s.filterVineyardGroup ?? '');
+    setFilterVineyard(s.filterVineyard ?? '');
+    setSplitByLimits(Boolean(s.splitByLimits));
+    if (s.minsThresholds && typeof s.minsThresholds === 'object') {
+      setMinsThresholds((prev) => ({ ...prev, ...s.minsThresholds }));
+    }
+    setSelectedTimeLimitRowId(
+      typeof s.selectedTimeLimitRowId === 'number' ? s.selectedTimeLimitRowId : null,
+    );
+    setShowLimitsTable(s.showLimitsTable !== false);
+    setSortKey(s.sortKey ?? null);
+    setSortDir(s.sortDir === 'desc' ? 'desc' : 'asc');
+    if (Array.isArray(s.sortColumns) && s.sortColumns.length === 3) {
+      const trip = s.sortColumns as [string, string, string];
+      setSortColumns(trip);
+      if (trip.some(Boolean)) sortColumnsInitialized.current = true;
+    }
+    if (typeof s.jobsPage === 'number' && s.jobsPage >= 0) setJobsPage(s.jobsPage);
+    const fj = s.focusJobId != null ? String(s.focusJobId).trim() : '';
+    pendingScrollToJobIdRef.current = fj || null;
+    router.replace('/query/summary');
+  }, [shParam, router, setClientCustomer]);
+
+  /** Reset to page 0 when filters change (suppress after history restore / Client hydrate). */
+  useEffect(() => {
+    if (jobsPageResetSuppressCountRef.current > 0) {
+      jobsPageResetSuppressCountRef.current -= 1;
+      return;
+    }
+    setJobsPage(0);
+  }, [effectiveCustomer, filterTemplate, filterActualFrom, filterActualTo, filterWinery, filterVineyardGroup, filterVineyard, filterTruckId, filterWorker, filterTrailermode]);
 
   useEffect(() => {
-    fetch('/api/vworkjobs')
+    const params = new URLSearchParams();
+    if (effectiveCustomer.trim()) params.set('customer', effectiveCustomer.trim());
+    if (filterTemplate.trim()) params.set('template', filterTemplate.trim());
+    if (filterActualFrom?.trim()) params.set('dateFrom', filterActualFrom.trim().slice(0, 10));
+    if (filterActualTo?.trim()) params.set('dateTo', filterActualTo.trim().slice(0, 10));
+    if (filterWinery.trim()) params.set('winery', filterWinery.trim());
+    if (filterVineyardGroup.trim()) params.set('vineyard_group', filterVineyardGroup.trim());
+    if (filterVineyard.trim()) params.set('vineyard', filterVineyard.trim());
+    if (filterTruckId.trim()) params.set('truck_id', filterTruckId.trim());
+    if (filterWorker.trim()) params.set('worker', filterWorker.trim());
+    if (filterTrailermode.trim()) params.set('trailermode', filterTrailermode.trim());
+    params.set('limit', String(jobsPageSize));
+    params.set('offset', String(jobsPage * jobsPageSize));
+
+    setLoading(true);
+    fetch(`/api/vworkjobs?${params}`)
       .then(async (res) => {
         const data = await res.json();
         if (!res.ok) throw new Error(data?.error ?? res.statusText);
@@ -211,11 +336,64 @@ export default function SummaryPage() {
       })
       .then((data) => {
         setRows(data.rows ?? []);
+        setTotalJobsFromApi(typeof data.total === 'number' ? data.total : (data.rows ?? []).length);
         setError(null);
       })
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false));
-  }, []);
+  }, [effectiveCustomer, filterTemplate, filterActualFrom, filterActualTo, filterWinery, filterVineyardGroup, filterVineyard, filterTruckId, filterWorker, filterTrailermode, jobsPage, jobsPageSize]);
+
+  /** Keep latest Summary state for sidebar history when navigating away from /query/summary. */
+  useEffect(() => {
+    if (clientCustomerLocked && !effectiveCustomer.trim()) {
+      registerSummarySnapshot(null);
+      return;
+    }
+    const payload: SummaryHistoryPayload = {
+      filterActualFrom,
+      filterActualTo,
+      filterTemplate,
+      filterTruckId,
+      filterWorker,
+      filterTrailermode,
+      summaryTab,
+      filterWinery,
+      filterVineyardGroup,
+      filterVineyard,
+      splitByLimits,
+      minsThresholds: { ...minsThresholds },
+      selectedTimeLimitRowId,
+      showLimitsTable,
+      sortKey,
+      sortDir,
+      sortColumns: [...sortColumns] as [string, string, string],
+      jobsPage,
+      clientCustomer: effectiveCustomer,
+    };
+    registerSummarySnapshot(payload);
+  }, [
+    registerSummarySnapshot,
+    effectiveCustomer,
+    clientCustomerLocked,
+    filterActualFrom,
+    filterActualTo,
+    filterTemplate,
+    filterTruckId,
+    filterWorker,
+    filterTrailermode,
+    summaryTab,
+    filterWinery,
+    filterVineyardGroup,
+    filterVineyard,
+    splitByLimits,
+    minsThresholds,
+    selectedTimeLimitRowId,
+    showLimitsTable,
+    sortKey,
+    sortDir,
+    sortColumns,
+    jobsPage,
+  ]);
 
   const distinctTruckIds = useMemo(() => {
     const set = new Set<string>();
@@ -242,6 +420,10 @@ export default function SummaryPage() {
         const v = row.delivery_winery;
         if (v == null || String(v).trim() !== filterWinery) continue;
       }
+      if (filterVineyardGroup) {
+        const v = (row as Record<string, unknown>).vineyard_group;
+        if (v == null || String(v).trim() !== filterVineyardGroup) continue;
+      }
       if (filterVineyard) {
         const v = row.vineyard_name;
         if (v == null || String(v).trim() !== filterVineyard) continue;
@@ -265,7 +447,7 @@ export default function SummaryPage() {
       if (w != null && String(w).trim() !== '') set.add(String(w).trim());
     }
     return Array.from(set).sort();
-  }, [rows, effectiveCustomer, filterTemplate, filterWinery, filterVineyard, filterTruckId, filterActualFrom, filterActualTo]);
+  }, [rows, effectiveCustomer, filterTemplate, filterWinery, filterVineyardGroup, filterVineyard, filterTruckId, filterActualFrom, filterActualTo]);
 
   /** Distinct trailermode values in the current summary result set (same filters as distinctWorkers). */
   const distinctTrailermodes = useMemo(() => {
@@ -282,6 +464,10 @@ export default function SummaryPage() {
       if (filterWinery) {
         const v = row.delivery_winery;
         if (v == null || String(v).trim() !== filterWinery) continue;
+      }
+      if (filterVineyardGroup) {
+        const v = (row as Record<string, unknown>).vineyard_group;
+        if (v == null || String(v).trim() !== filterVineyardGroup) continue;
       }
       if (filterVineyard) {
         const v = row.vineyard_name;
@@ -306,7 +492,7 @@ export default function SummaryPage() {
       if (t != null && String(t).trim() !== '') set.add(String(t).trim());
     }
     return Array.from(set).sort();
-  }, [rows, effectiveCustomer, filterTemplate, filterWinery, filterVineyard, filterTruckId, filterActualFrom, filterActualTo]);
+  }, [rows, effectiveCustomer, filterTemplate, filterWinery, filterVineyardGroup, filterVineyard, filterTruckId, filterActualFrom, filterActualTo]);
 
   const distinctCustomers = useMemo(() => {
     const set = new Set<string>();
@@ -343,6 +529,19 @@ export default function SummaryPage() {
     return Array.from(set).sort();
   }, [rows, effectiveCustomer]);
 
+  /** Vineyard groups (vineyard_group from tbl_vworkjobs) only for the effective customer. */
+  const distinctVineyardGroups = useMemo(() => {
+    if (!effectiveCustomer.trim()) return [];
+    const set = new Set<string>();
+    for (const row of rows) {
+      const cust = row.Customer ?? row.customer;
+      if (cust == null || String(cust).trim() !== effectiveCustomer) continue;
+      const v = (row as Record<string, unknown>).vineyard_group;
+      if (v != null && String(v).trim() !== '') set.add(String(v).trim());
+    }
+    return Array.from(set).sort();
+  }, [rows, effectiveCustomer]);
+
   /** Vineyards (vineyard_name) only for the effective customer. */
   const distinctVineyards = useMemo(() => {
     if (!effectiveCustomer.trim()) return [];
@@ -356,26 +555,61 @@ export default function SummaryPage() {
     return Array.from(set).sort();
   }, [rows, effectiveCustomer]);
 
-  /** Clear template, winery, vineyard, worker, trailermode when customer changes so we don't keep values from another customer. */
+  /**
+   * Clear template, winery, … when the *user* changes customer in the sidebar.
+   * Skip: (1) once after session restore; (2) transition empty → non-empty (Client: refreshUser runs after
+   * our layout restore and would otherwise wipe restored template / tab).
+   */
   useEffect(() => {
+    if (skipCustomerCascadeRef.current) {
+      skipCustomerCascadeRef.current = false;
+      prevEffectiveCustomerForCascadeRef.current = effectiveCustomer;
+      return;
+    }
+    const prev = prevEffectiveCustomerForCascadeRef.current;
+    if (prev === null) {
+      prevEffectiveCustomerForCascadeRef.current = effectiveCustomer;
+      return;
+    }
+    if (prev === effectiveCustomer) return;
+    if (prev.trim() === '' && effectiveCustomer.trim() !== '') {
+      prevEffectiveCustomerForCascadeRef.current = effectiveCustomer;
+      return;
+    }
+    prevEffectiveCustomerForCascadeRef.current = effectiveCustomer;
     setFilterTemplate('');
     setFilterWinery('');
+    setFilterVineyardGroup('');
     setFilterVineyard('');
     setFilterWorker('');
     setFilterTrailermode('');
   }, [effectiveCustomer]);
 
-  /** Clear winery, worker, trailermode when template changes so dropdowns only show values in the new result set. */
+  /** Clear winery, … when template changes (skip once after session restore; skip first mount). */
   useEffect(() => {
+    if (skipTemplateCascadeRef.current) {
+      skipTemplateCascadeRef.current = false;
+      prevFilterTemplateForCascadeRef.current = filterTemplate;
+      return;
+    }
+    const prev = prevFilterTemplateForCascadeRef.current;
+    if (prev === null) {
+      prevFilterTemplateForCascadeRef.current = filterTemplate;
+      return;
+    }
+    if (prev === filterTemplate) return;
+    prevFilterTemplateForCascadeRef.current = filterTemplate;
     setFilterWinery('');
+    setFilterVineyardGroup('');
     setFilterWorker('');
     setFilterTrailermode('');
   }, [filterTemplate]);
 
-  /** When Customer + Template + Winery are selected, load minute limits from tbl_wineryminutes (2=ToVine, 3=InVine, 4=ToWine, 5=InWine, travel=ToVine+ToWine, in_vineyard=InVine, in_winery=InWine, total=TotalMins). */
+  /** When Customer + Template + Winery (and optionally Vineyard group) are selected, load minute limits from tbl_wineryminutes (2=ToVine, 3=InVine, 4=ToWine, 5=InWine, travel=ToVine+ToWine, in_vineyard=InVine, in_winery=InWine, total=TotalMins). */
   useEffect(() => {
     if (!effectiveCustomer.trim() || !filterTemplate.trim() || !filterWinery.trim()) return;
     const params = new URLSearchParams({ customer: effectiveCustomer, template: filterTemplate, winery: filterWinery });
+    if (filterVineyardGroup.trim()) params.set('vineyard_group', filterVineyardGroup.trim());
     fetch(`/api/admin/wineryminutes?${params}`)
       .then((r) => r.json())
       .then((row) => {
@@ -400,7 +634,7 @@ export default function SummaryPage() {
         });
       })
       .catch(() => {});
-  }, [effectiveCustomer, filterTemplate, filterWinery]);
+  }, [effectiveCustomer, filterTemplate, filterWinery, filterVineyardGroup]);
 
   /** When a customer is selected, load time limit rows for the Time Limits section (tbl_wineryminutes by customer; if template selected, filter on template too). */
   useEffect(() => {
@@ -433,6 +667,10 @@ export default function SummaryPage() {
         const v = row.delivery_winery;
         if (v == null || String(v).trim() !== filterWinery) return false;
       }
+      if (filterVineyardGroup) {
+        const v = (row as Record<string, unknown>).vineyard_group;
+        if (v == null || String(v).trim() !== filterVineyardGroup) return false;
+      }
       if (filterVineyard) {
         const v = row.vineyard_name;
         if (v == null || String(v).trim() !== filterVineyard) return false;
@@ -463,18 +701,27 @@ export default function SummaryPage() {
       }
       return true;
     });
-  }, [rows, effectiveCustomer, filterTemplate, filterWinery, filterVineyard, filterTruckId, filterWorker, filterTrailermode, filterActualFrom, filterActualTo]);
+  }, [rows, effectiveCustomer, filterTemplate, filterWinery, filterVineyardGroup, filterVineyard, filterTruckId, filterWorker, filterTrailermode, filterActualFrom, filterActualTo]);
 
-  /** Find the time limit row that matches this job's delivery_winery and trailer type (tbl_vworkjobs.trailermode/trailertype = tbl_wineryminutes.TT; customer/template already applied to timeLimitRows). */
+  /** Find the time limit row that matches this job's delivery_winery, vineyard_group, and trailer type (tbl_vworkjobs = tbl_wineryminutes; customer/template already applied to timeLimitRows). Limit row with null/empty vineyardgroup matches any job vineyard_group. If no T or TT row exists for the job's trailermode, fall back to a TTT row (some wineries only have TTT). */
   const getMatchingLimitsRow = (job: Row): TimeLimitRow | null => {
     const winery = (job.delivery_winery ?? '').toString().trim();
     if (!winery) return null;
     const jobTT = (job.trailermode ?? job.trailertype ?? '').toString().trim();
-    return timeLimitRows.find((r) => {
+    const jobVg = ((job as Record<string, unknown>).vineyard_group ?? '').toString().trim();
+    const match = (r: TimeLimitRow) => {
       if ((r.Winery ?? '').toString().trim() !== winery) return false;
-      const limitTT = (r.TT ?? '').toString().trim();
-      return limitTT === jobTT;
-    }) ?? null;
+      const limitVg = (r.vineyardgroup ?? '').toString().trim();
+      if (limitVg !== '' && limitVg !== jobVg) return false;
+      return true;
+    };
+    const exact = timeLimitRows.find((r) => match(r) && (r.TT ?? '').toString().trim() === jobTT);
+    if (exact) return exact;
+    if (jobTT === 'T' || jobTT === 'TT') {
+      const tttRow = timeLimitRows.find((r) => match(r) && (r.TT ?? '').toString().trim() === 'TTT');
+      if (tttRow) return tttRow;
+    }
+    return null;
   };
 
   /** Get limit value from a limits row for a given key. Travel_ = ToVine + ToWine. */
@@ -646,13 +893,17 @@ export default function SummaryPage() {
         const v = row.delivery_winery;
         if (v == null || String(v).trim() !== filterWinery) return false;
       }
+      if (filterVineyardGroup) {
+        const v = (row as Record<string, unknown>).vineyard_group;
+        if (v == null || String(v).trim() !== filterVineyardGroup) return false;
+      }
       if (filterVineyard) {
         const v = row.vineyard_name;
         if (v == null || String(v).trim() !== filterVineyard) return false;
       }
       return true;
     });
-  }, [rows, effectiveCustomer, filterTemplate, filterWinery, filterVineyard]);
+  }, [rows, effectiveCustomer, filterTemplate, filterWinery, filterVineyardGroup, filterVineyard]);
 
   const fromValuesToQuad = (values: number[]): MinsQuad => {
     const valid = values.filter((v) => v != null && !Number.isNaN(v));
@@ -714,25 +965,41 @@ export default function SummaryPage() {
     return seasonRollup ? [{ rowType: 'Season Total', ...seasonRollup }] : null;
   }, [seasonFilteredRows, seasonRollup, splitByLimits]);
 
-  /** By Day footer: Total, Max, Min, Av across all days. When split by limits, use only Daily Total row per day. */
-  const byDayStats = useMemo(() => {
+  /** By Day footer: Total, Max, Min, Av. When split by limits: one set per type (Over, Within, Daily Total); Av = totalMins / totalJobs (not average of daily Av). */
+  type ByDayFooterSet = { rowType?: 'Over Limit' | 'Within Limit' | 'Daily Total'; jobCount: number; stats: Record<string, MinsQuad> };
+  const byDayFooterSets = useMemo((): ByDayFooterSet[] => {
     const keys = ['mins_2', 'mins_3', 'mins_4', 'mins_5', 'travel', 'total'] as const;
-    const stats: Record<string, MinsQuad> = {};
-    const rowsForFooter = splitByLimits ? rowsByDay.filter((r) => (r as { rowType?: string }).rowType === 'Daily Total') : rowsByDay;
-    for (const k of keys) {
-      const quads = rowsForFooter.map((r) => r[k]);
-      const sumTotal = quads.reduce((a, q) => a + q.total, 0);
-      const sumAv = quads.reduce((a, q) => a + q.av, 0);
-      const n = rowsForFooter.length;
-      stats[k] = {
-        total: sumTotal,
-        max: n ? Math.max(...quads.map((q) => q.max)) : 0,
-        min: n ? Math.min(...quads.map((q) => q.min)) : 0,
-        av: n ? Math.round(sumAv / n) : 0,
-      };
+    const build = (rowsForFooter: typeof rowsByDay): ByDayFooterSet => {
+      const jobCount = rowsForFooter.reduce((a, r) => a + r.jobs.length, 0);
+      const stats: Record<string, MinsQuad> = {};
+      for (const k of keys) {
+        const quads = rowsForFooter.map((r) => r[k]);
+        const sumTotal = quads.reduce((a, q) => a + q.total, 0);
+        const n = rowsForFooter.length;
+        stats[k] = {
+          total: sumTotal,
+          max: n ? Math.max(...quads.map((q) => q.max)) : 0,
+          min: n ? Math.min(...quads.map((q) => q.min)) : 0,
+          av: jobCount > 0 ? Math.round(sumTotal / jobCount) : 0,
+        };
+      }
+      return { jobCount, stats };
+    };
+    if (splitByLimits) {
+      const over = rowsByDay.filter((r) => (r as { rowType?: string }).rowType === 'Over Limit');
+      const within = rowsByDay.filter((r) => (r as { rowType?: string }).rowType === 'Within Limit');
+      const dailyTotal = rowsByDay.filter((r) => (r as { rowType?: string }).rowType === 'Daily Total');
+      return [
+        { rowType: 'Over Limit', ...build(over) },
+        { rowType: 'Within Limit', ...build(within) },
+        { rowType: 'Daily Total', ...build(dailyTotal) },
+      ];
     }
-    return stats;
+    return [{ ...build(rowsByDay) }];
   }, [rowsByDay, splitByLimits]);
+
+  /** Single set for non-split footer (first set). */
+  const byDayStats = useMemo(() => byDayFooterSets[0]?.stats ?? ({} as Record<string, MinsQuad>), [byDayFooterSets]);
 
   const handleSort = (key: string) => {
     if (sortKey === key) setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'));
@@ -861,6 +1128,51 @@ export default function SummaryPage() {
     return out;
   }, [rowsWithLimits, sortKey, sortDir, sortColumns]);
 
+  useEffect(() => {
+    const jid = pendingScrollToJobIdRef.current;
+    if (!jid || summaryTab !== 'by_job') return;
+    if (loading) return;
+    const onPage = sortedRows.some((r) => String(r.job_id ?? '').trim() === jid);
+    if (!onPage) {
+      pendingScrollToJobIdRef.current = null;
+      return;
+    }
+    let cancelled = false;
+    const run = () => {
+      if (cancelled) return;
+      const rowEl = document.querySelector(
+        `[data-summary-focus-job="${CSS.escape(jid)}"]`,
+      ) as HTMLElement | null;
+      const scrollParent = byJobTableScrollRef.current;
+      if (!rowEl) return;
+      pendingScrollToJobIdRef.current = null;
+      setFocusHighlightJobId(jid);
+      /** Space below sticky multi-row thead inside the scroll box. */
+      const stickyHeaderPad = 100;
+      if (scrollParent) {
+        const prect = scrollParent.getBoundingClientRect();
+        const rrect = rowEl.getBoundingClientRect();
+        const nextTop = scrollParent.scrollTop + (rrect.top - prect.top) - stickyHeaderPad;
+        scrollParent.scrollTo({ top: Math.max(0, nextTop), behavior: 'smooth' });
+      } else {
+        rowEl.scrollIntoView({ block: 'start', behavior: 'smooth' });
+      }
+    };
+    const id1 = window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(run);
+    });
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(id1);
+    };
+  }, [loading, summaryTab, sortedRows]);
+
+  useEffect(() => {
+    if (!focusHighlightJobId) return;
+    const t = window.setTimeout(() => setFocusHighlightJobId(null), 20000);
+    return () => clearTimeout(t);
+  }, [focusHighlightJobId]);
+
   /** Sum and average of mins columns over sorted (visible) rows. */
   const columnStats = useMemo(() => {
     const stats: Record<string, { sum: number; avg: number | null; count: number }> = {};
@@ -941,6 +1253,20 @@ export default function SummaryPage() {
                 <option value="">— All —</option>
                 {distinctWineries.map((w) => (
                   <option key={w} value={w}>{w}</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="mb-1 block text-xs font-medium text-zinc-500">Vineyard group</label>
+              <select
+                value={filterVineyardGroup}
+                onChange={(e) => setFilterVineyardGroup(e.target.value)}
+                disabled={!effectiveCustomer.trim()}
+                className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm disabled:cursor-not-allowed disabled:opacity-70 dark:border-zinc-600 dark:bg-zinc-800"
+              >
+                <option value="">— All —</option>
+                {distinctVineyardGroups.map((g) => (
+                  <option key={g} value={g}>{g}</option>
                 ))}
               </select>
             </div>
@@ -1087,7 +1413,7 @@ export default function SummaryPage() {
                 <p className="text-sm text-zinc-500 dark:text-zinc-400">No time limit rows for this customer.</p>
               ) : showLimitsTable && timeLimitRows.length > 0 ? (
                 <>
-                  <p className="mb-2 text-xs text-zinc-500 dark:text-zinc-400">Click a row to show its limits in the header boxes (for reference). Each job uses the row where Winery = delivery_winery and TT = trailermode (T / TT). Columns align with By Job table.</p>
+                  <p className="mb-2 text-xs text-zinc-500 dark:text-zinc-400">Click a row to show its limits in the header boxes (for reference). Each job uses the row where Winery = delivery_winery, Vineyard group = vineyard_group, and TT = trailermode (T / TT). Columns align with By Job table.</p>
                   <div className="overflow-x-auto">
                     <table className="w-full min-w-[64rem] text-left text-sm">
                       <thead>
@@ -1097,6 +1423,7 @@ export default function SummaryPage() {
                           <th className="border-r border-zinc-200 px-2 py-1.5 dark:border-zinc-700" />
                           <th className="border-r border-zinc-200 px-2 py-1.5 font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-400">TT</th>
                           <th className="border-r border-zinc-200 px-2 py-1.5 font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-400">Winery</th>
+                          <th className="border-r border-zinc-200 px-2 py-1.5 font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-400">Vineyard group</th>
                           <th className="border-r border-zinc-200 px-2 py-1.5 dark:border-zinc-700" />
                           <th colSpan={2} className="border-r border-zinc-200 px-2 py-1.5 dark:border-zinc-700" />
                           <th className={`border-r border-zinc-200 px-2 py-1.5 font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[2]}`}>To Vine</th>
@@ -1146,6 +1473,7 @@ export default function SummaryPage() {
                               {emptyCell(`${r.id}-e2`)}
                               <td className="border-r border-zinc-200 px-2 py-1.5 text-zinc-700 dark:border-zinc-700 dark:text-zinc-300">{formatCell(r.TT)}</td>
                               <td className="border-r border-zinc-200 px-2 py-1.5 text-zinc-700 dark:border-zinc-700 dark:text-zinc-300">{formatCell(r.Winery)}</td>
+                              <td className="border-r border-zinc-200 px-2 py-1.5 text-zinc-700 dark:border-zinc-700 dark:text-zinc-300">{formatCell(r.vineyardgroup)}</td>
                               {emptyCell(`${r.id}-e5`)}
                               <td colSpan={2} className="border-r border-zinc-200 px-2 py-1.5 dark:border-zinc-700">&nbsp;</td>
                               <td className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[2]}`}>{r.ToVineMins != null ? String(r.ToVineMins) : '—'}</td>
@@ -1492,20 +1820,24 @@ export default function SummaryPage() {
                       return (
                       <tr key={`${r.date}-${rowType ?? 'day'}`} className={dailyRowClass}>
                         <td className="whitespace-nowrap border-r border-zinc-200 px-3 py-2 dark:border-zinc-700">
-                          {dayClientView ? (
-                            <span className="font-medium text-zinc-700 dark:text-zinc-300">{r.dateLabel}</span>
+                          {isFirstRowOfDay ? (
+                            dayClientView ? (
+                              <span className="font-medium text-zinc-700 dark:text-zinc-300">{r.dateLabel}</span>
+                            ) : (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setFilterActualFrom(r.date);
+                                  setFilterActualTo(r.date);
+                                  setSummaryTab('by_job');
+                                }}
+                                className="font-medium text-blue-600 underline hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300"
+                              >
+                                {r.dateLabel}
+                              </button>
+                            )
                           ) : (
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setFilterActualFrom(r.date);
-                                setFilterActualTo(r.date);
-                                setSummaryTab('by_job');
-                              }}
-                              className="font-medium text-blue-600 underline hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300"
-                            >
-                              {r.dateLabel}
-                            </button>
+                            '\u00A0'
                           )}
                         </td>
                         {splitByLimits && (
@@ -1561,75 +1893,86 @@ export default function SummaryPage() {
                 </tbody>
                 {rowsByDay.length > 0 && (
                   <tfoot className="border-t-2 border-zinc-300 bg-zinc-100 dark:border-zinc-600 dark:bg-zinc-800">
-                    {(dayClientView ? (['total', 'av'] as const) : (['total', 'max', 'min', 'av'] as const)).map((metric) => (
-                      <tr key={metric} className="border-b border-zinc-200 dark:border-zinc-700">
-                        <td className="border-r border-zinc-200 px-3 py-1.5 text-xs font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-400">
-                          {metric === 'total' ? 'Total:' : 'Av:'}
-                        </td>
-                        {splitByLimits && <td className="border-r border-zinc-200 px-3 py-1.5 text-xs text-zinc-500 dark:border-zinc-700">—</td>}
-                        <td className="border-r border-zinc-200 px-3 py-1.5 tabular-nums text-xs text-zinc-500 dark:border-zinc-700 dark:text-zinc-400">
-                          {metric === 'total' ? (splitByLimits ? rowsByDay.filter((r) => (r as { rowType?: string }).rowType === 'Daily Total').reduce((a, r) => a + r.jobs.length, 0) : rowsByDay.reduce((a, r) => a + r.jobs.length, 0)) : '—'}
-                        </td>
-                        {!dayClientView && [byDayStats.mins_2, byDayStats.mins_3, byDayStats.mins_4, byDayStats.mins_5].map((s, i) =>
-                          (['total', 'max', 'min', 'av'] as const).map((key) => {
-                            const val = key === metric ? (metric === 'total' ? s.total : metric === 'max' ? s.max : metric === 'min' ? s.min : s.av) : null;
-                            const redClass = metric === 'av' && val != null ? redIfOverStepCol(val, i + 2) : '';
+                    {byDayFooterSets.map((set) => {
+                      const s = set.stats;
+                      const subKeys = dayClientView ? (['total', 'av'] as const) : (['total', 'max', 'min', 'av'] as const);
+                      return (
+                        <tr key={set.rowType ?? 'all'} className="border-b border-zinc-200 dark:border-zinc-700">
+                          <td className="border-r border-zinc-200 px-3 py-1.5 text-xs font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-400">
+                            Total / Av
+                          </td>
+                          {splitByLimits && (
+                            <td className="border-r border-zinc-200 px-3 py-1.5 text-xs font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-400">
+                              {set.rowType}
+                            </td>
+                          )}
+                          <td className="border-r border-zinc-200 px-3 py-1.5 tabular-nums text-xs text-zinc-500 dark:border-zinc-700 dark:text-zinc-400">
+                            {set.jobCount}
+                          </td>
+                          {!dayClientView && [s.mins_2, s.mins_3, s.mins_4, s.mins_5].map((quad, i) =>
+                            subKeys.map((key) => {
+                              const val = key === 'total' ? quad.total : key === 'max' ? quad.max : key === 'min' ? quad.min : quad.av;
+                              const redClass = key === 'av' && val != null ? redIfOverStepCol(val, i + 2) : '';
+                              return (
+                                <td key={`${i}-${key}`} className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-xs ${redClass ? redClass : `${STEP_GROUP_BG[(i + 2) as 2 | 3 | 4 | 5]} text-zinc-600 dark:text-zinc-400 dark:border-zinc-700`}`}>
+                                  {val ?? '—'}
+                                </td>
+                              );
+                            })
+                          )}
+                          {subKeys.map((key) => {
+                            const val = key === 'total' ? s.travel.total : key === 'max' ? s.travel.max : key === 'min' ? s.travel.min : s.travel.av;
+                            const redClass = key === 'av' && val != null ? redIfOver(val, 'travel') : '';
                             return (
-                              <td key={`${i}-${key}`} className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-xs ${redClass ? redClass : `${STEP_GROUP_BG[(i + 2) as 2 | 3 | 4 | 5]} text-zinc-600 dark:text-zinc-400 dark:border-zinc-700`}`}>
-                                {key === metric ? (metric === 'total' ? s.total : metric === 'max' ? s.max : metric === 'min' ? s.min : s.av) : '—'}
+                              <td key={`travel-${key}`} className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-xs ${redClass || (val != null ? 'text-zinc-600 dark:border-zinc-700 dark:text-zinc-400' : 'text-zinc-600 dark:border-zinc-700 dark:text-zinc-400')}`}>
+                                {val ?? '—'}
                               </td>
                             );
-                          })
-                        )}
-                        {(dayClientView ? (['total', 'av'] as const) : (['total', 'max', 'min', 'av'] as const)).map((key) => {
-                          const val = key === metric ? (metric === 'total' ? byDayStats.travel.total : byDayStats.travel.av) : null;
-                          const redClass = metric === 'av' && val != null ? redIfOver(val, 'travel') : '';
-                          return (
-                            <td key={`travel-${key}`} className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-xs ${redClass} ${val != null && !redClass ? 'text-zinc-600 dark:border-zinc-700 dark:text-zinc-400' : val == null ? 'text-zinc-600 dark:text-zinc-400 dark:border-zinc-700' : ''}`}>
-                              {key === metric ? (metric === 'total' ? byDayStats.travel.total : byDayStats.travel.av) : '—'}
-                            </td>
-                          );
-                        })}
-                        {(dayClientView ? (['total', 'av'] as const) : (['total', 'max', 'min', 'av'] as const)).map((key) => {
-                          const val = key === metric ? (metric === 'total' ? byDayStats.mins_3.total : byDayStats.mins_3.av) : null;
-                          const redClass = metric === 'av' && val != null ? redIfOver(val, 'in_vineyard') : '';
-                          return (
-                            <td key={`in_vineyard-${key}`} className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-xs ${redClass ? redClass : `${STEP_GROUP_BG[3]} text-zinc-600 dark:text-zinc-400 dark:border-zinc-700`}`}>
-                              {key === metric ? (metric === 'total' ? byDayStats.mins_3.total : byDayStats.mins_3.av) : '—'}
-                            </td>
-                          );
-                        })}
-                        {(dayClientView ? (['total', 'av'] as const) : (['total', 'max', 'min', 'av'] as const)).map((key) => {
-                          const val = key === metric ? (metric === 'total' ? byDayStats.mins_5.total : byDayStats.mins_5.av) : null;
-                          const redClass = metric === 'av' && val != null ? redIfOver(val, 'in_winery') : '';
-                          return (
-                            <td key={`in_winery-${key}`} className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-xs ${redClass ? redClass : `${STEP_GROUP_BG[5]} text-zinc-600 dark:text-zinc-400 dark:border-zinc-700`}`}>
-                              {key === metric ? (metric === 'total' ? byDayStats.mins_5.total : byDayStats.mins_5.av) : '—'}
-                            </td>
-                          );
-                        })}
-                        {(dayClientView ? (['total', 'av'] as const) : (['total', 'max', 'min', 'av'] as const)).map((key) => {
-                          const val = key === metric ? (metric === 'total' ? byDayStats.total.total : byDayStats.total.av) : null;
-                          const redClass = metric === 'av' && val != null ? redIfOver(val, 'total') : '';
-                          return (
-                            <td key={`total-${key}`} className={`border-zinc-200 px-2 py-1.5 tabular-nums text-xs font-medium ${redClass} ${val != null && !redClass ? 'text-zinc-700 dark:border-zinc-700 dark:text-zinc-300' : val == null ? 'text-zinc-700 dark:text-zinc-300 dark:border-zinc-700' : ''}`}>
-                              {key === metric ? (metric === 'total' ? byDayStats.total.total : byDayStats.total.av) : '—'}
-                            </td>
-                          );
-                        })}
-                      </tr>
-                    ))}
+                          })}
+                          {subKeys.map((key) => {
+                            const val = key === 'total' ? s.mins_3.total : key === 'max' ? s.mins_3.max : key === 'min' ? s.mins_3.min : s.mins_3.av;
+                            const redClass = key === 'av' && val != null ? redIfOver(val, 'in_vineyard') : '';
+                            return (
+                              <td key={`in_vineyard-${key}`} className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-xs ${redClass ? redClass : `${STEP_GROUP_BG[3]} text-zinc-600 dark:text-zinc-400 dark:border-zinc-700`}`}>
+                                {val ?? '—'}
+                              </td>
+                            );
+                          })}
+                          {subKeys.map((key) => {
+                            const val = key === 'total' ? s.mins_5.total : key === 'max' ? s.mins_5.max : key === 'min' ? s.mins_5.min : s.mins_5.av;
+                            const redClass = key === 'av' && val != null ? redIfOver(val, 'in_winery') : '';
+                            return (
+                              <td key={`in_winery-${key}`} className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-xs ${redClass ? redClass : `${STEP_GROUP_BG[5]} text-zinc-600 dark:text-zinc-400 dark:border-zinc-700`}`}>
+                                {val ?? '—'}
+                              </td>
+                            );
+                          })}
+                          {subKeys.map((key) => {
+                            const val = key === 'total' ? s.total.total : key === 'max' ? s.total.max : key === 'min' ? s.total.min : s.total.av;
+                            const redClass = key === 'av' && val != null ? redIfOver(val, 'total') : '';
+                            return (
+                              <td key={`total-${key}`} className={`border-zinc-200 px-2 py-1.5 tabular-nums text-xs font-medium ${redClass || (val != null ? 'text-zinc-700 dark:border-zinc-700 dark:text-zinc-300' : 'text-zinc-700 dark:border-zinc-700 dark:text-zinc-300')}`}>
+                                {val ?? '—'}
+                              </td>
+                            );
+                          })}
+                        </tr>
+                      );
+                    })}
                   </tfoot>
                 )}
               </table>
             </div>
           )}
           {summaryTab === 'by_job' && (
-          <div className="max-h-[70vh] overflow-auto rounded-lg border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900">
+          <div
+            ref={byJobTableScrollRef}
+            className="max-h-[70vh] overflow-auto rounded-lg border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900"
+          >
             <table className="w-full min-w-[64rem] text-left text-sm">
               <thead className="sticky top-0 z-10 bg-zinc-100 shadow-[0_1px_0_0_rgba(0,0,0,0.1)] dark:bg-zinc-800 dark:shadow-[0_1px_0_0_rgba(255,255,255,0.08)]">
                 <tr className="border-b border-zinc-200 dark:border-zinc-700">
-                  <th colSpan={9} className="border-r border-zinc-200 px-2 py-1 text-xs font-medium text-zinc-500 dark:border-zinc-700" title={timeLimitRows.length > 0 ? "Per job: red if value > limit from row where Winery = job's delivery_winery and TT = job's trailermode (T / TT). Boxes below show selected Time Limits row for reference only." : undefined}>
+                  <th colSpan={9} className="border-r border-zinc-200 px-2 py-1 text-xs font-medium text-zinc-500 dark:border-zinc-700" title={timeLimitRows.length > 0 ? "Per job: red if value > limit from row where Winery = delivery_winery, Vineyard group = vineyard_group, and TT = trailermode (T / TT). Boxes below show selected Time Limits row for reference only." : undefined}>
                     Limit (red if &gt;){timeLimitRows.length > 0 ? ' (per winery)' : ''}
                   </th>
                   {!jobClientView && (
@@ -1754,6 +2097,14 @@ export default function SummaryPage() {
                       {label} {sortKey === key ? (sortDir === 'asc' ? '↑' : '↓') : ''}
                     </th>
                   ))}
+                  {jobClientView && (
+                    <th
+                      onClick={() => handleSort('step_1_actual_time')}
+                      className={`cursor-pointer select-none whitespace-nowrap border-b border-r border-zinc-200 px-3 py-2 font-medium text-zinc-900 hover:bg-zinc-200 dark:border-zinc-700 dark:text-zinc-100 dark:hover:bg-zinc-700 ${sortKey === 'step_1_actual_time' ? 'bg-zinc-200 dark:bg-zinc-700' : ''}`}
+                    >
+                      Start Time {sortKey === 'step_1_actual_time' ? (sortDir === 'asc' ? '↑' : '↓') : ''}
+                    </th>
+                  )}
                   {!jobClientView && (
                     <>
                       <th colSpan={2} className={`border-b border-r border-zinc-200 px-3 py-2 font-medium text-zinc-900 dark:border-zinc-700 ${STEP_GROUP_BG[1]}`}>
@@ -1840,20 +2191,46 @@ export default function SummaryPage() {
               <tbody>
                 {sortedRows.length === 0 ? (
                   <tr>
-                    <td colSpan={jobClientView ? 11 : allColumns.length} className="px-3 py-6 text-center text-zinc-500">
+                    <td colSpan={jobClientView ? 12 : allColumns.length} className="px-3 py-6 text-center text-zinc-500">
                       No rows {filterActualFrom || filterActualTo || effectiveCustomer || filterTemplate || filterTruckId || filterWorker.trim() || filterTrailermode ? '(try relaxing filters)' : ''}.
                     </td>
                   </tr>
                 ) : (
-                  sortedRows.map((row, i) => (
-                    <tr key={i} className="border-b border-zinc-100 dark:border-zinc-800 hover:bg-zinc-50 dark:hover:bg-zinc-800/50">
+                  sortedRows.map((row, i) => {
+                    const isHistoryFocusRow =
+                      focusHighlightJobId != null &&
+                      String(focusHighlightJobId).trim() !== '' &&
+                      String(row.job_id ?? '').trim() === String(focusHighlightJobId).trim();
+                    const historyPlainLeadHighlight = (k: string) =>
+                      isHistoryFocusRow &&
+                      (k === 'Customer' || k === 'job_id' || k === 'worker')
+                        ? ' bg-sky-100 dark:bg-sky-900/45'
+                        : '';
+                    return (
+                    <tr
+                      key={i}
+                      data-summary-focus-job={
+                        row.job_id != null && String(row.job_id).trim() !== ''
+                          ? String(row.job_id).trim()
+                          : undefined
+                      }
+                      className="border-b border-zinc-100 dark:border-zinc-800 hover:bg-zinc-50 dark:hover:bg-zinc-800/50"
+                    >
                       {BY_JOB_LEAD_COLUMNS.map(({ key }) => (
-                        <td key={key} className={`whitespace-nowrap px-3 py-2 text-zinc-700 dark:text-zinc-300${key === 'limits_breached' ? ' text-center font-medium tabular-nums ' + (row.limits_breached === 'X' ? 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-200' : 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-200') : ''}`}>
+                        <td
+                          key={key}
+                          className={`whitespace-nowrap px-3 py-2 text-zinc-700 dark:text-zinc-300${historyPlainLeadHighlight(key)}${key === 'limits_breached' ? ' text-center font-medium tabular-nums ' + (row.limits_breached === 'X' ? 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-200' : 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-200') : ''}`}
+                        >
                           {key === 'limits_breached' ? (
                             row.limits_breached ?? '-'
                           ) : key === 'job_id' && viewMode !== 'client' ? (
                             <Link
                               href={inspectUrlForRow(row)}
+                              onClick={(e) => {
+                                if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
+                                const meta = inspectJumpMetaForRow(row);
+                                if (meta) registerPendingInspectForHistory(meta);
+                              }}
                               className="text-blue-600 underline hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300"
                             >
                               {formatCell(row[key])}
@@ -1865,6 +2242,11 @@ export default function SummaryPage() {
                           )}
                         </td>
                       ))}
+                      {jobClientView && (
+                        <td className="whitespace-nowrap px-3 py-2 text-zinc-600 dark:text-zinc-400">
+                          {formatDateDDMM(row.actual_start_time ?? row.step_1_actual_time ?? row.step_1_gps_completed_at ?? row.step_1_completed_at)}
+                        </td>
+                      )}
                       {!jobClientView && (() => {
                         const limitsRow = getMatchingLimitsRow(row);
                         return STEP_NUMS.map((n) => {
@@ -1934,19 +2316,65 @@ export default function SummaryPage() {
                         );
                       })()}
                     </tr>
-                  ))
+                    );
+                  })
                 )}
               </tbody>
             </table>
           </div>
           )}
-          <p className="mt-3 text-zinc-500">
-            {summaryTab === 'by_job'
-              ? `${sortedRows.length} row${sortedRows.length !== 1 ? 's' : ''}${(filterActualFrom || filterActualTo || filterTruckId || filterWorker.trim() || filterTrailermode || filterWinery || filterVineyard) ? ` (filtered from ${rows.length})` : ''} · max 500 from API`
-              : `${rowsByDay.length} day${rowsByDay.length !== 1 ? 's' : ''} · ${filteredRows.length} job${filteredRows.length !== 1 ? 's' : ''}${(filterActualFrom || filterActualTo || filterTruckId || filterWorker.trim() || filterTrailermode || filterWinery || filterVineyard) ? ` (filtered)` : ''}`}
-          </p>
+          <div className="mt-3 flex flex-wrap items-center gap-3 text-zinc-500">
+            <span>
+              {summaryTab === 'by_job'
+                ? (() => {
+                    const start = totalJobsFromApi === 0 ? 0 : jobsPage * jobsPageSize + 1;
+                    const end = Math.min((jobsPage + 1) * jobsPageSize, totalJobsFromApi);
+                    return totalJobsFromApi > jobsPageSize
+                      ? `${start}–${end} of ${totalJobsFromApi} jobs`
+                      : `${sortedRows.length} row${sortedRows.length !== 1 ? 's' : ''}${totalJobsFromApi > 0 ? ` of ${totalJobsFromApi}` : ''}`;
+                  })()
+                : `${rowsByDay.length} day${rowsByDay.length !== 1 ? 's' : ''} · ${filteredRows.length} job${filteredRows.length !== 1 ? 's' : ''}${totalJobsFromApi > rows.length ? ` (page of ${totalJobsFromApi} from API)` : ''}`}
+            </span>
+            {summaryTab === 'by_job' && totalJobsFromApi > jobsPageSize && (
+              <span className="flex items-center gap-2">
+                <button
+                  type="button"
+                  disabled={jobsPage === 0 || loading}
+                  onClick={() => setJobsPage((p) => Math.max(0, p - 1))}
+                  className="rounded border border-zinc-300 bg-white px-2 py-1 text-sm disabled:opacity-50 dark:border-zinc-600 dark:bg-zinc-800"
+                >
+                  Prev
+                </button>
+                <span className="text-xs">
+                  Page {jobsPage + 1} of {Math.ceil(totalJobsFromApi / jobsPageSize)}
+                </span>
+                <button
+                  type="button"
+                  disabled={jobsPage >= Math.ceil(totalJobsFromApi / jobsPageSize) - 1 || loading}
+                  onClick={() => setJobsPage((p) => p + 1)}
+                  className="rounded border border-zinc-300 bg-white px-2 py-1 text-sm disabled:opacity-50 dark:border-zinc-600 dark:bg-zinc-800"
+                >
+                  Next
+                </button>
+              </span>
+            )}
+          </div>
         </>
       )}
     </div>
+  );
+}
+
+export default function SummaryPage() {
+  return (
+    <Suspense
+      fallback={
+        <div className="flex min-h-[200px] items-center justify-center p-6 text-zinc-500 dark:text-zinc-400">
+          Loading…
+        </div>
+      }
+    >
+      <SummaryPageInner />
+    </Suspense>
   );
 }
