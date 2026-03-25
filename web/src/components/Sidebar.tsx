@@ -21,19 +21,6 @@ function buildInspectUrl(entry: InspectHistoryEntry): string {
   const params = new URLSearchParams();
   params.set('locateJobId', entry.job_id);
   if (entry.truck_id) params.set('truckId', entry.truck_id);
-  const actualStart = entry.actual_start_time?.trim();
-  if (actualStart) {
-    const d = new Date(actualStart.includes('T') ? actualStart : actualStart.replace(' ', 'T'));
-    if (!Number.isNaN(d.getTime())) {
-      const pad = (n: number) => String(n).padStart(2, '0');
-      const from = new Date(d);
-      from.setDate(from.getDate() - 1);
-      params.set('actualFrom', `${from.getFullYear()}-${pad(from.getMonth() + 1)}-${pad(from.getDate())}`);
-      const to = new Date(d);
-      to.setDate(to.getDate() + 1);
-      params.set('actualTo', `${to.getFullYear()}-${pad(to.getMonth() + 1)}-${pad(to.getDate())}`);
-    }
-  }
   return `/query/inspect?${params.toString()}`;
 }
 

@@ -1,8 +1,15 @@
 import { NextResponse } from 'next/server';
 import { query, execute } from '@/lib/db';
 import { addMinutesToTimestampAsNZ } from '@/lib/fetch-steps';
-import { deriveGpsStepsForJob, type JobForDerivedSteps } from '@/lib/derived-steps';
+import {
+  deriveGpsStepsForJob,
+  finalizeDerivedSteps,
+  toGpsLayerForFinalize,
+  type JobForDerivedSteps,
+  normalizeTimestampString,
+} from '@/lib/derived-steps';
 import { runStepsPlusQuery } from '@/lib/steps-plus-query';
+import { getStepsPlusSettings } from '@/lib/steps-plus-settings';
 
 /** Recursively convert BigInt to number (or string if too large) so JSON.stringify works. */
 function sanitizeForJson<T>(value: T): T {
@@ -107,6 +114,9 @@ export async function GET(request: Request) {
       actual_end_time: (pick('actual_end_time', 'Actual_End_Time') as string | null) ?? undefined,
       step_5_completed_at: (pick('step_5_completed_at', 'Step_5_Completed_At') as string | null) ?? undefined,
       step_1_completed_at: (pick('step_1_completed_at', 'Step_1_Completed_At') as string | null) ?? undefined,
+      step_2_completed_at: (pick('step_2_completed_at', 'Step_2_Completed_At') as string | null) ?? undefined,
+      step_3_completed_at: (pick('step_3_completed_at', 'Step_3_Completed_At') as string | null) ?? undefined,
+      step_4_completed_at: (pick('step_4_completed_at', 'Step_4_Completed_At') as string | null) ?? undefined,
       step1oride: (pick('step1oride', 'Step1oride') as string | null) ?? undefined,
       step2oride: (pick('step2oride', 'Step2oride') as string | null) ?? undefined,
       step3oride: (pick('step3oride', 'Step3oride') as string | null) ?? undefined,
@@ -174,7 +184,7 @@ export async function GET(request: Request) {
 
     // Steps+ (buffered vineyard fence): if standard derivation still misses VWork step 2 or 3, try expanded polygons.
     const vineyardName = job.vineyard_name ? String(job.vineyard_name).trim() : '';
-    if (writeBack && vineyardName && (result.step2 == null || result.step3 == null)) {
+    if (writeBack && vineyardName && (result.step2Gps == null || result.step3Gps == null)) {
       const mappings = await query<{ vwname: string | null; gpsname: string | null }>(
         "SELECT vwname, gpsname FROM tbl_gpsmappings WHERE type = 'Vineyard' AND (TRIM(COALESCE(vwname,'')) = $1 OR TRIM(COALESCE(gpsname,'')) = $1)",
         [vineyardName]
@@ -185,6 +195,8 @@ export async function GET(request: Request) {
         if (gps && !fenceNames.includes(gps)) fenceNames.push(gps);
       }
       if (fenceNames.length > 0) {
+        const { bufferMeters: stepsPlusBufferM, minDurationSeconds: stepsPlusMinSec } =
+          await getStepsPlusSettings();
         const stepsPlusEnd =
           effectivePositionBefore ?? addMinutesToTimestampAsNZ(positionAfter.trim(), 24 * 60);
         const stepsPlusRows = await runStepsPlusQuery(
@@ -192,17 +204,34 @@ export async function GET(request: Request) {
           positionAfter.trim(),
           stepsPlusEnd,
           fenceNames,
-          10
+          stepsPlusBufferM
         );
-        const stays = stepsPlusRows.filter((r) => Number(r.duration_seconds) >= 300);
-        if (stays.length === 1) {
-          result = {
-            ...result,
-            step2: stays[0].enter_time,
-            step3: stays[0].exit_time,
-            step2Via: 'VineFence+',
-            step3Via: 'VineFence+',
-          };
+        const stays = stepsPlusRows.filter((r) => Number(r.duration_seconds) >= stepsPlusMinSec);
+        const vworkEndRaw = pick('step_5_completed_at', 'Step_5_Completed_At') ?? pick('actual_end_time', 'Actual_End_Time');
+        const vworkEnd =
+          vworkEndRaw != null && String(vworkEndRaw).trim() !== ''
+            ? normalizeTimestampString(vworkEndRaw as string | Date)
+            : null;
+        const staysInJob =
+          vworkEnd == null
+            ? stays
+            : stays.filter((r) => {
+                const ent = normalizeTimestampString(r.enter_time);
+                const ext = normalizeTimestampString(r.exit_time);
+                return ent != null && ext != null && ent < vworkEnd && ext < vworkEnd;
+              });
+        if (staysInJob.length === 1) {
+          const fin = finalizeDerivedSteps(
+            {
+              ...toGpsLayerForFinalize(result),
+              step2Gps: staysInJob[0].enter_time,
+              step3Gps: staysInJob[0].exit_time,
+              step2Via: 'VineFence+',
+              step3Via: 'VineFence+',
+            },
+            job
+          );
+          result = { ...fin, debug: result.debug };
         }
       }
     }
@@ -223,21 +252,26 @@ export async function GET(request: Request) {
             Step5_gps_id = $10
           WHERE job_id::text = $11`,
           [
-            result.step1 ?? null,
+            result.step1Gps ?? null,
             result.step1TrackingId ?? null,
-            result.step2 ?? null,
+            result.step2Gps ?? null,
             result.step2TrackingId ?? null,
-            result.step3 ?? null,
+            result.step3Gps ?? null,
             result.step3TrackingId ?? null,
-            result.step4 ?? null,
+            result.step4Gps ?? null,
             result.step4TrackingId ?? null,
-            result.step5 ?? null,
+            result.step5Gps ?? null,
             result.step5TrackingId ?? null,
             jobId,
           ]
         );
-        const step1Actual = result.step1 ?? (job.step_1_completed_at as string | null) ?? null;
-        const step1Via = result.step1Via ?? (result.step1ActualOverride != null ? 'RULE' : (result.step1 != null ? 'GPS' : 'VW'));
+        const step1Actual =
+          result.step1 ??
+          result.step1ActualOverride ??
+          (pickTrim('step_1_completed_at', 'Step_1_Completed_At') ||
+            pickTrim('actual_start_time', 'Actual_Start_Time') ||
+            null);
+        const step1Via = result.step1Via ?? (result.step1ActualOverride != null ? 'RULE' : (result.step1Gps != null ? 'GPS' : 'VW'));
         await execute(
           `UPDATE tbl_vworkjobs SET
             step_1_actual_time = $1::timestamp,

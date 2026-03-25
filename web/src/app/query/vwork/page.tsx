@@ -532,7 +532,7 @@ export default function VworkPage() {
           </div>
           <p className="mt-3 text-zinc-500">
             {sortedRows.length} row{sortedRows.length !== 1 ? 's' : ''}
-            {(filterCustomer || filterTemplate || dateFilterCol) && ` (filtered from ${rows.length})`} · max 500 from API
+            {(filterCustomer || filterTemplate || dateFilterCol) && ` (filtered from ${rows.length})`} · all jobs from API
           </p>
         </>
       )}

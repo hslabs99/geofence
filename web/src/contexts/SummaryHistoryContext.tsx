@@ -19,8 +19,6 @@ import {
 export type SummaryInspectJumpMeta = {
   jobId: string;
   truckId: string;
-  actualFrom: string;
-  actualTo: string;
 };
 
 type Ctx = {
@@ -62,10 +60,6 @@ export function SummaryHistoryProvider({ children }: { children: ReactNode }) {
           ...p,
           focusJobId: jump.jobId,
           ...(jump.truckId.trim() ? { focusTruckId: jump.truckId.trim() } : {}),
-          ...(jump.actualFrom.trim()
-            ? { focusInspectActualFrom: jump.actualFrom.trim() }
-            : {}),
-          ...(jump.actualTo.trim() ? { focusInspectActualTo: jump.actualTo.trim() } : {}),
         }
       : p;
     if (appendSummaryHistory(payload)) setHistoryVersion((v) => v + 1);

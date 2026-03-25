@@ -112,6 +112,65 @@ function totalMins(row: Row): number | null {
   return (m2 ?? 0) + (m3 ?? 0) + (m4 ?? 0) + (m5 ?? 0);
 }
 
+/** Row-level outlier flag on Job ID / Daily date (not per-cell; keeps limit reds on cells). */
+const SUMMARY_OUTLIER_RED = 'bg-red-200 text-red-900 dark:bg-red-900/40 dark:text-red-200';
+const SUMMARY_OUTLIER_YELLOW = 'bg-yellow-200 text-yellow-900 dark:bg-yellow-900/35 dark:text-yellow-100';
+
+/** Minute columns aligned with By Job: steps 2–5, travel, total. */
+function jobRowMinuteValues(row: Row): number[] {
+  const out: number[] = [];
+  for (let n = 2; n <= 5; n++) {
+    const m = minsBetween(row, n - 1, n);
+    if (m != null) out.push(m);
+  }
+  const t = travelMins(row);
+  if (t != null) out.push(t);
+  const tot = totalMins(row);
+  if (tot != null) out.push(tot);
+  return out;
+}
+
+/** Any &lt; 0 → red; else any &lt; 5 → yellow. */
+function timeOutlierSeverity(values: number[]): 'red' | 'yellow' | null {
+  if (values.length === 0) return null;
+  if (values.some((v) => v < 0)) return 'red';
+  if (values.some((v) => v < 5)) return 'yellow';
+  return null;
+}
+
+type RollupQuads = {
+  jobs: Row[];
+  mins_2: { total: number; max: number; min: number; av: number };
+  mins_3: { total: number; max: number; min: number; av: number };
+  mins_4: { total: number; max: number; min: number; av: number };
+  mins_5: { total: number; max: number; min: number; av: number };
+  travel: { total: number; max: number; min: number; av: number };
+  total: { total: number; max: number; min: number; av: number };
+};
+
+function dayRollupOutlierSeverity(r: RollupQuads): 'red' | 'yellow' | null {
+  if (r.jobs.length === 0) return null;
+  const keys = ['mins_2', 'mins_3', 'mins_4', 'mins_5', 'travel', 'total'] as const;
+  const vals: number[] = [];
+  for (const k of keys) {
+    const q = r[k];
+    vals.push(q.total, q.max, q.min, q.av);
+  }
+  return timeOutlierSeverity(vals);
+}
+
+function footerStatsOutlierSeverity(
+  stats: Record<string, { total: number; max: number; min: number; av: number }>,
+  jobCount: number,
+): 'red' | 'yellow' | null {
+  if (jobCount === 0) return null;
+  const vals: number[] = [];
+  for (const q of Object.values(stats)) {
+    vals.push(q.total, q.max, q.min, q.av);
+  }
+  return timeOutlierSeverity(vals);
+}
+
 function compare(a: unknown, b: unknown): number {
   const va = a == null ? '' : a;
   const vb = b == null ? '' : b;
@@ -133,45 +192,20 @@ function sortValueFor(row: Row, key: string): unknown {
   return row[key];
 }
 
-/** Same date window as Inspect uses for `actualFrom` / `actualTo` (UI bounds only; not stored job timestamps). */
-function inspectJumpMetaForRow(row: Row): {
-  jobId: string;
-  truckId: string;
-  actualFrom: string;
-  actualTo: string;
-} | null {
+function inspectJumpMetaForRow(row: Row): { jobId: string; truckId: string } | null {
   const jobId = row.job_id != null ? String(row.job_id).trim() : '';
   if (!jobId) return null;
   const truckId = row.truck_id != null ? String(row.truck_id).trim() : '';
-  const actualStartRaw =
-    row.actual_start_time ?? row.step_1_actual_time ?? row.step_1_gps_completed_at ?? row.step_1_completed_at ?? '';
-  const actualStart = actualStartRaw ? String(actualStartRaw).trim() : '';
-  let actualFrom = '';
-  let actualTo = '';
-  if (actualStart) {
-    const d = new Date(actualStart.includes('T') ? actualStart : actualStart.replace(' ', 'T'));
-    if (!Number.isNaN(d.getTime())) {
-      const pad = (n: number) => String(n).padStart(2, '0');
-      const from = new Date(d);
-      from.setDate(from.getDate() - 1);
-      actualFrom = `${from.getFullYear()}-${pad(from.getMonth() + 1)}-${pad(from.getDate())}`;
-      const to = new Date(d);
-      to.setDate(to.getDate() + 1);
-      actualTo = `${to.getFullYear()}-${pad(to.getMonth() + 1)}-${pad(to.getDate())}`;
-    }
-  }
-  return { jobId, truckId, actualFrom, actualTo };
+  return { jobId, truckId };
 }
 
-/** Build Inspect URL to locate this job in the list (date range ±1 day, truck) so jobs before/after are visible. */
+/** Inspect: locate job + optional truck only (no date filters; Inspect clears UI filters when opening this link). */
 function inspectUrlForRow(row: Row): string {
   const meta = inspectJumpMetaForRow(row);
   if (!meta) return '/query/inspect';
   const params = new URLSearchParams();
   params.set('locateJobId', meta.jobId);
   if (meta.truckId) params.set('truckId', meta.truckId);
-  if (meta.actualFrom) params.set('actualFrom', meta.actualFrom);
-  if (meta.actualTo) params.set('actualTo', meta.actualTo);
   return `/query/inspect?${params.toString()}`;
 }
 
@@ -233,6 +267,12 @@ function SummaryPageInner() {
   const [jobsPage, setJobsPage] = useState(0);
   const [jobsPageSize] = useState(500);
   const [totalJobsFromApi, setTotalJobsFromApi] = useState(0);
+  /** Same WHERE as /api/vworkjobs for the current filters (for season/daily footer). */
+  const [jobsQueryDebug, setJobsQueryDebug] = useState<{
+    debugSql: string;
+    debugSqlParams: unknown[];
+    debugSqlLiteral: string;
+  } | null>(null);
 
   /** After sidebar history restore (?sh=): suppress jobs reset + cascade wipes (same as Client hydrate). */
   const jobsPageResetSuppressCountRef = useRef(0);
@@ -324,9 +364,7 @@ function SummaryPageInner() {
     if (filterTruckId.trim()) params.set('truck_id', filterTruckId.trim());
     if (filterWorker.trim()) params.set('worker', filterWorker.trim());
     if (filterTrailermode.trim()) params.set('trailermode', filterTrailermode.trim());
-    params.set('limit', String(jobsPageSize));
-    params.set('offset', String(jobsPage * jobsPageSize));
-
+    /** Full result set for rollups; By Job tab paginates client-side (was capped at 500 rows server-side). */
     setLoading(true);
     fetch(`/api/vworkjobs?${params}`)
       .then(async (res) => {
@@ -337,11 +375,20 @@ function SummaryPageInner() {
       .then((data) => {
         setRows(data.rows ?? []);
         setTotalJobsFromApi(typeof data.total === 'number' ? data.total : (data.rows ?? []).length);
+        if (typeof data.debugSql === 'string' && Array.isArray(data.debugSqlParams)) {
+          setJobsQueryDebug({
+            debugSql: data.debugSql,
+            debugSqlParams: data.debugSqlParams,
+            debugSqlLiteral: typeof data.debugSqlLiteral === 'string' ? data.debugSqlLiteral : data.debugSql,
+          });
+        } else {
+          setJobsQueryDebug(null);
+        }
         setError(null);
       })
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false));
-  }, [effectiveCustomer, filterTemplate, filterActualFrom, filterActualTo, filterWinery, filterVineyardGroup, filterVineyard, filterTruckId, filterWorker, filterTrailermode, jobsPage, jobsPageSize]);
+  }, [effectiveCustomer, filterTemplate, filterActualFrom, filterActualTo, filterWinery, filterVineyardGroup, filterVineyard, filterTruckId, filterWorker, filterTrailermode]);
 
   /** Keep latest Summary state for sidebar history when navigating away from /query/summary. */
   useEffect(() => {
@@ -878,33 +925,6 @@ function SummaryPageInner() {
     return out;
   }, [filteredRows, rowsWithLimits, splitByLimits, dayRange]);
 
-  /** Season (customer + template + winery + vineyard): one rollup over all matching jobs. Same metrics as daily. */
-  const seasonFilteredRows = useMemo(() => {
-    return rows.filter((row) => {
-      if (effectiveCustomer) {
-        const v = row.Customer ?? row.customer;
-        if (v == null || String(v).trim() !== effectiveCustomer) return false;
-      }
-      if (filterTemplate) {
-        const v = row.template;
-        if (v == null || String(v).trim() !== filterTemplate) return false;
-      }
-      if (filterWinery) {
-        const v = row.delivery_winery;
-        if (v == null || String(v).trim() !== filterWinery) return false;
-      }
-      if (filterVineyardGroup) {
-        const v = (row as Record<string, unknown>).vineyard_group;
-        if (v == null || String(v).trim() !== filterVineyardGroup) return false;
-      }
-      if (filterVineyard) {
-        const v = row.vineyard_name;
-        if (v == null || String(v).trim() !== filterVineyard) return false;
-      }
-      return true;
-    });
-  }, [rows, effectiveCustomer, filterTemplate, filterWinery, filterVineyardGroup, filterVineyard]);
-
   const fromValuesToQuad = (values: number[]): MinsQuad => {
     const valid = values.filter((v) => v != null && !Number.isNaN(v));
     const n = valid.length;
@@ -917,19 +937,20 @@ function SummaryPageInner() {
     };
   };
 
+  /** Season uses same job set as Daily / By Job: all filters (API + filteredRows). */
   const seasonRollup = useMemo((): {
     jobs: Row[];
     mins_2: MinsQuad; mins_3: MinsQuad; mins_4: MinsQuad; mins_5: MinsQuad; travel: MinsQuad; total: MinsQuad;
   } | null => {
-    if (seasonFilteredRows.length === 0) return null;
-    const m2vals = seasonFilteredRows.map((row) => minsBetween(row, 1, 2)).filter((v): v is number => v != null);
-    const m3vals = seasonFilteredRows.map((row) => minsBetween(row, 2, 3)).filter((v): v is number => v != null);
-    const m4vals = seasonFilteredRows.map((row) => minsBetween(row, 3, 4)).filter((v): v is number => v != null);
-    const m5vals = seasonFilteredRows.map((row) => minsBetween(row, 4, 5)).filter((v): v is number => v != null);
-    const travelVals = seasonFilteredRows.map((row) => travelMins(row)).filter((v): v is number => v != null);
-    const totalVals = seasonFilteredRows.map((row) => totalMins(row)).filter((v): v is number => v != null);
+    if (filteredRows.length === 0) return null;
+    const m2vals = filteredRows.map((row) => minsBetween(row, 1, 2)).filter((v): v is number => v != null);
+    const m3vals = filteredRows.map((row) => minsBetween(row, 2, 3)).filter((v): v is number => v != null);
+    const m4vals = filteredRows.map((row) => minsBetween(row, 3, 4)).filter((v): v is number => v != null);
+    const m5vals = filteredRows.map((row) => minsBetween(row, 4, 5)).filter((v): v is number => v != null);
+    const travelVals = filteredRows.map((row) => travelMins(row)).filter((v): v is number => v != null);
+    const totalVals = filteredRows.map((row) => totalMins(row)).filter((v): v is number => v != null);
     return {
-      jobs: seasonFilteredRows,
+      jobs: filteredRows,
       mins_2: fromValuesToQuad(m2vals),
       mins_3: fromValuesToQuad(m3vals),
       mins_4: fromValuesToQuad(m4vals),
@@ -937,13 +958,13 @@ function SummaryPageInner() {
       travel: fromValuesToQuad(travelVals),
       total: fromValuesToQuad(totalVals),
     };
-  }, [seasonFilteredRows]);
+  }, [filteredRows]);
 
   /** When splitByLimits: 3 rows (Over Limit, Within Limit, Season Total). Otherwise same as seasonRollup in single row. */
   type SeasonRollupRow = { rowType: 'Over Limit' | 'Within Limit' | 'Season Total'; jobs: Row[]; mins_2: MinsQuad; mins_3: MinsQuad; mins_4: MinsQuad; mins_5: MinsQuad; travel: MinsQuad; total: MinsQuad };
   const seasonRollupRows = useMemo((): SeasonRollupRow[] | null => {
-    if (seasonFilteredRows.length === 0) return null;
-    const withLimits = seasonFilteredRows.map((r) => ({ ...r, limits_breached: limitsBreachedForRow(r) }));
+    if (filteredRows.length === 0) return null;
+    const withLimits = filteredRows.map((r) => ({ ...r, limits_breached: limitsBreachedForRow(r) }));
     const overJobs = withLimits.filter((r) => (r as Row & { limits_breached?: string }).limits_breached === 'X');
     const withinJobs = withLimits.filter((r) => (r as Row & { limits_breached?: string }).limits_breached === '-');
     const build = (jobs: Row[]) => ({
@@ -959,11 +980,11 @@ function SummaryPageInner() {
       return [
         { rowType: 'Over Limit', ...build(overJobs) },
         { rowType: 'Within Limit', ...build(withinJobs) },
-        { rowType: 'Season Total', ...build(seasonFilteredRows) },
+        { rowType: 'Season Total', ...build(filteredRows) },
       ];
     }
     return seasonRollup ? [{ rowType: 'Season Total', ...seasonRollup }] : null;
-  }, [seasonFilteredRows, seasonRollup, splitByLimits]);
+  }, [filteredRows, seasonRollup, splitByLimits, timeLimitRows]);
 
   /** By Day footer: Total, Max, Min, Av. When split by limits: one set per type (Over, Within, Daily Total); Av = totalMins / totalJobs (not average of daily Av). */
   type ByDayFooterSet = { rowType?: 'Over Limit' | 'Within Limit' | 'Daily Total'; jobCount: number; stats: Record<string, MinsQuad> };
@@ -1128,11 +1149,18 @@ function SummaryPageInner() {
     return out;
   }, [rowsWithLimits, sortKey, sortDir, sortColumns]);
 
+  /** By Job table shows one page; season/daily use full sortedRows via filteredRows. */
+  const sortedRowsPage = useMemo(() => {
+    if (summaryTab !== 'by_job') return sortedRows;
+    const start = jobsPage * jobsPageSize;
+    return sortedRows.slice(start, start + jobsPageSize);
+  }, [sortedRows, summaryTab, jobsPage, jobsPageSize]);
+
   useEffect(() => {
     const jid = pendingScrollToJobIdRef.current;
     if (!jid || summaryTab !== 'by_job') return;
     if (loading) return;
-    const onPage = sortedRows.some((r) => String(r.job_id ?? '').trim() === jid);
+    const onPage = sortedRowsPage.some((r) => String(r.job_id ?? '').trim() === jid);
     if (!onPage) {
       pendingScrollToJobIdRef.current = null;
       return;
@@ -1165,7 +1193,7 @@ function SummaryPageInner() {
       cancelled = true;
       cancelAnimationFrame(id1);
     };
-  }, [loading, summaryTab, sortedRows]);
+  }, [loading, summaryTab, sortedRowsPage]);
 
   useEffect(() => {
     if (!focusHighlightJobId) return;
@@ -1509,7 +1537,16 @@ function SummaryPageInner() {
               </button>
               <button
                 type="button"
-                onClick={() => setSummaryTab('by_day')}
+                onClick={() => {
+                  const a = filterActualFrom.trim().slice(0, 10);
+                  const b = filterActualTo.trim().slice(0, 10);
+                  const singleDay = a.length > 0 && b.length > 0 && a === b;
+                  if (singleDay) {
+                    setFilterActualFrom('');
+                    setFilterActualTo('');
+                  }
+                  setSummaryTab('by_day');
+                }}
                 className={`rounded-t px-4 py-2 text-sm font-medium ${summaryTab === 'by_day' ? 'bg-zinc-200 dark:bg-zinc-700 text-zinc-900 dark:text-zinc-100' : 'bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 hover:bg-zinc-150 dark:hover:bg-zinc-750'}`}
               >
                 Daily Summary
@@ -1817,9 +1854,18 @@ function SummaryPageInner() {
                         splitByLimits && rowType === 'Daily Total' ? 'bg-white dark:bg-zinc-900 font-medium' : '',
                         !splitByLimits ? 'hover:bg-zinc-50 dark:hover:bg-zinc-800/50' : (rowType === 'Daily Total' ? '' : 'hover:bg-zinc-200/50 dark:hover:bg-zinc-700/50'),
                       ].filter(Boolean).join(' ');
+                      const dayTimeOutlier = isFirstRowOfDay ? dayRollupOutlierSeverity(r as RollupQuads) : null;
+                      const dateCellFlag =
+                        dayTimeOutlier === 'red'
+                          ? SUMMARY_OUTLIER_RED
+                          : dayTimeOutlier === 'yellow'
+                            ? SUMMARY_OUTLIER_YELLOW
+                            : '';
                       return (
                       <tr key={`${r.date}-${rowType ?? 'day'}`} className={dailyRowClass}>
-                        <td className="whitespace-nowrap border-r border-zinc-200 px-3 py-2 dark:border-zinc-700">
+                        <td
+                          className={`whitespace-nowrap border-r border-zinc-200 px-3 py-2 dark:border-zinc-700${dateCellFlag ? ` ${dateCellFlag}` : ''}`}
+                        >
                           {isFirstRowOfDay ? (
                             dayClientView ? (
                               <span className="font-medium text-zinc-700 dark:text-zinc-300">{r.dateLabel}</span>
@@ -1831,7 +1877,11 @@ function SummaryPageInner() {
                                   setFilterActualTo(r.date);
                                   setSummaryTab('by_job');
                                 }}
-                                className="font-medium text-blue-600 underline hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300"
+                                className={
+                                  dateCellFlag
+                                    ? 'font-medium text-inherit underline decoration-current hover:opacity-90'
+                                    : 'font-medium text-blue-600 underline hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300'
+                                }
                               >
                                 {r.dateLabel}
                               </button>
@@ -1896,9 +1946,18 @@ function SummaryPageInner() {
                     {byDayFooterSets.map((set) => {
                       const s = set.stats;
                       const subKeys = dayClientView ? (['total', 'av'] as const) : (['total', 'max', 'min', 'av'] as const);
+                      const footOutlier = footerStatsOutlierSeverity(s, set.jobCount);
+                      const footFlag =
+                        footOutlier === 'red'
+                          ? SUMMARY_OUTLIER_RED
+                          : footOutlier === 'yellow'
+                            ? SUMMARY_OUTLIER_YELLOW
+                            : '';
                       return (
                         <tr key={set.rowType ?? 'all'} className="border-b border-zinc-200 dark:border-zinc-700">
-                          <td className="border-r border-zinc-200 px-3 py-1.5 text-xs font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-400">
+                          <td
+                            className={`border-r border-zinc-200 px-3 py-1.5 text-xs font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-400${footFlag ? ` ${footFlag}` : ''}`}
+                          >
                             Total / Av
                           </td>
                           {splitByLimits && (
@@ -2196,7 +2255,7 @@ function SummaryPageInner() {
                     </td>
                   </tr>
                 ) : (
-                  sortedRows.map((row, i) => {
+                  sortedRowsPage.map((row, i) => {
                     const isHistoryFocusRow =
                       focusHighlightJobId != null &&
                       String(focusHighlightJobId).trim() !== '' &&
@@ -2206,6 +2265,7 @@ function SummaryPageInner() {
                       (k === 'Customer' || k === 'job_id' || k === 'worker')
                         ? ' bg-sky-100 dark:bg-sky-900/45'
                         : '';
+                    const jobTimeOutlier = timeOutlierSeverity(jobRowMinuteValues(row));
                     return (
                     <tr
                       key={i}
@@ -2216,10 +2276,19 @@ function SummaryPageInner() {
                       }
                       className="border-b border-zinc-100 dark:border-zinc-800 hover:bg-zinc-50 dark:hover:bg-zinc-800/50"
                     >
-                      {BY_JOB_LEAD_COLUMNS.map(({ key }) => (
+                      {BY_JOB_LEAD_COLUMNS.map(({ key }) => {
+                        const jobIdOutlierBg =
+                          key === 'job_id'
+                            ? jobTimeOutlier === 'red'
+                              ? ` ${SUMMARY_OUTLIER_RED}`
+                              : jobTimeOutlier === 'yellow'
+                                ? ` ${SUMMARY_OUTLIER_YELLOW}`
+                                : historyPlainLeadHighlight(key)
+                            : historyPlainLeadHighlight(key);
+                        return (
                         <td
                           key={key}
-                          className={`whitespace-nowrap px-3 py-2 text-zinc-700 dark:text-zinc-300${historyPlainLeadHighlight(key)}${key === 'limits_breached' ? ' text-center font-medium tabular-nums ' + (row.limits_breached === 'X' ? 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-200' : 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-200') : ''}`}
+                          className={`whitespace-nowrap px-3 py-2 text-zinc-700 dark:text-zinc-300${jobIdOutlierBg}${key === 'limits_breached' ? ' text-center font-medium tabular-nums ' + (row.limits_breached === 'X' ? 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-200' : 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-200') : ''}`}
                         >
                           {key === 'limits_breached' ? (
                             row.limits_breached ?? '-'
@@ -2231,7 +2300,11 @@ function SummaryPageInner() {
                                 const meta = inspectJumpMetaForRow(row);
                                 if (meta) registerPendingInspectForHistory(meta);
                               }}
-                              className="text-blue-600 underline hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300"
+                              className={
+                                jobTimeOutlier
+                                  ? 'font-medium text-inherit underline decoration-current hover:opacity-90'
+                                  : 'text-blue-600 underline hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300'
+                              }
                             >
                               {formatCell(row[key])}
                             </Link>
@@ -2241,7 +2314,8 @@ function SummaryPageInner() {
                             formatCell(row[key])
                           )}
                         </td>
-                      ))}
+                      );
+                      })}
                       {jobClientView && (
                         <td className="whitespace-nowrap px-3 py-2 text-zinc-600 dark:text-zinc-400">
                           {formatDateDDMM(row.actual_start_time ?? row.step_1_actual_time ?? row.step_1_gps_completed_at ?? row.step_1_completed_at)}
@@ -2327,15 +2401,16 @@ function SummaryPageInner() {
             <span>
               {summaryTab === 'by_job'
                 ? (() => {
-                    const start = totalJobsFromApi === 0 ? 0 : jobsPage * jobsPageSize + 1;
-                    const end = Math.min((jobsPage + 1) * jobsPageSize, totalJobsFromApi);
-                    return totalJobsFromApi > jobsPageSize
-                      ? `${start}–${end} of ${totalJobsFromApi} jobs`
-                      : `${sortedRows.length} row${sortedRows.length !== 1 ? 's' : ''}${totalJobsFromApi > 0 ? ` of ${totalJobsFromApi}` : ''}`;
+                    const n = sortedRows.length;
+                    const start = n === 0 ? 0 : jobsPage * jobsPageSize + 1;
+                    const end = Math.min((jobsPage + 1) * jobsPageSize, n);
+                    return n > jobsPageSize
+                      ? `${start}–${end} of ${n} jobs`
+                      : `${n} row${n !== 1 ? 's' : ''}`;
                   })()
-                : `${rowsByDay.length} day${rowsByDay.length !== 1 ? 's' : ''} · ${filteredRows.length} job${filteredRows.length !== 1 ? 's' : ''}${totalJobsFromApi > rows.length ? ` (page of ${totalJobsFromApi} from API)` : ''}`}
+                : `${rowsByDay.length} day${rowsByDay.length !== 1 ? 's' : ''} · ${filteredRows.length} job${filteredRows.length !== 1 ? 's' : ''}${filteredRows.length !== totalJobsFromApi ? ` (client filter ${filteredRows.length} vs API ${totalJobsFromApi})` : ''}`}
             </span>
-            {summaryTab === 'by_job' && totalJobsFromApi > jobsPageSize && (
+            {summaryTab === 'by_job' && sortedRows.length > jobsPageSize && (
               <span className="flex items-center gap-2">
                 <button
                   type="button"
@@ -2346,11 +2421,11 @@ function SummaryPageInner() {
                   Prev
                 </button>
                 <span className="text-xs">
-                  Page {jobsPage + 1} of {Math.ceil(totalJobsFromApi / jobsPageSize)}
+                  Page {jobsPage + 1} of {Math.ceil(sortedRows.length / jobsPageSize)}
                 </span>
                 <button
                   type="button"
-                  disabled={jobsPage >= Math.ceil(totalJobsFromApi / jobsPageSize) - 1 || loading}
+                  disabled={jobsPage >= Math.ceil(sortedRows.length / jobsPageSize) - 1 || loading}
                   onClick={() => setJobsPage((p) => p + 1)}
                   className="rounded border border-zinc-300 bg-white px-2 py-1 text-sm disabled:opacity-50 dark:border-zinc-600 dark:bg-zinc-800"
                 >
@@ -2359,6 +2434,19 @@ function SummaryPageInner() {
               </span>
             )}
           </div>
+          {jobsQueryDebug && (summaryTab === 'season' || summaryTab === 'by_day') && (
+            <details className="mt-4 rounded border border-zinc-200 bg-zinc-50 p-3 text-xs dark:border-zinc-600 dark:bg-zinc-900/50">
+              <summary className="cursor-pointer font-medium text-zinc-700 dark:text-zinc-300">
+                Debug: job count SQL (criteria for this summary)
+              </summary>
+              <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap break-all font-mono text-zinc-600 dark:text-zinc-400">
+                {jobsQueryDebug.debugSqlLiteral}
+              </pre>
+              <p className="mt-2 font-mono text-[10px] text-zinc-500 dark:text-zinc-500">
+                Params JSON: {JSON.stringify(jobsQueryDebug.debugSqlParams)}
+              </p>
+            </details>
+          )}
         </>
       )}
     </div>

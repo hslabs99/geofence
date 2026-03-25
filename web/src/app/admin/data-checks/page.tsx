@@ -221,7 +221,7 @@ function DataChecksPageContent() {
   const [sortBy2, setSortBy2] = useState<SortKey>('gap_from');
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
 
-  // Winery Name Fixes (tab 2)
+  // Winery / vineyard name fixes (tab 2)
   const [wineMappRows, setWineMappRows] = useState<WineMappRow[]>([]);
   const [wineMappLoading, setWineMappLoading] = useState(false);
   const [wineMappError, setWineMappError] = useState<string | null>(null);
@@ -234,6 +234,23 @@ function DataChecksPageContent() {
   const [deliveryWineries, setDeliveryWineries] = useState<string[]>([]);
   const [runFixesLoading, setRunFixesLoading] = useState(false);
   const [runFixesResult, setRunFixesResult] = useState<{ totalUpdated: number; perMapping: { id: number; oldvworkname: string; newvworkname: string; updated: number }[] } | null>(null);
+
+  // Vineyard name fixes (same tab as winery)
+  const [vineMappRows, setVineMappRows] = useState<WineMappRow[]>([]);
+  const [vineMappLoading, setVineMappLoading] = useState(false);
+  const [vineMappError, setVineMappError] = useState<string | null>(null);
+  const [vineMappNewOld, setVineMappNewOld] = useState('');
+  const [vineMappNewNew, setVineMappNewNew] = useState('');
+  const [vineMappSaving, setVineMappSaving] = useState(false);
+  const [vineEditingId, setVineEditingId] = useState<number | null>(null);
+  const [vineEditOld, setVineEditOld] = useState('');
+  const [vineEditNew, setVineEditNew] = useState('');
+  const [vineyardNamesList, setVineyardNamesList] = useState<string[]>([]);
+  const [runVineFixesLoading, setRunVineFixesLoading] = useState(false);
+  const [runVineFixesResult, setRunVineFixesResult] = useState<{
+    totalUpdated: number;
+    perMapping: { id: number; oldvworkname: string; newvworkname: string; updated: number }[];
+  } | null>(null);
 
   // Varied tab: Set Trailer Type
   const [setTrailerLoading, setSetTrailerLoading] = useState(false);
@@ -280,9 +297,23 @@ function DataChecksPageContent() {
       .finally(() => setWineMappLoading(false));
   }, []);
 
+  const fetchVineMapp = useCallback(() => {
+    setVineMappLoading(true);
+    setVineMappError(null);
+    fetch('/api/admin/data-checks/vine-mapp')
+      .then((r) => {
+        if (!r.ok) return r.json().then((d) => Promise.reject(new Error(d?.error ?? r.statusText)));
+        return r.json();
+      })
+      .then((data: { rows: WineMappRow[] }) => setVineMappRows(data.rows ?? []))
+      .catch((e) => setVineMappError(e instanceof Error ? e.message : String(e)))
+      .finally(() => setVineMappLoading(false));
+  }, []);
+
   useEffect(() => {
     if (activeTab === 'winery-fixes') {
       fetchWineMapp();
+      fetchVineMapp();
       fetch('/api/admin/data-checks/wine-mapp/delivery-wineries')
         .then((r) => {
           if (!r.ok) return r.json().then((d) => Promise.reject(new Error(d?.error ?? r.statusText)));
@@ -290,8 +321,15 @@ function DataChecksPageContent() {
         })
         .then((data: { rows: string[] }) => setDeliveryWineries(data.rows ?? []))
         .catch(() => setDeliveryWineries([]));
+      fetch('/api/admin/data-checks/vine-mapp/vineyard-names')
+        .then((r) => {
+          if (!r.ok) return r.json().then((d) => Promise.reject(new Error(d?.error ?? r.statusText)));
+          return r.json();
+        })
+        .then((data: { rows: string[] }) => setVineyardNamesList(data.rows ?? []))
+        .catch(() => setVineyardNamesList([]));
     }
-  }, [activeTab, fetchWineMapp]);
+  }, [activeTab, fetchWineMapp, fetchVineMapp]);
 
   const runGapsScan = () => {
     const minutes = parseFloat(minGapMinutes);
@@ -435,6 +473,99 @@ function DataChecksPageContent() {
       })
       .catch((e) => setWineMappError(e instanceof Error ? e.message : String(e)))
       .finally(() => setRunFixesLoading(false));
+  };
+
+  const createVineMapp = () => {
+    const oldV = vineMappNewOld.trim();
+    const newV = vineMappNewNew.trim();
+    if (!oldV || !newV) {
+      setVineMappError('Old name and new name are required.');
+      return;
+    }
+    setVineMappError(null);
+    setVineMappSaving(true);
+    fetch('/api/admin/data-checks/vine-mapp', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ oldvworkname: oldV, newvworkname: newV }),
+    })
+      .then((r) => {
+        if (!r.ok) return r.json().then((d) => Promise.reject(new Error(d?.error ?? r.statusText)));
+        return r.json();
+      })
+      .then(() => {
+        setVineMappNewOld('');
+        setVineMappNewNew('');
+        fetchVineMapp();
+      })
+      .catch((e) => setVineMappError(e instanceof Error ? e.message : String(e)))
+      .finally(() => setVineMappSaving(false));
+  };
+
+  const updateVineMapp = (id: number) => {
+    const oldV = vineEditOld.trim();
+    const newV = vineEditNew.trim();
+    if (!oldV || !newV) {
+      setVineMappError('Old name and new name are required.');
+      return;
+    }
+    setVineMappError(null);
+    setVineMappSaving(true);
+    fetch(`/api/admin/data-checks/vine-mapp/${id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ oldvworkname: oldV, newvworkname: newV }),
+    })
+      .then((r) => {
+        if (!r.ok) return r.json().then((d) => Promise.reject(new Error(d?.error ?? r.statusText)));
+        return r.json();
+      })
+      .then(() => {
+        setVineEditingId(null);
+        fetchVineMapp();
+      })
+      .catch((e) => setVineMappError(e instanceof Error ? e.message : String(e)))
+      .finally(() => setVineMappSaving(false));
+  };
+
+  const deleteVineMapp = (id: number) => {
+    if (!confirm('Delete this vineyard name fix?')) return;
+    setVineMappError(null);
+    setVineMappSaving(true);
+    fetch(`/api/admin/data-checks/vine-mapp/${id}`, { method: 'DELETE' })
+      .then((r) => {
+        if (!r.ok) return r.json().then((d) => Promise.reject(new Error(d?.error ?? r.statusText)));
+        return r.json();
+      })
+      .then(() => fetchVineMapp())
+      .catch((e) => setVineMappError(e instanceof Error ? e.message : String(e)))
+      .finally(() => setVineMappSaving(false));
+  };
+
+  const startEditVine = (row: WineMappRow) => {
+    setVineEditingId(row.id);
+    setVineEditOld(row.oldvworkname);
+    setVineEditNew(row.newvworkname);
+  };
+
+  const runVineFixes = () => {
+    setVineMappError(null);
+    setRunVineFixesResult(null);
+    setRunVineFixesLoading(true);
+    fetch('/api/admin/data-checks/vine-mapp/run-fixes', { method: 'POST' })
+      .then((r) => {
+        if (!r.ok) return r.json().then((d) => Promise.reject(new Error(d?.error ?? r.statusText)));
+        return r.json();
+      })
+      .then((data: { ok: boolean; totalUpdated: number; perMapping: { id: number; oldvworkname: string; newvworkname: string; updated: number }[] }) => {
+        setRunVineFixesResult({ totalUpdated: data.totalUpdated, perMapping: data.perMapping ?? [] });
+        setVineyardNamesList([]);
+        fetch('/api/admin/data-checks/vine-mapp/vineyard-names')
+          .then((res) => (res.ok ? res.json() : { rows: [] }))
+          .then((d: { rows: string[] }) => setVineyardNamesList(d.rows ?? []));
+      })
+      .catch((e) => setVineMappError(e instanceof Error ? e.message : String(e)))
+      .finally(() => setRunVineFixesLoading(false));
   };
 
   const runSetTrailerType = () => {
@@ -625,7 +756,7 @@ function DataChecksPageContent() {
             onClick={() => setActiveTab('winery-fixes')}
             className={`rounded-t px-4 py-2 text-sm font-medium ${activeTab === 'winery-fixes' ? 'border border-b-0 border-zinc-200 bg-white text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'}`}
           >
-            2. Winery Name Fixes
+            2. Winery/Vineyard Name Fixes
           </button>
           <button
             type="button"
@@ -1041,9 +1172,14 @@ function DataChecksPageContent() {
 
         {activeTab === 'winery-fixes' && (
         <section className="mt-0 rounded-b-lg border border-zinc-200 border-t-0 bg-white p-6 shadow-sm dark:border-zinc-700 dark:bg-zinc-900">
-          <h2 className="text-lg font-medium text-zinc-900 dark:text-zinc-100">Winery Name Fixes</h2>
+          <h2 className="text-lg font-medium text-zinc-900 dark:text-zinc-100">Winery/Vineyard Name Fixes</h2>
           <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
-            Map old work names to new work names in <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">tbl_wine_mapp</code>. Run Fixes updates <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">tbl_vworkjobs</code>: sets <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">delivery_winery_old</code> to the current value, then <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">delivery_winery</code> to the new name. Run <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">add_delivery_winery_old_tbl_vworkjobs.sql</code> once if the column is missing.
+            Map old vwork names to new names. Winery fixes use <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">tbl_wine_mapp</code> and <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">delivery_winery</code>; vineyard fixes use <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">tbl_vine_mapp</code> and <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">vineyard_name</code>. Run the SQL migrations once if columns or tables are missing.
+          </p>
+
+          <h3 className="mt-6 text-base font-medium text-zinc-800 dark:text-zinc-200">Winery name fixes</h3>
+          <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
+            <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">Run Fixes</code> sets <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">delivery_winery_old</code>, then <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">delivery_winery</code>. Run <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">add_delivery_winery_old_tbl_vworkjobs.sql</code> if needed.
           </p>
 
           <div className="mt-4 flex flex-wrap items-end gap-4 rounded border border-zinc-200 bg-zinc-50/50 p-4 dark:border-zinc-700 dark:bg-zinc-800/30">
@@ -1207,6 +1343,192 @@ function DataChecksPageContent() {
                                   type="button"
                                   onClick={() => deleteWineMapp(row.id)}
                                   disabled={wineMappSaving}
+                                  className="rounded border border-red-200 bg-white px-2 py-1 text-xs font-medium text-red-700 hover:bg-red-50 dark:border-red-800 dark:bg-zinc-800 dark:text-red-300 dark:hover:bg-red-950/30"
+                                >
+                                  Delete
+                                </button>
+                              </td>
+                            </>
+                          )}
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+
+          <h3 className="mt-10 border-t border-zinc-200 pt-8 text-base font-medium text-zinc-800 dark:border-zinc-700 dark:text-zinc-200">
+            Vineyard name fixes
+          </h3>
+          <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
+            Map old vineyard names to new names in <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">tbl_vine_mapp</code>. <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">Run Fixes</code> sets <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">vineyard_name_old</code>, then <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">vineyard_name</code>. Create the table with <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">create_tbl_vine_mapp.sql</code>; run <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">add_vineyard_name_old_tbl_vworkjobs.sql</code> if <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">vineyard_name_old</code> is missing.
+          </p>
+
+          <div className="mt-4 flex flex-wrap items-end gap-4 rounded border border-zinc-200 bg-zinc-50/50 p-4 dark:border-zinc-700 dark:bg-zinc-800/30">
+            <label className="flex flex-col gap-1">
+              <span className="text-xs font-medium text-zinc-500 dark:text-zinc-400">Old name</span>
+              <input
+                type="text"
+                list="vine-mapp-old-list"
+                value={vineMappNewOld}
+                onChange={(e) => setVineMappNewOld(e.target.value)}
+                placeholder="Select or type old vineyard name"
+                className="w-56 rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+              />
+              <datalist id="vine-mapp-old-list">
+                {vineyardNamesList.map((w) => (
+                  <option key={w} value={w} />
+                ))}
+              </datalist>
+            </label>
+            <label className="flex flex-col gap-1">
+              <span className="text-xs font-medium text-zinc-500 dark:text-zinc-400">New name</span>
+              <input
+                type="text"
+                list="vine-mapp-new-list"
+                value={vineMappNewNew}
+                onChange={(e) => setVineMappNewNew(e.target.value)}
+                placeholder="Select or type new vineyard name"
+                className="w-56 rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+              />
+              <datalist id="vine-mapp-new-list">
+                {vineyardNamesList.map((w) => (
+                  <option key={w} value={w} />
+                ))}
+              </datalist>
+            </label>
+            <button
+              type="button"
+              onClick={createVineMapp}
+              disabled={vineMappSaving}
+              className="rounded bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50 dark:bg-blue-700 dark:hover:bg-blue-600"
+            >
+              {vineMappSaving ? 'Saving…' : 'Add fix'}
+            </button>
+            <button
+              type="button"
+              onClick={runVineFixes}
+              disabled={runVineFixesLoading || vineMappRows.length === 0}
+              className="rounded bg-amber-600 px-4 py-2 text-sm font-medium text-white hover:bg-amber-700 disabled:opacity-50 dark:bg-amber-700 dark:hover:bg-amber-600"
+              title="Update tbl_vworkjobs: set vineyard_name_old = current vineyard_name, vineyard_name = new name where vineyard_name = old name"
+            >
+              {runVineFixesLoading ? 'Running…' : 'Run Fixes'}
+            </button>
+          </div>
+
+          {runVineFixesResult != null && (
+            <div className="mt-4 rounded border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-800 dark:border-emerald-800 dark:bg-emerald-950/50 dark:text-emerald-200">
+              Updated {runVineFixesResult.totalUpdated} row(s) in tbl_vworkjobs (vineyard_name).
+              {runVineFixesResult.perMapping.length > 0 && (
+                <ul className="mt-1 list-inside list-disc">
+                  {runVineFixesResult.perMapping.map((m) => (
+                    <li key={m.id}>
+                      <code className="rounded bg-emerald-100 px-0.5 dark:bg-emerald-900/50">{m.oldvworkname}</code> →{' '}
+                      <code className="rounded bg-emerald-100 px-0.5 dark:bg-emerald-900/50">{m.newvworkname}</code>: {m.updated}{' '}
+                      row(s)
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
+
+          {vineMappError && (
+            <div className="mt-4 rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-800 dark:bg-red-950/50 dark:text-red-200">
+              {vineMappError}
+            </div>
+          )}
+
+          <div className="mt-6">
+            {vineMappLoading ? (
+              <p className="text-sm text-zinc-500 dark:text-zinc-400">Loading vineyard fixes…</p>
+            ) : (
+              <div className="overflow-x-auto rounded border border-zinc-200 dark:border-zinc-700">
+                <table className="w-full min-w-[480px] border-collapse text-left text-sm">
+                  <thead>
+                    <tr className="border-b border-zinc-200 bg-zinc-100/80 dark:border-zinc-700 dark:bg-zinc-800/80">
+                      <th className="px-3 py-2 font-medium text-zinc-700 dark:text-zinc-300">Old name</th>
+                      <th className="px-3 py-2 font-medium text-zinc-700 dark:text-zinc-300">New name</th>
+                      <th className="px-3 py-2 text-right font-medium text-zinc-700 dark:text-zinc-300">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {vineMappRows.length === 0 ? (
+                      <tr>
+                        <td colSpan={3} className="px-3 py-4 text-center text-zinc-500 dark:text-zinc-400">
+                          No vineyard name fixes yet. Add one above.
+                        </td>
+                      </tr>
+                    ) : (
+                      vineMappRows.map((row) => (
+                        <tr key={row.id} className="border-b border-zinc-100 dark:border-zinc-800">
+                          {vineEditingId === row.id ? (
+                            <>
+                              <td className="px-3 py-2">
+                                <input
+                                  type="text"
+                                  list={`vine-mapp-edit-old-${row.id}`}
+                                  value={vineEditOld}
+                                  onChange={(e) => setVineEditOld(e.target.value)}
+                                  className="w-full rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+                                />
+                                <datalist id={`vine-mapp-edit-old-${row.id}`}>
+                                  {vineyardNamesList.map((w) => (
+                                    <option key={w} value={w} />
+                                  ))}
+                                </datalist>
+                              </td>
+                              <td className="px-3 py-2">
+                                <input
+                                  type="text"
+                                  list={`vine-mapp-edit-new-${row.id}`}
+                                  value={vineEditNew}
+                                  onChange={(e) => setVineEditNew(e.target.value)}
+                                  className="w-full rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+                                />
+                                <datalist id={`vine-mapp-edit-new-${row.id}`}>
+                                  {vineyardNamesList.map((w) => (
+                                    <option key={w} value={w} />
+                                  ))}
+                                </datalist>
+                              </td>
+                              <td className="px-3 py-2 text-right">
+                                <button
+                                  type="button"
+                                  onClick={() => updateVineMapp(row.id)}
+                                  disabled={vineMappSaving}
+                                  className="mr-2 rounded bg-emerald-600 px-2 py-1 text-xs font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
+                                >
+                                  Save
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setVineEditingId(null)}
+                                  className="rounded border border-zinc-300 bg-white px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-100 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700"
+                                >
+                                  Cancel
+                                </button>
+                              </td>
+                            </>
+                          ) : (
+                            <>
+                              <td className="px-3 py-2 text-zinc-900 dark:text-zinc-100">{row.oldvworkname}</td>
+                              <td className="px-3 py-2 text-zinc-900 dark:text-zinc-100">{row.newvworkname}</td>
+                              <td className="px-3 py-2 text-right">
+                                <button
+                                  type="button"
+                                  onClick={() => startEditVine(row)}
+                                  disabled={vineMappSaving}
+                                  className="mr-2 rounded border border-zinc-300 bg-white px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-100 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700"
+                                >
+                                  Edit
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => deleteVineMapp(row.id)}
+                                  disabled={vineMappSaving}
                                   className="rounded border border-red-200 bg-white px-2 py-1 text-xs font-medium text-red-700 hover:bg-red-50 dark:border-red-800 dark:bg-zinc-800 dark:text-red-300 dark:hover:bg-red-950/30"
                                 >
                                   Delete

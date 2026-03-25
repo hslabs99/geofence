@@ -114,8 +114,13 @@ function stepViasDisplayFromResult(o: Record<string, unknown>): string[] {
     return v != null && String(v).trim() !== '' ? String(v).trim() : undefined;
   };
   const inf1 =
-    o.step1ActualOverride != null ? 'RULE' : o.step1 != null ? 'GPS' : 'VW';
-  const infN = (n: 2 | 3 | 4 | 5) => (o[`step${n}`] != null ? 'GPS' : 'VW');
+    o.step1ActualOverride != null
+      ? 'RULE'
+      : (o as { step1Gps?: unknown }).step1Gps != null
+        ? 'GPS'
+        : 'VW';
+  const infN = (n: 2 | 3 | 4 | 5) =>
+    (o as Record<string, unknown>)[`step${n}Gps`] != null ? 'GPS' : 'VW';
   return [
     mapApiStepViaToDisplay(explicit(1) ?? inf1),
     mapApiStepViaToDisplay(explicit(2) ?? infN(2)),

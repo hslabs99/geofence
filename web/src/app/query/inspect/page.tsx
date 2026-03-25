@@ -19,6 +19,11 @@ const DATE_COLUMNS = new Set([
   'step_1_completed_at', 'step_2_completed_at', 'step_3_completed_at', 'step_4_completed_at',
 ]);
 
+const INSPECT_PAGE_SIZE = 100;
+
+/** columnDateCol API whitelist — matches route COLUMN_DATE_WHITELIST */
+const INSPECT_COLUMN_DATE_COLS = new Set(['planned_start_time', 'actual_start_time', 'actual_end_time']);
+
 function isIsoDateString(v: unknown): v is string {
   return typeof v === 'string' && /^\d{4}-\d{2}-\d{2}/.test(v);
 }
@@ -93,6 +98,7 @@ function InspectContent() {
   const searchParams = useSearchParams();
   const jobIdParam = searchParams.get('jobId');
   const locateJobIdParam = searchParams.get('locateJobId');
+  const paramToLocate = locateJobIdParam ?? jobIdParam;
   const [rows, setRows] = useState<Row[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -111,6 +117,19 @@ function InspectContent() {
   const [filterPlannedTo, setFilterPlannedTo] = useState<string>('');
   const [filterActualFrom, setFilterActualFrom] = useState<string>('');
   const [filterActualTo, setFilterActualTo] = useState<string>('');
+  const [jobsPage, setJobsPage] = useState(0);
+  const [totalJobsFromApi, setTotalJobsFromApi] = useState(0);
+  const [lastApiQueryString, setLastApiQueryString] = useState('');
+  const [apiDebugFromResponse, setApiDebugFromResponse] = useState<Record<string, unknown> | null>(null);
+  const [locateJobNotFound, setLocateJobNotFound] = useState(false);
+  const [truckIdsOptions, setTruckIdsOptions] = useState<string[]>([]);
+  const [trailermodeOptions, setTrailermodeOptions] = useState<string[]>([]);
+  const [customersOptions, setCustomersOptions] = useState<string[]>([]);
+  const [templateOptions, setTemplateOptions] = useState<string[]>([]);
+  const skipJobsPageFetchRef = useRef(false);
+  const prevFilterKeyRef = useRef('');
+  const locateResolveDoneRef = useRef(false);
+  const userClearedLocateRef = useRef(false);
   const [columnOrder, setColumnOrder] = useState<string[]>([]);
   const [hiddenColumns, setHiddenColumns] = useState<Set<string>>(new Set());
   const [showColumnConfig, setShowColumnConfig] = useState(false);
@@ -140,6 +159,8 @@ function InspectContent() {
   const [refetchStepsRunning, setRefetchStepsRunning] = useState(false);
   const [retagAndRefetchRunning, setRetagAndRefetchRunning] = useState(false);
   const [trackingRefreshKey, setTrackingRefreshKey] = useState(0);
+  /** Bump after steps write-back so the jobs grid reloads from DB without a full page refresh. */
+  const [jobsRefreshKey, setJobsRefreshKey] = useState(0);
   /** Manual overrides (oride) per step + comment; synced from selectedRow when it changes. */
   const [stepOverrides, setStepOverrides] = useState<{ step1oride: string; step2oride: string; step3oride: string; step4oride: string; step5oride: string }>({
     step1oride: '', step2oride: '', step3oride: '', step4oride: '', step5oride: '',
@@ -150,6 +171,97 @@ function InspectContent() {
     () => (rows.length > 0 ? Object.keys(rows[0]) : []),
     [rows],
   );
+
+  /** Filters only (not sort) — changing sort does not reset page; sort is applied in API. */
+  const inspectFilterOnlyKey = useMemo(
+    () =>
+      JSON.stringify({
+        filterCustomer,
+        filterTemplate,
+        filterTruckId,
+        filterTrailermode,
+        filterJobId,
+        filterPlannedFrom,
+        filterPlannedTo,
+        filterActualFrom,
+        filterActualTo,
+        dateFilterCol,
+        dateFrom,
+        dateTo,
+      }),
+    [
+      filterCustomer,
+      filterTemplate,
+      filterTruckId,
+      filterTrailermode,
+      filterJobId,
+      filterPlannedFrom,
+      filterPlannedTo,
+      filterActualFrom,
+      filterActualTo,
+      dateFilterCol,
+      dateFrom,
+      dateTo,
+    ],
+  );
+
+  const inspectDataKey = useMemo(
+    () =>
+      JSON.stringify({
+        filterOnly: inspectFilterOnlyKey,
+        sortColumns: [...sortColumns] as [string, string, string],
+      }),
+    [inspectFilterOnlyKey, sortColumns],
+  );
+
+  useEffect(() => {
+    if (prevFilterKeyRef.current !== '' && prevFilterKeyRef.current !== inspectFilterOnlyKey) {
+      setJobsPage(0);
+    }
+    prevFilterKeyRef.current = inspectFilterOnlyKey;
+  }, [inspectFilterOnlyKey]);
+
+  useEffect(() => {
+    locateResolveDoneRef.current = false;
+  }, [paramToLocate]);
+
+  /** Recent jobs / Summary link: primary sort by actual start (sort init may have already run without locate). */
+  useEffect(() => {
+    if (!locateJobIdParam?.trim()) return;
+    setSortColumns(['actual_start_time', '', '']);
+  }, [locateJobIdParam]);
+
+  useEffect(() => {
+    fetch('/api/vworkjobs/customers')
+      .then((r) => r.json())
+      .then((d) => setCustomersOptions(Array.isArray(d?.customers) ? d.customers : []))
+      .catch(() => setCustomersOptions([]));
+  }, []);
+
+  useEffect(() => {
+    fetch('/api/vworkjobs/filter-options')
+      .then((r) => r.json())
+      .then((d) => {
+        setTruckIdsOptions(Array.isArray(d?.truckIds) ? d.truckIds : []);
+        setTrailermodeOptions(Array.isArray(d?.trailermodes) ? d.trailermodes : []);
+      })
+      .catch(() => {
+        setTruckIdsOptions([]);
+        setTrailermodeOptions([]);
+      });
+  }, []);
+
+  useEffect(() => {
+    const c = filterCustomer.trim();
+    if (!c) {
+      setTemplateOptions([]);
+      return;
+    }
+    fetch(`/api/vworkjobs/templates?customer=${encodeURIComponent(c)}`)
+      .then((r) => r.json())
+      .then((d) => setTemplateOptions(Array.isArray(d?.templates) ? d.templates : []))
+      .catch(() => setTemplateOptions([]));
+  }, [filterCustomer]);
 
   useEffect(() => {
     if (apiColumns.length === 0 || columnOrderInitialized.current) return;
@@ -174,6 +286,11 @@ function InspectContent() {
   useEffect(() => {
     if (apiColumns.length === 0 || sortColumnsInitialized.current) return;
     sortColumnsInitialized.current = true;
+    const locate = locateJobIdParam?.trim();
+    if (locate && apiColumns.includes('actual_start_time')) {
+      setSortColumns(['actual_start_time', '', '']);
+      return;
+    }
     const q = new URLSearchParams({ type: SORT_SETTING_TYPE, name: SORT_SETTING_NAME }).toString();
     fetch(`/api/settings?${q}`, { cache: 'no-store' })
       .then((r) => r.json())
@@ -196,7 +313,7 @@ function InspectContent() {
         setSortColumns(['', '', '']);
       })
       .catch(() => setSortColumns(['', '', '']));
-  }, [apiColumns.length, apiColumns]);
+  }, [apiColumns.length, apiColumns, locateJobIdParam]);
 
   useEffect(() => {
     const type = 'System';
@@ -308,24 +425,83 @@ function InspectContent() {
       .catch(() => setGpsMappings([]));
   }, []);
 
-  /** Initial load: when we have locateJobId + actualFrom/actualTo, fetch the full date range so the job is in the result set. */
-  const initialFetchQuery = (() => {
-    const locate = searchParams.get('locateJobId') ?? searchParams.get('jobId');
-    const from = searchParams.get('actualFrom') ?? '';
-    const to = searchParams.get('actualTo') ?? '';
-    const fromOk = /^\d{4}-\d{2}-\d{2}$/.test(from);
-    const toOk = /^\d{4}-\d{2}-\d{2}$/.test(to);
-    if (locate && fromOk && toOk) {
-      return `dateFrom=${encodeURIComponent(from)}&dateTo=${encodeURIComponent(to)}`;
-    }
-    if (locate && fromOk) return `dateFrom=${encodeURIComponent(from)}&dateTo=${encodeURIComponent(from)}`;
-    if (locate && toOk) return `dateFrom=${encodeURIComponent(to)}&dateTo=${encodeURIComponent(to)}`;
-    return null;
-  })();
+  const buildInspectApiParams = useCallback(
+    (opts: { resolveJobId: string | null }) => {
+      const p = new URLSearchParams();
+      p.set('limit', String(INSPECT_PAGE_SIZE));
+      p.set('offset', String(jobsPage * INSPECT_PAGE_SIZE));
+      if (opts.resolveJobId) p.set('resolvePageForJob', opts.resolveJobId);
+      const c1 = sortColumns[0]?.trim() || 'actual_start_time';
+      p.set('sortColumn', c1);
+      p.set('sortDir', 'asc');
+      if (filterCustomer.trim()) p.set('customer', filterCustomer.trim());
+      if (filterTemplate.trim()) p.set('template', filterTemplate.trim());
+      if (filterTruckId.trim()) p.set('truck_id', filterTruckId.trim());
+      if (filterTrailermode.trim()) p.set('trailermode', filterTrailermode.trim());
+      if (filterJobId.trim()) p.set('jobIdContains', filterJobId.trim());
+      const useColumnDate =
+        !!dateFilterCol && INSPECT_COLUMN_DATE_COLS.has(dateFilterCol) && !!(dateFrom || dateTo);
+      if (useColumnDate) {
+        p.set('columnDateCol', dateFilterCol);
+        const df = dateFrom?.slice(0, 10);
+        const dt = dateTo?.slice(0, 10);
+        if (df && /^\d{4}-\d{2}-\d{2}$/.test(df)) p.set('columnDateFrom', df);
+        if (dt && /^\d{4}-\d{2}-\d{2}$/.test(dt)) p.set('columnDateTo', dt);
+      } else {
+        if (filterActualFrom?.trim() && /^\d{4}-\d{2}-\d{2}/.test(filterActualFrom)) p.set('dateFrom', filterActualFrom.slice(0, 10));
+        if (filterActualTo?.trim() && /^\d{4}-\d{2}-\d{2}/.test(filterActualTo)) p.set('dateTo', filterActualTo.slice(0, 10));
+        if (filterPlannedFrom?.trim() && /^\d{4}-\d{2}-\d{2}/.test(filterPlannedFrom)) p.set('plannedDateFrom', filterPlannedFrom.slice(0, 10));
+        if (filterPlannedTo?.trim() && /^\d{4}-\d{2}-\d{2}/.test(filterPlannedTo)) p.set('plannedDateTo', filterPlannedTo.slice(0, 10));
+      }
+      const fromUrl = searchParams.get('actualFrom') ?? '';
+      const toUrl = searchParams.get('actualTo') ?? '';
+      const hasLocate = !!(searchParams.get('locateJobId') ?? searchParams.get('jobId'));
+      if (
+        hasLocate &&
+        fromUrl &&
+        toUrl &&
+        /^\d{4}-\d{2}-\d{2}$/.test(fromUrl) &&
+        /^\d{4}-\d{2}-\d{2}$/.test(toUrl) &&
+        !useColumnDate &&
+        !filterActualFrom?.trim() &&
+        !filterActualTo?.trim()
+      ) {
+        p.set('dateFrom', fromUrl);
+        p.set('dateTo', toUrl);
+      }
+      return p;
+    },
+    [
+      jobsPage,
+      sortColumns,
+      filterCustomer,
+      filterTemplate,
+      filterTruckId,
+      filterTrailermode,
+      filterJobId,
+      filterPlannedFrom,
+      filterPlannedTo,
+      filterActualFrom,
+      filterActualTo,
+      dateFilterCol,
+      dateFrom,
+      dateTo,
+      searchParams,
+    ],
+  );
 
   useEffect(() => {
-    const url = initialFetchQuery ? `/api/vworkjobs?${initialFetchQuery}` : '/api/vworkjobs';
-    fetch(url)
+    if (skipJobsPageFetchRef.current) {
+      skipJobsPageFetchRef.current = false;
+      return;
+    }
+    let cancelled = false;
+    const want = (paramToLocate ?? '').trim();
+    const useResolve = !!want && !userClearedLocateRef.current && !locateResolveDoneRef.current;
+    const params = buildInspectApiParams({ resolveJobId: useResolve ? want : null });
+    const qs = params.toString();
+    setLoading(true);
+    fetch(`/api/vworkjobs?${qs}`)
       .then(async (res) => {
         const data = await res.json();
         if (!res.ok) {
@@ -335,139 +511,50 @@ function InspectContent() {
         return data;
       })
       .then((data) => {
+        if (cancelled) return;
         setRows(data.rows ?? []);
+        setTotalJobsFromApi(typeof data.total === 'number' ? data.total : (data.rows ?? []).length);
+        setLastApiQueryString(qs);
+        setApiDebugFromResponse((data.debug as Record<string, unknown>) ?? null);
+        setLocateJobNotFound(!!data.jobNotFound);
         setError(null);
         setErrorDetail(null);
+        if (typeof data.resolvePage === 'number') {
+          skipJobsPageFetchRef.current = true;
+          locateResolveDoneRef.current = true;
+          setJobsPage(data.resolvePage);
+        }
       })
-      .catch((e) => setError(e.message))
-      .finally(() => setLoading(false));
-  }, [initialFetchQuery]);
-
-  const distinctTruckIds = useMemo(() => {
-    const set = new Set<string>();
-    for (const row of rows) {
-      const v = row.truck_id;
-      if (v != null && v !== '') set.add(String(v).trim());
-    }
-    return Array.from(set).sort();
-  }, [rows]);
-
-  const distinctTrailermodes = useMemo(() => {
-    const set = new Set<string>();
-    for (const row of rows) {
-      const v = row.trailermode;
-      if (v != null && String(v).trim() !== '') set.add(String(v).trim());
-    }
-    return Array.from(set).sort();
-  }, [rows]);
-
-  const distinctJobIds = useMemo(() => {
-    const set = new Set<string>();
-    for (const row of rows) {
-      const v = row.job_id;
-      if (v != null && v !== '') set.add(String(v).trim());
-    }
-    return Array.from(set).sort();
-  }, [rows]);
-
-  const distinctCustomers = useMemo(() => {
-    const set = new Set<string>();
-    for (const row of rows) {
-      const v = row.Customer ?? row.customer;
-      if (v != null && String(v).trim() !== '') set.add(String(v).trim());
-    }
-    return Array.from(set).sort();
-  }, [rows]);
-
-  const distinctTemplates = useMemo(() => {
-    if (!filterCustomer.trim()) return [];
-    const set = new Set<string>();
-    for (const row of rows) {
-      const cust = row.Customer ?? row.customer;
-      if (cust == null || String(cust).trim() !== filterCustomer) continue;
-      const v = row.template;
-      if (v != null && String(v).trim() !== '') set.add(String(v).trim());
-    }
-    return Array.from(set).sort();
-  }, [rows, filterCustomer]);
+      .catch((e) => {
+        if (!cancelled) setError(e.message);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [inspectDataKey, jobsPage, buildInspectApiParams, paramToLocate, jobsRefreshKey]);
 
   useEffect(() => {
     setFilterTemplate('');
   }, [filterCustomer]);
 
-  const filteredRows = useMemo(() => {
-    return rows.filter((row) => {
-      if (filterCustomer) {
-        const v = row.Customer ?? row.customer;
-        if (v == null || String(v).trim() !== filterCustomer) return false;
-      }
-      if (filterTemplate) {
-        const v = row.template;
-        if (v == null || String(v).trim() !== filterTemplate) return false;
-      }
-      if (filterTruckId) {
-        const v = row.truck_id;
-        if (v == null || String(v).trim() !== filterTruckId) return false;
-      }
-      if (filterTrailermode) {
-        const v = row.trailermode;
-        if (v == null || String(v).trim() !== filterTrailermode) return false;
-      }
-      if (filterJobId.trim()) {
-        const v = row.job_id;
-        const s = v != null ? String(v).trim().toLowerCase() : '';
-        const q = filterJobId.trim().toLowerCase();
-        if (!s.includes(q)) return false;
-      }
-      if (filterPlannedFrom || filterPlannedTo) {
-        const v = row.planned_start_time;
-        if (v == null || v === '') return false;
-        const str = String(v).trim();
-        const datePart = str.match(/^(\d{4})-(\d{2})-(\d{2})/)?.[0] ?? '';
-        if (!datePart) return false;
-        const from = filterPlannedFrom ? filterPlannedFrom.slice(0, 10) : '';
-        const to = filterPlannedTo ? filterPlannedTo.slice(0, 10) : '';
-        if (from && datePart < from) return false;
-        if (to && datePart > to) return false;
-      }
-      if (filterActualFrom || filterActualTo) {
-        const v = row.actual_start_time;
-        if (v == null || v === '') return false;
-        const str = String(v).trim();
-        const datePart = str.match(/^(\d{4})-(\d{2})-(\d{2})/)?.[0] ?? '';
-        if (!datePart) return false;
-        const from = filterActualFrom ? filterActualFrom.slice(0, 10) : '';
-        const to = filterActualTo ? filterActualTo.slice(0, 10) : '';
-        if (from && datePart < from) return false;
-        if (to && datePart > to) return false;
-      }
-      if (dateFilterCol && (dateFrom || dateTo)) {
-        const v = row[dateFilterCol];
-        if (v == null || v === '') return false;
-        const str = String(v).trim();
-        const datePart = str.match(/^(\d{4})-(\d{2})-(\d{2})/)?.[0] ?? '';
-        if (!datePart) return false;
-        if (dateFrom && datePart < dateFrom.slice(0, 10)) return false;
-        if (dateTo && datePart > dateTo.slice(0, 10)) return false;
-      }
-      return true;
-    });
-  }, [rows, filterCustomer, filterTemplate, filterTruckId, filterTrailermode, filterJobId, filterPlannedFrom, filterPlannedTo, filterActualFrom, filterActualTo, dateFilterCol, dateFrom, dateTo]);
-
+  /** Server applies filters + primary sort; secondary/tertiary sort columns only (within page). */
   const sortedRows = useMemo(() => {
-    const [c1, c2, c3] = sortColumns;
-    const cols = [c1, c2, c3].filter(Boolean);
-    if (cols.length === 0) return filteredRows;
-    const out = [...filteredRows];
+    const [, c2, c3] = sortColumns;
+    const secondary = [c2, c3].filter(Boolean);
+    if (secondary.length === 0) return rows;
+    const out = [...rows];
     out.sort((a, b) => {
-      for (const col of cols) {
+      for (const col of secondary) {
         const c = compare(a[col], b[col], col);
         if (c !== 0) return c;
       }
       return 0;
     });
     return out;
-  }, [filteredRows, sortColumns]);
+  }, [rows, sortColumns]);
 
   const selectedRow = sortedRows[Math.min(selectedRowIndex, Math.max(0, sortedRows.length - 1))] ?? sortedRows[0] ?? null;
 
@@ -482,6 +569,10 @@ function InspectContent() {
         startLessMinutes,
         endPlusMinutes,
       });
+      if (result.log.some((e) => e.status === 'ok')) {
+        setJobsRefreshKey((k) => k + 1);
+        setTrackingRefreshKey((k) => k + 1);
+      }
       if (result.lastResult != null && typeof result.lastResult === 'object') {
         const d = (result.lastResult as { debug?: Record<string, unknown> }).debug;
         setDerivedStepsDebug(d != null ? { ...d, _singleJob: true } : { _singleJob: true, fullResponse: result.lastResult });
@@ -492,20 +583,34 @@ function InspectContent() {
     }
   }, [selectedRow, startLessMinutes, endPlusMinutes]);
 
-  /** Apply URL params (from Summary link): truck, actual from/to. If locateJobId, do not set job filter so list shows jobs before/after. */
+  /** URL params: with locateJobId (Recent jobs / Summary job link), only truck — clear other persisted filters and all date filters so the job is not hidden. */
   useEffect(() => {
     const truck = searchParams.get('truckId') ?? '';
     const actualFrom = searchParams.get('actualFrom') ?? '';
     const actualTo = searchParams.get('actualTo') ?? '';
     const jobId = searchParams.get('jobId') ?? '';
     const locateJobId = searchParams.get('locateJobId') ?? '';
-    if (truck) setFilterTruckId(truck);
-    if (actualFrom) setFilterActualFrom(actualFrom);
-    if (actualTo) setFilterActualTo(actualTo);
-    if (jobId && !locateJobId) setFilterJobId(jobId);
+    if (locateJobId) {
+      setFilterCustomer('');
+      setFilterTemplate('');
+      setFilterTrailermode('');
+      setFilterJobId('');
+      setFilterPlannedFrom('');
+      setFilterPlannedTo('');
+      setFilterActualFrom('');
+      setFilterActualTo('');
+      setDateFilterCol('');
+      setDateFrom('');
+      setDateTo('');
+      setFilterTruckId(truck);
+    } else {
+      if (truck) setFilterTruckId(truck);
+      if (actualFrom) setFilterActualFrom(actualFrom);
+      if (actualTo) setFilterActualTo(actualTo);
+      if (jobId && !locateJobId) setFilterJobId(jobId);
+    }
   }, [searchParams]);
 
-  const paramToLocate = locateJobIdParam ?? jobIdParam;
   /** Add this job to sidebar "Recent jobs" history when we landed with locateJobId/jobId. */
   useEffect(() => {
     const jobId = (paramToLocate ?? '').trim();
@@ -518,7 +623,6 @@ function InspectContent() {
   }, [paramToLocate]);
 
   /** When user manually clicks a different row (not the located job), stop re-applying locate on sortedRows changes. */
-  const userClearedLocateRef = useRef(false);
   useEffect(() => {
     if (!paramToLocate) userClearedLocateRef.current = false;
   }, [paramToLocate]);
@@ -668,6 +772,9 @@ function InspectContent() {
         startLessMinutes,
         endPlusMinutes,
       });
+      if (result.log.some((e) => e.status === 'ok')) {
+        setJobsRefreshKey((k) => k + 1);
+      }
       setTrackingRefreshKey((k) => k + 1);
       if (result.lastResult != null && typeof result.lastResult === 'object') {
         const d = (result.lastResult as { debug?: Record<string, unknown> }).debug;
@@ -818,6 +925,7 @@ function InspectContent() {
     const next: [string, string, string] = [...sortColumns];
     next[idx] = value;
     setSortColumns(next);
+    setJobsPage(0);
   };
 
   const formatCell = useCallback((v: unknown): string => {
@@ -994,7 +1102,7 @@ function InspectContent() {
                 className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800"
               >
                 <option value="">— All —</option>
-                {distinctCustomers.map((c) => <option key={c} value={c}>{c}</option>)}
+                {customersOptions.map((c) => <option key={c} value={c}>{c}</option>)}
               </select>
             </div>
             <div>
@@ -1006,7 +1114,7 @@ function InspectContent() {
                 disabled={!filterCustomer}
               >
                 <option value="">— All —</option>
-                {distinctTemplates.map((t) => <option key={t} value={t}>{t}</option>)}
+                {templateOptions.map((t) => <option key={t} value={t}>{t}</option>)}
               </select>
             </div>
             <div>
@@ -1031,11 +1139,7 @@ function InspectContent() {
                 className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800" />
             </div>
           </div>
-          <datalist id="filter-job-id-list">
-            {distinctJobIds.map((id) => (
-              <option key={id} value={id} />
-            ))}
-          </datalist>
+          <datalist id="filter-job-id-list" />
           <div className="max-h-[28rem] overflow-auto rounded-lg border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900">
             <table className="w-max table-fixed text-left text-sm">
               <colgroup>
@@ -1056,7 +1160,7 @@ function InspectContent() {
                           title="Filter by Truck ID"
                         >
                           <option value="">— All —</option>
-                          {distinctTruckIds.map((id) => (
+                          {truckIdsOptions.map((id) => (
                             <option key={id} value={id}>{id}</option>
                           ))}
                         </select>
@@ -1070,7 +1174,7 @@ function InspectContent() {
                           title="Filter by trailermode (TT)"
                         >
                           <option value="">— All —</option>
-                          {distinctTrailermodes.map((t) => (
+                          {trailermodeOptions.map((t) => (
                             <option key={t} value={t}>{t}</option>
                           ))}
                         </select>
@@ -1176,9 +1280,40 @@ function InspectContent() {
               </tbody>
             </table>
           </div>
-          <p className="mt-3 text-zinc-500">
-            {sortedRows.length} row{sortedRows.length !== 1 ? 's' : ''}
-            {(filterCustomer || filterTemplate || filterTruckId || filterTrailermode || filterJobId.trim() || filterPlannedFrom || filterPlannedTo || filterActualFrom || filterActualTo || dateFilterCol) && ` (filtered from ${rows.length})`} · max 500 from API · click row to select
+          <div className="mt-3 flex flex-wrap items-center justify-between gap-3 text-sm text-zinc-500">
+            <p>
+              {sortedRows.length} row{sortedRows.length !== 1 ? 's' : ''} on this page · {totalJobsFromApi} total matching filters · page {jobsPage + 1} of{' '}
+              {Math.max(1, Math.ceil(totalJobsFromApi / INSPECT_PAGE_SIZE) || 1)} · click row to select
+            </p>
+            {totalJobsFromApi > INSPECT_PAGE_SIZE && (
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  disabled={jobsPage <= 0 || loading}
+                  onClick={() => setJobsPage((p) => Math.max(0, p - 1))}
+                  className="rounded border border-zinc-300 px-2 py-1 text-xs disabled:opacity-50 dark:border-zinc-600"
+                >
+                  Previous
+                </button>
+                <button
+                  type="button"
+                  disabled={loading || jobsPage >= Math.max(0, Math.ceil(totalJobsFromApi / INSPECT_PAGE_SIZE) - 1)}
+                  onClick={() => setJobsPage((p) => p + 1)}
+                  className="rounded border border-zinc-300 px-2 py-1 text-xs disabled:opacity-50 dark:border-zinc-600"
+                >
+                  Next
+                </button>
+              </div>
+            )}
+          </div>
+          {locateJobNotFound && (paramToLocate ?? '').trim() !== '' && (
+            <p className="mt-2 text-sm text-amber-700 dark:text-amber-300">
+              Job ID {(paramToLocate ?? '').trim()} was not found for the current API filters (see query below). Adjust filters or check the job exists for this truck.
+            </p>
+          )}
+          <p className="mt-2 font-mono text-[11px] leading-snug text-zinc-400 break-all">
+            API query: /api/vworkjobs?{lastApiQueryString || '—'}
+            {apiDebugFromResponse != null && <> · debug: {JSON.stringify(apiDebugFromResponse)}</>}
           </p>
           <section className="mt-6 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900">
             {selectedRow && (
@@ -1403,16 +1538,30 @@ function InspectContent() {
                                 steporidecomment: steporidecomment || null,
                               }),
                             });
+                            const data = await res.json().catch(() => ({}));
                             if (!res.ok) {
-                              const data = await res.json().catch(() => ({}));
-                              throw new Error(data?.error ?? res.statusText);
+                              throw new Error(
+                                typeof data?.error === 'string' ? data.error : res.statusText,
+                              );
                             }
-                            // Re-run steps so actuals/via update (e.g. when orides cleared, Summary shows GPS/VW not ORIDE).
-                            await runFetchStepsForJobs({
-                              jobs: [selectedRow],
-                              startLessMinutes,
-                              endPlusMinutes,
-                            });
+                            // step-overrides already sets step_N_actual_time / step_N_via for ORIDE. Do not run
+                            // derived-steps write-back here: it clears actuals/GPS-derived fields first and can
+                            // fight the save; use "Refetch steps" when you need GPS re-derivation.
+                            const s = data?.saved as Record<string, unknown> | undefined;
+                            if (s && typeof s === 'object') {
+                              const str = (k: string) =>
+                                s[k] != null && String(s[k]).trim() !== '' ? String(s[k]).trim().slice(0, 19) : '';
+                              setStepOverrides({
+                                step1oride: str('step1oride'),
+                                step2oride: str('step2oride'),
+                                step3oride: str('step3oride'),
+                                step4oride: str('step4oride'),
+                                step5oride: str('step5oride'),
+                              });
+                              const c = s.steporidecomment;
+                              setSteporidecomment(c != null && String(c).trim() !== '' ? String(c) : '');
+                            }
+                            setJobsRefreshKey((k) => k + 1);
                             setSaveOverridesStatus('saved');
                           } catch (e) {
                             setSaveOverridesStatus('error');

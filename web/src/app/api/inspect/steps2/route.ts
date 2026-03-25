@@ -1,12 +1,13 @@
 /**
  * POST /api/inspect/steps2 — **Steps+** preview (legacy path name "steps2"; not VWork steps 1–5).
  * Buffered-fence stays for device/window/fences. Read-only; does not update any table.
- * Body: { device, startTime, endTime, fenceNames: string[], bufferMeters?: number }
- * Returns: { fenceNamesIn, stays, maxTimePerFence } where stays = segments >= 300s.
+ * Body: { device, startTime, endTime, fenceNames: string[], bufferMeters?: number, minDurationSeconds?: number }
+ * Returns: { fenceNamesIn, stays, maxTimePerFence } where stays = segments >= min duration (System setting GPS+ Time, default 300s).
  */
 
 import { NextResponse } from 'next/server';
 import { runStepsPlusQuery } from '@/lib/steps-plus-query';
+import { getStepsPlusSettings } from '@/lib/steps-plus-settings';
 
 /** Normalize to YYYY-MM-DD HH:mm:ss for DB (same idea as tracking API). */
 function toTimestampLiteral(s: string | null): string | null {
@@ -37,9 +38,15 @@ export async function POST(request: Request) {
     const fenceNames = Array.isArray(body?.fenceNames)
       ? (body.fenceNames as string[]).map((s: unknown) => String(s).trim()).filter(Boolean)
       : [];
-    const bufferMeters = typeof body?.bufferMeters === 'number' && body.bufferMeters >= 0
-      ? body.bufferMeters
-      : 10;
+    const defaults = await getStepsPlusSettings();
+    const bufferMeters =
+      typeof body?.bufferMeters === 'number' && body.bufferMeters >= 0
+        ? body.bufferMeters
+        : defaults.bufferMeters;
+    const minDurationSeconds =
+      typeof body?.minDurationSeconds === 'number' && body.minDurationSeconds >= 0
+        ? body.minDurationSeconds
+        : defaults.minDurationSeconds;
 
     if (!device || !startTime || !endTime) {
       return NextResponse.json(
@@ -51,7 +58,7 @@ export async function POST(request: Request) {
     const rows = await runStepsPlusQuery(device, startTime, endTime, fenceNames, bufferMeters);
 
     const duration = (r: { duration_seconds: string | number }) => Number(r.duration_seconds);
-    const stays = rows.filter((r) => duration(r) >= 300);
+    const stays = rows.filter((r) => duration(r) >= minDurationSeconds);
 
     const maxByFence: { fence_name: string; max_seconds: number }[] = [];
     for (const name of fenceNames) {

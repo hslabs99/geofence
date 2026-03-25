@@ -3,6 +3,12 @@
 import { useCallback, useEffect, useState } from 'react';
 import { runFetchStepsForJobs } from '@/lib/fetch-steps';
 
+type VworkFilterOptions = {
+  vineyardNames: string[];
+  deliveryWineries: string[];
+  workers: string[];
+};
+
 type StreamEvent =
   | { stage: 'reset'; message: string }
   | { stage: 'device_start'; deviceName: string; index: number; total: number }
@@ -97,6 +103,21 @@ function getJobField(j: Record<string, unknown>, ...keys: string[]): string {
   return '';
 }
 
+/** Amber progress line: explicit Day / Job counts for Steps. */
+function stepsProgressStage(
+  date: string,
+  dayIndex0: number,
+  totalDays: number,
+  jobCurrent: number,
+  jobTotal: number
+): string {
+  const d = dayIndex0 + 1;
+  if (jobTotal <= 0) {
+    return `Progress: ${date}: Steps (Day ${d}/${totalDays})`;
+  }
+  return `Progress: ${date}: Steps (Day ${d}/${totalDays}) (Job ${jobCurrent}/${jobTotal})`;
+}
+
 export default function TaggingPage() {
   const [dateFrom, setDateFrom] = useState(DEFAULT_DATE);
   const [dateTo, setDateTo] = useState(DEFAULT_DATE);
@@ -118,6 +139,92 @@ export default function TaggingPage() {
   const [fenceTaggingLogs, setFenceTaggingLogs] = useState<string[]>([]);
   const [fenceTaggingError, setFenceTaggingError] = useState<string | null>(null);
   const [fenceTaggingScope, setFenceTaggingScope] = useState<FenceTaggingScope>('unattempted');
+
+  /** Optional Steps filters (tbl_vworkjobs): exact vineyard / winery / device (worker). */
+  const [filterVineyard, setFilterVineyard] = useState('');
+  const [filterWinery, setFilterWinery] = useState('');
+  const [filterDevice, setFilterDevice] = useState('');
+  const [vworkFilterOptions, setVworkFilterOptions] = useState<VworkFilterOptions>({
+    vineyardNames: [],
+    deliveryWineries: [],
+    workers: [],
+  });
+  const [vworkjobsMatchCount, setVworkjobsMatchCount] = useState<number | null>(null);
+  const [vworkjobsCountLoading, setVworkjobsCountLoading] = useState(false);
+  const [vworkjobsCountError, setVworkjobsCountError] = useState<string | null>(null);
+  const [filterOptionsLoadError, setFilterOptionsLoadError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setFilterOptionsLoadError(null);
+    fetch('/api/vworkjobs/filter-options', { cache: 'no-store' })
+      .then(async (r) => {
+        const d = (await r.json()) as Record<string, unknown>;
+        if (!r.ok) {
+          throw new Error(typeof d.error === 'string' ? d.error : `HTTP ${r.status}`);
+        }
+        return d;
+      })
+      .then((d) => {
+        if (cancelled) return;
+        setVworkFilterOptions({
+          vineyardNames: Array.isArray(d.vineyardNames) ? (d.vineyardNames as string[]) : [],
+          deliveryWineries: Array.isArray(d.deliveryWineries) ? (d.deliveryWineries as string[]) : [],
+          workers: Array.isArray(d.workers) ? (d.workers as string[]) : [],
+        });
+      })
+      .catch((e: unknown) => {
+        if (!cancelled) {
+          setVworkFilterOptions({ vineyardNames: [], deliveryWineries: [], workers: [] });
+          setFilterOptionsLoadError(e instanceof Error ? e.message : String(e));
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    const from = dateFrom.trim();
+    const to = dateTo.trim();
+    if (!from || !to || dateRange(from, to).length === 0) {
+      setVworkjobsMatchCount(null);
+      setVworkjobsCountError(null);
+      setVworkjobsCountLoading(false);
+      return;
+    }
+    setVworkjobsCountLoading(true);
+    setVworkjobsCountError(null);
+    const ac = new AbortController();
+    const t = setTimeout(() => {
+      const u = new URL('/api/vworkjobs', window.location.origin);
+      u.searchParams.set('dateFrom', from);
+      u.searchParams.set('dateTo', to);
+      u.searchParams.set('countOnly', 'true');
+      if (!stepsForce) u.searchParams.set('stepsFetched', 'false');
+      if (filterVineyard) u.searchParams.set('vineyard', filterVineyard);
+      if (filterWinery) u.searchParams.set('winery', filterWinery);
+      if (filterDevice) u.searchParams.set('device', filterDevice);
+      fetch(u.toString(), { signal: ac.signal })
+        .then(async (res) => {
+          const j = (await res.json()) as { count?: number; error?: string };
+          if (!res.ok) throw new Error(j?.error ?? `HTTP ${res.status}`);
+          setVworkjobsMatchCount(typeof j.count === 'number' ? j.count : null);
+        })
+        .catch((e: unknown) => {
+          if (e instanceof Error && e.name === 'AbortError') return;
+          setVworkjobsCountError(e instanceof Error ? e.message : String(e));
+          setVworkjobsMatchCount(null);
+        })
+        .finally(() => {
+          if (!ac.signal.aborted) setVworkjobsCountLoading(false);
+        });
+    }, 280);
+    return () => {
+      clearTimeout(t);
+      ac.abort();
+    };
+  }, [dateFrom, dateTo, stepsForce, filterVineyard, filterWinery, filterDevice]);
 
   const loadEntryexitLogs = useCallback(async () => {
     setEntryexitLogsLoading(true);
@@ -259,7 +366,7 @@ export default function TaggingPage() {
     setRunStatus('running');
     setStepsOnlyRunActive(false);
     setStreamLogs([]);
-    setCurrentStage('Applying position_time_nz and store_fences…');
+    setCurrentStage('Progress: Applying position_time_nz and store_fences…');
     setSummary(null);
     setRunError(null);
 
@@ -271,7 +378,7 @@ export default function TaggingPage() {
         setCurrentStage('');
         return;
       }
-      setCurrentStage('Fetching devices for range…');
+      setCurrentStage('Progress: Fetching devices for range…');
       const devRes = await fetch(
         `/api/admin/tracking/devices-for-date-range?dateFrom=${encodeURIComponent(from)}&dateTo=${encodeURIComponent(to)}`
       );
@@ -287,7 +394,7 @@ export default function TaggingPage() {
         ...prev,
         `Devices for ${from} → ${to}: ${list.length} — ${list.join(', ')}`,
       ]);
-      setCurrentStage('Starting…');
+      setCurrentStage('Progress: Starting ENTER/EXIT tagging…');
       const res = await fetch('/api/admin/tagging/run', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -327,13 +434,16 @@ export default function TaggingPage() {
           try {
             const ev = JSON.parse(line) as StreamEvent;
             setStreamLogs((prev) => [...prev, formatLogLine(ev)]);
-            if (ev.stage === 'reset') setCurrentStage('Reset');
+            if (ev.stage === 'reset') setCurrentStage('Progress: Reset');
             if (ev.stage === 'device_start')
-              setCurrentStage(`Device ${ev.index}/${ev.total}: ${ev.deviceName}`);
-            if (ev.stage === 'device_done') setCurrentStage(`Done: ${ev.deviceName}`);
+              setCurrentStage(
+                `Progress: ENTER/EXIT (Device ${ev.index}/${ev.total}) — ${ev.deviceName}`
+              );
+            if (ev.stage === 'device_done')
+              setCurrentStage(`Progress: Done device — ${ev.deviceName}`);
             if (ev.stage === 'done') {
               setSummary(ev.summary);
-              setCurrentStage('Complete');
+              setCurrentStage('Progress: Complete');
               setRunStatus('done');
             }
             if (ev.stage === 'error') {
@@ -353,7 +463,7 @@ export default function TaggingPage() {
           if (ev.stage === 'done') {
             setSummary(ev.summary);
             setRunStatus('done');
-            setCurrentStage('Complete');
+            setCurrentStage('Progress: Complete');
           }
         } catch {
           setStreamLogs((prev) => [...prev, `[Raw] ${buffer}`]);
@@ -374,18 +484,24 @@ export default function TaggingPage() {
     totalDays: number,
     appendLog: (line: string) => void
   ): Promise<void> => {
-    setCurrentStage(`${date}: Steps (${dayIndex + 1}/${totalDays})`);
+    setCurrentStage(stepsProgressStage(date, dayIndex, totalDays, 0, 0));
     appendLog(`=== ${date}: Steps ===`);
-    const stepsUrl = stepsForce
-      ? `/api/vworkjobs?date=${encodeURIComponent(date)}`
-      : `/api/vworkjobs?date=${encodeURIComponent(date)}&stepsFetched=false`;
-    const stepsRes = await fetch(stepsUrl);
+    const stepsParams = new URLSearchParams();
+    stepsParams.set('date', date);
+    if (!stepsForce) stepsParams.set('stepsFetched', 'false');
+    if (filterVineyard) stepsParams.set('vineyard', filterVineyard);
+    if (filterWinery) stepsParams.set('winery', filterWinery);
+    if (filterDevice) stepsParams.set('device', filterDevice);
+    const stepsRes = await fetch(`/api/vworkjobs?${stepsParams.toString()}`);
     const stepsData = await stepsRes.json();
     if (!stepsRes.ok) {
       appendLog(`[Error] Steps job list: ${stepsData?.error ?? stepsRes.status}`);
       return;
     }
     const jobs: Record<string, unknown>[] = stepsData.rows ?? [];
+    if (jobs.length > 0) {
+      setCurrentStage(stepsProgressStage(date, dayIndex, totalDays, 0, jobs.length));
+    }
     appendLog(`  Jobs for ${date}: ${jobs.length}`);
     jobs.forEach((job) => {
       const jobId = job.job_id != null ? String(job.job_id) : '?';
@@ -400,6 +516,7 @@ export default function TaggingPage() {
         endPlusMinutes: stepsEndPlusMinutes,
         jobDateForLog: date,
         onProgress: (current, total, log) => {
+          setCurrentStage(stepsProgressStage(date, dayIndex, totalDays, current, total));
           const last = log[log.length - 1];
           if (!last) return;
           appendLog(
@@ -445,7 +562,7 @@ export default function TaggingPage() {
         await runStepsForDate(dates[d]!, d, dates.length, appendLog);
       }
       appendLog('Steps-only run complete.');
-      setCurrentStage('Complete');
+      setCurrentStage('Progress: Complete');
       setRunStatus('done');
     } catch (err) {
       setRunError(err instanceof Error ? err.message : String(err));
@@ -478,7 +595,11 @@ export default function TaggingPage() {
     try {
       for (let d = 0; d < dates.length; d++) {
         const date = dates[d]!;
-        setCurrentStage(`${date}: devices + Tag Enter/Exit (${d + 1}/${dates.length})`);
+        const dayNum = d + 1;
+        const dayTotal = dates.length;
+        setCurrentStage(
+          `Progress: ${date}: Tag Enter/Exit (Day ${dayNum}/${dayTotal})`
+        );
         appendLog(`=== ${date}: Tag Enter/Exit ===`);
 
         const devRes = await fetch(`/api/admin/tracking/devices-for-date?date=${encodeURIComponent(date)}`);
@@ -526,6 +647,16 @@ export default function TaggingPage() {
               try {
                 const ev = JSON.parse(line) as StreamEvent;
                 appendLog(formatLogLine(ev));
+                if (ev.stage === 'device_start') {
+                  setCurrentStage(
+                    `Progress: ${date}: Tag Enter/Exit (Day ${dayNum}/${dayTotal}) (Device ${ev.index}/${ev.total}) — ${ev.deviceName}`
+                  );
+                }
+                if (ev.stage === 'device_done') {
+                  setCurrentStage(
+                    `Progress: ${date}: Tag Enter/Exit (Day ${dayNum}/${dayTotal}) — done ${ev.deviceName}`
+                  );
+                }
                 if (ev.stage === 'error') {
                   setRunError(ev.message);
                   setRunStatus('error');
@@ -541,6 +672,16 @@ export default function TaggingPage() {
             try {
               const ev = JSON.parse(buffer) as StreamEvent;
               appendLog(formatLogLine(ev));
+              if (ev.stage === 'device_start') {
+                setCurrentStage(
+                  `Progress: ${date}: Tag Enter/Exit (Day ${dayNum}/${dayTotal}) (Device ${ev.index}/${ev.total}) — ${ev.deviceName}`
+                );
+              }
+              if (ev.stage === 'device_done') {
+                setCurrentStage(
+                  `Progress: ${date}: Tag Enter/Exit (Day ${dayNum}/${dayTotal}) — done ${ev.deviceName}`
+                );
+              }
               if (ev.stage === 'error') {
                 setRunError(ev.message);
                 setRunStatus('error');
@@ -555,7 +696,7 @@ export default function TaggingPage() {
 
         await runStepsForDate(date, d, dates.length, appendLog);
       }
-      setCurrentStage('Complete');
+      setCurrentStage('Progress: Complete');
       setRunStatus('done');
     } catch (err) {
       setRunError(err instanceof Error ? err.message : String(err));
@@ -716,6 +857,80 @@ export default function TaggingPage() {
                     className="w-12 rounded border border-zinc-300 bg-white px-1 py-0.5 dark:border-zinc-600 dark:bg-zinc-800"
                   />
                   <span>min after</span>
+                </div>
+              </div>
+              <div className="mt-3 flex flex-wrap items-end gap-3 border-t border-zinc-200 pt-3 dark:border-zinc-600">
+                <p className="w-full text-xs text-zinc-500 dark:text-zinc-400">
+                  Optional: limit <strong>Steps</strong> jobs (same filters as <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">tbl_vworkjobs</code>). ENTER/EXIT tagging is unchanged.
+                </p>
+                {filterOptionsLoadError && (
+                  <p className="w-full text-xs text-red-600 dark:text-red-400">
+                    Could not load dropdown values: {filterOptionsLoadError}
+                  </p>
+                )}
+                <label className="flex flex-col gap-1">
+                  <span className="text-xs font-medium text-zinc-600 dark:text-zinc-400">Vineyard name</span>
+                  <select
+                    value={filterVineyard}
+                    onChange={(e) => setFilterVineyard(e.target.value)}
+                    disabled={runStatus === 'running'}
+                    className="min-w-[10rem] max-w-[14rem] rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+                  >
+                    <option value="">Any</option>
+                    {vworkFilterOptions.vineyardNames.map((v) => (
+                      <option key={v} value={v}>
+                        {v}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="flex flex-col gap-1">
+                  <span className="text-xs font-medium text-zinc-600 dark:text-zinc-400">Delivery winery</span>
+                  <select
+                    value={filterWinery}
+                    onChange={(e) => setFilterWinery(e.target.value)}
+                    disabled={runStatus === 'running'}
+                    className="min-w-[10rem] max-w-[14rem] rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+                  >
+                    <option value="">Any</option>
+                    {vworkFilterOptions.deliveryWineries.map((w) => (
+                      <option key={w} value={w}>
+                        {w}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="flex flex-col gap-1">
+                  <span className="text-xs font-medium text-zinc-600 dark:text-zinc-400">Device (worker)</span>
+                  <select
+                    value={filterDevice}
+                    onChange={(e) => setFilterDevice(e.target.value)}
+                    disabled={runStatus === 'running'}
+                    className="min-w-[10rem] max-w-[14rem] rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+                  >
+                    <option value="">Any</option>
+                    {vworkFilterOptions.workers.map((w) => (
+                      <option key={w} value={w}>
+                        {w}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <div className="flex flex-col gap-0.5 text-sm">
+                  <span className="text-xs font-medium text-zinc-600 dark:text-zinc-400">Matching jobs (Steps)</span>
+                  <span className="font-mono text-zinc-800 dark:text-zinc-200">
+                    {vworkjobsCountLoading
+                      ? '…'
+                      : vworkjobsCountError
+                        ? <span className="text-red-600 dark:text-red-400">{vworkjobsCountError}</span>
+                        : vworkjobsMatchCount !== null
+                          ? vworkjobsMatchCount.toLocaleString()
+                          : '—'}
+                  </span>
+                  <span className="text-[10px] text-zinc-500 dark:text-zinc-500">
+                    Same filters as Steps run (incl. “force”){' '}
+                    <code className="rounded bg-zinc-100 px-0.5 dark:bg-zinc-800">actual_start_time</code> in range
+                  </span>
                 </div>
               </div>
             </div>

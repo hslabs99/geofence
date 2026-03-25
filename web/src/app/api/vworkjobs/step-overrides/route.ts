@@ -22,7 +22,8 @@ export async function POST(request: Request) {
     const steporidecomment = body.steporidecomment != null ? String(body.steporidecomment) : null;
 
     // Pass orides as text so PostgreSQL deduces one type; use ::text in CASE and cast to timestamp only when assigning.
-    await execute(
+    // Match job_id with trim so client string matches DB text/numeric job_id consistently.
+    const rowCount = await execute(
       `UPDATE tbl_vworkjobs SET
         step1oride = CASE WHEN $1::text IS NOT NULL AND trim($1::text) <> '' THEN ($1::text)::timestamp ELSE NULL END,
         step2oride = CASE WHEN $2::text IS NOT NULL AND trim($2::text) <> '' THEN ($2::text)::timestamp ELSE NULL END,
@@ -40,11 +41,29 @@ export async function POST(request: Request) {
         step_4_via = CASE WHEN $4::text IS NOT NULL AND trim($4::text) <> '' THEN 'ORIDE' ELSE step_4_via END,
         step_5_actual_time = CASE WHEN $5::text IS NOT NULL AND trim($5::text) <> '' THEN ($5::text)::timestamp ELSE step_5_actual_time END,
         step_5_via = CASE WHEN $5::text IS NOT NULL AND trim($5::text) <> '' THEN 'ORIDE' ELSE step_5_via END
-      WHERE job_id::text = $7`,
+      WHERE trim(job_id::text) = trim($7::text)`,
       [step1oride ?? null, step2oride ?? null, step3oride ?? null, step4oride ?? null, step5oride ?? null, steporidecomment ?? null, jobId]
     );
 
-    return NextResponse.json({ ok: true, job_id: jobId });
+    if (rowCount === 0) {
+      return NextResponse.json(
+        { error: 'No job updated — job_id not found in tbl_vworkjobs', job_id: jobId },
+        { status: 404 },
+      );
+    }
+
+    return NextResponse.json({
+      ok: true,
+      job_id: jobId,
+      saved: {
+        step1oride,
+        step2oride,
+        step3oride,
+        step4oride,
+        step5oride,
+        steporidecomment,
+      },
+    });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return NextResponse.json({ error: message }, { status: 500 });

@@ -6,7 +6,7 @@ import { query } from '@/lib/db';
 import { dateToLiteral } from '@/lib/utils';
 
 /** Same as tracking API: parse to YYYY-MM-DD HH:mm:ss only — no timezone in output. Handles Date (e.g. from DB) and strings; strips GMT+1300 etc. so PostgreSQL never sees them. */
-function normalizeTimestampString(s: string | Date | null): string | null {
+export function normalizeTimestampString(s: string | Date | null): string | null {
   if (s == null) return null;
   let t: string = typeof s === 'string' ? s.trim() : s.toString().trim();
   // Strip timezone suffix so we never pass "GMT+1300" etc. to PostgreSQL (not recognized)
@@ -190,7 +190,7 @@ export type JobForDerivedSteps = {
   actual_end_time?: string | null;
   /** VWork step 5 (job completed in system). Use this for step 5 rule: only use GPS when Winery EXIT < this value. */
   step_5_completed_at?: string | null;
-  /** VWork-reported step 1 (job start). Used in cleanup: if step_1_completed_at > step2_gps we apply step1 = step2_gps - 20 min. */
+  /** VWork-reported step 1 (job start). Cleanup also falls back to actual_start_time when this is empty. */
   step_1_completed_at?: string | null;
   /** Manual overrides (Part 3): if set, trump GPS/VWork for that step. */
   step1oride?: string | null;
@@ -198,6 +198,9 @@ export type JobForDerivedSteps = {
   step3oride?: string | null;
   step4oride?: string | null;
   step5oride?: string | null;
+  step_2_completed_at?: string | null;
+  step_3_completed_at?: string | null;
+  step_4_completed_at?: string | null;
 };
 
 /** Part 1: A single fetched GPS candidate (value + tracking id). No decision applied. */
@@ -212,17 +215,29 @@ export type FetchedGpsCandidates = {
   step5: GpsStepCandidate | null;
 };
 
+export type StepVia = 'GPS' | 'VW' | 'RULE' | 'ORIDE' | 'VineFence+';
+
 export type DerivedStepsResult = {
-  step1: string | null; // Job start by GPS: first Winery EXIT before Vineyard ENTER (step 2); may be null if job started after leaving fence
-  step2: string | null; // Vineyard ENTER (Arrive Vineyard)
-  step3: string | null; // Vineyard EXIT (Depart Vineyard)
-  step4: string | null; // Winery ENTER (Arrive Winery)
-  step5: string | null; // Job end by GPS: first Winery EXIT after step 4, within data window, and < VWork step 5 (forgot to end); in most jobs null
+  /** Raw GPS times from tbl_tracking (Step_N_GPS_completed_at). */
+  step1Gps: string | null;
+  step2Gps: string | null;
+  step3Gps: string | null;
+  step4Gps: string | null;
+  step5Gps: string | null;
+  /** Final times for step_N_actual_time: GPS∨VWork base, then cleanup, then orides. */
+  step1: string | null;
+  step2: string | null;
+  step3: string | null;
+  step4: string | null;
+  step5: string | null;
   step1TrackingId: number | null;
   step2TrackingId: number | null;
   step3TrackingId: number | null;
   step4TrackingId: number | null;
   step5TrackingId: number | null;
+  /** Steps+ may set before finalizeDerivedSteps so applyOrides keeps VineFence+. */
+  step2Via?: StepVia;
+  step3Via?: StepVia;
 };
 
 export type DerivedStepsDebug = {
@@ -246,8 +261,6 @@ export type DerivedStepsDebug = {
 
 /** After cleanup: when step1 vwork > step2 gps we set step1_actual = step2_gps - travel_min (step4−step3); Via = RULE. */
 export type Step1CleanupOverride = string | null;
-
-export type StepVia = 'GPS' | 'VW' | 'RULE' | 'ORIDE' | 'VineFence+';
 
 export type DerivedStepsResultWithDebug = DerivedStepsResult & {
   debug: DerivedStepsDebug;
@@ -278,13 +291,96 @@ export type DerivedStepsOptions = {
  *   - May be absent if the job started after the driver had already left the winery fence.
  * Step 2 — Arrive vineyard: First Vineyard ENTER in window.
  * Step 3 — Leave vineyard: First Vineyard EXIT after step 2 (so we don't pick an earlier exit before the enter).
- * Step 4 — Arrive winery: First Winery ENTER that (a) is in the data window and (b) is after max(step2, step3) if both exist; else only (a). Only step 5 (Winery EXIT) is subject to step 5 times.
+ * Step 4 — Arrive winery (return leg): First mapped Winery ENTER with position_time_nz strictly &gt; max(GPS step1, step2, step3) among non-null steps (first re-entry after vineyard steps 2–3; step 1 included so we do not pick an ENTER before the morning exit), and strictly &lt; data window end (positionBefore). If steps 1–3 are all absent, lower bound is positionAfter.
  * Step 5 — Job end by GPS: VWork step 5 = step_5_completed_at (job completed in system). Only use GPS when Winery EXIT is strictly < VWork step 5 (gpsNorm < vworkStep5). IF VWork step 5 > step 4, AND we have a Winery EXIT that is > step 4, within the data window, and < VWork step 5, we use that Winery EXIT (driver left winery after returning from vineyard and forgot to end job). We take the FIRST such Winery EXIT (not the last), so we get the “forgot to end” exit, not the exit at job end. Search window capped at job end and at positionBefore (data window). In most jobs this does not apply (step5 null).
  *
  * Derive GPS step timestamps for a job using these rules. Window is passed in (same as tbl_tracking UI)
  * — no server-side timezone or date logic. Uses tbl_gpsmappings + original vwork name → tbl_geofences
  * → fence_ids; then scans tbl_tracking in window.
+ *
+ * Guardrail (after fetch): If GPS step 1 exists, steps 2–3 and 5 must be strictly &gt; step 1 time (step 4 uses max(step1–3) floor — see below). Each tbl_tracking id may appear at most once. Step 5 cleared if step 4 cleared.
+ * Guardrail — step 4: must be strictly &gt; max(GPS step1, step2, step3) among non-null steps so “arrive winery” cannot precede leaving the vineyard (or an earlier winery exit).
+ * Guardrail — VWork job end: GPS steps 1–3 must be strictly **before** VWork step 5 (job completed). Stops picking the next job’s winery exit as step 1, or vineyard enter/exit from after job end.
  */
+
+/** Lexicographic max for YYYY-MM-DD HH:mm:ss strings; ignores nulls. */
+function maxTimestampString(...vals: (string | null | undefined)[]): string | null {
+  let best: string | null = null;
+  for (const v of vals) {
+    if (v == null || v === '') continue;
+    const n = normalizeTimestampString(v);
+    if (n == null) continue;
+    if (best == null || n > best) best = n;
+  }
+  return best;
+}
+
+/**
+ * If GPS step 1 exists, drop steps 2–3 and 5 with time &lt;= step 1 (step 4 excluded — uses max(step1–3) floor below).
+ * Step 4: drop if &lt;= max(GPS step1, step2, step3) when that max exists.
+ * VWork ceiling: steps 1–3 must be &lt; VWork job end (step_5_completed_at / actual_end) — no winery exit / vineyard events on the way to the next job.
+ */
+function applyGpsGuardrails(candidates: FetchedGpsCandidates, job: JobForDerivedSteps): void {
+  const vworkEnd =
+    job.step_5_completed_at != null || job.actual_end_time != null
+      ? normalizeTimestampString((job.step_5_completed_at ?? job.actual_end_time) as string | Date)
+      : null;
+  if (vworkEnd != null && candidates.step1?.value != null) {
+    const s1c = normalizeTimestampString(candidates.step1.value);
+    if (s1c != null && s1c >= vworkEnd) {
+      candidates.step1 = null;
+    }
+  }
+  const s1 = candidates.step1;
+  if (s1?.value != null) {
+    const floor = normalizeTimestampString(s1.value);
+    if (floor) {
+      for (const key of ['step2', 'step3', 'step5'] as const) {
+        const c = candidates[key];
+        if (c?.value == null) continue;
+        const n = normalizeTimestampString(c.value);
+        if (n != null && n <= floor) candidates[key] = null;
+      }
+    }
+  }
+  if (vworkEnd != null) {
+    const s2 = candidates.step2?.value != null ? normalizeTimestampString(candidates.step2!.value) : null;
+    if (s2 != null && s2 >= vworkEnd) {
+      candidates.step2 = null;
+      candidates.step3 = null;
+    } else {
+      const s3 = candidates.step3?.value != null ? normalizeTimestampString(candidates.step3!.value) : null;
+      if (s3 != null && s3 >= vworkEnd) {
+        candidates.step3 = null;
+      }
+    }
+  }
+  const step4Floor = maxTimestampString(
+    candidates.step1?.value,
+    candidates.step2?.value,
+    candidates.step3?.value
+  );
+  if (step4Floor != null && candidates.step4?.value != null) {
+    const s4 = normalizeTimestampString(candidates.step4.value);
+    if (s4 != null && s4 <= step4Floor) {
+      candidates.step4 = null;
+    }
+  }
+  const seen = new Set<number>();
+  for (const key of ['step1', 'step2', 'step3', 'step4', 'step5'] as const) {
+    const c = candidates[key];
+    const id = c?.trackingId;
+    if (id == null || !Number.isFinite(id)) continue;
+    if (seen.has(id)) {
+      candidates[key] = null;
+    } else {
+      seen.add(id);
+    }
+  }
+  if (candidates.step4 == null && candidates.step5 != null) {
+    candidates.step5 = null;
+  }
+}
 
 /** Part 1: Fetch GPS candidates for each step (winery/vineyard, ENTER/EXIT). No decision — just lookups. */
 async function fetchGpsStepCandidates(
@@ -324,12 +420,14 @@ async function fetchGpsStepCandidates(
       const step1Before = step2Value ?? positionBefore;
       const step1Result = await getFirstTrackingInWindowWithDebug(truckId, positionAfter, step1Before, wineryFenceIds, 'EXIT');
       debug.winery.step1 = step1Result.debug;
-      if (step1Result.value != null) candidates.step1 = { value: step1Result.value, trackingId: step1Result.trackingId };
-      const step4After =
-        step2Value != null && step3Value != null
-          ? (step2Value > step3Value ? step2Value : step3Value)
-          : positionAfter;
-      const step4Result = await getFirstTrackingInWindowWithDebug(truckId, step4After, positionBefore, wineryFenceIds, 'ENTER');
+      let step1Value: string | null = null;
+      if (step1Result.value != null) {
+        candidates.step1 = { value: step1Result.value, trackingId: step1Result.trackingId };
+        step1Value = step1Result.value;
+      }
+      const step4LowerBound =
+        maxTimestampString(step1Value, step2Value, step3Value) ?? positionAfter;
+      const step4Result = await getFirstTrackingInWindowWithDebug(truckId, step4LowerBound, positionBefore, wineryFenceIds, 'ENTER');
       step4Value = step4Result.value;
       debug.winery.step4 = step4Result.debug;
       if (step4Result.value != null) candidates.step4 = { value: step4Result.value, trackingId: step4Result.trackingId };
@@ -344,6 +442,7 @@ async function fetchGpsStepCandidates(
       }
     }
   }
+  applyGpsGuardrails(candidates, job);
   return candidates;
 }
 
@@ -377,34 +476,83 @@ function minutesBetween(tsEarlier: string, tsLater: string): number {
 }
 
 /**
- * Cleanup rules run after GPS phase (after we have decided GPS vs VWork and populated final step values).
- * Rule 1: If step1 VWork start > step2 GPS (vineyard arrive), we have impossible negative travel time.
- *         Then set step1_actual = step2_gps - travel_minutes, where travel_minutes = step4_final - step3_final
- *         (return leg: vineyard → winery). If step3/step4 missing, fall back to 20 minutes. Summary shows Via = RULE.
+ * VWork job-start time for cleanup rules: `step_1_completed_at` when set, otherwise `actual_start_time`
+ * (many jobs only have actual start populated; without this, cleanup_start / travel rule never run).
  */
-function applyCleanupRules(
-  result: DerivedStepsResult,
-  job: JobForDerivedSteps
-): { result: DerivedStepsResult; step1ActualOverride: Step1CleanupOverride } {
-  let step1ActualOverride: Step1CleanupOverride = null;
-  const step1Vwork = job.step_1_completed_at != null ? normalizeTimestampString(job.step_1_completed_at as string) : null;
-  const step2Gps = result.step2 != null ? normalizeTimestampString(result.step2) : null;
-  if (step1Vwork != null && step2Gps != null && step1Vwork > step2Gps) {
-    const travelMinutes =
-      result.step3 != null && result.step4 != null
-        ? minutesBetween(result.step3, result.step4)
-        : 20;
-    const safeMinutes = Math.max(1, Math.min(120, travelMinutes));
-    step1ActualOverride = subtractMinutesFromTimestamp(step2Gps, safeMinutes);
-  }
-  return { result, step1ActualOverride };
+function vworkStep1TimeForCleanup(job: JobForDerivedSteps): string | null {
+  const s1 =
+    job.step_1_completed_at != null && String(job.step_1_completed_at).trim() !== ''
+      ? job.step_1_completed_at
+      : job.actual_start_time != null && String(job.actual_start_time).trim() !== ''
+        ? job.actual_start_time
+        : null;
+  return s1 != null ? normalizeTimestampString(s1 as string) : null;
 }
 
-/** Part 3: Apply manual overrides (orides). If job has stepNoride set, use it for that step and set via = ORIDE; otherwise keep result and set via from GPS/VW/RULE. */
+/** VWork step N completed time for merging into actuals (steps 2–5). */
+function vworkStepTime(job: JobForDerivedSteps, which: 2 | 3 | 4 | 5): string | null {
+  const raw =
+    which === 2
+      ? job.step_2_completed_at
+      : which === 3
+        ? job.step_3_completed_at
+        : which === 4
+          ? job.step_4_completed_at
+          : job.step_5_completed_at ?? job.actual_end_time;
+  if (raw == null || String(raw).trim() === '') return null;
+  return normalizeTimestampString(raw as string);
+}
+
+/**
+ * After GPS decisions: fill step1..step5 with GPS time or VWork step completed time (same scale as stored job fields).
+ */
+function resolveActualFromGpsAndVwork(gps: DerivedStepsResult, job: JobForDerivedSteps): DerivedStepsResult {
+  const v1 = vworkStep1TimeForCleanup(job);
+  const v2 = vworkStepTime(job, 2);
+  const v3 = vworkStepTime(job, 3);
+  const v4 = vworkStepTime(job, 4);
+  const v5 = vworkStepTime(job, 5);
+  return {
+    ...gps,
+    step1: gps.step1Gps ?? v1 ?? null,
+    step2: gps.step2Gps ?? v2 ?? null,
+    step3: gps.step3Gps ?? v3 ?? null,
+    step4: gps.step4Gps ?? v4 ?? null,
+    step5: gps.step5Gps ?? v5 ?? null,
+  };
+}
+
+/**
+ * Cleanup runs only on **actual** times (`step1`..`step5` after GPS ∨ VWork merge). Does not read `stepNGps`.
+ * Runs once at end of finalize after actuals are fully populated.
+ *
+ * cleanup_start: VWork start is after actual vineyard arrive, but **actual step 1 is missing** → step1 = actual.step2 − 10 min.
+ * travel: VWork start is after actual step 2, and **actual step 1 is missing or not strictly before step 2** →
+ *   step1 = actual.step2 − travel (actual.step3→step4 leg, else 20 min).
+ */
+function applyCleanupRules(actual: DerivedStepsResult, job: JobForDerivedSteps): void {
+  const step1Vwork = vworkStep1TimeForCleanup(job);
+  const a1 = actual.step1 != null ? normalizeTimestampString(actual.step1) : null;
+  const a2 = actual.step2 != null ? normalizeTimestampString(actual.step2) : null;
+
+  if (a1 == null && a2 != null && step1Vwork != null && a2 < step1Vwork) {
+    actual.step1 = subtractMinutesFromTimestamp(a2, 10);
+  } else if (step1Vwork != null && a2 != null && step1Vwork > a2 && (a1 == null || a1 >= a2)) {
+    const travelMinutes =
+      actual.step3 != null && actual.step4 != null
+        ? minutesBetween(actual.step3, actual.step4)
+        : 20;
+    const safeMinutes = Math.max(1, Math.min(120, travelMinutes));
+    actual.step1 = subtractMinutesFromTimestamp(a2, safeMinutes);
+  }
+}
+
+/** Part 3: Manual overrides on top of resolved actuals. `gps` retains raw GPS for Via labels. */
 function applyOrides(
-  result: DerivedStepsResult,
+  actual: DerivedStepsResult,
   job: JobForDerivedSteps,
-  step1ActualOverride: Step1CleanupOverride
+  gps: DerivedStepsResult,
+  step1CleanupApplied: boolean
 ): { result: DerivedStepsResult; step1Via: StepVia; step2Via: StepVia; step3Via: StepVia; step4Via: StepVia; step5Via: StepVia } {
   const orides = [
     job.step1oride != null && String(job.step1oride).trim() !== '' ? normalizeTimestampString(String(job.step1oride).trim()) : null,
@@ -413,48 +561,127 @@ function applyOrides(
     job.step4oride != null && String(job.step4oride).trim() !== '' ? normalizeTimestampString(String(job.step4oride).trim()) : null,
     job.step5oride != null && String(job.step5oride).trim() !== '' ? normalizeTimestampString(String(job.step5oride).trim()) : null,
   ];
-  const step1Final = orides[0] ?? step1ActualOverride ?? result.step1;
-  const step2Final = orides[1] ?? result.step2;
-  const step3Final = orides[2] ?? result.step3;
-  const step4Final = orides[3] ?? result.step4;
-  const step5Final = orides[4] ?? result.step5;
+  const step1Final = orides[0] ?? actual.step1;
+  const step2Final = orides[1] ?? actual.step2;
+  const step3Final = orides[2] ?? actual.step3;
+  const step4Final = orides[3] ?? actual.step4;
+  const step5Final = orides[4] ?? actual.step5;
   const out: DerivedStepsResult = {
-    ...result,
+    ...gps,
     step1: step1Final,
     step2: step2Final,
     step3: step3Final,
     step4: step4Final,
     step5: step5Final,
   };
-  const step1Via: StepVia = orides[0] != null ? 'ORIDE' : (step1ActualOverride != null ? 'RULE' : (result.step1 != null ? 'GPS' : 'VW'));
-  const step2Via: StepVia = orides[1] != null ? 'ORIDE' : (result.step2 != null ? 'GPS' : 'VW');
-  const step3Via: StepVia = orides[2] != null ? 'ORIDE' : (result.step3 != null ? 'GPS' : 'VW');
-  const step4Via: StepVia = orides[3] != null ? 'ORIDE' : (result.step4 != null ? 'GPS' : 'VW');
-  const step5Via: StepVia = orides[4] != null ? 'ORIDE' : (result.step5 != null ? 'GPS' : 'VW');
+  const step1Via: StepVia = orides[0] != null ? 'ORIDE' : step1CleanupApplied ? 'RULE' : (gps.step1Gps != null ? 'GPS' : 'VW');
+  const step2Via: StepVia =
+    orides[1] != null ? 'ORIDE' : gps.step2Via === 'VineFence+' ? 'VineFence+' : (gps.step2Gps != null ? 'GPS' : 'VW');
+  const step3Via: StepVia =
+    orides[2] != null ? 'ORIDE' : gps.step3Via === 'VineFence+' ? 'VineFence+' : (gps.step3Gps != null ? 'GPS' : 'VW');
+  const step4Via: StepVia = orides[3] != null ? 'ORIDE' : (gps.step4Gps != null ? 'GPS' : 'VW');
+  const step5Via: StepVia = orides[4] != null ? 'ORIDE' : (gps.step5Gps != null ? 'GPS' : 'VW');
   return { result: out, step1Via, step2Via, step3Via, step4Via, step5Via };
 }
 
-/** Part 2: Decide which date (VWork or GPS) gets used in final. Steps 1–4: if GPS exists use GPS else VWork. Step 5: use GPS only if GPS < VWork step 5. */
+/** Part 2: Raw GPS times only (`stepNGps`). VWork merge, cleanup, orides happen in finalizeDerivedSteps. */
 function decideFinalSteps(candidates: FetchedGpsCandidates, job: JobForDerivedSteps): DerivedStepsResult {
   const result: DerivedStepsResult = {
-    step1: null, step2: null, step3: null, step4: null, step5: null,
-    step1TrackingId: null, step2TrackingId: null, step3TrackingId: null, step4TrackingId: null, step5TrackingId: null,
+    step1Gps: null,
+    step2Gps: null,
+    step3Gps: null,
+    step4Gps: null,
+    step5Gps: null,
+    step1: null,
+    step2: null,
+    step3: null,
+    step4: null,
+    step5: null,
+    step1TrackingId: null,
+    step2TrackingId: null,
+    step3TrackingId: null,
+    step4TrackingId: null,
+    step5TrackingId: null,
   };
   const vworkStep5 = (job.step_5_completed_at ?? job.actual_end_time) != null
     ? normalizeTimestampString((job.step_5_completed_at ?? job.actual_end_time) as string | Date)
     : null;
-  if (candidates.step1) { result.step1 = candidates.step1.value; result.step1TrackingId = candidates.step1.trackingId; }
-  if (candidates.step2) { result.step2 = candidates.step2.value; result.step2TrackingId = candidates.step2.trackingId; }
-  if (candidates.step3) { result.step3 = candidates.step3.value; result.step3TrackingId = candidates.step3.trackingId; }
-  if (candidates.step4) { result.step4 = candidates.step4.value; result.step4TrackingId = candidates.step4.trackingId; }
+  if (candidates.step1) {
+    result.step1Gps = candidates.step1.value;
+    result.step1TrackingId = candidates.step1.trackingId;
+  }
+  if (candidates.step2) {
+    result.step2Gps = candidates.step2.value;
+    result.step2TrackingId = candidates.step2.trackingId;
+  }
+  if (candidates.step3) {
+    result.step3Gps = candidates.step3.value;
+    result.step3TrackingId = candidates.step3.trackingId;
+  }
+  if (candidates.step4) {
+    result.step4Gps = candidates.step4.value;
+    result.step4TrackingId = candidates.step4.trackingId;
+  }
   if (candidates.step5 && vworkStep5 != null) {
     const gpsNorm = normalizeTimestampString(candidates.step5.value);
     if (gpsNorm != null && gpsNorm < vworkStep5) {
-      result.step5 = candidates.step5.value;
+      result.step5Gps = candidates.step5.value;
       result.step5TrackingId = candidates.step5.trackingId;
     }
   }
   return result;
+}
+
+/** Strip merged actuals so finalize re-runs resolve + cleanup (e.g. after Steps+). */
+export function toGpsLayerForFinalize(r: DerivedStepsResult): DerivedStepsResult {
+  return {
+    step1Gps: r.step1Gps,
+    step2Gps: r.step2Gps,
+    step3Gps: r.step3Gps,
+    step4Gps: r.step4Gps,
+    step5Gps: r.step5Gps,
+    step1: null,
+    step2: null,
+    step3: null,
+    step4: null,
+    step5: null,
+    step1TrackingId: r.step1TrackingId,
+    step2TrackingId: r.step2TrackingId,
+    step3TrackingId: r.step3TrackingId,
+    step4TrackingId: r.step4TrackingId,
+    step5TrackingId: r.step5TrackingId,
+    step2Via: r.step2Via,
+    step3Via: r.step3Via,
+  };
+}
+
+/**
+ * GPS + VWork merge, cleanup on actuals, orides. Call again after Steps+ updates `step2Gps`/`step3Gps`.
+ */
+export function finalizeDerivedSteps(gps: DerivedStepsResult, job: JobForDerivedSteps): DerivedStepsResult & {
+  step1Via: StepVia;
+  step2Via: StepVia;
+  step3Via: StepVia;
+  step4Via: StepVia;
+  step5Via: StepVia;
+  step1ActualOverride?: Step1CleanupOverride;
+} {
+  const actual = resolveActualFromGpsAndVwork(gps, job);
+  const beforeCleanup = actual.step1;
+  applyCleanupRules(actual, job);
+  const step1CleanupApplied =
+    normalizeTimestampString(beforeCleanup) !== normalizeTimestampString(actual.step1);
+  const step1ActualOverride: Step1CleanupOverride = step1CleanupApplied ? actual.step1 : null;
+  const { result, step1Via, step2Via, step3Via, step4Via, step5Via } = applyOrides(actual, job, gps, step1CleanupApplied);
+  return {
+    ...result,
+    step1Via,
+    step2Via,
+    step3Via,
+    step4Via,
+    step5Via,
+    step1ActualOverride: step1ActualOverride ?? undefined,
+  };
 }
 
 export async function deriveGpsStepsForJob(
@@ -462,8 +689,21 @@ export async function deriveGpsStepsForJob(
   options: DerivedStepsOptions
 ): Promise<DerivedStepsResultWithDebug> {
   const emptyResult: DerivedStepsResult = {
-    step1: null, step2: null, step3: null, step4: null, step5: null,
-    step1TrackingId: null, step2TrackingId: null, step3TrackingId: null, step4TrackingId: null, step5TrackingId: null,
+    step1Gps: null,
+    step2Gps: null,
+    step3Gps: null,
+    step4Gps: null,
+    step5Gps: null,
+    step1: null,
+    step2: null,
+    step3: null,
+    step4: null,
+    step5: null,
+    step1TrackingId: null,
+    step2TrackingId: null,
+    step3TrackingId: null,
+    step4TrackingId: null,
+    step5TrackingId: null,
   };
   const debug: DerivedStepsDebug = {
     jobId: String(job.job_id ?? ''),
@@ -478,11 +718,11 @@ export async function deriveGpsStepsForJob(
   };
   if (!options.device || !options.positionAfter) return { ...emptyResult, debug, step1ActualOverride: null };
   const candidates = await fetchGpsStepCandidates(job, options, debug);
-  const result = decideFinalSteps(candidates, job);
-  const { result: afterCleanup, step1ActualOverride } = applyCleanupRules(result, job);
-  const { result: afterOrides, step1Via, step2Via, step3Via, step4Via, step5Via } = applyOrides(afterCleanup, job, step1ActualOverride ?? null);
+  const gpsOnly = decideFinalSteps(candidates, job);
+  const finalized = finalizeDerivedSteps(gpsOnly, job);
+  const { step1Via, step2Via, step3Via, step4Via, step5Via, step1ActualOverride, ...rest } = finalized;
   return {
-    ...afterOrides,
+    ...rest,
     debug,
     step1ActualOverride: step1ActualOverride ?? undefined,
     step1Via,
