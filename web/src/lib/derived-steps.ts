@@ -38,11 +38,11 @@ export function normalizeTimestampString(s: string | Date | null): string | null
 export type FenceResolutionDebug = {
   type: 'Vineyard' | 'Winery';
   vworkName: string;
-  /** Rows from tbl_gpsmappings WHERE type = ... AND (vwname = vworkName OR gpsname = vworkName) */
+  /** Rows from tbl_gpsmappings matched case-insensitively on trimmed vwname/gpsname vs vwork name */
   mappingsFound: { vwname: string | null; gpsname: string | null }[];
-  /** List used in IN (...): [original vwork name, ...gpsnames from mappings] */
+  /** List passed to geofence resolve: [original vwork name, ...gpsnames from mappings] */
   fenceNamesInList: string[];
-  /** All fence_ids from tbl_geofences WHERE fence_name IN (...); we query tracking for any of these */
+  /** All fence_ids from tbl_geofences whose fence_name matches any list entry (case-insensitive, trimmed) */
   fenceIds: number[];
   /** Human-readable: fence_name per fence_id (for debug) */
   resolvedFenceNames: { fence_id: number; fence_name: string | null }[];
@@ -67,7 +67,11 @@ async function getFenceIdsForVworkNameWithDebug(
   }
 
   const mappings = await query<{ type: string; vwname: string | null; gpsname: string | null }>(
-    'SELECT type, vwname, gpsname FROM tbl_gpsmappings WHERE type = $1 AND (TRIM(vwname) = $2 OR TRIM(gpsname) = $2)',
+    `SELECT type, vwname, gpsname FROM tbl_gpsmappings WHERE type = $1
+     AND (
+       LOWER(TRIM(COALESCE(vwname,''))) = LOWER(TRIM($2::text))
+       OR LOWER(TRIM(COALESCE(gpsname,''))) = LOWER(TRIM($2::text))
+     )`,
     [type, vworkName.trim()]
   );
 
@@ -82,13 +86,24 @@ async function getFenceIdsForVworkNameWithDebug(
 
   if (names.length === 0) return { fenceIds: [], debug };
   const rows = await query<{ fence_id: number | string; fence_name: string | null }>(
-    'SELECT fence_id, fence_name FROM tbl_geofences WHERE fence_name = ANY($1::text[])',
+    `SELECT fence_id, fence_name FROM tbl_geofences g
+     WHERE EXISTS (
+       SELECT 1 FROM unnest($1::text[]) AS n(nm)
+       WHERE nm IS NOT NULL AND TRIM(nm) <> ''
+         AND LOWER(TRIM(COALESCE(g.fence_name,''))) = LOWER(TRIM(nm))
+     )`,
     [names]
   );
   debug.resolvedFenceNames = rows.map((r) => ({ fence_id: Number(r.fence_id), fence_name: r.fence_name }));
   debug.fenceIds = rows.map((r) => Number(r.fence_id));
 
   return { fenceIds: debug.fenceIds, debug };
+}
+
+/** Job vineyard fence_ids (tbl_geofences) for GPS* / Steps+ alien-fence checks. */
+export async function getVineyardFenceIdsForVworkName(vineyardName: string): Promise<number[]> {
+  const { fenceIds } = await getFenceIdsForVworkNameWithDebug('Vineyard', vineyardName.trim());
+  return fenceIds;
 }
 
 export type TrackingLookupDebug = {
@@ -179,6 +194,246 @@ async function getFirstTrackingInWindowWithDebug(
   return { value, trackingId: trackingIdSafe, debug };
 }
 
+/** Max vineyard EXIT→ENTER same-fence aggregations for step 3 (GPS*); further same-vineyard pairs are ignored. */
+const MAX_GPS_STAR_LOOPS = 3;
+
+type FenceEventRow = {
+  id: number;
+  geofenceId: number;
+  geofenceType: 'ENTER' | 'EXIT';
+  timeNorm: string;
+};
+
+/** All ENTER/EXIT rows in the tracking window, ordered by time (for GPS* step-3 aggregation only). */
+async function listFenceEnterExitEventsInWindow(
+  device: string,
+  positionAfter: string,
+  positionBefore: string | null
+): Promise<FenceEventRow[]> {
+  const rawAfter = normalizeTimestampString(positionAfter) ?? String(positionAfter).trim().slice(0, 19);
+  const rawBefore = positionBefore ? (normalizeTimestampString(positionBefore) ?? String(positionBefore).trim().slice(0, 19)) : null;
+  const params: unknown[] = [device, rawAfter];
+  let cond = 't.position_time_nz > $2';
+  if (rawBefore) {
+    params.push(rawBefore);
+    cond += ' AND t.position_time_nz < $3';
+  }
+  const rows = await query<{ id: unknown; geofence_id: unknown; geofence_type: string | null; position_time_nz: unknown }>(
+    `SELECT t.id, t.geofence_id, t.geofence_type,
+            to_char(t.position_time_nz, 'YYYY-MM-DD HH24:MI:SS') AS position_time_nz
+     FROM tbl_tracking t
+     WHERE t.device_name = $1 AND t.geofence_type IN ('ENTER','EXIT') AND ${cond}
+     ORDER BY t.position_time_nz ASC, t.id ASC`,
+    params
+  );
+  const out: FenceEventRow[] = [];
+  for (const r of rows) {
+    const gt = (r.geofence_type ?? '').trim().toUpperCase();
+    if (gt !== 'ENTER' && gt !== 'EXIT') continue;
+    const timeNorm = normalizeTimestampString(String(r.position_time_nz ?? ''));
+    if (!timeNorm) continue;
+    const rawId = r.id;
+    const id =
+      rawId != null && typeof rawId === 'number'
+        ? rawId
+        : rawId != null && (typeof rawId === 'string' || typeof rawId === 'bigint')
+          ? Number(rawId)
+          : NaN;
+    if (!Number.isFinite(id)) continue;
+    const gid = Number(r.geofence_id);
+    if (!Number.isFinite(gid)) continue;
+    out.push({ id, geofenceId: gid, geofenceType: gt as 'ENTER' | 'EXIT', timeNorm });
+  }
+  return out;
+}
+
+/** True if any ENTER/EXIT on a geofence outside `vineyardSet` lies strictly between the two times. */
+function hasNonVineyardEnterExitBetween(
+  events: FenceEventRow[],
+  vineyardSet: Set<number>,
+  timeAfterExclusive: string,
+  timeBeforeExclusive: string
+): boolean {
+  const tLo = normalizeTimestampString(timeAfterExclusive);
+  const tHi = normalizeTimestampString(timeBeforeExclusive);
+  if (!tLo || !tHi || tLo >= tHi) return false;
+  for (const e of events) {
+    if (e.timeNorm <= tLo) continue;
+    if (e.timeNorm >= tHi) break;
+    if (!vineyardSet.has(e.geofenceId)) return true;
+  }
+  return false;
+}
+
+/**
+ * Optionally move step 3 from first vineyard EXIT to a later EXIT after up to MAX_GPS_STAR_LOOPS
+ * same-vineyard re-entries. Any non-vineyard ENTER/EXIT between consecutive anchors voids GPS*.
+ */
+function tryGpsStarVineyardExit(
+  events: FenceEventRow[],
+  vineyardFenceIds: number[],
+  step2: GpsStepCandidate,
+  step3: GpsStepCandidate,
+  positionBefore: string | null
+): { step3: GpsStepCandidate; usedGpsStar: boolean } {
+  const vineyardSet = new Set(vineyardFenceIds.map((n) => Number(n)));
+  const e1Norm = normalizeTimestampString(step2.value);
+  const x1Norm = normalizeTimestampString(step3.value);
+  if (!e1Norm || !x1Norm) return { step3, usedGpsStar: false };
+
+  const step2Idx = events.findIndex((e) => e.id === step2.trackingId);
+  if (step2Idx < 0) return { step3, usedGpsStar: false };
+
+  if (hasNonVineyardEnterExitBetween(events, vineyardSet, e1Norm, x1Norm)) {
+    return { step3, usedGpsStar: false };
+  }
+
+  let candTime = x1Norm;
+  let candId: number | null = step3.trackingId;
+  let candIdx = events.findIndex(
+    (e) =>
+      e.id === step3.trackingId &&
+      e.geofenceType === 'EXIT' &&
+      vineyardSet.has(e.geofenceId) &&
+      e.timeNorm === x1Norm
+  );
+  if (candIdx < 0) {
+    candIdx = events.findIndex(
+      (e) =>
+        e.geofenceType === 'EXIT' &&
+        vineyardSet.has(e.geofenceId) &&
+        e.timeNorm === x1Norm &&
+        e.timeNorm > e1Norm
+    );
+  }
+  if (candIdx < 0) return { step3, usedGpsStar: false };
+
+  const hiBound = positionBefore ? normalizeTimestampString(positionBefore) : null;
+  let usedGpsStar = false;
+
+  for (let loop = 0; loop < MAX_GPS_STAR_LOOPS; loop++) {
+    let enterJ = -1;
+    let j = candIdx + 1;
+    for (; j < events.length; j++) {
+      const e = events[j];
+      if (hiBound != null && e.timeNorm >= hiBound) {
+        enterJ = -1;
+        break;
+      }
+      if (!vineyardSet.has(e.geofenceId)) {
+        enterJ = -2;
+        break;
+      }
+      if (e.geofenceType === 'ENTER') {
+        enterJ = j;
+        break;
+      }
+      enterJ = -3;
+      break;
+    }
+    if (enterJ < 0) break;
+
+    if (hasNonVineyardEnterExitBetween(events, vineyardSet, candTime, events[enterJ].timeNorm)) break;
+
+    let exitJ = -1;
+    for (let k = enterJ + 1; k < events.length; k++) {
+      const e = events[k];
+      if (hiBound != null && e.timeNorm >= hiBound) break;
+      if (!vineyardSet.has(e.geofenceId)) {
+        exitJ = -2;
+        break;
+      }
+      if (e.geofenceType === 'EXIT') {
+        exitJ = k;
+        break;
+      }
+      exitJ = -3;
+      break;
+    }
+    if (exitJ < 0) break;
+
+    if (hasNonVineyardEnterExitBetween(events, vineyardSet, events[enterJ].timeNorm, events[exitJ].timeNorm)) break;
+
+    candTime = events[exitJ].timeNorm;
+    candId = events[exitJ].id;
+    candIdx = exitJ;
+    usedGpsStar = true;
+  }
+
+  if (!usedGpsStar) return { step3, usedGpsStar: false };
+  return {
+    step3: { value: candTime, trackingId: Number.isFinite(candId as number) ? (candId as number) : null },
+    usedGpsStar: true,
+  };
+}
+
+/** Steps+ buffered segment shape (from runStepsPlusQuery); fence_name optional for sorting only. */
+export type StepsPlusBufferedSegment = {
+  enter_time: string;
+  exit_time: string;
+  fence_name?: string;
+};
+
+/**
+ * Merge multiple Steps+ inside-segments (driver just outside buffer, re-enters same vineyard buffer):
+ * first segment's enter_time, last merged segment's exit_time, up to MAX_GPS_STAR_LOOPS re-entries.
+ * Same alien-fence rule as GPS*: any ENTER/EXIT on a geofence not in `vineyardFenceIds` strictly between
+ * a segment exit and the next segment enter voids further merging.
+ */
+export async function aggregateStepsPlusBufferedSegments(
+  segments: StepsPlusBufferedSegment[],
+  device: string,
+  positionAfter: string,
+  positionBefore: string | null,
+  vineyardFenceIds: number[]
+): Promise<{ enter: string; exit: string; usedGpsStarMerge: boolean }> {
+  if (segments.length === 0) {
+    return { enter: '', exit: '', usedGpsStarMerge: false };
+  }
+  const sorted = [...segments].sort((a, b) => {
+    const ea = normalizeTimestampString(a.enter_time) ?? '';
+    const eb = normalizeTimestampString(b.enter_time) ?? '';
+    const c = ea.localeCompare(eb);
+    if (c !== 0) return c;
+    const xa = normalizeTimestampString(a.exit_time) ?? '';
+    const xb = normalizeTimestampString(b.exit_time) ?? '';
+    return xa.localeCompare(xb);
+  });
+  const e0 = normalizeTimestampString(sorted[0].enter_time);
+  const x0 = normalizeTimestampString(sorted[0].exit_time);
+  if (!e0 || !x0) {
+    return {
+      enter: sorted[0].enter_time,
+      exit: sorted[0].exit_time,
+      usedGpsStarMerge: false,
+    };
+  }
+  if (vineyardFenceIds.length === 0 || sorted.length === 1) {
+    return { enter: e0, exit: x0, usedGpsStarMerge: false };
+  }
+
+  const events = await listFenceEnterExitEventsInWindow(device, positionAfter, positionBefore);
+  const vineyardSet = new Set(vineyardFenceIds.map((n) => Number(n)));
+  let candidateExit = x0;
+  let segIdx = 0;
+  let usedGpsStarMerge = false;
+
+  for (let loop = 0; loop < MAX_GPS_STAR_LOOPS; loop++) {
+    if (segIdx + 1 >= sorted.length) break;
+    const nextEnter = normalizeTimestampString(sorted[segIdx + 1].enter_time);
+    if (!nextEnter) break;
+    if (candidateExit >= nextEnter) break;
+    if (hasNonVineyardEnterExitBetween(events, vineyardSet, candidateExit, nextEnter)) break;
+    segIdx += 1;
+    const xn = normalizeTimestampString(sorted[segIdx].exit_time);
+    if (!xn) break;
+    candidateExit = xn;
+    usedGpsStarMerge = true;
+  }
+
+  return { enter: e0, exit: candidateExit, usedGpsStarMerge };
+}
+
 export type JobForDerivedSteps = {
   job_id: unknown;
   vineyard_name?: string | null;
@@ -213,9 +468,11 @@ export type FetchedGpsCandidates = {
   step3: GpsStepCandidate | null;
   step4: GpsStepCandidate | null;
   step5: GpsStepCandidate | null;
+  /** Step 3 used GPS* vineyard re-exit aggregation (tbl_vworkjobs.step_3_via / calcnotes). */
+  step3GpsStar?: boolean;
 };
 
-export type StepVia = 'GPS' | 'VW' | 'RULE' | 'ORIDE' | 'VineFence+';
+export type StepVia = 'GPS' | 'VW' | 'RULE' | 'ORIDE' | 'VineFence+' | 'GPS*';
 
 export type DerivedStepsResult = {
   /** Raw GPS times from tbl_tracking (Step_N_GPS_completed_at). */
@@ -257,6 +514,8 @@ export type DerivedStepsDebug = {
     step4?: TrackingLookupDebug;
     step5?: TrackingLookupDebug; // Winery EXIT after step 4, before job end = GPS job end
   };
+  /** Step 3 extended via same-vineyard re-entry smoothing (GPS*). */
+  step3GpsStar?: boolean;
 };
 
 /** After cleanup: when step1 vwork > step2 gps we set step1_actual = step2_gps - travel_min (step4−step3); Via = RULE. */
@@ -291,6 +550,9 @@ export type DerivedStepsOptions = {
  *   - May be absent if the job started after the driver had already left the winery fence.
  * Step 2 — Arrive vineyard: First Vineyard ENTER in window.
  * Step 3 — Leave vineyard: First Vineyard EXIT after step 2 (so we don't pick an earlier exit before the enter).
+ *   GPS* (optional): If the driver briefly exits and re-enters the same vineyard fence set with no other fence
+ *   ENTER/EXIT between, aggregate up to 3 such loops; step 3 becomes the last EXIT in the chain. Any alien fence
+ *   event voids GPS* for that job (revert to first exit only). Marked step3Via = GPS* and calcnotes GPS*:.
  * Step 4 — Arrive winery (return leg): First mapped Winery ENTER with position_time_nz strictly &gt; max(GPS step1, step2, step3) among non-null steps (first re-entry after vineyard steps 2–3; step 1 included so we do not pick an ENTER before the morning exit), and strictly &lt; data window end (positionBefore). If steps 1–3 are all absent, lower bound is positionAfter.
  * Step 5 — Job end by GPS: VWork step 5 = step_5_completed_at (job completed in system). Only use GPS when Winery EXIT is strictly < VWork step 5 (gpsNorm < vworkStep5). IF VWork step 5 > step 4, AND we have a Winery EXIT that is > step 4, within the data window, and < VWork step 5, we use that Winery EXIT (driver left winery after returning from vineyard and forgot to end job). We take the FIRST such Winery EXIT (not the last), so we get the “forgot to end” exit, not the exit at job end. Search window capped at job end and at positionBefore (data window). In most jobs this does not apply (step5 null).
  *
@@ -380,6 +642,52 @@ function applyGpsGuardrails(candidates: FetchedGpsCandidates, job: JobForDerived
   if (candidates.step4 == null && candidates.step5 != null) {
     candidates.step5 = null;
   }
+  if (candidates.step3 == null) {
+    delete candidates.step3GpsStar;
+  }
+}
+
+/**
+ * Winery steps 4–5: first mapped Winery ENTER after max(step1..3), then first Winery EXIT before VWork job end
+ * (same SQL rules as fetchGpsStepCandidates). Updates debug.winery.step4 / step5.
+ */
+async function fetchWineryStep4And5ForValues(
+  job: JobForDerivedSteps,
+  options: DerivedStepsOptions,
+  debug: DerivedStepsDebug,
+  truckId: string,
+  wineryFenceIds: number[],
+  step1Value: string | null,
+  step2Value: string | null,
+  step3Value: string | null
+): Promise<{ step4: GpsStepCandidate | null; step5: GpsStepCandidate | null }> {
+  const { positionAfter, positionBefore } = options;
+  if (wineryFenceIds.length === 0) {
+    return { step4: null, step5: null };
+  }
+  const step4LowerBound = maxTimestampString(step1Value, step2Value, step3Value) ?? positionAfter;
+  const step4Result = await getFirstTrackingInWindowWithDebug(truckId, step4LowerBound, positionBefore, wineryFenceIds, 'ENTER');
+  debug.winery.step4 = step4Result.debug;
+  let step4: GpsStepCandidate | null = null;
+  if (step4Result.value != null) {
+    step4 = { value: step4Result.value, trackingId: step4Result.trackingId };
+  }
+  const step4Value = step4?.value ?? null;
+  const vworkStep5 =
+    (job.step_5_completed_at ?? job.actual_end_time) != null
+      ? normalizeTimestampString((job.step_5_completed_at ?? job.actual_end_time) as string | Date)
+      : null;
+  const step5WindowEnd =
+    vworkStep5 != null ? (positionBefore != null && positionBefore < vworkStep5 ? positionBefore : vworkStep5) : positionBefore;
+  let step5: GpsStepCandidate | null = null;
+  if (step4Value != null && vworkStep5 != null && step5WindowEnd != null && vworkStep5 > step4Value) {
+    const step5Result = await getFirstTrackingInWindowWithDebug(truckId, step4Value, step5WindowEnd, wineryFenceIds, 'EXIT', false);
+    debug.winery.step5 = step5Result.debug;
+    if (step5Result.value != null) {
+      step5 = { value: step5Result.value, trackingId: step5Result.trackingId };
+    }
+  }
+  return { step4, step5 };
 }
 
 /** Part 1: Fetch GPS candidates for each step (winery/vineyard, ENTER/EXIT). No decision — just lookups. */
@@ -394,7 +702,6 @@ async function fetchGpsStepCandidates(
   const deliveryWinery = job.delivery_winery ? String(job.delivery_winery).trim() : '';
   let step2Value: string | null = null;
   let step3Value: string | null = null;
-  let step4Value: string | null = null;
 
   if (vineyardName) {
     const { fenceIds: vineyardFenceIds, debug: vineyardDebug } = await getFenceIdsForVworkNameWithDebug('Vineyard', vineyardName);
@@ -410,6 +717,15 @@ async function fetchGpsStepCandidates(
       step3Value = step3Result.value;
       debug.vineyard.step3 = step3Result.debug;
       if (step3Result.value != null) candidates.step3 = { value: step3Result.value, trackingId: step3Result.trackingId };
+      if (candidates.step2 != null && candidates.step3 != null) {
+        const eventRows = await listFenceEnterExitEventsInWindow(truckId, positionAfter, positionBefore);
+        const star = tryGpsStarVineyardExit(eventRows, vineyardFenceIds, candidates.step2, candidates.step3, positionBefore);
+        candidates.step3 = star.step3;
+        if (star.usedGpsStar) {
+          candidates.step3GpsStar = true;
+          debug.step3GpsStar = true;
+        }
+      }
     }
   }
 
@@ -425,24 +741,24 @@ async function fetchGpsStepCandidates(
         candidates.step1 = { value: step1Result.value, trackingId: step1Result.trackingId };
         step1Value = step1Result.value;
       }
-      const step4LowerBound =
-        maxTimestampString(step1Value, step2Value, step3Value) ?? positionAfter;
-      const step4Result = await getFirstTrackingInWindowWithDebug(truckId, step4LowerBound, positionBefore, wineryFenceIds, 'ENTER');
-      step4Value = step4Result.value;
-      debug.winery.step4 = step4Result.debug;
-      if (step4Result.value != null) candidates.step4 = { value: step4Result.value, trackingId: step4Result.trackingId };
-      const vworkStep5 = (job.step_5_completed_at ?? job.actual_end_time) != null
-        ? normalizeTimestampString((job.step_5_completed_at ?? job.actual_end_time) as string | Date)
-        : null;
-      const step5WindowEnd = vworkStep5 != null ? (positionBefore != null && positionBefore < vworkStep5 ? positionBefore : vworkStep5) : positionBefore;
-      if (step4Value != null && vworkStep5 != null && step5WindowEnd != null && vworkStep5 > step4Value) {
-        const step5Result = await getFirstTrackingInWindowWithDebug(truckId, step4Value, step5WindowEnd, wineryFenceIds, 'EXIT', false);
-        debug.winery.step5 = step5Result.debug;
-        if (step5Result.value != null) candidates.step5 = { value: step5Result.value, trackingId: step5Result.trackingId };
-      }
+      const { step4, step5 } = await fetchWineryStep4And5ForValues(
+        job,
+        options,
+        debug,
+        truckId,
+        wineryFenceIds,
+        step1Value,
+        step2Value,
+        step3Value
+      );
+      if (step4 != null) candidates.step4 = step4;
+      if (step5 != null) candidates.step5 = step5;
     }
   }
   applyGpsGuardrails(candidates, job);
+  if (!candidates.step3GpsStar) {
+    delete debug.step3GpsStar;
+  }
   return candidates;
 }
 
@@ -578,7 +894,15 @@ function applyOrides(
   const step2Via: StepVia =
     orides[1] != null ? 'ORIDE' : gps.step2Via === 'VineFence+' ? 'VineFence+' : (gps.step2Gps != null ? 'GPS' : 'VW');
   const step3Via: StepVia =
-    orides[2] != null ? 'ORIDE' : gps.step3Via === 'VineFence+' ? 'VineFence+' : (gps.step3Gps != null ? 'GPS' : 'VW');
+    orides[2] != null
+      ? 'ORIDE'
+      : gps.step3Via === 'VineFence+'
+        ? 'VineFence+'
+        : gps.step3Via === 'GPS*'
+          ? 'GPS*'
+          : gps.step3Gps != null
+            ? 'GPS'
+            : 'VW';
   const step4Via: StepVia = orides[3] != null ? 'ORIDE' : (gps.step4Gps != null ? 'GPS' : 'VW');
   const step5Via: StepVia = orides[4] != null ? 'ORIDE' : (gps.step5Gps != null ? 'GPS' : 'VW');
   return { result: out, step1Via, step2Via, step3Via, step4Via, step5Via };
@@ -618,6 +942,9 @@ function decideFinalSteps(candidates: FetchedGpsCandidates, job: JobForDerivedSt
     result.step3Gps = candidates.step3.value;
     result.step3TrackingId = candidates.step3.trackingId;
   }
+  if (candidates.step3GpsStar) {
+    result.step3Via = 'GPS*';
+  }
   if (candidates.step4) {
     result.step4Gps = candidates.step4.value;
     result.step4TrackingId = candidates.step4.trackingId;
@@ -630,6 +957,51 @@ function decideFinalSteps(candidates: FetchedGpsCandidates, job: JobForDerivedSt
     }
   }
   return result;
+}
+
+/**
+ * After VineFence+ (Steps+) sets vineyard enter/exit, re-query winery steps 4–5 so the max(step1–3) floor uses
+ * those times (not step 4/5 from the first pass with missing or fence-only step 2/3).
+ */
+export async function deriveGpsLayerAfterVineFencePlus(
+  job: JobForDerivedSteps,
+  options: DerivedStepsOptions,
+  step123: {
+    step1: GpsStepCandidate | null;
+    step2: GpsStepCandidate | null;
+    step3: GpsStepCandidate | null;
+  },
+  debug: DerivedStepsDebug
+): Promise<DerivedStepsResult> {
+  const truckId = options.device;
+  const deliveryWinery = job.delivery_winery ? String(job.delivery_winery).trim() : '';
+  const candidates: FetchedGpsCandidates = {
+    step1: step123.step1,
+    step2: step123.step2,
+    step3: step123.step3,
+    step4: null,
+    step5: null,
+  };
+  if (deliveryWinery) {
+    const { fenceIds: wineryFenceIds, debug: wineryDebug } = await getFenceIdsForVworkNameWithDebug('Winery', deliveryWinery);
+    Object.assign(debug.winery, wineryDebug);
+    if (wineryFenceIds.length > 0) {
+      const { step4, step5 } = await fetchWineryStep4And5ForValues(
+        job,
+        options,
+        debug,
+        truckId,
+        wineryFenceIds,
+        step123.step1?.value ?? null,
+        step123.step2?.value ?? null,
+        step123.step3?.value ?? null
+      );
+      if (step4 != null) candidates.step4 = step4;
+      if (step5 != null) candidates.step5 = step5;
+    }
+  }
+  applyGpsGuardrails(candidates, job);
+  return decideFinalSteps(candidates, job);
 }
 
 /** Strip merged actuals so finalize re-runs resolve + cleanup (e.g. after Steps+). */

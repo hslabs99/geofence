@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server';
+import { execute } from '@/lib/db';
 
 export async function POST() {
   const base = process.env.IMPORT_SERVICE_URL ?? 'http://localhost:8080';
@@ -26,6 +27,24 @@ export async function POST() {
         { status: res.status }
       );
     }
+
+    try {
+      await execute(
+        'INSERT INTO tbl_logs (logtype, logcat1, logcat2, logdetails) VALUES ($1, $2, $3, $4)',
+        [
+          'AutoRun',
+          'vwork-import',
+          'manual',
+          JSON.stringify({
+            ok: true,
+            resultsCount: Array.isArray(data.results) ? data.results.length : 0,
+          }),
+        ]
+      );
+    } catch (logErr) {
+      console.error('[run-vwork] Failed to write tbl_logs:', logErr);
+    }
+
     return NextResponse.json(data);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

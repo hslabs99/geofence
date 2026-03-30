@@ -5,6 +5,8 @@ import { getClient } from '@/lib/db';
 
 const HK_ENDPOINT = 'hk';
 
+const DATE_API_CONCURRENCY = 6;
+
 /** Take first, middle, and last point that day for the 3 checks. */
 function firstMiddleLast<T>(arr: T[]): [T, T, T] {
   if (arr.length === 0) throw new Error('empty');
@@ -30,9 +32,79 @@ function dateRange(from: string, to: string): string[] {
   return out;
 }
 
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let nextIndex = 0;
+  async function worker() {
+    while (true) {
+      const i = nextIndex++;
+      if (i >= items.length) break;
+      results[i] = await fn(items[i], i);
+    }
+  }
+  const n = Math.max(1, Math.min(limit, items.length || 1));
+  await Promise.all(Array.from({ length: n }, () => worker()));
+  return results;
+}
+
+/**
+ * Count, min/max position_time, and whether exact first/last API times exist in tbl_tracking.
+ * Must be called with client that has SET LOCAL timezone = 'UTC'.
+ */
+async function getTrackingStatsAndPresence(
+  client: PoolClient,
+  deviceName: string,
+  beginStr: string,
+  endStr: string,
+  firstTime: string,
+  lastTime: string
+): Promise<{
+  count: number;
+  minTime: string | null;
+  maxTime: string | null;
+  firstOk: boolean;
+  lastOk: boolean;
+}> {
+  const res = await client.query(
+    `SELECT
+       COUNT(*)::bigint AS cnt,
+       MIN(position_time)::text AS min_t,
+       MAX(position_time)::text AS max_t,
+       EXISTS (
+         SELECT 1 FROM tbl_tracking t
+         WHERE t.device_name = $1 AND t.position_time = $4::timestamp
+         LIMIT 1
+       ) AS has_first,
+       EXISTS (
+         SELECT 1 FROM tbl_tracking t
+         WHERE t.device_name = $1 AND t.position_time = $5::timestamp
+         LIMIT 1
+       ) AS has_last
+     FROM tbl_tracking
+     WHERE device_name = $1 AND position_time >= $2::timestamp AND position_time <= $3::timestamp`,
+    [deviceName.trim(), beginStr.trim(), endStr.trim(), firstTime.trim(), lastTime.trim()]
+  );
+  const row = res.rows[0] as
+    | { cnt: string; min_t: string | null; max_t: string | null; has_first: boolean; has_last: boolean }
+    | undefined;
+  if (!row) {
+    return { count: 0, minTime: null, maxTime: null, firstOk: false, lastOk: false };
+  }
+  return {
+    count: parseInt(row.cnt, 10),
+    minTime: row.min_t?.trim() || null,
+    maxTime: row.max_t?.trim() || null,
+    firstOk: row.has_first === true,
+    lastOk: row.has_last === true,
+  };
+}
+
 /**
  * Check if tbl_tracking has a row with exact device_name and position_time.
- * We compare API JSON gpsTime (position_time) to tbl_tracking.position_time only — NOT position_time_nz.
  * Must be called with same client that has SET LOCAL timezone = 'UTC'.
  */
 async function hasPositionInTracking(
@@ -49,31 +121,6 @@ async function hasPositionInTracking(
   return (res.rows[0] as { found?: number } | undefined)?.found === 1;
 }
 
-/**
- * Count and min/max position_time in tbl_tracking for device in UTC day [begin, end].
- * Must be called with same client that has SET LOCAL timezone = 'UTC'.
- */
-async function getTrackingStatsForDeviceDay(
-  client: PoolClient,
-  deviceName: string,
-  beginStr: string,
-  endStr: string
-): Promise<{ count: number; minTime: string | null; maxTime: string | null }> {
-  const res = await client.query(
-    `SELECT COUNT(*) AS cnt, MIN(position_time)::text AS min_t, MAX(position_time)::text AS max_t
-     FROM tbl_tracking
-     WHERE device_name = $1 AND position_time >= $2::timestamp AND position_time <= $3::timestamp`,
-    [deviceName.trim(), beginStr.trim(), endStr.trim()]
-  );
-  const row = res.rows[0] as { cnt: string; min_t: string | null; max_t: string | null } | undefined;
-  if (!row) return { count: 0, minTime: null, maxTime: null };
-  return {
-    count: parseInt(row.cnt, 10),
-    minTime: row.min_t?.trim() || null,
-    maxTime: row.max_t?.trim() || null,
-  };
-}
-
 export type GpsIntegrityLogEntry = {
   date: string;
   device: string;
@@ -81,7 +128,7 @@ export type GpsIntegrityLogEntry = {
   sampleTimes: string[];
 };
 
-/** Cell for grid: one per (date, device). Three checks: 1st time, last time, row count (API vs tbl_tracking). dbFirstTime/dbLastTime = min/max in DB for red display. */
+/** Cell for grid: one per (date, device). Three checks: 1st time, last time, row count (API vs tbl_tracking). */
 export type GpsIntegrityCell =
   | { status: 'no_data' }
   | {
@@ -97,11 +144,48 @@ export type GpsIntegrityCell =
       dbLastTime: string | null;
     };
 
+/** Rows = devices, columns = dates (cells[i] aligns with dates[i]). */
 export type GpsIntegrityGridResponse = {
   dates: string[];
   devices: string[];
-  rows: Array<{ date: string; cells: GpsIntegrityCell[] }>;
+  rows: Array<{ device: string; cells: GpsIntegrityCell[] }>;
 };
+
+async function buildCellForDeviceDate(
+  client: PoolClient,
+  token: string,
+  imeiByDevice: Record<string, string>,
+  deviceName: string,
+  date: string
+): Promise<GpsIntegrityCell> {
+  const imei = imeiByDevice[deviceName];
+  if (!imei) return { status: 'no_data' };
+
+  const { begin, end } = getDayRangeUTC(date);
+  const trackResult = await getTrackForDevice(token, imei, begin, end, HK_ENDPOINT);
+  const points = trackResult.points ?? [];
+  if (points.length < 1) return { status: 'no_data' };
+
+  const firstTime = String(points[0].gpsTime ?? '').trim();
+  const lastTime = String(points[points.length - 1].gpsTime ?? '').trim();
+  if (!firstTime || !lastTime) return { status: 'no_data' };
+
+  const stats = await getTrackingStatsAndPresence(client, deviceName, begin, end, firstTime, lastTime);
+  const apiCount = points.length;
+  const dbCount = stats.count;
+  return {
+    status: 'data',
+    firstOk: stats.firstOk,
+    lastOk: stats.lastOk,
+    countOk: apiCount === dbCount,
+    firstTime,
+    lastTime,
+    apiCount,
+    dbCount,
+    dbFirstTime: stats.minTime,
+    dbLastTime: stats.maxTime,
+  };
+}
 
 /** GET: Return list of device names from HK endpoint (for manual device selection). */
 export async function GET() {
@@ -126,9 +210,8 @@ export async function GET() {
 
 /**
  * POST: Two modes.
- * - grid: true → rows = dates, columns = all devices; each cell = 1st row gpsTime checked vs tbl_tracking.position_time. Returns { dates, devices, rows }.
- * - else → legacy log: first device with data per date, 3 samples (1st/middle/last). Returns { log }.
- * Body: dateFrom, dateTo (required), deviceName (optional, legacy), grid (optional boolean).
+ * - grid: true → rows = devices, columns = dates; stream: true → NDJSON lines (meta, deviceRow × N, done).
+ * - else → legacy log.
  */
 export async function POST(request: Request) {
   try {
@@ -137,11 +220,13 @@ export async function POST(request: Request) {
       dateTo?: string;
       deviceName?: string;
       grid?: boolean;
+      stream?: boolean;
     };
     const dateFrom = (body?.dateFrom ?? '').trim();
     const dateTo = (body?.dateTo ?? '').trim();
     const deviceFilter = (body?.deviceName ?? '').trim();
     const isGrid = body?.grid === true;
+    const wantStream = body?.stream === true;
 
     if (!dateFrom || !dateTo) {
       return NextResponse.json(
@@ -177,61 +262,56 @@ export async function POST(request: Request) {
       );
     }
 
+    if (isGrid && wantStream) {
+      const encoder = new TextEncoder();
+      const token = tokenResult.token;
+      const stream = new ReadableStream({
+        async start(controller) {
+          const send = (obj: unknown) => {
+            controller.enqueue(encoder.encode(`${JSON.stringify(obj)}\n`));
+          };
+          const client = await getClient();
+          try {
+            await client.query("SET LOCAL timezone = 'UTC'");
+            send({ type: 'meta', dates, devices: deviceNames });
+            for (const deviceName of deviceNames) {
+              const cells = await mapWithConcurrency(dates, DATE_API_CONCURRENCY, (date) =>
+                buildCellForDeviceDate(client, token, imeiByDevice, deviceName, date)
+              );
+              send({ type: 'deviceRow', device: deviceName, cells });
+            }
+            send({ type: 'done' });
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            console.error('[gps-integrity stream]', message);
+            send({ type: 'error', message });
+          } finally {
+            client.release();
+            controller.close();
+          }
+        },
+      });
+      return new Response(stream, {
+        headers: {
+          'Content-Type': 'application/x-ndjson; charset=utf-8',
+          'Cache-Control': 'no-store',
+        },
+      });
+    }
+
     const client = await getClient();
 
     try {
       await client.query("SET LOCAL timezone = 'UTC'");
 
       if (isGrid) {
-        const rows: Array<{ date: string; cells: GpsIntegrityCell[] }> = [];
-        for (const date of dates) {
-          const { begin, end } = getDayRangeUTC(date);
-          const cells: GpsIntegrityCell[] = [];
-          for (const deviceName of deviceNames) {
-            const imei = imeiByDevice[deviceName];
-            if (!imei) {
-              cells.push({ status: 'no_data' });
-              continue;
-            }
-            const trackResult = await getTrackForDevice(
-              tokenResult.token,
-              imei,
-              begin,
-              end,
-              HK_ENDPOINT
-            );
-            const points = trackResult.points ?? [];
-            if (points.length < 1) {
-              cells.push({ status: 'no_data' });
-              continue;
-            }
-            const firstTime = String(points[0].gpsTime ?? '').trim();
-            const lastTime = String(points[points.length - 1].gpsTime ?? '').trim();
-            if (!firstTime || !lastTime) {
-              cells.push({ status: 'no_data' });
-              continue;
-            }
-            const stats = await getTrackingStatsForDeviceDay(client, deviceName, begin, end);
-            const [firstOk, lastOk] = await Promise.all([
-              hasPositionInTracking(client, deviceName, firstTime),
-              hasPositionInTracking(client, deviceName, lastTime),
-            ]);
-            const apiCount = points.length;
-            const dbCount = stats.count;
-            cells.push({
-              status: 'data',
-              firstOk,
-              lastOk,
-              countOk: apiCount === dbCount,
-              firstTime,
-              lastTime,
-              apiCount,
-              dbCount,
-              dbFirstTime: stats.minTime,
-              dbLastTime: stats.maxTime,
-            });
-          }
-          rows.push({ date, cells });
+        const rows: Array<{ device: string; cells: GpsIntegrityCell[] }> = [];
+        const token = tokenResult.token;
+        for (const deviceName of deviceNames) {
+          const cells = await mapWithConcurrency(dates, DATE_API_CONCURRENCY, (date) =>
+            buildCellForDeviceDate(client, token, imeiByDevice, deviceName, date)
+          );
+          rows.push({ device: deviceName, cells });
         }
         return NextResponse.json({
           dates,

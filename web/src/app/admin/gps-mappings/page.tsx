@@ -29,6 +29,8 @@ type Options = {
   trackingCountByFenceId?: Record<number, number>;
   deliveryWineries: string[];
   vineyardNames: string[];
+  /** Count of tbl_vworkjobs rows per vineyard_name (same key as vineyardNames entries) */
+  vineyardJobCounts?: Record<string, number>;
 };
 
 const TYPE_OPTIONS = ['Winery', 'Vineyard'] as const;
@@ -762,23 +764,29 @@ export default function GpsMappingsPage() {
             )}
           </div>
 
-          {/* Distinct vineyard_name from tbl_vworkjobs */}
-          <div className="min-w-0 flex-shrink-0 rounded-lg border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900 lg:w-56">
+          {/* Distinct vineyard_name from tbl_vworkjobs (+50% width vs delivery_winery column) */}
+          <div className="min-w-0 flex-shrink-0 rounded-lg border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900 lg:w-[21rem]">
             <h2 className="border-b border-zinc-200 px-3 py-2 text-sm font-semibold text-zinc-900 dark:border-zinc-700 dark:text-zinc-100">
               Distinct vineyard_name
             </h2>
             <p className="px-3 py-1 text-xs text-zinc-500 dark:text-zinc-400">
               <code className="rounded bg-zinc-100 px-0.5 dark:bg-zinc-800">tbl_vworkjobs</code>
+              {' '}
+              <span className="text-zinc-400 dark:text-zinc-500">(n) = job count</span>
             </p>
             <ul className="max-h-[64rem] overflow-y-auto px-3 pb-3 text-xs text-zinc-700 dark:text-zinc-300">
               {(options?.vineyardNames ?? []).map((name) => (
-                <li key={name} className="flex items-baseline gap-1 py-0.5 min-w-0" title={`Click to add mapping: ${name}`}>
+                <li key={name} className="flex flex-wrap items-baseline gap-x-1 gap-y-0 py-0.5 min-w-0" title={`Click to add mapping: ${name}`}>
                   <button
                     type="button"
                     onClick={() => startAddWithVineyard(name)}
-                    className="truncate min-w-0 text-left underline hover:no-underline cursor-pointer text-inherit"
+                    className="min-w-0 text-left underline hover:no-underline cursor-pointer text-inherit break-words"
                   >
                     {name}
+                    <span className="whitespace-nowrap font-normal text-zinc-500 dark:text-zinc-400">
+                      {' '}
+                      ({options?.vineyardJobCounts?.[name] ?? '—'})
+                    </span>
                   </button>
                   {resolvableSet.has(name.trim()) && (
                     <span className="flex-shrink-0 text-emerald-600 dark:text-emerald-400">(Mapped)</span>

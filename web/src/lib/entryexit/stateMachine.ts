@@ -1,6 +1,6 @@
 /**
  * ENTER/EXIT tagging — simple rule:
- * If a state (fence or null) persists >= graceSeconds (e.g. 300 s), it's real; else it's noise.
+ * If a state (fence or null) persists >= graceSeconds (from Settings GPSstdTime), it's real; else it's noise.
  * We tag EXIT when leaving a fence whose stay was real (duration >= grace).
  * We tag ENTER only when we have confirmed the fence stay was real: i.e. when we leave that
  * fence (or end stream) and the fence segment lasted >= grace. So ENTER is applied to the

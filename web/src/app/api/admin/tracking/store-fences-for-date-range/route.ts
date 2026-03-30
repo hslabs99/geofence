@@ -26,21 +26,34 @@ function streamLine(obj: Record<string, unknown>): string {
 }
 
 /**
- * POST: 1) Update position_time_nz once for the range. 2) Run store_fences_for_date(p_date, p_only_unattempted, p_only_missed) for each day.
+ * POST: 1) Update position_time_nz once for the range. 2) Run store_fences_for_date_scoped for each day (see fenceScope).
  * Streams NDJSON in real time: { type: 'position_time_nz', updated } then { type: 'day', date, updated, durationMs } per day, then { type: 'done', totalUpdated }.
- * Body: { dateFrom, dateTo, forceUpdate?: boolean, reprocessMissedOnly?: boolean }.
- * - Default: only rows not yet attempted (p_only_unattempted=true, p_only_missed=false).
- * - forceUpdate: reprocess all rows (p_only_unattempted=false, p_only_missed=false).
- * - reprocessMissedOnly: only rows attempted but missed — for picking up new fence hits (p_only_unattempted=false, p_only_missed=true).
+ * Body: { dateFrom, dateTo, fenceScope?: 'unattempted' | 'all' | 'unattempted_and_missed' }
+ *   OR legacy: forceUpdate, reprocessMissedOnly.
+ * - unattempted (default): only rows not yet attempted.
+ * - all: reprocess every row for each day.
+ * - unattempted_and_missed: unattempted pass, then missed-only pass (attempted but not mapped — e.g. new geofences).
+ * Legacy reprocessMissedOnly=true: missed-only pass only (no unattempted).
  */
 export async function POST(req: Request) {
   try {
     const body = await req.json();
     const dateFrom = typeof body?.dateFrom === 'string' ? body.dateFrom.trim() : '';
     const dateTo = typeof body?.dateTo === 'string' ? body.dateTo.trim() : '';
-    const forceUpdate = body?.forceUpdate === true;
-    const reprocessMissedOnly = body?.reprocessMissedOnly === true;
-    const onlyMissed = reprocessMissedOnly;
+
+    type Scope = 'unattempted' | 'all' | 'unattempted_and_missed' | 'missed_only';
+    let scope: Scope = 'unattempted';
+    const fs = typeof body?.fenceScope === 'string' ? body.fenceScope.trim() : '';
+    if (fs === 'all') scope = 'all';
+    else if (fs === 'unattempted_and_missed') scope = 'unattempted_and_missed';
+    else if (fs === 'unattempted') scope = 'unattempted';
+    else if (fs === 'missed_only') scope = 'missed_only';
+    else if (body?.forceUpdate === true) scope = 'all';
+    else if (body?.reprocessMissedOnly === true) scope = 'missed_only';
+
+    const forceUpdate = scope === 'all';
+    const onlyMissed = scope === 'missed_only';
+    const runUnattemptedThenMissed = scope === 'unattempted_and_missed';
     if (!dateFrom || !dateTo) {
       return NextResponse.json(
         { ok: false, error: 'dateFrom and dateTo (YYYY-MM-DD) required' },
@@ -73,12 +86,25 @@ export async function POST(req: Request) {
           let totalUpdated = 0;
           for (const date of dates) {
             const startMs = Date.now();
-            const rows = await query<{ store_fences_for_date_scoped: number }>(
-              'SELECT store_fences_for_date_scoped($1::date, $2::boolean, $3::boolean) AS store_fences_for_date_scoped',
-              [date, forceUpdate, onlyMissed]
-            );
+            let updated = 0;
+            if (runUnattemptedThenMissed) {
+              const r1 = await query<{ n: number }>(
+                'SELECT store_fences_for_date_scoped($1::date, $2::boolean, $3::boolean)::int AS n',
+                [date, false, false]
+              );
+              const r2 = await query<{ n: number }>(
+                'SELECT store_fences_for_date_scoped($1::date, $2::boolean, $3::boolean)::int AS n',
+                [date, false, true]
+              );
+              updated = (r1[0]?.n ?? 0) + (r2[0]?.n ?? 0);
+            } else {
+              const rows = await query<{ store_fences_for_date_scoped: number }>(
+                'SELECT store_fences_for_date_scoped($1::date, $2::boolean, $3::boolean) AS store_fences_for_date_scoped',
+                [date, forceUpdate, onlyMissed]
+              );
+              updated = rows[0]?.store_fences_for_date_scoped ?? 0;
+            }
             const durationMs = Date.now() - startMs;
-            const updated = rows[0]?.store_fences_for_date_scoped ?? 0;
             totalUpdated += updated;
             controller.enqueue(
               encoder.encode(streamLine({ type: 'day', date, updated, durationMs }))

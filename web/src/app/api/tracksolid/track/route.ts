@@ -10,14 +10,15 @@ import {
 import { execute } from '@/lib/db';
 
 export async function GET(request: Request) {
+  const { searchParams } = new URL(request.url);
+  const imei = searchParams.get('imei');
+  const endpoint = searchParams.get('endpoint') || undefined;
+  const period = searchParams.get('period') || undefined;
+  const date = searchParams.get('date')?.trim() || undefined; // YYYY-MM-DD = single day 00:00:00–23:59:59 UTC
+  const deviceName = searchParams.get('deviceName') || undefined;
+  const refreshToken = searchParams.get('refreshToken') === '1' || searchParams.get('skipCache') === '1';
+
   try {
-    const { searchParams } = new URL(request.url);
-    const imei = searchParams.get('imei');
-    const endpoint = searchParams.get('endpoint') || undefined;
-    const period = searchParams.get('period') || undefined;
-    const date = searchParams.get('date')?.trim() || undefined; // YYYY-MM-DD = single day 00:00:00–23:59:59 UTC
-    const deviceName = searchParams.get('deviceName') || undefined;
-    const refreshToken = searchParams.get('refreshToken') === '1' || searchParams.get('skipCache') === '1';
     if (!imei?.trim()) {
       return NextResponse.json({ ok: false, error: 'imei required' }, { status: 400 });
     }
@@ -43,7 +44,18 @@ export async function GET(request: Request) {
       try {
         await execute(
           'INSERT INTO tbl_logs (logtype, logcat1, logcat2, logdetails) VALUES ($1, $2, $3, $4)',
-          ['APIfetch', deviceName || imei.trim(), date, `rowcount: ${trackResult.points.length}`]
+          [
+            'APIfetch',
+            deviceName || imei.trim(),
+            date,
+            JSON.stringify({
+              status: trackResult.points.length > 0 ? 'ok' : 'ok_empty',
+              rowcount: trackResult.points.length,
+              imei: imei.trim(),
+              endpoint: endpoint ?? 'default',
+              period: date ? 'day' : period ?? 'yesterday',
+            }),
+          ]
         );
       } catch (logErr) {
         // eslint-disable-next-line no-console
@@ -67,6 +79,30 @@ export async function GET(request: Request) {
     const rateLimitHint =
       err instanceof TracksolidApiError &&
       (debug?.fullResponse as { code?: number } | undefined)?.code === 1006;
+    if (date && imei?.trim()) {
+      try {
+        await execute(
+          'INSERT INTO tbl_logs (logtype, logcat1, logcat2, logdetails) VALUES ($1, $2, $3, $4)',
+          [
+            'APIfetch',
+            deviceName || imei.trim(),
+            date,
+            JSON.stringify({
+              status: 'api_fail',
+              rowcount: 0,
+              imei: imei.trim(),
+              endpoint: endpoint ?? 'default',
+              period: date ? 'day' : period ?? 'yesterday',
+              error: message,
+              rateLimitHint,
+            }),
+          ]
+        );
+      } catch (logErr) {
+        // eslint-disable-next-line no-console
+        console.error('[tracksolid/track] Failed to write tbl_logs for failure:', logErr);
+      }
+    }
     return NextResponse.json(
       {
         ok: false,

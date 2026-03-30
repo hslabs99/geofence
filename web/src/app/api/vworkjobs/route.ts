@@ -208,7 +208,13 @@ function buildWhereAndParams(searchParams: URLSearchParams): { conditions: strin
   }
 
   const jobIdContains = searchParams.get('jobIdContains')?.trim();
-  if (jobIdContains) {
+  const jobIdExact = searchParams.get('jobIdExact')?.trim();
+  if (jobIdExact) {
+    conditions.push(`trim(t.job_id::text) = trim($${idx}::text)`);
+    values.push(jobIdExact);
+    idx++;
+    debug.jobIdExact = jobIdExact;
+  } else if (jobIdContains) {
     conditions.push(`(trim(t.job_id::text) ILIKE $${idx})`);
     values.push(`%${jobIdContains}%`);
     idx++;

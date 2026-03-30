@@ -159,8 +159,6 @@ function InspectContent() {
   const [refetchStepsRunning, setRefetchStepsRunning] = useState(false);
   const [retagAndRefetchRunning, setRetagAndRefetchRunning] = useState(false);
   const [trackingRefreshKey, setTrackingRefreshKey] = useState(0);
-  /** Bump after steps write-back so the jobs grid reloads from DB without a full page refresh. */
-  const [jobsRefreshKey, setJobsRefreshKey] = useState(0);
   /** Manual overrides (oride) per step + comment; synced from selectedRow when it changes. */
   const [stepOverrides, setStepOverrides] = useState<{ step1oride: string; step2oride: string; step3oride: string; step4oride: string; step5oride: string }>({
     step1oride: '', step2oride: '', step3oride: '', step4oride: '', step5oride: '',
@@ -490,6 +488,40 @@ function InspectContent() {
     ],
   );
 
+  /** Merge one job from DB into the grid — no full list reload (avoids loading flash / re-scroll). */
+  const refreshJobRowFromApi = useCallback(async (jobId: unknown) => {
+    const id = String(jobId ?? '').trim();
+    if (!id) return;
+    const p = new URLSearchParams();
+    p.set('limit', '1');
+    p.set('offset', '0');
+    const c1 = sortColumns[0]?.trim() || 'actual_start_time';
+    p.set('sortColumn', c1);
+    p.set('sortDir', 'asc');
+    p.set('jobIdExact', id);
+    try {
+      const res = await fetch(`/api/vworkjobs?${p.toString()}`, { cache: 'no-store' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(typeof data?.error === 'string' ? data.error : res.statusText);
+      const fresh = (data.rows ?? [])[0] as Row | undefined;
+      if (!fresh) return;
+      const jid = String(fresh.job_id ?? '').trim();
+      setRows((prev) => {
+        let hit = false;
+        const next = prev.map((r) => {
+          if (String(r.job_id ?? '').trim() === jid) {
+            hit = true;
+            return fresh;
+          }
+          return r;
+        });
+        return hit ? next : prev;
+      });
+    } catch (e) {
+      console.error('[Inspect refresh job row]', e);
+    }
+  }, [sortColumns]);
+
   useEffect(() => {
     if (skipJobsPageFetchRef.current) {
       skipJobsPageFetchRef.current = false;
@@ -534,7 +566,7 @@ function InspectContent() {
     return () => {
       cancelled = true;
     };
-  }, [inspectDataKey, jobsPage, buildInspectApiParams, paramToLocate, jobsRefreshKey]);
+  }, [inspectDataKey, jobsPage, buildInspectApiParams, paramToLocate]);
 
   useEffect(() => {
     setFilterTemplate('');
@@ -570,7 +602,7 @@ function InspectContent() {
         endPlusMinutes,
       });
       if (result.log.some((e) => e.status === 'ok')) {
-        setJobsRefreshKey((k) => k + 1);
+        await refreshJobRowFromApi(selectedRow.job_id);
         setTrackingRefreshKey((k) => k + 1);
       }
       if (result.lastResult != null && typeof result.lastResult === 'object') {
@@ -581,7 +613,7 @@ function InspectContent() {
     } finally {
       setRefetchStepsRunning(false);
     }
-  }, [selectedRow, startLessMinutes, endPlusMinutes]);
+  }, [selectedRow, startLessMinutes, endPlusMinutes, refreshJobRowFromApi]);
 
   /** URL params: with locateJobId (Recent jobs / Summary job link), only truck — clear other persisted filters and all date filters so the job is not hidden. */
   useEffect(() => {
@@ -773,7 +805,7 @@ function InspectContent() {
         endPlusMinutes,
       });
       if (result.log.some((e) => e.status === 'ok')) {
-        setJobsRefreshKey((k) => k + 1);
+        await refreshJobRowFromApi(selectedRow.job_id);
       }
       setTrackingRefreshKey((k) => k + 1);
       if (result.lastResult != null && typeof result.lastResult === 'object') {
@@ -784,7 +816,7 @@ function InspectContent() {
     } finally {
       setRetagAndRefetchRunning(false);
     }
-  }, [selectedRow, deviceForTracking, actualStartTime, startLessMinutes, endPlusMinutes]);
+  }, [selectedRow, deviceForTracking, actualStartTime, startLessMinutes, endPlusMinutes, refreshJobRowFromApi]);
 
   useEffect(() => {
     if (!deviceForTracking || !actualStartTime.trim()) {
@@ -1561,7 +1593,7 @@ function InspectContent() {
                               const c = s.steporidecomment;
                               setSteporidecomment(c != null && String(c).trim() !== '' ? String(c) : '');
                             }
-                            setJobsRefreshKey((k) => k + 1);
+                            await refreshJobRowFromApi(selectedRow.job_id);
                             setSaveOverridesStatus('saved');
                           } catch (e) {
                             setSaveOverridesStatus('error');

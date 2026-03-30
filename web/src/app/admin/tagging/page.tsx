@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from 'react';
 import { runFetchStepsForJobs } from '@/lib/fetch-steps';
+import { GPS_FENCE_SETTINGS_TYPE, GPS_STD_TIME_NAME } from '@/lib/gps-fence-settings-names';
 
 type VworkFilterOptions = {
   vineyardNames: string[];
@@ -50,7 +51,8 @@ interface LogRow {
   logdetails: string | null;
 }
 
-type FenceTaggingScope = 'unattempted' | 'all' | 'missed';
+/** Low / Med / High — see Fence tagging scope UI. */
+type FenceTaggingScope = 'unattempted' | 'unattempted_and_missed' | 'all';
 
 function formatLogLine(ev: StreamEvent): string {
   switch (ev.stage) {
@@ -124,7 +126,10 @@ export default function TaggingPage() {
   const [stepsForce, setStepsForce] = useState(true);
   const [stepsStartLessMinutes, setStepsStartLessMinutes] = useState(15);
   const [stepsEndPlusMinutes, setStepsEndPlusMinutes] = useState(60);
-  const [graceSeconds, setGraceSeconds] = useState(300);
+  /** Loaded from Settings (GPS Std time); null until loaded or if unset/invalid. */
+  const [graceSeconds, setGraceSeconds] = useState<number | null>(null);
+  const [graceSettingsLoading, setGraceSettingsLoading] = useState(true);
+  const [graceSettingsError, setGraceSettingsError] = useState<string | null>(null);
   const [runStatus, setRunStatus] = useState<'idle' | 'running' | 'done' | 'error'>('idle');
   /** When true, the in-progress run is Steps-only (not full tagging). */
   const [stepsOnlyRunActive, setStepsOnlyRunActive] = useState(false);
@@ -139,6 +144,16 @@ export default function TaggingPage() {
   const [fenceTaggingLogs, setFenceTaggingLogs] = useState<string[]>([]);
   const [fenceTaggingError, setFenceTaggingError] = useState<string | null>(null);
   const [fenceTaggingScope, setFenceTaggingScope] = useState<FenceTaggingScope>('unattempted');
+  const [maxPositionTime, setMaxPositionTime] = useState<string | null>(null);
+  const [maxPositionTimeFenceAttempted, setMaxPositionTimeFenceAttempted] = useState<string | null>(null);
+  const [maxPositionTimeNz, setMaxPositionTimeNz] = useState<string | null>(null);
+  const [maxPositionTimeNzFenceAttempted, setMaxPositionTimeNzFenceAttempted] = useState<string | null>(null);
+  const [maxTimesLoading, setMaxTimesLoading] = useState(false);
+  const [maxTimesError, setMaxTimesError] = useState<string | null>(null);
+  const [maxActualStartAll, setMaxActualStartAll] = useState<string | null>(null);
+  const [maxActualStartWithStepData, setMaxActualStartWithStepData] = useState<string | null>(null);
+  const [vworkStartSummaryLoading, setVworkStartSummaryLoading] = useState(false);
+  const [vworkStartSummaryError, setVworkStartSummaryError] = useState<string | null>(null);
 
   /** Optional Steps filters (tbl_vworkjobs): exact vineyard / winery / device (worker). */
   const [filterVineyard, setFilterVineyard] = useState('');
@@ -178,6 +193,46 @@ export default function TaggingPage() {
           setVworkFilterOptions({ vineyardNames: [], deliveryWineries: [], workers: [] });
           setFilterOptionsLoadError(e instanceof Error ? e.message : String(e));
         }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    setGraceSettingsLoading(true);
+    setGraceSettingsError(null);
+    fetch(
+      `/api/settings?${new URLSearchParams({ type: GPS_FENCE_SETTINGS_TYPE, name: GPS_STD_TIME_NAME })}`,
+      { cache: 'no-store' }
+    )
+      .then((r) => r.json())
+      .then((d: { settingvalue?: string | null }) => {
+        if (cancelled) return;
+        const v = d?.settingvalue;
+        if (v != null && String(v).trim() !== '') {
+          const n = parseInt(String(v).trim(), 10);
+          if (!Number.isNaN(n) && n >= 0) {
+            setGraceSeconds(Math.min(86400, n));
+            setGraceSettingsError(null);
+          } else {
+            setGraceSeconds(null);
+            setGraceSettingsError('GPS Std time in Settings is not a valid number.');
+          }
+        } else {
+          setGraceSeconds(null);
+          setGraceSettingsError('Set GPS Std time (seconds) in Admin → Settings.');
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setGraceSeconds(null);
+          setGraceSettingsError('Could not load GPS Std time from Settings.');
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setGraceSettingsLoading(false);
       });
     return () => {
       cancelled = true;
@@ -243,10 +298,78 @@ export default function TaggingPage() {
     if (runStatus === 'done' || runStatus === 'idle') loadEntryexitLogs();
   }, [runStatus, loadEntryexitLogs]);
 
-  /** Call shared API: position_time_nz + store_fences (same as api-test between merge and tag). */
-  const applyPositionTimeNzAndFences = async (): Promise<{ ok: boolean; error?: string }> => {
+  const loadMaxPositionTimes = useCallback(async () => {
+    setMaxTimesLoading(true);
+    setMaxTimesError(null);
     try {
-      const res = await fetch('/api/admin/tracking/apply-position-time-nz-and-fences', { method: 'POST' });
+      const res = await fetch('/api/admin/tracking/max-position-times', { cache: 'no-store' });
+      const data = (await res.json()) as {
+        ok?: boolean;
+        maxPositionTime?: string | null;
+        maxPositionTimeFenceAttempted?: string | null;
+        maxPositionTimeNz?: string | null;
+        maxPositionTimeNzFenceAttempted?: string | null;
+        error?: string;
+      };
+      if (!res.ok || !data.ok) {
+        throw new Error(data.error ?? `HTTP ${res.status}`);
+      }
+      setMaxPositionTime(data.maxPositionTime ?? null);
+      setMaxPositionTimeFenceAttempted(data.maxPositionTimeFenceAttempted ?? null);
+      setMaxPositionTimeNz(data.maxPositionTimeNz ?? null);
+      setMaxPositionTimeNzFenceAttempted(data.maxPositionTimeNzFenceAttempted ?? null);
+    } catch (e) {
+      setMaxTimesError(e instanceof Error ? e.message : String(e));
+      setMaxPositionTime(null);
+      setMaxPositionTimeFenceAttempted(null);
+      setMaxPositionTimeNz(null);
+      setMaxPositionTimeNzFenceAttempted(null);
+    } finally {
+      setMaxTimesLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadMaxPositionTimes();
+  }, [loadMaxPositionTimes]);
+
+  const loadVworkActualStartSummary = useCallback(async () => {
+    setVworkStartSummaryLoading(true);
+    setVworkStartSummaryError(null);
+    try {
+      const res = await fetch('/api/admin/vworkjobs/max-actual-start-summary', { cache: 'no-store' });
+      const data = (await res.json()) as {
+        ok?: boolean;
+        maxActualStartTime?: string | null;
+        maxActualStartWithStepData?: string | null;
+        error?: string;
+      };
+      if (!res.ok || !data.ok) {
+        throw new Error(data.error ?? `HTTP ${res.status}`);
+      }
+      setMaxActualStartAll(data.maxActualStartTime ?? null);
+      setMaxActualStartWithStepData(data.maxActualStartWithStepData ?? null);
+    } catch (e) {
+      setVworkStartSummaryError(e instanceof Error ? e.message : String(e));
+      setMaxActualStartAll(null);
+      setMaxActualStartWithStepData(null);
+    } finally {
+      setVworkStartSummaryLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadVworkActualStartSummary();
+  }, [loadVworkActualStartSummary]);
+
+  useEffect(() => {
+    if (runStatus === 'done') loadVworkActualStartSummary();
+  }, [runStatus, loadVworkActualStartSummary]);
+
+  /** NZ backfill only (no store_fences — fence prep runs in the SQL pipeline before this page). */
+  const applyPositionTimeNzOnly = async (): Promise<{ ok: boolean; error?: string }> => {
+    try {
+      const res = await fetch('/api/admin/tracking/apply-position-time-nz', { method: 'POST' });
       const data = await res.json();
       if (!res.ok || !data?.ok) return { ok: false, error: data?.error ?? `HTTP ${res.status}` };
       return { ok: true };
@@ -265,7 +388,12 @@ export default function TaggingPage() {
       return;
     }
     setFenceTaggingStatus('running');
-    const scopeLabel = fenceTaggingScope === 'all' ? ' [reprocess all]' : fenceTaggingScope === 'missed' ? ' [reprocess missed only]' : '';
+    const scopeLabel =
+      fenceTaggingScope === 'all'
+        ? ' [High: reprocess all]'
+        : fenceTaggingScope === 'unattempted_and_missed'
+          ? ' [Med: unattempted + missed]'
+          : ' [Low: unattempted only]';
     setFenceTaggingLogs([
       `Fence tagging for ${from} → ${to} (${dates.length} day(s))${scopeLabel}…`,
     ]);
@@ -277,8 +405,7 @@ export default function TaggingPage() {
         body: JSON.stringify({
           dateFrom: from,
           dateTo: to,
-          forceUpdate: fenceTaggingScope === 'all',
-          reprocessMissedOnly: fenceTaggingScope === 'missed',
+          fenceScope: fenceTaggingScope,
         }),
       });
       if (!res.ok) {
@@ -321,6 +448,7 @@ export default function TaggingPage() {
             } else if (ev.type === 'done') {
               setFenceTaggingLogs((prev) => [...prev, `Done. Total fences: ${ev.totalUpdated ?? 0} row(s) updated.`]);
               setFenceTaggingStatus('done');
+              loadMaxPositionTimes();
             } else if (ev.type === 'error') {
               setFenceTaggingError(ev.message ?? 'Unknown error');
               setFenceTaggingStatus('error');
@@ -342,6 +470,7 @@ export default function TaggingPage() {
           } else if (ev.type === 'done') {
             setFenceTaggingLogs((prev) => [...prev, `Done. Total fences: ${ev.totalUpdated ?? 0} row(s) updated.`]);
             setFenceTaggingStatus('done');
+            loadMaxPositionTimes();
           } else if (ev.type === 'error') {
             setFenceTaggingError(ev.message ?? 'Unknown error');
             setFenceTaggingStatus('error');
@@ -363,17 +492,22 @@ export default function TaggingPage() {
     const from = dateFrom.trim();
     const to = dateTo.trim();
     if (!from || !to || dateRange(from, to).length === 0) return;
+    if (graceSeconds === null) {
+      setRunError(graceSettingsError ?? 'Configure GPS Std time in Settings.');
+      setRunStatus('error');
+      return;
+    }
     setRunStatus('running');
     setStepsOnlyRunActive(false);
     setStreamLogs([]);
-    setCurrentStage('Progress: Applying position_time_nz and store_fences…');
+    setCurrentStage('Progress: Applying position_time_nz…');
     setSummary(null);
     setRunError(null);
 
     try {
-      const prep = await applyPositionTimeNzAndFences();
+      const prep = await applyPositionTimeNzOnly();
       if (!prep.ok) {
-        setRunError(prep.error ?? 'Prep failed');
+        setRunError(prep.error ?? 'position_time_nz failed');
         setRunStatus('error');
         setCurrentStage('');
         return;
@@ -582,6 +716,11 @@ export default function TaggingPage() {
       setRunError('Date from must be ≤ date to');
       return;
     }
+    if (graceSeconds === null) {
+      setRunError(graceSettingsError ?? 'Configure GPS Std time in Settings.');
+      setRunStatus('error');
+      return;
+    }
     setRunStatus('running');
     setStepsOnlyRunActive(false);
     setStreamLogs([]);
@@ -722,13 +861,68 @@ export default function TaggingPage() {
           Fence tagging (date range)
         </h2>
         <p className="mb-3 text-xs text-zinc-600 dark:text-zinc-400">
-          Once: set <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">position_time_nz</code> for the range (rows where it is null). Then run{' '}
-          <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">store_fences_for_date</code> for each day in the range. Assigns <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">geofence_id</code> from{' '}
-          <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">tbl_geofences</code>. By default only rows not yet attempted; use scope to reprocess all or only missed rows (e.g. after adding a new geofence).
+          <strong>Once:</strong> set <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">position_time_nz</code> for the range (rows where it is null).{' '}
+          <strong>Then</strong> run <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">store_fences_for_date</code> for each day in the range. Assigns{' '}
+          <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">geofence_id</code> from <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">tbl_geofences</code>.{' '}
+          By default only rows not yet attempted; use scope to reprocess all or unattempted + missed (e.g. after adding a new geofence).
         </p>
+        <div className="mb-3 rounded-md border border-zinc-200 bg-zinc-50 px-3 py-2 text-xs dark:border-zinc-600 dark:bg-zinc-800/50">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <span className="font-medium text-zinc-700 dark:text-zinc-300">Latest in tbl_tracking</span>
+            <button
+              type="button"
+              onClick={() => loadMaxPositionTimes()}
+              disabled={maxTimesLoading || fenceTaggingStatus === 'running'}
+              className="rounded border border-zinc-300 bg-white px-2 py-0.5 text-zinc-700 hover:bg-zinc-100 disabled:opacity-50 dark:border-zinc-600 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800"
+            >
+              {maxTimesLoading ? 'Loading…' : 'Refresh'}
+            </button>
+          </div>
+          {maxTimesError && <p className="mt-1 text-red-600 dark:text-red-400">{maxTimesError}</p>}
+          {!maxTimesError && (
+            <div className="mt-2 overflow-x-auto">
+              <table className="w-full min-w-[20rem] border-collapse text-left text-xs">
+                <thead>
+                  <tr className="border-b border-zinc-200 dark:border-zinc-600">
+                    <th className="py-1.5 pr-3 font-medium text-zinc-600 dark:text-zinc-400" />
+                    <th className="py-1.5 pr-3 font-medium text-zinc-700 dark:text-zinc-300">All rows</th>
+                    <th className="py-1.5 font-medium text-zinc-700 dark:text-zinc-300">
+                      <code className="rounded bg-zinc-200/80 px-1 font-mono text-[0.7rem] dark:bg-zinc-700">geofence_attempted</code>
+                    </th>
+                  </tr>
+                </thead>
+                <tbody className="font-mono text-zinc-900 dark:text-zinc-100">
+                  <tr className="border-b border-zinc-100 dark:border-zinc-700/80">
+                    <th className="py-1.5 pr-3 text-left font-sans font-normal text-zinc-500 dark:text-zinc-400">
+                      max(position_time)
+                    </th>
+                    <td className="py-1.5 pr-3">{maxTimesLoading ? '…' : maxPositionTime ?? '—'}</td>
+                    <td className="py-1.5">{maxTimesLoading ? '…' : maxPositionTimeFenceAttempted ?? '—'}</td>
+                  </tr>
+                  <tr>
+                    <th className="py-1.5 pr-3 text-left font-sans font-normal text-zinc-500 dark:text-zinc-400">
+                      max(position_time_nz)
+                    </th>
+                    <td className="py-1.5 pr-3">{maxTimesLoading ? '…' : maxPositionTimeNz ?? '—'}</td>
+                    <td className="py-1.5">{maxTimesLoading ? '…' : maxPositionTimeNzFenceAttempted ?? '—'}</td>
+                  </tr>
+                </tbody>
+              </table>
+              <p className="mt-1.5 text-[0.65rem] text-zinc-500 dark:text-zinc-400">
+                Second column is the latest row fence tagging has processed (<code className="rounded bg-zinc-200/80 px-0.5 dark:bg-zinc-700">store_fences</code> set{' '}
+                <code className="rounded bg-zinc-200/80 px-0.5 dark:bg-zinc-700">geofence_attempted</code>).
+              </p>
+            </div>
+          )}
+          <p className="mt-2 text-zinc-500 dark:text-zinc-400">
+            Use these to see how far tracking data runs; pick a date range that covers the days you care about.
+          </p>
+        </div>
         <div className="mb-3 flex flex-wrap items-center gap-4">
-          <fieldset className="flex flex-wrap items-center gap-4" disabled={fenceTaggingStatus === 'running'}>
-            <legend className="sr-only">Fence tagging scope</legend>
+          <fieldset className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center sm:gap-4" disabled={fenceTaggingStatus === 'running'}>
+            <legend className="mb-1 text-xs font-medium text-zinc-600 dark:text-zinc-400 sm:mb-0 sm:w-full">
+              Fence tagging scope
+            </legend>
             <label className="flex cursor-pointer items-center gap-2 text-sm text-zinc-700 dark:text-zinc-300">
               <input
                 type="radio"
@@ -737,7 +931,21 @@ export default function TaggingPage() {
                 onChange={() => setFenceTaggingScope('unattempted')}
                 className="border-zinc-300 text-zinc-800 focus:ring-zinc-500 dark:border-zinc-600 dark:bg-zinc-700"
               />
-              Only unattempted
+              <span>
+                <span className="font-medium text-zinc-800 dark:text-zinc-200">1 — Low:</span> Only unattempted
+              </span>
+            </label>
+            <label className="flex cursor-pointer items-center gap-2 text-sm text-zinc-700 dark:text-zinc-300">
+              <input
+                type="radio"
+                name="fenceTaggingScope"
+                checked={fenceTaggingScope === 'unattempted_and_missed'}
+                onChange={() => setFenceTaggingScope('unattempted_and_missed')}
+                className="border-zinc-300 text-zinc-800 focus:ring-zinc-500 dark:border-zinc-600 dark:bg-zinc-700"
+              />
+              <span>
+                <span className="font-medium text-zinc-800 dark:text-zinc-200">3 — Med:</span> Reprocess unattempted and missed only (1 + missed hits)
+              </span>
             </label>
             <label className="flex cursor-pointer items-center gap-2 text-sm text-zinc-700 dark:text-zinc-300">
               <input
@@ -747,17 +955,9 @@ export default function TaggingPage() {
                 onChange={() => setFenceTaggingScope('all')}
                 className="border-zinc-300 text-zinc-800 focus:ring-zinc-500 dark:border-zinc-600 dark:bg-zinc-700"
               />
-              Reprocess all (include rows already attempted)
-            </label>
-            <label className="flex cursor-pointer items-center gap-2 text-sm text-zinc-700 dark:text-zinc-300">
-              <input
-                type="radio"
-                name="fenceTaggingScope"
-                checked={fenceTaggingScope === 'missed'}
-                onChange={() => setFenceTaggingScope('missed')}
-                className="border-zinc-300 text-zinc-800 focus:ring-zinc-500 dark:border-zinc-600 dark:bg-zinc-700"
-              />
-              Reprocess missed only (attempted but missed — pick up new fence hits)
+              <span>
+                <span className="font-medium text-zinc-800 dark:text-zinc-200">2 — High:</span> Reprocess all (include rows already attempted)
+              </span>
             </label>
           </fieldset>
         </div>
@@ -859,6 +1059,46 @@ export default function TaggingPage() {
                   <span>min after</span>
                 </div>
               </div>
+              <div className="mt-3 rounded-md border border-zinc-200 bg-white px-3 py-2 text-xs dark:border-zinc-600 dark:bg-zinc-900/40">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="font-medium text-zinc-700 dark:text-zinc-300">
+                    Steps coverage (<code className="rounded bg-zinc-100 px-0.5 font-mono dark:bg-zinc-800">tbl_vworkjobs</code>)
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => loadVworkActualStartSummary()}
+                    disabled={vworkStartSummaryLoading || runStatus === 'running'}
+                    className="rounded border border-zinc-300 bg-zinc-50 px-2 py-0.5 text-zinc-700 hover:bg-zinc-100 disabled:opacity-50 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-200 dark:hover:bg-zinc-700"
+                  >
+                    {vworkStartSummaryLoading ? 'Loading…' : 'Refresh'}
+                  </button>
+                </div>
+                {vworkStartSummaryError && (
+                  <p className="mt-1 text-red-600 dark:text-red-400">{vworkStartSummaryError}</p>
+                )}
+                {!vworkStartSummaryError && (
+                  <dl className="mt-2 space-y-2">
+                    <div>
+                      <dt className="text-zinc-500 dark:text-zinc-400">max(actual_start_time) — any job</dt>
+                      <dd className="font-mono text-zinc-900 dark:text-zinc-100">
+                        {vworkStartSummaryLoading ? '…' : maxActualStartAll ?? '—'}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt className="text-zinc-500 dark:text-zinc-400">
+                        max(actual_start_time) — has any{' '}
+                        <code className="rounded bg-zinc-100 px-0.5 dark:bg-zinc-800">step_*_actual_time</code>
+                      </dt>
+                      <dd className="font-mono text-zinc-900 dark:text-zinc-100">
+                        {vworkStartSummaryLoading ? '…' : maxActualStartWithStepData ?? '—'}
+                      </dd>
+                    </div>
+                  </dl>
+                )}
+                <p className="mt-2 text-[0.65rem] text-zinc-500 dark:text-zinc-400">
+                  Second line is how far out you have at least one derived step time stored (logical “last” steps data by job start). No worker filter.
+                </p>
+              </div>
               <div className="mt-3 flex flex-wrap items-end gap-3 border-t border-zinc-200 pt-3 dark:border-zinc-600">
                 <p className="w-full text-xs text-zinc-500 dark:text-zinc-400">
                   Optional: limit <strong>Steps</strong> jobs (same filters as <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">tbl_vworkjobs</code>). ENTER/EXIT tagging is unchanged.
@@ -942,13 +1182,26 @@ export default function TaggingPage() {
                 type="number"
                 min={0}
                 max={86400}
-                value={graceSeconds}
-                onChange={(e) => setGraceSeconds(parseInt(e.target.value, 10) || 0)}
-                className="mt-1 block w-full rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+                disabled={graceSettingsLoading}
+                value={graceSeconds === null ? '' : graceSeconds}
+                onChange={(e) => {
+                  const t = e.target.value;
+                  if (t === '') {
+                    setGraceSeconds(null);
+                    return;
+                  }
+                  const n = parseInt(t, 10);
+                  setGraceSeconds(Number.isNaN(n) ? null : Math.max(0, Math.min(86400, n)));
+                }}
+                className="mt-1 block w-full rounded border border-zinc-300 bg-white px-3 py-2 text-sm disabled:opacity-60 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
               />
               <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
-                ENTER/EXIT only if the new state persists at least this long (default 300 s).
+                Loaded from Settings → GPS Std time (seconds). Override here for this page only; API calls without{' '}
+                <code className="rounded bg-zinc-100 px-0.5 dark:bg-zinc-800">graceSeconds</code> use that setting.
               </p>
+              {graceSettingsError && (
+                <p className="mt-1 text-xs text-amber-700 dark:text-amber-400">{graceSettingsError}</p>
+              )}
             </div>
             <div className="flex flex-wrap gap-3">
               <button
@@ -956,6 +1209,8 @@ export default function TaggingPage() {
                 onClick={runTagging}
                 disabled={
                   runStatus === 'running' ||
+                  graceSettingsLoading ||
+                  graceSeconds === null ||
                   !dateFrom ||
                   !dateTo ||
                   dateRange(dateFrom, dateTo).length === 0
@@ -969,6 +1224,8 @@ export default function TaggingPage() {
                 onClick={runTagsAndSteps}
                 disabled={
                   runStatus === 'running' ||
+                  graceSettingsLoading ||
+                  graceSeconds === null ||
                   !dateFrom ||
                   !dateTo ||
                   dateRange(dateFrom, dateTo).length === 0
@@ -994,7 +1251,7 @@ export default function TaggingPage() {
               </button>
             </div>
             <p className="text-xs text-zinc-500 dark:text-zinc-400">
-              Run tagging: fetches devices from tbl_tracking for the range, then tags ENTER/EXIT. Tag Enter/Exit and Steps: for each day, gets devices for that day from tbl_tracking and runs Enter/Exit then Steps (vworkjobs); the same derived-steps pipeline as Inspect, including <strong>Steps+</strong> (buffered vineyard) when step 2/3 are still missing. <strong>Rerun Steps only</strong> uses the same date range and Steps options (force, window) but does not call tagging — for example after new mappings when tracking tags are already correct. Device lists appear in the log. Run Fence tagging above first if needed.
+              Run tagging: applies the NZ <code className="rounded bg-zinc-100 px-0.5 dark:bg-zinc-800">position_time_nz</code> SQL only (not <code className="rounded bg-zinc-100 px-0.5 dark:bg-zinc-800">store_fences</code>), then fetches devices for the range and tags ENTER/EXIT. Tag Enter/Exit and Steps: for each day, gets devices for that day from tbl_tracking and runs Enter/Exit then Steps (vworkjobs); the same derived-steps pipeline as Inspect, including <strong>Steps+</strong> (buffered vineyard) when step 2/3 are still missing. <strong>Rerun Steps only</strong> uses the same date range and Steps options (force, window) but does not call tagging — for example after new mappings when tracking tags are already correct. Device lists appear in the log. Run Fence tagging above first if needed.
             </p>
           </div>
         </section>

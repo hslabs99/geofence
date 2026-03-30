@@ -30,6 +30,8 @@ const TRACKING_SELECT = `
   t.geofence_id,
   g.fence_name,
   t.geofence_type,
+  t.lat,
+  t.lon,
   t.apirow
 `;
 
@@ -43,11 +45,22 @@ export async function GET(request: Request) {
     const offset = Math.max(0, parseInt(searchParams.get('offset') ?? '0', 10) || 0);
     const orderBy = ALLOWED_ORDER_COLUMNS.includes(searchParams.get('orderBy') ?? '')
       ? searchParams.get('orderBy')!
-      : 'position_time_nz';
+      : 'position_time';
     const orderDir = (searchParams.get('orderDir') ?? 'asc').toLowerCase() === 'desc' ? 'DESC' : 'ASC';
     const geofenceType = searchParams.get('geofenceType') ?? '';
     const geofenceIdParam = searchParams.get('geofenceId');
     const geofenceId = geofenceIdParam != null && geofenceIdParam !== '' ? parseInt(geofenceIdParam, 10) : null;
+
+    const dateRe = /^\d{4}-\d{2}-\d{2}$/;
+    let dateFrom = searchParams.get('dateFrom')?.trim() || '';
+    let dateTo = searchParams.get('dateTo')?.trim() || '';
+    const dayParam = searchParams.get('day')?.trim() || '';
+    if (dayParam && dateRe.test(dayParam)) {
+      dateFrom = dayParam;
+      dateTo = dayParam;
+    }
+    if (dateFrom && !dateRe.test(dateFrom)) dateFrom = '';
+    if (dateTo && !dateRe.test(dateTo)) dateTo = '';
 
     const conditions: string[] = [];
     const params: unknown[] = [];
@@ -55,6 +68,14 @@ export async function GET(request: Request) {
     if (device && String(device).trim() !== '') {
       conditions.push(`t.device_name = $${idx++}`);
       params.push(String(device).trim());
+    }
+    if (dateFrom) {
+      conditions.push(`t.position_time IS NOT NULL AND t.position_time::date >= $${idx++}::date`);
+      params.push(dateFrom);
+    }
+    if (dateTo) {
+      conditions.push(`t.position_time IS NOT NULL AND t.position_time::date <= $${idx++}::date`);
+      params.push(dateTo);
     }
     if (geofenceId != null && !Number.isNaN(geofenceId)) {
       conditions.push(`t.geofence_id = $${idx++}`);

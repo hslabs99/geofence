@@ -2,9 +2,11 @@ import { NextResponse } from 'next/server';
 import { query, execute } from '@/lib/db';
 import { addMinutesToTimestampAsNZ } from '@/lib/fetch-steps';
 import {
+  aggregateStepsPlusBufferedSegments,
+  deriveGpsLayerAfterVineFencePlus,
   deriveGpsStepsForJob,
   finalizeDerivedSteps,
-  toGpsLayerForFinalize,
+  getVineyardFenceIdsForVworkName,
   type JobForDerivedSteps,
   normalizeTimestampString,
 } from '@/lib/derived-steps';
@@ -182,11 +184,18 @@ export async function GET(request: Request) {
       positionBefore: effectivePositionBefore,
     });
 
+    /** Steps+ merged multiple buffered segments (GPS* rule); append calcnotes GPS*: on write-back. */
+    let stepsPlusGpsStarMerge = false;
+
     // Steps+ (buffered vineyard fence): if standard derivation still misses VWork step 2 or 3, try expanded polygons.
     const vineyardName = job.vineyard_name ? String(job.vineyard_name).trim() : '';
     if (writeBack && vineyardName && (result.step2Gps == null || result.step3Gps == null)) {
       const mappings = await query<{ vwname: string | null; gpsname: string | null }>(
-        "SELECT vwname, gpsname FROM tbl_gpsmappings WHERE type = 'Vineyard' AND (TRIM(COALESCE(vwname,'')) = $1 OR TRIM(COALESCE(gpsname,'')) = $1)",
+        `SELECT vwname, gpsname FROM tbl_gpsmappings WHERE type = 'Vineyard'
+         AND (
+           LOWER(TRIM(COALESCE(vwname,''))) = LOWER(TRIM($1::text))
+           OR LOWER(TRIM(COALESCE(gpsname,''))) = LOWER(TRIM($1::text))
+         )`,
         [vineyardName]
       );
       const fenceNames: string[] = [vineyardName];
@@ -220,12 +229,37 @@ export async function GET(request: Request) {
                 const ext = normalizeTimestampString(r.exit_time);
                 return ent != null && ext != null && ent < vworkEnd && ext < vworkEnd;
               });
-        if (staysInJob.length === 1) {
+        if (staysInJob.length >= 1) {
+          const vineyardFenceIds = await getVineyardFenceIdsForVworkName(vineyardName);
+          const merged = await aggregateStepsPlusBufferedSegments(
+            staysInJob,
+            deviceForTracking,
+            positionAfter.trim(),
+            stepsPlusEnd,
+            vineyardFenceIds
+          );
+          stepsPlusGpsStarMerge = merged.usedGpsStarMerge;
+          const derivedAfterPlus = await deriveGpsLayerAfterVineFencePlus(
+            job,
+            {
+              windowMinutes,
+              device: deviceForTracking,
+              positionAfter: positionAfter.trim(),
+              positionBefore: effectivePositionBefore,
+            },
+            {
+              step1:
+                result.step1Gps != null
+                  ? { value: result.step1Gps, trackingId: result.step1TrackingId }
+                  : null,
+              step2: { value: merged.enter, trackingId: null },
+              step3: { value: merged.exit, trackingId: null },
+            },
+            result.debug
+          );
           const fin = finalizeDerivedSteps(
             {
-              ...toGpsLayerForFinalize(result),
-              step2Gps: staysInJob[0].enter_time,
-              step3Gps: staysInJob[0].exit_time,
+              ...derivedAfterPlus,
               step2Via: 'VineFence+',
               step3Via: 'VineFence+',
             },
@@ -310,6 +344,13 @@ export async function GET(request: Request) {
         if (result.step2Via === 'VineFence+' || result.step3Via === 'VineFence+') {
           await execute(
             `UPDATE tbl_vworkjobs SET calcnotes = COALESCE(TRIM(calcnotes) || ' ', '') || 'VineFence+:'
+             WHERE job_id::text = $1`,
+            [jobId]
+          );
+        }
+        if (result.step3Via === 'GPS*' || stepsPlusGpsStarMerge) {
+          await execute(
+            `UPDATE tbl_vworkjobs SET calcnotes = COALESCE(TRIM(calcnotes) || ' ', '') || 'GPS*:'
              WHERE job_id::text = $1`,
             [jobId]
           );

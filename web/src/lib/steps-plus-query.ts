@@ -3,8 +3,9 @@
  *
  * Project term **Steps+** means: expand vineyard fence polygons by N metres (PostGIS ST_Buffer),
  * then find contiguous inside-segments from tbl_tracking. Used when standard step 2/3 derivation
- * misses the vineyard (see /api/tracking/derived-steps). The HTTP path `/api/inspect/steps2` is a
- * legacy name; same logic lives here.
+ * misses the vineyard (see /api/tracking/derived-steps). Multiple short in/out segments are merged
+ * with the same GPS* rules (alien fence + max 3 loops) via `aggregateStepsPlusBufferedSegments` in
+ * derived-steps. The HTTP path `/api/inspect/steps2` is a legacy name; same logic lives here.
  */
 
 import { query } from '@/lib/db';
@@ -29,8 +30,12 @@ const STEPS_PLUS_SQL = `
   fence_buffered AS (
     SELECT g.fence_name, ST_Buffer(ST_Transform(ST_Force2D(g.geom), 3857), $5::numeric) AS buf
     FROM tbl_geofences g
-    WHERE g.fence_name = ANY($4::text[])
-      AND g.geom IS NOT NULL
+    WHERE g.geom IS NOT NULL
+      AND EXISTS (
+        SELECT 1 FROM unnest($4::text[]) AS n(nm)
+        WHERE nm IS NOT NULL AND TRIM(nm) <> ''
+          AND LOWER(TRIM(COALESCE(g.fence_name,''))) = LOWER(TRIM(nm))
+      )
   ),
   points_with_inside AS (
     SELECT p.t, f.fence_name,

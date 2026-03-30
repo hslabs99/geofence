@@ -13,12 +13,20 @@ const TABLE_NAME = 'tbl_tracking';
 const SORT_SETTING_TYPE = 'System';
 const SORT_SETTING_NAME = 'TrackingSort';
 
-const PRIORITY_COLUMNS = ['device_name', 'imei', 'position_time', 'position_time_nz', 'geofence_id', 'fence_name', 'geofence_type', 'apirow'];
+const PRIORITY_COLUMNS = ['device_name', 'imei', 'position_time', 'position_time_nz', 'geofence_id', 'fence_name', 'geofence_type', 'lat', 'lon', 'apirow'];
 
 const DATE_COLUMNS = new Set(['position_time', 'position_time_nz']);
 
 function isIsoDateString(v: unknown): v is string {
   return typeof v === 'string' && /^\d{4}-\d{2}-\d{2}/.test(v);
+}
+
+/** WGS84 lat/lon from a tbl_tracking row; null if missing or invalid. */
+function rowLatLon(row: Row): { lat: number; lon: number } | null {
+  const lat = row.lat != null ? Number(row.lat) : NaN;
+  const lon = row.lon != null ? Number(row.lon) : NaN;
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+  return { lat, lon };
 }
 
 function compare(a: unknown, b: unknown, col: string): number {
@@ -67,6 +75,9 @@ function GpsDataContent() {
   const [dateTo, setDateTo] = useState<string>('');
   const searchParams = useSearchParams();
   const [deviceNameFilter, setDeviceNameFilter] = useState<string>('');
+  /** YYYY-MM-DD server filter on position_time::date (optional). */
+  const [apiDateFrom, setApiDateFrom] = useState<string>('');
+  const [apiDateTo, setApiDateTo] = useState<string>('');
   const [fenceNameFilter, setFenceNameFilter] = useState<string>('');
   const [geofenceIdFilter, setGeofenceIdFilter] = useState<string>(() => {
     const id = searchParams.get('geofenceId');
@@ -79,9 +90,12 @@ function GpsDataContent() {
   const [hiddenColumns, setHiddenColumns] = useState<Set<string>>(new Set());
   const [showColumnConfig, setShowColumnConfig] = useState(false);
   const columnOrderInitialized = useRef(false);
+  const urlQueryApplied = useRef(false);
+  /** Ignore responses from superseded fetches (avoids unfiltered request overwriting filtered results). */
+  const gpsFetchSeq = useRef(0);
   const [totalRows, setTotalRows] = useState<number>(0);
   const [offset, setOffset] = useState(0);
-  const [apiOrderBy, setApiOrderBy] = useState<'position_time_nz' | 'position_time'>('position_time_nz');
+  const [apiOrderBy, setApiOrderBy] = useState<'position_time_nz' | 'position_time'>('position_time');
   const [apiOrderDir, setApiOrderDir] = useState<'asc' | 'desc'>('asc');
 
   const apiColumns = useMemo(
@@ -95,6 +109,43 @@ function GpsDataContent() {
       const next = (id != null && id !== '') ? id.trim() : '';
       return next !== prev ? next : prev;
     });
+  }, [searchParams]);
+
+  /** Deep link: /query/gpsdata?device=&day=YYYY-MM-DD&orderBy=position_time&orderDir=asc */
+  useEffect(() => {
+    if (urlQueryApplied.current) return;
+    const device = searchParams.get('device')?.trim();
+    const day = searchParams.get('day')?.trim();
+    const df = searchParams.get('dateFrom')?.trim();
+    const dt = searchParams.get('dateTo')?.trim();
+    const ob = searchParams.get('orderBy');
+    const od = searchParams.get('orderDir');
+    const dateRe = /^\d{4}-\d{2}-\d{2}$/;
+    const hasUrlFilters =
+      !!device ||
+      !!(day && dateRe.test(day)) ||
+      !!(df && dateRe.test(df)) ||
+      !!(dt && dateRe.test(dt)) ||
+      ob === 'position_time' ||
+      ob === 'position_time_nz' ||
+      od === 'asc' ||
+      od === 'desc';
+    if (!hasUrlFilters) return;
+    urlQueryApplied.current = true;
+    if (device) setDeviceNameFilter(device);
+    if (day && dateRe.test(day)) {
+      setApiDateFrom(day);
+      setApiDateTo(day);
+      setDateFilterCol('position_time');
+      setDateFrom(`${day}T00:00`);
+      setDateTo(`${day}T23:59`);
+    } else {
+      if (df && dateRe.test(df)) setApiDateFrom(df);
+      if (dt && dateRe.test(dt)) setApiDateTo(dt);
+      if ((df && dateRe.test(df)) || (dt && dateRe.test(dt))) setDateFilterCol('position_time');
+    }
+    if (ob === 'position_time' || ob === 'position_time_nz') setApiOrderBy(ob);
+    if (od === 'asc' || od === 'desc') setApiOrderDir(od);
   }, [searchParams]);
 
   useEffect(() => {
@@ -257,6 +308,7 @@ function GpsDataContent() {
   };
 
   const fetchPage = useCallback((off: number) => {
+    const seq = ++gpsFetchSeq.current;
     setLoading(true);
     const params = new URLSearchParams({
       limit: '500',
@@ -265,6 +317,8 @@ function GpsDataContent() {
       orderDir: apiOrderDir,
     });
     if (deviceNameFilter.trim()) params.set('device', deviceNameFilter.trim());
+    if (apiDateFrom) params.set('dateFrom', apiDateFrom);
+    if (apiDateTo) params.set('dateTo', apiDateTo);
     if (geofenceIdFilter.trim()) params.set('geofenceId', geofenceIdFilter.trim());
     if (geofenceTypeFilter) params.set('geofenceType', geofenceTypeFilter);
     fetch(`/api/gpsdata?${params}`)
@@ -277,15 +331,22 @@ function GpsDataContent() {
         return data;
       })
       .then((data) => {
+        if (seq !== gpsFetchSeq.current) return;
         setRows(data.rows ?? []);
         setTotalRows(Number(data.total) ?? 0);
         setOffset(off);
         setError(null);
         setErrorDetail(null);
       })
-      .catch((e) => setError(e.message))
-      .finally(() => setLoading(false));
-  }, [apiOrderBy, apiOrderDir, deviceNameFilter, geofenceIdFilter, geofenceTypeFilter]);
+      .catch((e) => {
+        if (seq !== gpsFetchSeq.current) return;
+        setError(e.message);
+      })
+      .finally(() => {
+        if (seq !== gpsFetchSeq.current) return;
+        setLoading(false);
+      });
+  }, [apiOrderBy, apiOrderDir, apiDateFrom, apiDateTo, deviceNameFilter, geofenceIdFilter, geofenceTypeFilter]);
 
   useEffect(() => {
     fetchPage(0);
@@ -395,7 +456,9 @@ function GpsDataContent() {
     <div className="w-full min-w-0 p-6">
       <h1 className="mb-4 text-2xl font-semibold text-zinc-900 dark:text-zinc-100">GPS Tracking</h1>
       <p className="mb-4 text-sm text-zinc-500 dark:text-zinc-400">
-        Inspect tbl_tracking in detail (device_name, imei, position times, geofence, apirow). Not linked to any job — for raw tracking inspection.
+        Inspect tbl_tracking in detail (device_name, imei, position times, geofence, lat/lon, apirow). Use <strong>View</strong> to open the point in Google Maps. Optional URL:{' '}
+        <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">?device=…&amp;day=YYYY-MM-DD&amp;orderBy=position_time&amp;orderDir=asc</code>{' '}
+        filters by <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">position_time::date</code> and server-sorts for pagination.
       </p>
       {loading && <p className="text-zinc-600">Loading…</p>}
       {error && (
@@ -513,13 +576,29 @@ function GpsDataContent() {
             </div>
             <div>
               <label className="mb-1 block text-xs font-medium text-zinc-500">From</label>
-              <input type="datetime-local" value={dateFrom} onChange={(e) => setDateFrom(e.target.value)}
-                className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800" />
+              <input
+                type="datetime-local"
+                value={dateFrom}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  setDateFrom(v);
+                  setApiDateFrom(v.length >= 10 ? v.slice(0, 10) : '');
+                }}
+                className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+              />
             </div>
             <div>
               <label className="mb-1 block text-xs font-medium text-zinc-500">To</label>
-              <input type="datetime-local" value={dateTo} onChange={(e) => setDateTo(e.target.value)}
-                className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800" />
+              <input
+                type="datetime-local"
+                value={dateTo}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  setDateTo(v);
+                  setApiDateTo(v.length >= 10 ? v.slice(0, 10) : '');
+                }}
+                className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+              />
             </div>
             <div>
               <label className="mb-1 block text-xs font-medium text-zinc-500">Device name</label>
@@ -529,6 +608,9 @@ function GpsDataContent() {
                 className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800"
               >
                 <option value="">— All —</option>
+                {deviceNameFilter && !uniqueDeviceNames.includes(deviceNameFilter) && (
+                  <option value={deviceNameFilter}>{deviceNameFilter}</option>
+                )}
                 {uniqueDeviceNames.map((name) => (
                   <option key={name} value={name}>{name}</option>
                 ))}
@@ -584,10 +666,10 @@ function GpsDataContent() {
                 className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800"
                 title="Raw column order for pagination — no timezone conversion"
               >
-                <option value="position_time_nz:asc">Earliest first (position_time_nz)</option>
-                <option value="position_time_nz:desc">Latest first (position_time_nz)</option>
                 <option value="position_time:asc">Earliest first (position_time)</option>
                 <option value="position_time:desc">Latest first (position_time)</option>
+                <option value="position_time_nz:asc">Earliest first (position_time_nz)</option>
+                <option value="position_time_nz:desc">Latest first (position_time_nz)</option>
               </select>
             </div>
           </div>
@@ -597,6 +679,7 @@ function GpsDataContent() {
                 {columns.map((col) => (
                   <col key={col} style={{ width: columnWidths[col], minWidth: columnWidths[col] }} />
                 ))}
+                <col style={{ width: 52, minWidth: 52 }} />
               </colgroup>
               <thead className="sticky top-0 z-10 bg-zinc-100 dark:bg-zinc-800 shadow-[0_1px_0_0_rgba(0,0,0,0.1)] dark:shadow-[0_1px_0_0_rgba(255,255,255,0.1)]">
                 <tr className="border-b border-zinc-200 dark:border-zinc-700">
@@ -623,10 +706,18 @@ function GpsDataContent() {
                       </span>
                     </th>
                   ))}
+                  <th
+                    className="cursor-default select-none whitespace-nowrap px-3 py-2 font-medium text-zinc-900 dark:text-zinc-100"
+                    title="Open coordinates in Google Maps (same as Inspect)"
+                  >
+                    View
+                  </th>
                 </tr>
               </thead>
               <tbody>
-                {sortedRows.map((row, i) => (
+                {sortedRows.map((row, i) => {
+                  const ll = rowLatLon(row);
+                  return (
                   <tr key={i} className="border-b border-zinc-100 dark:border-zinc-800 hover:bg-zinc-50 dark:hover:bg-zinc-800/50">
                     {columns.map((col) => (
                       <td
@@ -637,8 +728,23 @@ function GpsDataContent() {
                         {formatCell(row[col])}
                       </td>
                     ))}
+                    <td className="whitespace-nowrap px-3 py-2">
+                      {ll ? (
+                        <a
+                          href={`https://www.google.com/maps?q=${ll.lat},${ll.lon}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-blue-600 underline hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300"
+                        >
+                          View
+                        </a>
+                      ) : (
+                        <span className="text-zinc-400">—</span>
+                      )}
+                    </td>
                   </tr>
-                ))}
+                  );
+                })}
               </tbody>
             </table>
           </div>
@@ -647,7 +753,7 @@ function GpsDataContent() {
               {sortedRows.length} row{sortedRows.length !== 1 ? 's' : ''}
               {(dateFilterCol || fenceNameFilter) && ` (filtered from ${rows.length} on this page)`}
               {sortedRows.length > 0 && (() => {
-                const times = sortedRows.map((r) => r.position_time_nz ?? r.position_time).filter(Boolean) as string[];
+                const times = sortedRows.map((r) => r.position_time ?? r.position_time_nz).filter(Boolean) as string[];
                 if (times.length === 0) return null;
                 const sorted = [...times].sort();
                 const minT = sorted[0].toString().slice(0, 19).replace('T', ' ');

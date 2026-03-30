@@ -38,7 +38,7 @@ export async function GET(request: Request) {
          WHERE t.device_name = $1
            AND t.position_time >= $2::timestamp - interval '5 minutes'
            AND t.position_time <= $3::timestamp + interval '90 minutes'
-         ORDER BY t.position_time_nz ASC`,
+         ORDER BY t.position_time ASC, t.ctid ASC`,
         [device, fromParam, toParam]
       );
       return NextResponse.json({ rows: rows.rows ?? [] });

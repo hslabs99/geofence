@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { execute, query } from '@/lib/db';
+import { mergeVworkjobsIntoTblDevices } from '@/lib/tbl-devices-sync';
 
 /**
  * Sync devices from tbl_vworkjobs.worker into tbl_devices:
@@ -8,38 +8,7 @@ import { execute, query } from '@/lib/db';
  */
 export async function POST() {
   try {
-    const withGroup = `
-      INSERT INTO tbl_devices (device_name, "!group")
-      SELECT DISTINCT trim(w.worker), 'Newt'
-      FROM tbl_vworkjobs w
-      WHERE w.worker IS NOT NULL AND trim(w.worker) <> ''
-      AND NOT EXISTS (SELECT 1 FROM tbl_devices d WHERE d.device_name = trim(w.worker))
-    `;
-    const withoutGroup = `
-      INSERT INTO tbl_devices (device_name)
-      SELECT DISTINCT trim(w.worker)
-      FROM tbl_vworkjobs w
-      WHERE w.worker IS NOT NULL AND trim(w.worker) <> ''
-      AND NOT EXISTS (SELECT 1 FROM tbl_devices d WHERE d.device_name = trim(w.worker))
-    `;
-    let inserted = 0;
-    try {
-      inserted = await execute(withGroup);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      if (msg.includes('"!group"') || msg.includes('!group') || msg.includes('column')) {
-        inserted = await execute(withoutGroup);
-      } else {
-        throw e;
-      }
-    }
-
-    const countResult = await query<{ count: string }>('SELECT COUNT(*) AS count FROM tbl_devices');
-    const totalDevices = Number(countResult[0]?.count ?? 0);
-    const workersResult = await query<{ count: string }>(
-      "SELECT COUNT(DISTINCT trim(worker)) AS count FROM tbl_vworkjobs WHERE worker IS NOT NULL AND trim(worker) <> ''"
-    );
-    const totalWorkers = Number(workersResult[0]?.count ?? 0);
+    const { inserted, totalDevices, totalWorkers } = await mergeVworkjobsIntoTblDevices();
 
     return NextResponse.json({
       ok: true,

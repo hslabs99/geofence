@@ -1,13 +1,28 @@
 import { NextResponse } from 'next/server';
 import { runForDate, type ProgressEvent } from '@/lib/entryexit';
+import { getGpsStdTimeSeconds } from '@/lib/gps-fence-settings';
 
 const DEFAULT_BUFFER_HOURS = 1;
+
+/** If body omits graceSeconds or sends empty string, use DB (GPSstdTime). */
+function parseGraceSecondsOverride(b: Record<string, unknown>): number | undefined {
+  if (!('graceSeconds' in b)) return undefined;
+  const v = b.graceSeconds;
+  if (typeof v === 'number' && !Number.isNaN(v)) return Math.max(0, Math.min(86400, v));
+  if (typeof v === 'string') {
+    const t = v.trim();
+    if (t === '') return undefined;
+    const n = parseInt(t, 10);
+    if (!Number.isNaN(n)) return Math.max(0, Math.min(86400, n));
+  }
+  return undefined;
+}
 
 function parseBody(body: unknown): {
   dateFrom: string;
   dateTo: string;
   deviceNames: string[];
-  graceSeconds: number;
+  graceSecondsOverride: number | undefined;
   bufferHours: number;
 } | null {
   if (!body || typeof body !== 'object') return null;
@@ -15,13 +30,7 @@ function parseBody(body: unknown): {
   const deviceNames = Array.isArray(b.deviceNames)
     ? (b.deviceNames as unknown[]).map((d) => (typeof d === 'string' ? d.trim() : '')).filter(Boolean)
     : null;
-  let graceSeconds = 300;
-  if (typeof b.graceSeconds === 'number' && !Number.isNaN(b.graceSeconds)) {
-    graceSeconds = Math.max(0, Math.min(86400, b.graceSeconds));
-  } else if (typeof b.graceSeconds === 'string') {
-    const n = parseInt(b.graceSeconds, 10);
-    if (!Number.isNaN(n)) graceSeconds = Math.max(0, Math.min(86400, n));
-  }
+  const graceSecondsOverride = parseGraceSecondsOverride(b);
   let bufferHours = DEFAULT_BUFFER_HOURS;
   if (typeof b.bufferHours === 'number' && !Number.isNaN(b.bufferHours)) {
     bufferHours = Math.max(0, Math.min(24, b.bufferHours));
@@ -38,7 +47,7 @@ function parseBody(body: unknown): {
   if (!dateFrom || !re.test(dateFrom) || !dateTo || !re.test(dateTo) || !deviceNames?.length) return null;
   if (new Date(dateFrom + 'T00:00:00Z').getTime() > new Date(dateTo + 'T00:00:00Z').getTime()) return null;
 
-  return { dateFrom, dateTo, deviceNames, graceSeconds, bufferHours };
+  return { dateFrom, dateTo, deviceNames, graceSecondsOverride, bufferHours };
 }
 
 export async function POST(request: Request) {
@@ -65,7 +74,24 @@ export async function POST(request: Request) {
     );
   }
 
-  const { dateFrom, dateTo, deviceNames, graceSeconds, bufferHours } = parsed;
+  const { dateFrom, dateTo, deviceNames, graceSecondsOverride, bufferHours } = parsed;
+
+  let graceSeconds: number;
+  if (graceSecondsOverride !== undefined) {
+    graceSeconds = graceSecondsOverride;
+  } else {
+    const fromDb = await getGpsStdTimeSeconds();
+    if (fromDb === null) {
+      return NextResponse.json(
+        {
+          error:
+            'Set GPS Std time (seconds) in Admin → Settings, or pass graceSeconds in the request body.',
+        },
+        { status: 400 }
+      );
+    }
+    graceSeconds = fromDb;
+  }
   const encoder = new TextEncoder();
 
   const stream = new ReadableStream({

@@ -2,8 +2,9 @@ import { NextResponse } from 'next/server';
 import { query } from '@/lib/db';
 
 /**
- * GET: Scan tbl_tracking for gaps in position_time_nz per device (ordered by device_name, position_time_nz).
+ * GET: Scan tbl_tracking for gaps in position_time per device (ordered by device_name, position_time).
  * Returns gaps > minGapMinutes. Report by date, by device with largest gap in minutes.
+ * Uses position_time only (verbatim API time) for ordering, gap length, and day boundaries.
  *
  * Query params: minGapMinutes (required), dateFrom (optional YYYY-MM-DD), dateTo (optional YYYY-MM-DD).
  */
@@ -35,26 +36,25 @@ export async function GET(request: Request) {
       dateCondition += ` AND position_time::date <= $${paramIdx}::date`;
     }
 
-    // Gaps: for each row, previous position_time_nz in same device; gap_minutes = (current - prev) in minutes.
-    // Report date (column 1) and date filter use position_time (not position_time_nz).
-    // From/To = position_time (raw); From_NZ/To_NZ = position_time_nz.
-    // DayCount = total tbl_tracking rows for that device on that (position_time) date.
+    // Gaps: consecutive rows ordered by position_time; gap_minutes = (current - previous) in minutes.
+    // Report date, filters, and day_count use position_time::date. NZ columns are informational only.
     const summarySql = `
 WITH daily_counts AS (
   SELECT device_name, position_time::date AS d, COUNT(*)::int AS day_count
   FROM tbl_tracking
-  WHERE position_time_nz IS NOT NULL AND position_time IS NOT NULL
+  WHERE position_time IS NOT NULL
   ${dateCondition}
   GROUP BY device_name, position_time::date
 ),
 ordered AS (
-  SELECT device_name, position_time_nz, position_time, lat, lon,
-    LAG(position_time_nz) OVER (PARTITION BY device_name ORDER BY position_time_nz) AS prev_nz,
-    LAG(position_time) OVER (PARTITION BY device_name ORDER BY position_time_nz) AS prev_position_time,
-    LAG(lat) OVER (PARTITION BY device_name ORDER BY position_time_nz) AS prev_lat,
-    LAG(lon) OVER (PARTITION BY device_name ORDER BY position_time_nz) AS prev_lon
+  SELECT device_name, position_time, position_time_nz, lat, lon,
+    LAG(position_time) OVER (PARTITION BY device_name ORDER BY position_time ASC, ctid) AS prev_pt,
+    LAG(position_time_nz) OVER (PARTITION BY device_name ORDER BY position_time ASC, ctid) AS prev_nz,
+    LAG(position_time) OVER (PARTITION BY device_name ORDER BY position_time ASC, ctid) AS prev_position_time,
+    LAG(lat) OVER (PARTITION BY device_name ORDER BY position_time ASC, ctid) AS prev_lat,
+    LAG(lon) OVER (PARTITION BY device_name ORDER BY position_time ASC, ctid) AS prev_lon
   FROM tbl_tracking
-  WHERE position_time_nz IS NOT NULL AND position_time IS NOT NULL
+  WHERE position_time IS NOT NULL
   ${dateCondition}
 ),
 gaps AS (
@@ -67,10 +67,10 @@ gaps AS (
     prev_lon AS gap_start_lon,
     lat AS gap_end_lat,
     lon AS gap_end_lon,
-    EXTRACT(EPOCH FROM (position_time_nz - prev_nz))/60 AS gap_minutes
+    EXTRACT(EPOCH FROM (position_time - prev_pt))/60 AS gap_minutes
   FROM ordered
-  WHERE prev_nz IS NOT NULL
-  AND EXTRACT(EPOCH FROM (position_time_nz - prev_nz))/60 > $1
+  WHERE prev_pt IS NOT NULL
+  AND EXTRACT(EPOCH FROM (position_time - prev_pt))/60 > $1
 ),
 ranked AS (
   SELECT
@@ -125,21 +125,20 @@ ORDER BY r.report_date DESC, r.device_name
       gap_end_lon: number | null;
     }>(summarySql, params);
 
-    // Detail: all gaps > minGapMinutes for optional display (limit 500); date filter by position_time
     const detailSql = `
 WITH ordered AS (
   SELECT device_name, position_time_nz, position_time,
-    LAG(position_time_nz) OVER (PARTITION BY device_name ORDER BY position_time_nz) AS prev_nz
+    LAG(position_time) OVER (PARTITION BY device_name ORDER BY position_time ASC, ctid) AS prev_pt
   FROM tbl_tracking
-  WHERE position_time_nz IS NOT NULL AND position_time IS NOT NULL
+  WHERE position_time IS NOT NULL
   ${dateCondition}
 ),
 gaps AS (
-  SELECT device_name, prev_nz AS gap_start, position_time_nz AS gap_end,
-    ROUND((EXTRACT(EPOCH FROM (position_time_nz - prev_nz))/60)::numeric, 2) AS gap_minutes
+  SELECT device_name, prev_pt AS gap_start, position_time AS gap_end,
+    ROUND((EXTRACT(EPOCH FROM (position_time - prev_pt))/60)::numeric, 2) AS gap_minutes
   FROM ordered
-  WHERE prev_nz IS NOT NULL
-  AND EXTRACT(EPOCH FROM (position_time_nz - prev_nz))/60 > $1
+  WHERE prev_pt IS NOT NULL
+  AND EXTRACT(EPOCH FROM (position_time - prev_pt))/60 > $1
 )
 SELECT device_name,
   to_char(gap_start, 'YYYY-MM-DD HH24:MI:SS') AS gap_start,

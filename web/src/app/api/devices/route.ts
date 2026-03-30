@@ -1,20 +1,23 @@
 import { NextResponse } from 'next/server';
 import { query } from '@/lib/db';
+import { ensureTblDevicesSchema } from '@/lib/ensure-tbl-devices-schema';
 
 /**
- * List devices (workers) from tbl_vworkjobs: SELECT DISTINCT worker.
- * Use this for any device list or table with checkboxes (e.g. tagging). No CRUD on tbl_devices.
+ * List devices from tbl_devices (union of TrackSolid + vworkjobs harvest). Includes imei when known.
  */
 export async function GET() {
   try {
-    const rows = await query<{ worker: string | null }>(
-      `SELECT DISTINCT trim(w.worker) AS worker
-       FROM tbl_vworkjobs w
-       WHERE w.worker IS NOT NULL AND trim(w.worker) <> ''
+    await ensureTblDevicesSchema();
+    const rows = await query<{ device_name: string | null; imei: string | null }>(
+      `SELECT trim(device_name) AS device_name, nullif(trim(imei), '') AS imei
+       FROM tbl_devices
        ORDER BY 1`
     );
     const devices = rows
-      .map((r) => ({ deviceName: r.worker?.trim() ?? '' }))
+      .map((r) => ({
+        deviceName: (r.device_name ?? '').trim(),
+        imei: r.imei?.trim() || null,
+      }))
       .filter((d) => d.deviceName);
     return NextResponse.json({ ok: true, devices });
   } catch (err) {

@@ -98,6 +98,8 @@ export function mapApiStepViaToDisplay(code: string | undefined | null): string 
       return 'GPS';
     case 'VineFence+':
       return 'GPS+';
+    case 'GPS*':
+      return 'GPS*';
     case 'ORIDE':
       return 'Manual';
     case 'RULE':

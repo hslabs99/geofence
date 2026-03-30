@@ -1,18 +1,23 @@
 'use client';
 
 import { useEffect, useState } from 'react';
+import {
+  GPS_FENCE_SETTINGS_TYPE,
+  GPS_STD_TIME_NAME,
+  GPSPLUS_GROWTH_NAME,
+  GPSPLUS_TIME_NAME,
+} from '@/lib/gps-fence-settings-names';
 
 const SETTING_TYPE = 'System';
 const GPS_START_BUFFER_NAME = 'GPSstartbuffer';
 const INSPECT_START_LESS_NAME = 'InspectStartLess';
 const INSPECT_END_PLUS_NAME = 'InspectEndPlus';
-const GPSPLUS_GROWTH_NAME = 'GPSplusGrowth';
-const GPSPLUS_TIME_NAME = 'GPSplusTime';
 
 export default function SettingsPage() {
   const [gpsStartBuffer, setGpsStartBuffer] = useState<string>('');
   const [inspectStartLess, setInspectStartLess] = useState<string>('');
   const [inspectEndPlus, setInspectEndPlus] = useState<string>('');
+  const [gpsStdTime, setGpsStdTime] = useState<string>('');
   const [gpsplusGrowth, setGpsplusGrowth] = useState<string>('');
   const [gpsplusTime, setGpsplusTime] = useState<string>('');
   const [loading, setLoading] = useState(true);
@@ -20,31 +25,36 @@ export default function SettingsPage() {
 
   useEffect(() => {
     const type = SETTING_TYPE;
+    const fenceType = GPS_FENCE_SETTINGS_TYPE;
     Promise.all([
       fetch(`/api/settings?${new URLSearchParams({ type, name: GPS_START_BUFFER_NAME })}`).then((r) => r.json()),
       fetch(`/api/settings?${new URLSearchParams({ type, name: INSPECT_START_LESS_NAME })}`).then((r) => r.json()),
       fetch(`/api/settings?${new URLSearchParams({ type, name: INSPECT_END_PLUS_NAME })}`).then((r) => r.json()),
-      fetch(`/api/settings?${new URLSearchParams({ type, name: GPSPLUS_GROWTH_NAME })}`).then((r) => r.json()),
-      fetch(`/api/settings?${new URLSearchParams({ type, name: GPSPLUS_TIME_NAME })}`).then((r) => r.json()),
+      fetch(`/api/settings?${new URLSearchParams({ type: fenceType, name: GPS_STD_TIME_NAME })}`).then((r) => r.json()),
+      fetch(`/api/settings?${new URLSearchParams({ type: fenceType, name: GPSPLUS_GROWTH_NAME })}`).then((r) => r.json()),
+      fetch(`/api/settings?${new URLSearchParams({ type: fenceType, name: GPSPLUS_TIME_NAME })}`).then((r) => r.json()),
     ])
-      .then(([data1, data2, data3, data4, data5]) => {
+      .then(([data1, data2, data3, dataStd, data4, data5]) => {
         const v1 = data1?.settingvalue;
         setGpsStartBuffer(v1 != null && v1 !== '' ? String(v1) : '15');
         const v2 = data2?.settingvalue;
         setInspectStartLess(v2 != null && v2 !== '' ? String(v2) : '10');
         const v3 = data3?.settingvalue;
         setInspectEndPlus(v3 != null && v3 !== '' ? String(v3) : '60');
+        const vStd = dataStd?.settingvalue;
+        setGpsStdTime(vStd != null && String(vStd).trim() !== '' ? String(vStd).trim() : '');
         const v4 = data4?.settingvalue;
         setGpsplusGrowth(v4 != null && v4 !== '' ? String(v4) : '10');
         const v5 = data5?.settingvalue;
-        setGpsplusTime(v5 != null && v5 !== '' ? String(v5) : '300');
+        setGpsplusTime(v5 != null && String(v5).trim() !== '' ? String(v5).trim() : '');
       })
       .catch(() => {
         setGpsStartBuffer('15');
         setInspectStartLess('10');
         setInspectEndPlus('60');
+        setGpsStdTime('');
         setGpsplusGrowth('10');
-        setGpsplusTime('300');
+        setGpsplusTime('');
       })
       .finally(() => setLoading(false));
   }, []);
@@ -124,6 +134,31 @@ export default function SettingsPage() {
       });
   };
 
+  const saveGpsStdTime = () => {
+    const sec = Math.max(0, parseInt(gpsStdTime, 10));
+    if (Number.isNaN(sec)) return;
+    setSaveStatus('saving');
+    fetch('/api/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        type: GPS_FENCE_SETTINGS_TYPE,
+        settingname: GPS_STD_TIME_NAME,
+        settingvalue: String(sec),
+      }),
+    })
+      .then((r) => {
+        if (r.ok) {
+          setSaveStatus('saved');
+          setGpsStdTime(String(sec));
+        } else setSaveStatus('error');
+      })
+      .catch(() => setSaveStatus('error'))
+      .finally(() => {
+        setTimeout(() => setSaveStatus('idle'), 2000);
+      });
+  };
+
   const saveGpsplusGrowth = () => {
     const meters = Math.max(0, parseInt(gpsplusGrowth, 10));
     if (Number.isNaN(meters)) return;
@@ -132,7 +167,7 @@ export default function SettingsPage() {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        type: SETTING_TYPE,
+        type: GPS_FENCE_SETTINGS_TYPE,
         settingname: GPSPLUS_GROWTH_NAME,
         settingvalue: String(meters),
       }),
@@ -157,7 +192,7 @@ export default function SettingsPage() {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        type: SETTING_TYPE,
+        type: GPS_FENCE_SETTINGS_TYPE,
         settingname: GPSPLUS_TIME_NAME,
         settingvalue: String(sec),
       }),
@@ -256,6 +291,34 @@ export default function SettingsPage() {
                 <button
                   type="button"
                   onClick={saveInspectEndPlus}
+                  disabled={saveStatus === 'saving'}
+                  className="rounded bg-zinc-200 px-3 py-2 text-sm font-medium hover:bg-zinc-300 disabled:opacity-50 dark:bg-zinc-700 dark:hover:bg-zinc-600"
+                >
+                  {saveStatus === 'saving' ? 'Saving…' : saveStatus === 'saved' ? 'Saved' : saveStatus === 'error' ? 'Save failed' : 'Save'}
+                </button>
+              </div>
+            </label>
+          </div>
+          <div className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900">
+            <label className="block">
+              <span className="text-sm font-medium text-zinc-700 dark:text-zinc-300">GPS Std time (seconds)</span>
+              <p className="mt-0.5 text-xs text-zinc-500">
+                Entry/Exit Tagging: minimum seconds a fence or null state must persist before writing ENTER/EXIT to tbl_tracking.
+              </p>
+              <div className="mt-2 flex items-center gap-2">
+                <input
+                  type="number"
+                  min={0}
+                  max={86400}
+                  value={gpsStdTime}
+                  onChange={(e) => setGpsStdTime(e.target.value)}
+                  onBlur={saveGpsStdTime}
+                  className="rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+                />
+                <span className="text-sm text-zinc-500">seconds</span>
+                <button
+                  type="button"
+                  onClick={saveGpsStdTime}
                   disabled={saveStatus === 'saving'}
                   className="rounded bg-zinc-200 px-3 py-2 text-sm font-medium hover:bg-zinc-300 disabled:opacity-50 dark:bg-zinc-700 dark:hover:bg-zinc-600"
                 >

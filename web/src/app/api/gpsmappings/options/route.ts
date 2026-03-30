@@ -3,7 +3,7 @@ import { query } from '@/lib/db';
 
 export async function GET() {
   try {
-    const [fenceNames, geofencesRows, trackingCounts, deliveryWineries, vineyardNames] = await Promise.all([
+    const [fenceNames, geofencesRows, trackingCounts, deliveryWineries, vineyardRows] = await Promise.all([
       query<{ fence_name: string | null }>(
         `SELECT DISTINCT fence_name FROM tbl_gpsdata
          WHERE fence_name IS NOT NULL AND fence_name != ''
@@ -25,9 +25,11 @@ export async function GET() {
          WHERE delivery_winery IS NOT NULL AND delivery_winery != ''
          ORDER BY delivery_winery`
       ),
-      query<{ vineyard_name: string | null }>(
-        `SELECT DISTINCT vineyard_name FROM tbl_vworkjobs
-         WHERE vineyard_name IS NOT NULL AND vineyard_name != ''
+      query<{ vineyard_name: string; job_count: string }>(
+        `SELECT vineyard_name, COUNT(*)::text AS job_count
+         FROM tbl_vworkjobs
+         WHERE vineyard_name IS NOT NULL AND trim(vineyard_name) <> ''
+         GROUP BY vineyard_name
          ORDER BY vineyard_name`
       ),
     ]);
@@ -39,6 +41,13 @@ export async function GET() {
       fence_id: r.fence_id,
       fence_name: (r.fence_name ?? '').trim(),
     }));
+    const vineyardNames = vineyardRows.map((r) => r.vineyard_name).filter(Boolean) as string[];
+    const vineyardJobCounts: Record<string, number> = {};
+    for (const r of vineyardRows) {
+      if (r.vineyard_name) {
+        vineyardJobCounts[r.vineyard_name] = parseInt(r.job_count, 10) || 0;
+      }
+    }
     return NextResponse.json({
       fenceNames: fenceNames.map((r) => r.fence_name).filter(Boolean) as string[],
       /** tbl_geofences rows (fence_id, fence_name); no duplicates */
@@ -46,7 +55,9 @@ export async function GET() {
       /** Count of tbl_tracking rows per fence_id */
       trackingCountByFenceId,
       deliveryWineries: deliveryWineries.map((r) => r.delivery_winery).filter(Boolean) as string[],
-      vineyardNames: vineyardNames.map((r) => r.vineyard_name).filter(Boolean) as string[],
+      vineyardNames,
+      /** tbl_vworkjobs row count per distinct vineyard_name */
+      vineyardJobCounts,
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

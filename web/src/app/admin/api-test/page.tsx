@@ -191,6 +191,8 @@ export default function ApiTestPage() {
   const [singleDateTo, setSingleDateTo] = useState(''); // YYYY-MM-DD; empty = use singleDateFrom or trackDate
   const [singleDeviceDayLog, setSingleDeviceDayLog] = useState<Array<{
     date: string;
+    apiStatus: 'ok' | 'ok_empty' | 'api_fail';
+    apiError: string | null;
     apiCount: number;
     apifeedCount: number;
     trackingCount: number;
@@ -294,7 +296,7 @@ export default function ApiTestPage() {
     setSaveMessage(null);
     setImportDebug(null);
     try {
-      const res = await fetch('/api/apifeed/import', {
+      const res = await fetch('/api/tracking/import-direct', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ deviceName, imei: trackImei.trim() || undefined, points: trackPoints }),
@@ -306,17 +308,10 @@ export default function ApiTestPage() {
         return;
       }
       setSaveStatus('saved');
-      const parts = [`Inserted ${data.inserted} rows into tbl_apifeed`];
-      if (data.deleted != null && data.deleted > 0) parts.push(`${data.deleted} existing rows deleted for range`);
-      if (data.skipped) parts.push(`${data.skipped} skipped`);
+      const parts = [`Inserted ${data.inserted} new rows into tbl_tracking`];
+      if (data.skipped) parts.push(`${data.skipped} skipped invalid`);
       setSaveMessage(parts.join(' · ') + '.');
-      setImportDebug({
-        deleteSql: data.deleteSql ?? null,
-        deleteParams: Array.isArray(data.deleteParams) ? data.deleteParams : null,
-        skippedRows: Array.isArray(data.skippedRows) ? data.skippedRows : null,
-        uniquePositionTimes: typeof data.uniquePositionTimes === 'number' ? data.uniquePositionTimes : undefined,
-        duplicatePositionTimeInPayload: typeof data.duplicatePositionTimeInPayload === 'number' ? data.duplicatePositionTimeInPayload : undefined,
-      });
+      setImportDebug(null);
       setTimeout(() => {
         setSaveStatus('idle');
         setSaveMessage(null);
@@ -329,62 +324,46 @@ export default function ApiTestPage() {
 
   const mergeToTracking = async () => {
     if (!trackPoints?.length || !trackImei.trim()) return;
-    const times = trackPoints.map((p) => p.gpsTime).filter(Boolean) as string[];
-    if (times.length === 0) {
-      setMergeMessage('No valid times to merge');
-      setMergeStatus('error');
-      setMergeResult(null);
-      return;
-    }
-    const sorted = [...times].sort();
-    const minTime = sorted[0];
-    const maxTime = sorted[sorted.length - 1];
     const deviceName = devices?.find((d) => d.imei === trackImei)?.deviceName ?? trackImei;
     setMergeStatus('merging');
     setMergeMessage(null);
     setMergeDebug(null);
     setMergeResult(null);
     try {
-      const res = await fetch('/api/apifeed/merge-tracking', {
+      const res = await fetch('/api/tracking/import-direct', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ deviceName, minTime, maxTime }),
+        body: JSON.stringify({ deviceName, imei: trackImei.trim(), points: trackPoints }),
       });
       const data = await res.json();
       if (!data.ok) {
         setMergeStatus('error');
-        setMergeMessage(data.error ?? 'Merge failed');
-        setMergeDebug(
-          data.failedStep || data.rawSql
-            ? { failedStep: data.failedStep, rawSql: data.rawSql }
-            : null
-        );
+        setMergeMessage(data.error ?? 'Direct import failed');
+        setMergeDebug(null);
         setMergeResult({
           deviceName,
-          minTime,
-          maxTime,
+          minTime: '—',
+          maxTime: '—',
           deleted: 0,
           inserted: 0,
-          apifeedRowsInRange: data.apifeedRowsInRange,
-          error: data.error ?? 'Merge failed',
+          apifeedRowsInRange: undefined,
+          error: data.error ?? 'Direct import failed',
         });
         return;
       }
       setMergeStatus('merged');
-      const msg = [
-        `${data.inserted} rows merged into tbl_tracking`,
-        data.deleted != null && data.deleted > 0 ? ` (${data.deleted} old rows deleted)` : '',
-        typeof data.apifeedRowsInRange === 'number' ? ` · ${data.apifeedRowsInRange} rows in tbl_apifeed in range` : '',
-      ].join('');
+      const msg = `${data.inserted} new rows inserted into tbl_tracking${data.skipped ? ` · ${data.skipped} skipped invalid` : ''}`;
       setMergeMessage(msg + '.');
       setMergeDebug(null);
+      const times = trackPoints.map((p) => p.gpsTime).filter(Boolean) as string[];
+      const sorted = [...times].sort();
       setMergeResult({
         deviceName,
-        minTime,
-        maxTime,
-        deleted: Number(data.deleted) ?? 0,
+        minTime: sorted[0] ?? '—',
+        maxTime: sorted[sorted.length - 1] ?? '—',
+        deleted: 0,
         inserted: Number(data.inserted) ?? 0,
-        apifeedRowsInRange: data.apifeedRowsInRange,
+        apifeedRowsInRange: undefined,
       });
       await fillPositionTimeNzNullsAfterImport();
       setTimeout(() => {
@@ -398,8 +377,8 @@ export default function ApiTestPage() {
       setMergeDebug(null);
       setMergeResult({
         deviceName,
-        minTime,
-        maxTime,
+        minTime: '—',
+        maxTime: '—',
         deleted: 0,
         inserted: 0,
         error: errMsg,
@@ -407,7 +386,7 @@ export default function ApiTestPage() {
     }
   };
 
-  /** Single device: run clear → fetch → save → merge for each day in [singleDateFrom, singleDateTo]; build day log table. */
+  /** Single device: run fetch + direct upsert for each day in [singleDateFrom, singleDateTo]; build day log table. */
   const runSingleDeviceRange = async () => {
     if (!trackImei.trim()) return;
     const deviceName = devices?.find((d) => d.imei === trackImei)?.deviceName ?? trackImei;
@@ -420,6 +399,8 @@ export default function ApiTestPage() {
     setSingleDeviceRunProgress({ currentDay: 0, totalDays: dates.length, dateLabel: dates[0] ?? '' });
     const log: Array<{
       date: string;
+      apiStatus: 'ok' | 'ok_empty' | 'api_fail';
+      apiError: string | null;
       apiCount: number;
       apifeedCount: number;
       trackingCount: number;
@@ -432,54 +413,64 @@ export default function ApiTestPage() {
     for (let i = 0; i < dates.length; i++) {
       const day = dates[i];
       setSingleDeviceRunProgress({ currentDay: i + 1, totalDays: dates.length, dateLabel: day });
-      const trackParams = new URLSearchParams({ imei, endpoint, date: day, deviceName });
-      const actualRequestUrl = `/api/tracksolid/track?${trackParams.toString()}`;
-      setGpsFetchLog((prev) => [...prev, { date: day, device: deviceName, url: actualRequestUrl }]);
       try {
-        const clearRes = await fetch('/api/apifeed/clear-for-device-date', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ deviceName, date: day }),
-        });
-        const clearData = await clearRes.json();
-        if (!clearData.ok) {
-          log.push({ date: day, apiCount: 0, apifeedCount: 0, trackingCount: 0, largestGapMinutes: null, gapFrom: null, gapTo: null, apiRequestSummary: actualRequestUrl, rawPayload: null });
+        const out = await fetchTrackByImei(deviceName, imei, day);
+        const actualRequestUrl = out.requestUrl;
+        if (!out.ok) {
+          log.push({
+            date: day,
+            apiStatus: 'api_fail',
+            apiError: out.error ?? 'Fetch failed',
+            apiCount: 0,
+            apifeedCount: 0,
+            trackingCount: 0,
+            largestGapMinutes: null,
+            gapFrom: null,
+            gapTo: null,
+            apiRequestSummary: actualRequestUrl,
+            rawPayload: null,
+          });
           setSingleDeviceDayLog([...log]);
           continue;
         }
-        const trackRes = await fetch(actualRequestUrl);
-        const trackData = await trackRes.json();
-        const getTrackStep = trackData.debug?.steps?.find((s: { step: string }) => s.step === 'getTrack');
-        const rawPayload: string | null = (getTrackStep?.debug?.responseBody != null && typeof getTrackStep.debug.responseBody === 'string')
-          ? getTrackStep.debug.responseBody
-          : null;
-        const points: TrackPoint[] = trackData.ok ? (trackData.points ?? []) : [];
+        const rawPayload = out.rawPayload;
+        const points: TrackPoint[] = out.points ?? [];
         const apiCount = points.length;
         let apifeedCount = 0;
         let trackingCount = 0;
         const gapInfo = largestGapFromPayload(points);
         if (points.length > 0) {
-          const saveRes = await fetch('/api/apifeed/import', {
+          const saveRes = await fetch('/api/tracking/import-direct', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ deviceName, imei, points }),
+            body: JSON.stringify({ deviceName, imei, points, date: day }),
           });
           const saveData = await saveRes.json();
-          if (saveData.ok) apifeedCount = Number(saveData.inserted) ?? 0;
-          const times = points.map((p) => p.gpsTime).filter(Boolean) as string[];
-          if (times.length > 0) {
-            const sorted = [...times].sort();
-            const mergeRes = await fetch('/api/apifeed/merge-tracking', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ deviceName, minTime: sorted[0], maxTime: sorted[sorted.length - 1] }),
+          if (saveData.ok) {
+            trackingCount = Number(saveData.inserted) ?? 0;
+            apifeedCount = 0;
+          } else {
+            log.push({
+              date: day,
+              apiStatus: 'api_fail',
+              apiError: saveData.error ?? 'Direct import failed',
+              apiCount,
+              apifeedCount: 0,
+              trackingCount: 0,
+              largestGapMinutes: gapInfo?.largestGapMinutes ?? null,
+              gapFrom: gapInfo?.gapFrom ?? null,
+              gapTo: gapInfo?.gapTo ?? null,
+              apiRequestSummary: actualRequestUrl,
+              rawPayload,
             });
-            const mergeData = await mergeRes.json();
-            if (mergeData.ok) trackingCount = Number(mergeData.inserted) ?? 0;
+            setSingleDeviceDayLog([...log]);
+            continue;
           }
         }
         log.push({
           date: day,
+          apiStatus: apiCount > 0 ? 'ok' : 'ok_empty',
+          apiError: null,
           apiCount,
           apifeedCount,
           trackingCount,
@@ -490,7 +481,20 @@ export default function ApiTestPage() {
           rawPayload,
         });
       } catch {
-        log.push({ date: day, apiCount: 0, apifeedCount: 0, trackingCount: 0, largestGapMinutes: null, gapFrom: null, gapTo: null, apiRequestSummary: actualRequestUrl, rawPayload: null });
+        const urlFallback = `/api/tracksolid/track?${new URLSearchParams({ imei, endpoint, date: day, deviceName }).toString()}`;
+        log.push({
+          date: day,
+          apiStatus: 'api_fail',
+          apiError: 'Request failed',
+          apiCount: 0,
+          apifeedCount: 0,
+          trackingCount: 0,
+          largestGapMinutes: null,
+          gapFrom: null,
+          gapTo: null,
+          apiRequestSummary: urlFallback,
+          rawPayload: null,
+        });
       }
       setSingleDeviceDayLog([...log]);
     }
@@ -506,17 +510,72 @@ export default function ApiTestPage() {
   const resolveImei = (deviceName: string): string | null =>
     devices?.find((d) => d.deviceName === deviceName)?.imei ?? null;
 
-  const fetchTrackForDevice = async (deviceName: string, dateOverride?: string): Promise<TrackPoint[] | null> => {
-    const imei = fleetRows.find((r) => r.deviceName === deviceName)?.imei ?? resolveImei(deviceName);
-    if (!imei?.trim()) {
-      updateFleetRow(deviceName, {
-        getApiStatus: 'error',
-        error: 'Run Step 2 (Fetch devices) first to resolve IMEI for this device.',
+  type FetchTrackResult = {
+    ok: boolean;
+    points: TrackPoint[];
+    requestUrl: string;
+    rawPayload: string | null;
+    error?: string;
+    /** Present when TrackSolid route returned JSON with debug (same shape as /api/tracksolid/track). */
+    debug?: unknown;
+  };
+
+  /** DB row stays `attempting` until complete — use to detect timeouts / aborted fetches. */
+  const startTracksolidFetchLog = async (
+    deviceName: string,
+    imei: string,
+    date: string,
+    trackUrl: string
+  ): Promise<number | null> => {
+    try {
+      const res = await fetch('/api/logs/tracksolid-fetch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'start',
+          deviceName,
+          imei,
+          date,
+          endpoint,
+          requestUrl: trackUrl,
+        }),
       });
+      const data = (await res.json()) as { ok?: boolean; logId?: number };
+      return typeof data.logId === 'number' && Number.isFinite(data.logId) ? data.logId : null;
+    } catch {
       return null;
     }
-    updateFleetRow(deviceName, { getApiStatus: 'loading', error: null, imei: imei || null });
-    const date = dateOverride ?? trackDate;
+  };
+
+  const completeTracksolidFetchLog = async (
+    logId: number | null,
+    outcome: 'success' | 'failed' | 'error' | 'client_abort',
+    extra: { rowcount?: number; error?: string | null; httpStatus?: number | null }
+  ): Promise<void> => {
+    if (logId == null) return;
+    try {
+      await fetch('/api/logs/tracksolid-fetch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'complete',
+          logId,
+          outcome,
+          rowcount: extra.rowcount,
+          error: extra.error ?? null,
+          httpStatus: extra.httpStatus ?? null,
+        }),
+      });
+    } catch {
+      /* ignore */
+    }
+  };
+
+  const fetchTrackByImei = async (
+    deviceName: string,
+    imei: string,
+    date: string
+  ): Promise<FetchTrackResult> => {
     const params = new URLSearchParams({
       imei,
       endpoint,
@@ -525,19 +584,141 @@ export default function ApiTestPage() {
     });
     const trackUrl = `/api/tracksolid/track?${params.toString()}`;
     setGpsFetchLog((prev) => [...prev, { date, device: deviceName, url: trackUrl }]);
+
+    const logId = await startTracksolidFetchLog(deviceName, imei, date, trackUrl);
+
     try {
       const res = await fetch(trackUrl);
+      let data: {
+        ok?: boolean;
+        error?: string;
+        points?: TrackPoint[];
+        debug?: { steps?: Array<{ step: string; debug?: { responseBody?: string } }> };
+        rateLimitHint?: boolean;
+      };
+      try {
+        data = await res.json();
+      } catch {
+        await completeTracksolidFetchLog(logId, 'error', {
+          error: 'Response body is not JSON',
+          httpStatus: res.status,
+        });
+        return {
+          ok: false,
+          points: [],
+          requestUrl: trackUrl,
+          rawPayload: null,
+          error: 'Invalid JSON response from server',
+        };
+      }
+      if (!data.ok) {
+        await completeTracksolidFetchLog(logId, 'failed', {
+          error: data.error ?? 'Fetch failed',
+          httpStatus: res.status,
+        });
+        return {
+          ok: false,
+          points: [],
+          requestUrl: trackUrl,
+          rawPayload: null,
+          error: data.error ?? 'Fetch failed',
+          debug: data.debug,
+        };
+      }
+      const points: TrackPoint[] = data.points ?? [];
+      const getTrackStep = data.debug?.steps?.find((s: { step: string }) => s.step === 'getTrack');
+      const rawPayload: string | null = (getTrackStep?.debug?.responseBody != null && typeof getTrackStep.debug.responseBody === 'string')
+        ? getTrackStep.debug.responseBody
+        : null;
+      await completeTracksolidFetchLog(logId, 'success', { rowcount: points.length, httpStatus: res.status });
+      return {
+        ok: true,
+        points,
+        requestUrl: trackUrl,
+        rawPayload,
+        debug: data.debug,
+      };
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      await completeTracksolidFetchLog(logId, 'client_abort', {
+        error: msg,
+        httpStatus: null,
+      });
+      return {
+        ok: false,
+        points: [],
+        requestUrl: trackUrl,
+        rawPayload: null,
+        error: msg,
+      };
+    }
+  };
+
+  const importDirectForDevice = async (
+    deviceName: string,
+    imei: string,
+    points: TrackPoint[],
+    dateOverride?: string
+  ): Promise<{ inserted: number; skipped: number; total: number } | null> => {
+    updateFleetRow(deviceName, { saveStatus: 'saving', mergeStatus: 'merging', error: null });
+    try {
+      const res = await fetch('/api/tracking/import-direct', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ deviceName, imei, points, date: dateOverride ?? trackDate }),
+      });
       const data = await res.json();
       if (!data.ok) {
         updateFleetRow(deviceName, {
+          saveStatus: 'error',
+          mergeStatus: 'error',
+          error: data.error ?? 'Direct import failed',
+        });
+        return null;
+      }
+      updateFleetRow(deviceName, { saveStatus: 'done', mergeStatus: 'done', error: null });
+      return {
+        inserted: Number(data.inserted) ?? 0,
+        skipped: Number(data.skipped) ?? 0,
+        total: Number(data.total) ?? points.length,
+      };
+    } catch (e) {
+      updateFleetRow(deviceName, {
+        saveStatus: 'error',
+        mergeStatus: 'error',
+        error: e instanceof Error ? e.message : String(e),
+      });
+      return null;
+    }
+  };
+
+  const fetchTrackForDevice = async (deviceName: string, dateOverride?: string): Promise<TrackPoint[] | null> => {
+    const imei = fleetRows.find((r) => r.deviceName === deviceName)?.imei ?? resolveImei(deviceName);
+    if (!imei?.trim()) {
+      updateFleetRow(deviceName, {
+        getApiStatus: 'error',
+        saveStatus: 'idle',
+        mergeStatus: 'idle',
+        error: 'Run Step 2 (Fetch devices) first to resolve IMEI for this device.',
+      });
+      return null;
+    }
+    updateFleetRow(deviceName, { getApiStatus: 'loading', error: null, imei: imei || null });
+    const date = dateOverride ?? trackDate;
+    try {
+      const out = await fetchTrackByImei(deviceName, imei, date);
+      if (!out.ok) {
+        updateFleetRow(deviceName, {
           getApiStatus: 'error',
-          error: data.error ?? 'Fetch failed',
+          saveStatus: 'idle',
+          mergeStatus: 'idle',
+          error: out.error ?? 'Fetch failed',
           points: null,
           recordCount: null,
         });
         return null;
       }
-      const points: TrackPoint[] = data.points ?? [];
+      const points: TrackPoint[] = out.points ?? [];
       updateFleetRow(deviceName, {
         points,
         recordCount: points.length,
@@ -549,6 +730,8 @@ export default function ApiTestPage() {
     } catch (e) {
       updateFleetRow(deviceName, {
         getApiStatus: 'error',
+        saveStatus: 'idle',
+        mergeStatus: 'idle',
         error: e instanceof Error ? e.message : String(e),
       });
       return null;
@@ -560,68 +743,16 @@ export default function ApiTestPage() {
     const points = pointsOverride ?? row?.points;
     if (!points?.length) return;
     const imei = row?.imei ?? resolveImei(deviceName) ?? '';
-    updateFleetRow(deviceName, { saveStatus: 'saving', error: null });
-    try {
-      const res = await fetch('/api/apifeed/import', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          deviceName,
-          imei: imei || undefined,
-          points,
-        }),
-      });
-      const data = await res.json();
-      if (!data.ok) {
-        updateFleetRow(deviceName, { saveStatus: 'error', error: data.error ?? 'Save failed' });
-        return;
-      }
-      updateFleetRow(deviceName, { saveStatus: 'done', error: null });
-    } catch (e) {
-      updateFleetRow(deviceName, {
-        saveStatus: 'error',
-        error: e instanceof Error ? e.message : String(e),
-      });
-    }
+    await importDirectForDevice(deviceName, imei, points);
   };
 
   const mergeForDevice = async (deviceName: string, pointsOverride?: TrackPoint[] | null): Promise<{ inserted: number } | null> => {
     const row = fleetRows.find((r) => r.deviceName === deviceName);
     const points = pointsOverride ?? row?.points;
     if (!points?.length) return null;
-    const times = points.map((p) => p.gpsTime).filter(Boolean) as string[];
-    if (times.length === 0) return null;
-    const sorted = [...times].sort();
-    const minTime = sorted[0];
-    const maxTime = sorted[sorted.length - 1];
-    updateFleetRow(deviceName, { mergeStatus: 'merging', error: null });
-    try {
-      const res = await fetch('/api/apifeed/merge-tracking', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          deviceName,
-          minTime,
-          maxTime,
-        }),
-      });
-      const data = await res.json();
-      if (!data.ok) {
-        updateFleetRow(deviceName, {
-          mergeStatus: 'error',
-          error: data.error ?? 'Merge failed',
-        });
-        return null;
-      }
-      updateFleetRow(deviceName, { mergeStatus: 'done', error: null });
-      return { inserted: Number(data.inserted) ?? 0 };
-    } catch (e) {
-      updateFleetRow(deviceName, {
-        mergeStatus: 'error',
-        error: e instanceof Error ? e.message : String(e),
-      });
-      return null;
-    }
+    const imei = row?.imei ?? resolveImei(deviceName) ?? '';
+    const out = await importDirectForDevice(deviceName, imei, points);
+    return out ? { inserted: out.inserted } : null;
   };
 
   const TAG_GRACE_SECONDS = 300;
@@ -707,30 +838,28 @@ export default function ApiTestPage() {
     for (let i = 0; i < dates.length; i++) {
       const day = dates[i];
       setFleetRunProgress({ currentDay: i + 1, totalDays: dates.length, dateLabel: day });
+      // New day: clear prior-day row statuses/counts so in-progress state is unambiguous.
+      setFleetRows((prev) =>
+        prev.map((r) => ({
+          ...r,
+          points: null,
+          recordCount: null,
+          getApiStatus: 'idle',
+          saveStatus: 'idle',
+          mergeStatus: 'idle',
+          tagStatus: 'idle',
+          tagMessage: null,
+          error: null,
+        }))
+      );
       for (const row of fleetRows) {
-        // Clear requested day first (raw YYYY-MM-DD; API uses UTC bounds). Avoids partial-day leftovers.
-        try {
-          const clearRes = await fetch('/api/apifeed/clear-for-device-date', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ deviceName: row.deviceName, date: day }),
-          });
-          const clearData = await clearRes.json();
-          if (!clearData.ok) {
-            updateFleetRow(row.deviceName, { saveStatus: 'error', error: clearData.error ?? 'Clear failed' });
-            continue;
-          }
-        } catch (e) {
-          updateFleetRow(row.deviceName, {
-            saveStatus: 'error',
-            error: e instanceof Error ? e.message : String(e),
-          });
-          continue;
-        }
         const points = await fetchTrackForDevice(row.deviceName, day);
-        if (points?.length) {
-          await saveForDevice(row.deviceName, points);
-          const mergeResult = await mergeForDevice(row.deviceName, points);
+        if (points) {
+          const imei = (fleetRows.find((r) => r.deviceName === row.deviceName)?.imei ?? resolveImei(row.deviceName) ?? '').trim();
+          const importResult = points.length > 0 ? await importDirectForDevice(row.deviceName, imei, points, day) : { inserted: 0, skipped: 0, total: 0 };
+          if (points.length === 0) {
+            updateFleetRow(row.deviceName, { saveStatus: 'done', mergeStatus: 'done', error: null });
+          }
           const times = points.map((p) => p.gpsTime).filter(Boolean) as string[];
           const sorted = [...times].sort();
           const minTime = sorted[0] ?? '';
@@ -743,7 +872,7 @@ export default function ApiTestPage() {
               minTime,
               maxTime,
               apiRows: points.length,
-              inserted: mergeResult?.inserted,
+              inserted: importResult?.inserted,
             },
           ]);
         }
@@ -788,16 +917,25 @@ export default function ApiTestPage() {
     setRefreshDevicesMessage(null);
     setRefreshDevicesLoading(true);
     try {
-      const res = await fetch('/api/admin/devices/sync-from-vworkjobs', { method: 'POST' });
+      const res = await fetch('/api/admin/devices/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ endpoint }),
+      });
       const data = await res.json();
       if (!data.ok) {
         setRefreshDevicesMessage(data.error ?? 'Sync failed');
         return;
       }
-      const msg = data.inserted > 0
-        ? `Added ${data.inserted} device(s) from vworkjobs. Total tbl_devices: ${data.totalDevices}.`
-        : `No new devices. All ${data.totalWorkers} worker(s) from vworkjobs already in tbl_devices.`;
-      setRefreshDevicesMessage(msg);
+      const msg = [
+        `tbl_devices: ${data.totalDevices ?? '—'} rows.`,
+        data.tracksolidInserted ? `TrackSolid +${data.tracksolidInserted} new` : null,
+        data.tracksolidImeiUpdates ? `IMEI updates ${data.tracksolidImeiUpdates}` : null,
+        data.vworkjobsInserted ? `vworkjobs +${data.vworkjobsInserted}` : null,
+      ]
+        .filter(Boolean)
+        .join(' · ');
+      setRefreshDevicesMessage(msg || 'Harvest complete (no new rows).');
       await loadFleetDevices();
       await fetchMaxDates();
     } catch (e) {
@@ -888,9 +1026,9 @@ export default function ApiTestPage() {
       }
       const list = data.devices ?? [];
       setFleetRows(
-        list.map((d: { deviceName?: string }) => ({
+        list.map((d: { deviceName?: string; imei?: string | null }) => ({
           deviceName: d.deviceName ?? '',
-          imei: null as string | null,
+          imei: (d.imei ?? null) as string | null,
           points: null,
           recordCount: null,
           getApiStatus: 'idle' as FleetRowStatus,
@@ -1002,54 +1140,41 @@ export default function ApiTestPage() {
     const trackUrl = `/api/tracksolid/track?${trackParams.toString()}`;
     setGpsFetchLog((prev) => [...prev, { date: effectiveDate || '(no date)', device: deviceName, url: trackUrl }]);
     try {
-      // Stage 1a: Clear both tables for this device + date (ground zero) so we can debug each stage
-      if (effectiveDate && deviceName) {
-        const clearRes = await fetch('/api/apifeed/clear-for-device-date', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ deviceName, date: effectiveDate }),
-        });
-        const clearData = await clearRes.json();
-        if (!clearData.ok) {
-          setTrackError(clearData.error ?? 'Clear failed');
+      if (effectiveDate?.trim()) {
+        const out = await fetchTrackByImei(deviceName, trackImei.trim(), effectiveDate.trim());
+        if (!out.ok) {
+          let errMsg = out.error ?? 'Request failed';
+          setTrackError(errMsg);
+          setTrackDebug((out.debug as DevicesDebugPayload | null | undefined) ?? null);
           setTrackLoading(false);
           return;
         }
-        if (clearData.debug) {
-          setClearDebug({
-            deleteSqlApifeed: clearData.debug.deleteSqlApifeed ?? '',
-            deleteParamsApifeed: Array.isArray(clearData.debug.deleteParamsApifeed) ? clearData.debug.deleteParamsApifeed : [],
-            deleteSqlTracking: clearData.debug.deleteSqlTracking ?? '',
-            deleteParamsTracking: Array.isArray(clearData.debug.deleteParamsTracking) ? clearData.debug.deleteParamsTracking : [],
-            deletedApifeed: clearData.deletedApifeed ?? 0,
-            deletedTracking: clearData.deletedTracking ?? 0,
-          });
-        }
+        const points = out.points ?? [];
+        setTrackPoints(points);
+        setTrackDebug((out.debug as DevicesDebugPayload | null | undefined) ?? null);
         setSaveMessage(
-          `Stage 1: Cleared tbl_apifeed (${clearData.deletedApifeed}) and tbl_tracking (${clearData.deletedTracking}) for ${deviceName} ${effectiveDate}. Now fetching from API…`
+          deviceName
+            ? `Stage 1 done: fetched ${points.length} points. Next: Stage 2 direct import to tbl_tracking (insert-only).`
+            : null
         );
-      }
-      // Stage 1b: Fetch from API only — no save, no merge
-      const res = await fetch(trackUrl);
-      const data = await res.json();
-      if (!data.ok) {
-        let errMsg = data.error ?? 'Request failed';
-        if (data.rateLimitHint) {
-          errMsg += ' Token rate limit: wait ~1 minute then try again (or run Step 1 first to cache a token).';
+      } else {
+        const res = await fetch(trackUrl);
+        const data = await res.json();
+        if (!data.ok) {
+          let errMsg = data.error ?? 'Request failed';
+          if (data.rateLimitHint) {
+            errMsg += ' Token rate limit: wait ~1 minute then try again (or run Step 1 first to cache a token).';
+          }
+          setTrackError(errMsg);
+          setTrackDebug(data.debug ?? null);
+          setTrackLoading(false);
+          return;
         }
-        setTrackError(errMsg);
+        const points = data.points ?? [];
+        setTrackPoints(points);
         setTrackDebug(data.debug ?? null);
-        setTrackLoading(false);
-        return;
+        setSaveMessage(null);
       }
-      const points = data.points ?? [];
-      setTrackPoints(points);
-      setTrackDebug(data.debug ?? null);
-      setSaveMessage(
-        effectiveDate && deviceName
-          ? `Stage 1 done: ground zero + fetched ${points.length} points. Next: Stage 2 Save to database, then Stage 3 Merge to tbl_tracking.`
-          : null
-      );
     } catch (e) {
       setTrackError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -1288,7 +1413,7 @@ export default function ApiTestPage() {
             onClick={refreshDevicesFromVworkjobs}
             disabled={refreshDevicesLoading || fleetRowsLoading}
             className="rounded border border-zinc-400 bg-white px-4 py-2 text-sm font-medium text-zinc-700 hover:bg-zinc-100 disabled:opacity-50 dark:border-zinc-500 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700"
-            title="Sync workers from tbl_vworkjobs into tbl_devices (with !group=Newt), then load the device list"
+            title="Merge TrackSolid devices (IMEI) + vworkjobs workers into tbl_devices, then reload the list"
           >
             {refreshDevicesLoading ? 'Syncing…' : fleetRowsLoading ? 'Loading…' : 'Harvest and Refresh Devices'}
           </button>
@@ -1489,10 +1614,10 @@ export default function ApiTestPage() {
                         Fetched API
                       </th>
                       <th className="border-b border-zinc-200 px-3 py-2 text-left font-medium dark:border-zinc-700">
-                        DB tbl_apifeed
+                        Import
                       </th>
                       <th className="border-b border-zinc-200 px-3 py-2 text-left font-medium dark:border-zinc-700">
-                        Merged tbl_tracking
+                        Tbl_tracking
                       </th>
                       <th className="border-b border-zinc-200 px-3 py-2 text-left font-medium dark:border-zinc-700">
                         Tagged
@@ -1527,7 +1652,7 @@ export default function ApiTestPage() {
                             disabled={!row.points?.length || row.saveStatus === 'saving'}
                             className="rounded bg-emerald-600 px-2 py-1 text-xs font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
                           >
-                            {row.saveStatus === 'saving' ? '…' : 'Save'}
+                            {row.saveStatus === 'saving' ? '…' : 'Import'}
                           </button>
                           <span className="ml-2 text-zinc-600 dark:text-zinc-400">
                             {row.saveStatus === 'done' ? 'Done' : row.saveStatus === 'error' ? '✗' : '—'}
@@ -1540,7 +1665,7 @@ export default function ApiTestPage() {
                             disabled={!row.points?.length || row.mergeStatus === 'merging'}
                             className="rounded bg-blue-600 px-2 py-1 text-xs font-medium text-white hover:bg-blue-700 disabled:opacity-50"
                           >
-                            {row.mergeStatus === 'merging' ? '…' : 'Merge'}
+                            {row.mergeStatus === 'merging' ? '…' : 'Import'}
                           </button>
                           <span className="ml-2 text-zinc-600 dark:text-zinc-400">
                             {row.mergeStatus === 'done' ? 'Done' : row.mergeStatus === 'error' ? '✗' : '—'}
@@ -1617,7 +1742,7 @@ export default function ApiTestPage() {
             onClick={fetchTrack}
             disabled={trackLoading || !trackImei.trim()}
             className="rounded bg-zinc-800 px-4 py-2 text-sm font-medium text-white hover:bg-zinc-700 disabled:opacity-50 dark:bg-zinc-700 dark:hover:bg-zinc-600"
-            title="Stage 1: Clear tbl_apifeed + tbl_tracking for this device/date, then fetch from API. Data shown below; no save or merge."
+            title="Stage 1: Fetch from API for this device/date. No delete path."
           >
             {trackLoading ? 'Fetching…' : `1. Fetch GPS for ${singleDateFrom || trackDate || 'day'}`}
           </button>
@@ -1626,7 +1751,7 @@ export default function ApiTestPage() {
             onClick={runSingleDeviceRange}
             disabled={singleDeviceRunLoading || !trackImei.trim()}
             className="rounded bg-emerald-700 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-800 disabled:opacity-50 dark:bg-emerald-600 dark:hover:bg-emerald-700"
-            title="For each day in range (From 00:00:00 to To 23:59:59 inclusive): clear → fetch → save to apifeed → merge to tbl_tracking. Fills the day log table below."
+            title="For each day in range (From 00:00:00 to To 23:59:59 inclusive): fetch → direct insert-only import to tbl_tracking. Fills the day log table below."
           >
             {singleDeviceRunLoading && singleDeviceRunProgress
               ? `Day ${singleDeviceRunProgress.currentDay}/${singleDeviceRunProgress.totalDays} (${singleDeviceRunProgress.dateLabel})…`
@@ -1636,7 +1761,7 @@ export default function ApiTestPage() {
           </button>
         </div>
         <p className="mb-2 text-xs text-zinc-500 dark:text-zinc-400">
-          From/To inclusive (day 00:00:00 UTC to day 23:59:59 UTC). Single-day: <strong>1 Fetch GPS</strong> → <strong>2 Save</strong> → <strong>3 Merge</strong>. Range: use <strong>Run import for range</strong> to clear → fetch → save → merge each day and fill the table below.
+          From/To inclusive (day 00:00:00 UTC to day 23:59:59 UTC). Single-day: <strong>1 Fetch GPS</strong> → <strong>2 Import</strong>. Range: use <strong>Run import for range</strong> to fetch then direct insert-only import each day and fill the table below.
         </p>
         {singleDeviceRunProgress && (
           <div className="mb-3 rounded border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm font-medium text-emerald-800 dark:border-emerald-800 dark:bg-emerald-900/25 dark:text-emerald-200">
@@ -1646,16 +1771,17 @@ export default function ApiTestPage() {
         {singleDeviceDayLog.length > 0 && (
           <div className="mb-4 rounded border border-zinc-200 bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-800/50">
             <p className="border-b border-zinc-200 px-3 py-1.5 text-xs font-medium text-zinc-500 dark:border-zinc-700 dark:text-zinc-400">
-              Day log — API Date, API count, API FEED count, Tbl Tracking count; Largest gap (from API payload raw gpsTime) and From/To to find why tbl_tracking has gaps
+              Day log — API Date, API status, API count, direct inserted into tbl_tracking; Largest gap (from API payload raw gpsTime) and From/To to inspect gaps
             </p>
             <div className="overflow-x-auto">
               <table className="w-full min-w-[880px] border-collapse text-sm">
                 <thead>
                   <tr className="border-b border-zinc-200 bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-800">
                     <th className="px-3 py-2 text-left font-medium text-zinc-700 dark:text-zinc-300">API Date</th>
+                    <th className="px-3 py-2 text-left font-medium text-zinc-700 dark:text-zinc-300">API status</th>
                     <th className="px-3 py-2 text-right font-medium text-zinc-700 dark:text-zinc-300">API count</th>
                     <th className="px-3 py-2 text-right font-medium text-zinc-700 dark:text-zinc-300">API FEED Count</th>
-                    <th className="px-3 py-2 text-right font-medium text-zinc-700 dark:text-zinc-300">Tbl Tracking Count</th>
+                    <th className="px-3 py-2 text-right font-medium text-zinc-700 dark:text-zinc-300">Tbl Tracking Count (inserted)</th>
                     <th className="px-3 py-2 text-right font-medium text-zinc-700 dark:text-zinc-300" title="Largest gap between consecutive points in API payload (minutes)">Largest Gap (min)</th>
                     <th className="px-3 py-2 text-left font-medium text-zinc-700 dark:text-zinc-300" title="Last point before largest gap (raw gpsTime from API)">From</th>
                     <th className="px-3 py-2 text-left font-medium text-zinc-700 dark:text-zinc-300" title="First point after largest gap (raw gpsTime from API)">To</th>
@@ -1667,6 +1793,15 @@ export default function ApiTestPage() {
                   {singleDeviceDayLog.map((row, idx) => (
                     <tr key={idx} className="border-b border-zinc-100 dark:border-zinc-800">
                       <td className="px-3 py-2 font-mono text-zinc-900 dark:text-zinc-100">{row.date}</td>
+                      <td className="px-3 py-2 text-xs">
+                        {row.apiStatus === 'ok' ? (
+                          <span className="text-emerald-700 dark:text-emerald-300">OK</span>
+                        ) : row.apiStatus === 'ok_empty' ? (
+                          <span className="text-amber-700 dark:text-amber-300" title="API responded but returned 0 rows">OK (0 rows)</span>
+                        ) : (
+                          <span className="text-red-600 dark:text-red-400" title={row.apiError ?? undefined}>API FAIL ✗</span>
+                        )}
+                      </td>
                       <td className="px-3 py-2 text-right font-mono text-zinc-800 dark:text-zinc-200">{row.apiCount}</td>
                       <td className="px-3 py-2 text-right font-mono text-zinc-800 dark:text-zinc-200">{row.apifeedCount}</td>
                       <td className="px-3 py-2 text-right font-mono text-zinc-800 dark:text-zinc-200">{row.trackingCount}</td>

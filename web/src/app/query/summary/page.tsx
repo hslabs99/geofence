@@ -2330,13 +2330,14 @@ function SummaryPageInner() {
                           const viaVal = row[viaKey];
                           const viaStr = formatCell(viaVal);
                           const isGps = viaStr.toLowerCase() === 'gps';
+                          const isGpsStar = viaStr === 'GPS*' || viaStr.toLowerCase() === 'gps*';
                           const isVineFencePlus = viaStr.toLowerCase() === 'vinefence+';
                           const isOride = viaStr.toUpperCase() === 'ORIDE';
                           const mins = n >= 2 ? minsBetween(row, n - 1, n) : null;
                           const minsOver = n >= 2 && isOverLimitStepWithRow(mins, limitsRow, n);
                           const groupBg = STEP_GROUP_BG[n];
                           const viaDisplay = isVineFencePlus ? 'GPS+' : viaStr;
-                          const viaGreen = isGps || isVineFencePlus;
+                          const viaGreen = isGps || isVineFencePlus || isGpsStar;
                           return (
                             <React.Fragment key={n}>
                               {n >= 2 && (

@@ -1,5 +1,6 @@
 'use client';
 
+import Link from 'next/link';
 import { Suspense, useState, useEffect, useCallback } from 'react';
 import { useSearchParams } from 'next/navigation';
 
@@ -156,13 +157,6 @@ function sortSummary(rows: SummaryRow[], sortBy1: SortKey, sortBy2: SortKey, dir
   });
 }
 
-type GpsIntegrityLogEntry = {
-  date: string;
-  device: string;
-  outcomes: ('true' | 'not found')[];
-  sampleTimes: string[];
-};
-
 type GpsIntegrityCell =
   | { status: 'no_data' }
   | {
@@ -181,16 +175,148 @@ type GpsIntegrityCell =
 type GpsIntegrityGridResponse = {
   dates: string[];
   devices: string[];
-  rows: Array<{ date: string; cells: GpsIntegrityCell[] }>;
+  rows: Array<{ device: string; cells: GpsIntegrityCell[] }>;
 };
 
-type DataChecksTab = 'gps-gaps' | 'winery-fixes' | 'varied' | 'gps-integrity' | 'vineyard-mappings';
+type DbCheckCell =
+  | { status: 'empty' }
+  | { status: 'data'; count: number; minTime: string; maxTime: string };
+
+type DbCheckGridResponse = {
+  dates: string[];
+  devices: string[];
+  rows: Array<{ device: string; cells: DbCheckCell[] }>;
+};
+
+type DbCheckSimpleRow =
+  | { date: string; status: 'empty' }
+  | { date: string; status: 'data'; count: number; minTime: string; maxTime: string };
+
+type DbCheckSimpleResponse = {
+  dates: string[];
+  rows: DbCheckSimpleRow[];
+};
+
+type VworkStaleRow = {
+  job_id: string;
+  worker: string | null;
+  vineyard_name: string | null;
+  delivery_winery: string | null;
+  actual_start_time: string | null;
+  steps_fetched: boolean | null;
+  steps_fetched_when: string | null;
+  issue: 'never_fetched' | 'no_timestamp' | 'stale' | 'fresh';
+  hours_since_steps: number | null;
+};
+
+type VworkStaleResponse = {
+  staleHours: number;
+  /** When true, list is jobs with all step_1–5 actual times null (not stale-filtered). */
+  noStepActuals?: boolean;
+  dateFrom: string | null;
+  dateTo: string | null;
+  count: number;
+  rows: VworkStaleRow[];
+};
+
+type GeofenceGapsRow = {
+  device_name: string;
+  day: string;
+  point_count: number;
+  unattempted_count: number;
+  attempted_count: number;
+};
+
+type GeofenceGapsDayRow = {
+  day: string;
+  point_count: number;
+  unattempted_count: number;
+  attempted_count: number;
+  device_count: number;
+};
+
+type GeofenceGapsResponse =
+  | {
+      dateFrom: string;
+      dateTo: string;
+      minPoints: number;
+      view: 'by-device-day';
+      count: number;
+      rows: GeofenceGapsRow[];
+    }
+  | {
+      dateFrom: string;
+      dateTo: string;
+      minPoints: number;
+      view: 'by-day';
+      count: number;
+      rows: GeofenceGapsDayRow[];
+    };
+
+type GeofenceEnterExitGapsRow = {
+  device_name: string;
+  day: string;
+  point_count: number;
+  enter_exit_count: number;
+};
+
+type GeofenceEnterExitGapsResponse = {
+  dateFrom: string;
+  dateTo: string;
+  minPoints: number;
+  count: number;
+  rows: GeofenceEnterExitGapsRow[];
+};
+
+type DataHealthOverviewResponse = {
+  ok: true;
+  generatedAt: string;
+  window: { dateFrom: string; dateTo: string; minPointsEnterExit: number };
+  tracking: {
+    totalRows: number;
+    maxPositionTime: string | null;
+    maxPositionTimeNz: string | null;
+    rowsMissingPositionTimeNz: number;
+    rowsGeofenceNotAttempted: number;
+    maxPositionTimeFenceAttempted: string | null;
+    maxPositionTimeNzFenceAttempted: string | null;
+  };
+  vworkjobs: {
+    jobsWithActualStart: number;
+    maxActualStartTime: string | null;
+    maxActualStartWithStepData: string | null;
+    jobsWithStartStepsNotFetched: number;
+  };
+  windowMetrics: {
+    deviceDaysWithGeofenceGap: number;
+    deviceDaysWithEnterExitGap: number;
+  };
+};
+
+type DataChecksTab =
+  | 'data-health-overview'
+  | 'gps-gaps'
+  | 'winery-fixes'
+  | 'varied'
+  | 'gps-integrity'
+  | 'db-check'
+  | 'db-check-simple'
+  | 'vineyard-mappings'
+  | 'vwork-stale'
+  | 'geofence-gaps'
+  | 'geofence-enter-exit-gaps';
 
 function DataChecksPageContent() {
   const searchParams = useSearchParams();
   const tabParam = searchParams.get('tab');
   const [activeTab, setActiveTab] = useState<DataChecksTab>(() => {
+    if (tabParam === 'data-health-overview') return 'data-health-overview';
     if (tabParam === 'vineyard-mappings') return 'vineyard-mappings';
+    if (tabParam === 'vwork-stale') return 'vwork-stale';
+    if (tabParam === 'geofence-enter-exit-gaps') return 'geofence-enter-exit-gaps';
+    if (tabParam === 'geofence-gaps' || tabParam === 'enter-exit-coverage') return 'geofence-gaps';
+    if (tabParam === 'db-check-simple') return 'db-check-simple';
+    if (tabParam === 'db-check') return 'db-check';
     if (tabParam === 'gps-integrity') return 'gps-integrity';
     if (tabParam === 'winery-fixes') return 'winery-fixes';
     if (tabParam === 'varied') return 'varied';
@@ -199,7 +325,13 @@ function DataChecksPageContent() {
   });
 
   useEffect(() => {
-    if (tabParam === 'vineyard-mappings') setActiveTab('vineyard-mappings');
+    if (tabParam === 'data-health-overview') setActiveTab('data-health-overview');
+    else if (tabParam === 'vineyard-mappings') setActiveTab('vineyard-mappings');
+    else if (tabParam === 'vwork-stale') setActiveTab('vwork-stale');
+    else if (tabParam === 'geofence-enter-exit-gaps') setActiveTab('geofence-enter-exit-gaps');
+    else if (tabParam === 'geofence-gaps' || tabParam === 'enter-exit-coverage') setActiveTab('geofence-gaps');
+    else if (tabParam === 'db-check-simple') setActiveTab('db-check-simple');
+    else if (tabParam === 'db-check') setActiveTab('db-check');
     else if (tabParam === 'gps-integrity') setActiveTab('gps-integrity');
     else if (tabParam === 'winery-fixes') setActiveTab('winery-fixes');
     else if (tabParam === 'varied') setActiveTab('varied');
@@ -220,6 +352,18 @@ function DataChecksPageContent() {
   const [sortBy1, setSortBy1] = useState<SortKey>('device_name');
   const [sortBy2, setSortBy2] = useState<SortKey>('gap_from');
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
+
+  const [healthDateFrom, setHealthDateFrom] = useState(() => {
+    const to = new Date();
+    const from = new Date(to);
+    from.setUTCDate(from.getUTCDate() - 13);
+    return from.toISOString().slice(0, 10);
+  });
+  const [healthDateTo, setHealthDateTo] = useState(() => new Date().toISOString().slice(0, 10));
+  const [healthMinPointsEE, setHealthMinPointsEE] = useState(25);
+  const [healthData, setHealthData] = useState<DataHealthOverviewResponse | null>(null);
+  const [healthLoading, setHealthLoading] = useState(false);
+  const [healthError, setHealthError] = useState<string | null>(null);
 
   // Winery / vineyard name fixes (tab 2)
   const [wineMappRows, setWineMappRows] = useState<WineMappRow[]>([]);
@@ -252,6 +396,23 @@ function DataChecksPageContent() {
     perMapping: { id: number; oldvworkname: string; newvworkname: string; updated: number }[];
   } | null>(null);
 
+  // Driver name fixes (same tab)
+  const [driverMappRows, setDriverMappRows] = useState<WineMappRow[]>([]);
+  const [driverMappLoading, setDriverMappLoading] = useState(false);
+  const [driverMappError, setDriverMappError] = useState<string | null>(null);
+  const [driverMappNewOld, setDriverMappNewOld] = useState('');
+  const [driverMappNewNew, setDriverMappNewNew] = useState('');
+  const [driverMappSaving, setDriverMappSaving] = useState(false);
+  const [driverEditingId, setDriverEditingId] = useState<number | null>(null);
+  const [driverEditOld, setDriverEditOld] = useState('');
+  const [driverEditNew, setDriverEditNew] = useState('');
+  const [workerNamesList, setWorkerNamesList] = useState<string[]>([]);
+  const [runDriverFixesLoading, setRunDriverFixesLoading] = useState(false);
+  const [runDriverFixesResult, setRunDriverFixesResult] = useState<{
+    totalUpdated: number;
+    perMapping: { id: number; oldvworkname: string; newvworkname: string; updated: number }[];
+  } | null>(null);
+
   // Varied tab: Set Trailer Type
   const [setTrailerLoading, setSetTrailerLoading] = useState(false);
   const [setTrailerError, setSetTrailerError] = useState<string | null>(null);
@@ -277,12 +438,148 @@ function DataChecksPageContent() {
   const [vgEditVineyard, setVgEditVineyard] = useState('');
   const [vgEditGroup, setVgEditGroup] = useState('');
 
-  // GPS Integrity Check tab (tab 4): grid = rows (dates) × columns (devices), 1st row check vs tbl_tracking.position_time
+  // GPS Integrity Check: devices × dates, API vs tbl_tracking.position_time (streams NDJSON)
   const [gpsIntegrityFrom, setGpsIntegrityFrom] = useState('');
   const [gpsIntegrityTo, setGpsIntegrityTo] = useState('');
   const [gpsIntegrityLoading, setGpsIntegrityLoading] = useState(false);
   const [gpsIntegrityError, setGpsIntegrityError] = useState<string | null>(null);
   const [gpsIntegrityGrid, setGpsIntegrityGrid] = useState<GpsIntegrityGridResponse | null>(null);
+
+  const [dbCheckFrom, setDbCheckFrom] = useState('');
+  const [dbCheckTo, setDbCheckTo] = useState('');
+  const [dbCheckLoading, setDbCheckLoading] = useState(false);
+  const [dbCheckError, setDbCheckError] = useState<string | null>(null);
+  const [dbCheckGrid, setDbCheckGrid] = useState<DbCheckGridResponse | null>(null);
+
+  const [dbCheckSimpleFrom, setDbCheckSimpleFrom] = useState('');
+  const [dbCheckSimpleTo, setDbCheckSimpleTo] = useState('');
+  const [dbCheckSimpleLoading, setDbCheckSimpleLoading] = useState(false);
+  const [dbCheckSimpleError, setDbCheckSimpleError] = useState<string | null>(null);
+  const [dbCheckSimpleResult, setDbCheckSimpleResult] = useState<DbCheckSimpleResponse | null>(null);
+
+  const [vworkStaleHours, setVworkStaleHours] = useState('48');
+  const [vworkStaleFrom, setVworkStaleFrom] = useState('');
+  const [vworkStaleTo, setVworkStaleTo] = useState('');
+  /** Stage 1 = not stepped (no step actuals). Stage 2 = aging / stale threshold only — mutually exclusive. */
+  const [vworkStaleMode, setVworkStaleMode] = useState<'stage1' | 'stage2'>('stage1');
+  const [vworkStaleLoading, setVworkStaleLoading] = useState(false);
+  const [vworkStaleError, setVworkStaleError] = useState<string | null>(null);
+  const [vworkStaleResult, setVworkStaleResult] = useState<VworkStaleResponse | null>(null);
+
+  const [geofenceGapsFrom, setGeofenceGapsFrom] = useState('');
+  const [geofenceGapsTo, setGeofenceGapsTo] = useState('');
+  const [geofenceGapsMinPoints, setGeofenceGapsMinPoints] = useState('1');
+  /** Rerun list: one row per calendar day (whole-day tagging/steps/mapping). */
+  const [geofenceGapsDaysOnly, setGeofenceGapsDaysOnly] = useState(false);
+  const [geofenceGapsLoading, setGeofenceGapsLoading] = useState(false);
+  const [geofenceGapsError, setGeofenceGapsError] = useState<string | null>(null);
+  const [geofenceGapsResult, setGeofenceGapsResult] = useState<GeofenceGapsResponse | null>(null);
+
+  const [eeGapsFrom, setEeGapsFrom] = useState('');
+  const [eeGapsTo, setEeGapsTo] = useState('');
+  const [eeGapsMinPoints, setEeGapsMinPoints] = useState('25');
+  const [eeGapsLoading, setEeGapsLoading] = useState(false);
+  const [eeGapsError, setEeGapsError] = useState<string | null>(null);
+  const [eeGapsResult, setEeGapsResult] = useState<GeofenceEnterExitGapsResponse | null>(null);
+
+  const runGpsIntegrityCheck = useCallback(async () => {
+    setGpsIntegrityError(null);
+    setGpsIntegrityGrid(null);
+    if (!gpsIntegrityFrom || !gpsIntegrityTo) {
+      setGpsIntegrityError('From and To dates required');
+      return;
+    }
+    setGpsIntegrityLoading(true);
+    try {
+      const res = await fetch('/api/admin/data-checks/gps-integrity', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          dateFrom: gpsIntegrityFrom,
+          dateTo: gpsIntegrityTo,
+          grid: true,
+          stream: true,
+        }),
+      });
+      const ct = res.headers.get('content-type') ?? '';
+      if (!res.ok) {
+        const d = ct.includes('application/json') ? await res.json() : {};
+        throw new Error((d as { error?: string })?.error ?? res.statusText);
+      }
+      if (!res.body) throw new Error('No response body');
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      let metaDates: string[] = [];
+      let metaDevices: string[] = [];
+      const rows: Array<{ device: string; cells: GpsIntegrityCell[] }> = [];
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split('\n');
+        buf = lines.pop() ?? '';
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          const msg = JSON.parse(line) as
+            | { type: 'meta'; dates: string[]; devices: string[] }
+            | { type: 'deviceRow'; device: string; cells: GpsIntegrityCell[] }
+            | { type: 'done' }
+            | { type: 'error'; message: string };
+          if (msg.type === 'meta') {
+            metaDates = msg.dates;
+            metaDevices = msg.devices;
+            setGpsIntegrityGrid({ dates: metaDates, devices: metaDevices, rows: [] });
+          } else if (msg.type === 'deviceRow') {
+            rows.push({ device: msg.device, cells: msg.cells });
+            setGpsIntegrityGrid({
+              dates: metaDates,
+              devices: metaDevices,
+              rows: [...rows],
+            });
+          } else if (msg.type === 'error') {
+            throw new Error(msg.message);
+          }
+        }
+      }
+      if (buf.trim()) {
+        const msg = JSON.parse(buf) as { type?: string; message?: string };
+        if (msg.type === 'error' && msg.message) throw new Error(msg.message);
+      }
+    } catch (e) {
+      setGpsIntegrityError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setGpsIntegrityLoading(false);
+    }
+  }, [gpsIntegrityFrom, gpsIntegrityTo]);
+
+  const fetchHealthOverview = useCallback(async () => {
+    setHealthLoading(true);
+    setHealthError(null);
+    try {
+      const p = new URLSearchParams();
+      p.set('dateFrom', formatDateInput(healthDateFrom.trim()) || healthDateFrom.trim());
+      p.set('dateTo', formatDateInput(healthDateTo.trim()) || healthDateTo.trim());
+      p.set('minPointsEnterExit', String(healthMinPointsEE));
+      const r = await fetch(`/api/admin/data-checks/data-health-overview?${p.toString()}`);
+      const d = (await r.json()) as DataHealthOverviewResponse & { ok?: boolean; error?: string };
+      if (!r.ok || d.ok !== true) {
+        throw new Error(typeof d.error === 'string' ? d.error : r.statusText);
+      }
+      setHealthData(d);
+    } catch (e) {
+      setHealthError(e instanceof Error ? e.message : String(e));
+      setHealthData(null);
+    } finally {
+      setHealthLoading(false);
+    }
+  }, [healthDateFrom, healthDateTo, healthMinPointsEE]);
+
+  useEffect(() => {
+    if (activeTab === 'data-health-overview') {
+      void fetchHealthOverview();
+    }
+  }, [activeTab, fetchHealthOverview]);
 
   const fetchWineMapp = useCallback(() => {
     setWineMappLoading(true);
@@ -310,10 +607,24 @@ function DataChecksPageContent() {
       .finally(() => setVineMappLoading(false));
   }, []);
 
+  const fetchDriverMapp = useCallback(() => {
+    setDriverMappLoading(true);
+    setDriverMappError(null);
+    fetch('/api/admin/data-checks/driver-mapp')
+      .then((r) => {
+        if (!r.ok) return r.json().then((d) => Promise.reject(new Error(d?.error ?? r.statusText)));
+        return r.json();
+      })
+      .then((data: { rows: WineMappRow[] }) => setDriverMappRows(data.rows ?? []))
+      .catch((e) => setDriverMappError(e instanceof Error ? e.message : String(e)))
+      .finally(() => setDriverMappLoading(false));
+  }, []);
+
   useEffect(() => {
     if (activeTab === 'winery-fixes') {
       fetchWineMapp();
       fetchVineMapp();
+      fetchDriverMapp();
       fetch('/api/admin/data-checks/wine-mapp/delivery-wineries')
         .then((r) => {
           if (!r.ok) return r.json().then((d) => Promise.reject(new Error(d?.error ?? r.statusText)));
@@ -328,8 +639,15 @@ function DataChecksPageContent() {
         })
         .then((data: { rows: string[] }) => setVineyardNamesList(data.rows ?? []))
         .catch(() => setVineyardNamesList([]));
+      fetch('/api/admin/data-checks/driver-mapp/worker-names')
+        .then((r) => {
+          if (!r.ok) return r.json().then((d) => Promise.reject(new Error(d?.error ?? r.statusText)));
+          return r.json();
+        })
+        .then((data: { rows: string[] }) => setWorkerNamesList(data.rows ?? []))
+        .catch(() => setWorkerNamesList([]));
     }
-  }, [activeTab, fetchWineMapp, fetchVineMapp]);
+  }, [activeTab, fetchWineMapp, fetchVineMapp, fetchDriverMapp]);
 
   const runGapsScan = () => {
     const minutes = parseFloat(minGapMinutes);
@@ -568,6 +886,99 @@ function DataChecksPageContent() {
       .finally(() => setRunVineFixesLoading(false));
   };
 
+  const createDriverMapp = () => {
+    const oldV = driverMappNewOld.trim();
+    const newV = driverMappNewNew.trim();
+    if (!oldV || !newV) {
+      setDriverMappError('Old name and new name are required.');
+      return;
+    }
+    setDriverMappError(null);
+    setDriverMappSaving(true);
+    fetch('/api/admin/data-checks/driver-mapp', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ oldvworkname: oldV, newvworkname: newV }),
+    })
+      .then((r) => {
+        if (!r.ok) return r.json().then((d) => Promise.reject(new Error(d?.error ?? r.statusText)));
+        return r.json();
+      })
+      .then(() => {
+        setDriverMappNewOld('');
+        setDriverMappNewNew('');
+        fetchDriverMapp();
+      })
+      .catch((e) => setDriverMappError(e instanceof Error ? e.message : String(e)))
+      .finally(() => setDriverMappSaving(false));
+  };
+
+  const updateDriverMapp = (id: number) => {
+    const oldV = driverEditOld.trim();
+    const newV = driverEditNew.trim();
+    if (!oldV || !newV) {
+      setDriverMappError('Old name and new name are required.');
+      return;
+    }
+    setDriverMappError(null);
+    setDriverMappSaving(true);
+    fetch(`/api/admin/data-checks/driver-mapp/${id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ oldvworkname: oldV, newvworkname: newV }),
+    })
+      .then((r) => {
+        if (!r.ok) return r.json().then((d) => Promise.reject(new Error(d?.error ?? r.statusText)));
+        return r.json();
+      })
+      .then(() => {
+        setDriverEditingId(null);
+        fetchDriverMapp();
+      })
+      .catch((e) => setDriverMappError(e instanceof Error ? e.message : String(e)))
+      .finally(() => setDriverMappSaving(false));
+  };
+
+  const deleteDriverMapp = (id: number) => {
+    if (!confirm('Delete this driver name fix?')) return;
+    setDriverMappError(null);
+    setDriverMappSaving(true);
+    fetch(`/api/admin/data-checks/driver-mapp/${id}`, { method: 'DELETE' })
+      .then((r) => {
+        if (!r.ok) return r.json().then((d) => Promise.reject(new Error(d?.error ?? r.statusText)));
+        return r.json();
+      })
+      .then(() => fetchDriverMapp())
+      .catch((e) => setDriverMappError(e instanceof Error ? e.message : String(e)))
+      .finally(() => setDriverMappSaving(false));
+  };
+
+  const startEditDriver = (row: WineMappRow) => {
+    setDriverEditingId(row.id);
+    setDriverEditOld(row.oldvworkname);
+    setDriverEditNew(row.newvworkname);
+  };
+
+  const runDriverFixes = () => {
+    setDriverMappError(null);
+    setRunDriverFixesResult(null);
+    setRunDriverFixesLoading(true);
+    fetch('/api/admin/data-checks/driver-mapp/run-fixes', { method: 'POST' })
+      .then((r) => {
+        if (!r.ok) return r.json().then((d) => Promise.reject(new Error(d?.error ?? r.statusText)));
+        return r.json();
+      })
+      .then((data: { ok: boolean; totalUpdated: number; perMapping: { id: number; oldvworkname: string; newvworkname: string; updated: number }[] }) => {
+        setRunDriverFixesResult({ totalUpdated: data.totalUpdated, perMapping: data.perMapping ?? [] });
+        setWorkerNamesList([]);
+        fetch('/api/admin/data-checks/driver-mapp/worker-names')
+          .then((res) => (res.ok ? res.json() : { rows: [] }))
+          .then((d: { rows: string[] }) => setWorkerNamesList(d.rows ?? []));
+      })
+      .catch((e) => setDriverMappError(e instanceof Error ? e.message : String(e)))
+      .finally(() => setRunDriverFixesLoading(false));
+  };
+
   const runSetTrailerType = () => {
     setSetTrailerError(null);
     setSetTrailerResult(null);
@@ -743,7 +1154,14 @@ function DataChecksPageContent() {
           Scan and report on data quality (tbl_tracking).
         </p>
 
-        <div className="mt-6 flex gap-1 border-b border-zinc-200 dark:border-zinc-700">
+        <div className="mt-6 flex flex-wrap gap-1 border-b border-zinc-200 dark:border-zinc-700">
+          <button
+            type="button"
+            onClick={() => setActiveTab('data-health-overview')}
+            className={`rounded-t px-4 py-2 text-sm font-medium ${activeTab === 'data-health-overview' ? 'border border-b-0 border-zinc-200 bg-white text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'}`}
+          >
+            0. Data Health Overview
+          </button>
           <button
             type="button"
             onClick={() => setActiveTab('gps-gaps')}
@@ -756,7 +1174,7 @@ function DataChecksPageContent() {
             onClick={() => setActiveTab('winery-fixes')}
             className={`rounded-t px-4 py-2 text-sm font-medium ${activeTab === 'winery-fixes' ? 'border border-b-0 border-zinc-200 bg-white text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'}`}
           >
-            2. Winery/Vineyard Name Fixes
+            2. Winery/Vineyard/Driver Name Fixes
           </button>
           <button
             type="button"
@@ -770,16 +1188,249 @@ function DataChecksPageContent() {
             onClick={() => setActiveTab('gps-integrity')}
             className={`rounded-t px-4 py-2 text-sm font-medium ${activeTab === 'gps-integrity' ? 'border border-b-0 border-zinc-200 bg-white text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'}`}
           >
-            4. GPS Integrity Check
+            4. GPS Integrity (API)
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveTab('db-check')}
+            className={`rounded-t px-4 py-2 text-sm font-medium ${activeTab === 'db-check' ? 'border border-b-0 border-zinc-200 bg-white text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'}`}
+          >
+            5. DB Check
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveTab('db-check-simple')}
+            className={`rounded-t px-4 py-2 text-sm font-medium ${activeTab === 'db-check-simple' ? 'border border-b-0 border-zinc-200 bg-white text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'}`}
+          >
+            6. DB Check Simple
           </button>
           <button
             type="button"
             onClick={() => setActiveTab('vineyard-mappings')}
             className={`rounded-t px-4 py-2 text-sm font-medium ${activeTab === 'vineyard-mappings' ? 'border border-b-0 border-zinc-200 bg-white text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'}`}
           >
-            5. Vineyard Mappings
+            7. Vineyard Mappings
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveTab('vwork-stale')}
+            className={`rounded-t px-4 py-2 text-sm font-medium ${activeTab === 'vwork-stale' ? 'border border-b-0 border-zinc-200 bg-white text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'}`}
+          >
+            8. VWork steps
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveTab('geofence-gaps')}
+            className={`rounded-t px-4 py-2 text-sm font-medium ${activeTab === 'geofence-gaps' ? 'border border-b-0 border-zinc-200 bg-white text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'}`}
+          >
+            9. Geofence gaps
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveTab('geofence-enter-exit-gaps')}
+            className={`rounded-t px-4 py-2 text-sm font-medium ${activeTab === 'geofence-enter-exit-gaps' ? 'border border-b-0 border-zinc-200 bg-white text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'}`}
+          >
+            10. Geofence Enter/Exit gaps
           </button>
         </div>
+
+        {activeTab === 'data-health-overview' && (
+        <section className="mt-0 rounded-b-lg border border-zinc-200 border-t-0 bg-white p-6 shadow-sm dark:border-zinc-700 dark:bg-zinc-900">
+          <h2 className="text-lg font-medium text-zinc-900 dark:text-zinc-100">
+            Data Health Overview
+          </h2>
+          <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
+            DB-only snapshot: tracking coverage, fence assignment backlog, ENTER/EXIT gaps in a date window, and vworkjobs steps coverage. Use the numbered tabs below for detail and actions. Day boundaries for window metrics use{' '}
+            <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">position_time::date</code> (verbatim API date).
+          </p>
+
+          <div className="mt-4 flex flex-wrap items-end gap-4">
+            <div>
+              <label className="block text-xs font-medium text-zinc-600 dark:text-zinc-400">Window from</label>
+              <input
+                type="date"
+                value={healthDateFrom}
+                onChange={(e) => setHealthDateFrom(e.target.value)}
+                className="mt-0.5 rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-zinc-600 dark:text-zinc-400">Window to</label>
+              <input
+                type="date"
+                value={healthDateTo}
+                onChange={(e) => setHealthDateTo(e.target.value)}
+                className="mt-0.5 rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-medium text-zinc-600 dark:text-zinc-400">Min points (Enter/Exit gap)</label>
+              <input
+                type="number"
+                min={1}
+                max={50000}
+                value={healthMinPointsEE}
+                onChange={(e) => setHealthMinPointsEE(Math.max(1, Math.min(50000, parseInt(e.target.value, 10) || 25)))}
+                className="mt-0.5 w-24 rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+              />
+            </div>
+            <button
+              type="button"
+              onClick={() => void fetchHealthOverview()}
+              disabled={healthLoading}
+              className="rounded bg-zinc-800 px-4 py-2 text-sm font-medium text-white hover:bg-zinc-700 disabled:opacity-50 dark:bg-zinc-200 dark:text-zinc-900 dark:hover:bg-zinc-300"
+            >
+              {healthLoading ? 'Loading…' : 'Refresh'}
+            </button>
+          </div>
+
+          {healthError && (
+            <p className="mt-4 text-sm text-red-600 dark:text-red-400">{healthError}</p>
+          )}
+
+          {healthData && !healthError && (
+            <>
+              <p className="mt-3 text-xs text-zinc-500 dark:text-zinc-400">
+                Snapshot:{' '}
+                <span className="font-mono text-zinc-700 dark:text-zinc-300">
+                  {new Date(healthData.generatedAt).toLocaleString()}
+                </span>
+                {' · '}
+                Window{' '}
+                <span className="font-mono">
+                  {healthData.window.dateFrom} → {healthData.window.dateTo}
+                </span>
+              </p>
+
+              <div className="mt-6 grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+                <div className="rounded-lg border border-zinc-200 bg-zinc-50/80 p-4 dark:border-zinc-600 dark:bg-zinc-800/40">
+                  <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">tbl_tracking (all rows)</h3>
+                  <dl className="mt-3 space-y-2 text-sm text-zinc-700 dark:text-zinc-300">
+                    <div className="flex justify-between gap-2">
+                      <dt>Total rows</dt>
+                      <dd className="font-mono tabular-nums">{healthData.tracking.totalRows.toLocaleString()}</dd>
+                    </div>
+                    <div className="flex justify-between gap-2">
+                      <dt>max(position_time)</dt>
+                      <dd className="font-mono text-xs">{healthData.tracking.maxPositionTime ?? '—'}</dd>
+                    </div>
+                    <div className="flex justify-between gap-2">
+                      <dt>max(position_time_nz)</dt>
+                      <dd className="font-mono text-xs">{healthData.tracking.maxPositionTimeNz ?? '—'}</dd>
+                    </div>
+                    <div className="flex justify-between gap-2">
+                      <dt>Rows missing NZ time</dt>
+                      <dd className={`font-mono tabular-nums ${healthData.tracking.rowsMissingPositionTimeNz > 0 ? 'text-amber-700 dark:text-amber-400' : ''}`}>
+                        {healthData.tracking.rowsMissingPositionTimeNz.toLocaleString()}
+                      </dd>
+                    </div>
+                    <div className="flex justify-between gap-2">
+                      <dt>Geofence not attempted</dt>
+                      <dd className={`font-mono tabular-nums ${healthData.tracking.rowsGeofenceNotAttempted > 0 ? 'text-amber-700 dark:text-amber-400' : ''}`}>
+                        {healthData.tracking.rowsGeofenceNotAttempted.toLocaleString()}
+                      </dd>
+                    </div>
+                    <div className="flex justify-between gap-2 border-t border-zinc-200 pt-2 dark:border-zinc-600">
+                      <dt className="text-xs">max PT (geofence_attempted)</dt>
+                      <dd className="font-mono text-xs">{healthData.tracking.maxPositionTimeFenceAttempted ?? '—'}</dd>
+                    </div>
+                    <div className="flex justify-between gap-2">
+                      <dt className="text-xs">max PT NZ (geofence_attempted)</dt>
+                      <dd className="font-mono text-xs">{healthData.tracking.maxPositionTimeNzFenceAttempted ?? '—'}</dd>
+                    </div>
+                  </dl>
+                  <div className="mt-3 flex flex-wrap gap-x-3 gap-y-1 text-xs">
+                    <Link href="/admin/data-checks?tab=db-check-simple" className="text-blue-600 hover:underline dark:text-blue-400">
+                      DB Check Simple
+                    </Link>
+                    <Link href="/admin/data-checks?tab=geofence-gaps" className="text-blue-600 hover:underline dark:text-blue-400">
+                      Geofence gaps
+                    </Link>
+                    <Link href="/admin/tagging" className="text-blue-600 hover:underline dark:text-blue-400">
+                      Tagging / fence prep
+                    </Link>
+                  </div>
+                </div>
+
+                <div className="rounded-lg border border-zinc-200 bg-zinc-50/80 p-4 dark:border-zinc-600 dark:bg-zinc-800/40">
+                  <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Window: fence &amp; ENTER/EXIT</h3>
+                  <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+                    Device-days in range with issues (see tabs 9–10 for lists).
+                  </p>
+                  <dl className="mt-3 space-y-2 text-sm text-zinc-700 dark:text-zinc-300">
+                    <div className="flex justify-between gap-2">
+                      <dt>Device-days w/ geofence gap</dt>
+                      <dd className={`font-mono tabular-nums ${healthData.windowMetrics.deviceDaysWithGeofenceGap > 0 ? 'font-semibold text-amber-800 dark:text-amber-300' : ''}`}>
+                        {healthData.windowMetrics.deviceDaysWithGeofenceGap.toLocaleString()}
+                      </dd>
+                    </div>
+                    <div className="flex justify-between gap-2">
+                      <dt>Device-days w/ Enter/Exit gap</dt>
+                      <dd className={`font-mono tabular-nums ${healthData.windowMetrics.deviceDaysWithEnterExitGap > 0 ? 'font-semibold text-amber-800 dark:text-amber-300' : ''}`}>
+                        {healthData.windowMetrics.deviceDaysWithEnterExitGap.toLocaleString()}
+                      </dd>
+                    </div>
+                    <div className="text-xs text-zinc-500 dark:text-zinc-400">
+                      Enter/Exit threshold: ≥ {healthData.window.minPointsEnterExit} points/day, zero ENTER/EXIT.
+                    </div>
+                  </dl>
+                  <div className="mt-3 flex flex-wrap gap-x-3 gap-y-1 text-xs">
+                    <Link href="/admin/data-checks?tab=geofence-gaps" className="text-blue-600 hover:underline dark:text-blue-400">
+                      Tab 9 — Geofence gaps
+                    </Link>
+                    <Link href="/admin/data-checks?tab=geofence-enter-exit-gaps" className="text-blue-600 hover:underline dark:text-blue-400">
+                      Tab 10 — Enter/Exit gaps
+                    </Link>
+                  </div>
+                </div>
+
+                <div className="rounded-lg border border-zinc-200 bg-zinc-50/80 p-4 dark:border-zinc-600 dark:bg-zinc-800/40 sm:col-span-2 xl:col-span-1">
+                  <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">tbl_vworkjobs (steps)</h3>
+                  <dl className="mt-3 space-y-2 text-sm text-zinc-700 dark:text-zinc-300">
+                    <div className="flex justify-between gap-2">
+                      <dt>Jobs with actual_start</dt>
+                      <dd className="font-mono tabular-nums">{healthData.vworkjobs.jobsWithActualStart.toLocaleString()}</dd>
+                    </div>
+                    <div className="flex justify-between gap-2">
+                      <dt>max(actual_start_time)</dt>
+                      <dd className="font-mono text-xs">{healthData.vworkjobs.maxActualStartTime ?? '—'}</dd>
+                    </div>
+                    <div className="flex justify-between gap-2">
+                      <dt>max start w/ step_*_actual_time</dt>
+                      <dd className="font-mono text-xs">{healthData.vworkjobs.maxActualStartWithStepData ?? '—'}</dd>
+                    </div>
+                    <div className="flex justify-between gap-2">
+                      <dt>Started but steps_fetched ≠ true</dt>
+                      <dd className={`font-mono tabular-nums ${healthData.vworkjobs.jobsWithStartStepsNotFetched > 0 ? 'text-amber-700 dark:text-amber-400' : ''}`}>
+                        {healthData.vworkjobs.jobsWithStartStepsNotFetched.toLocaleString()}
+                      </dd>
+                    </div>
+                  </dl>
+                  <div className="mt-3 flex flex-wrap gap-x-3 gap-y-1 text-xs">
+                    <Link href="/admin/data-checks?tab=vwork-stale" className="text-blue-600 hover:underline dark:text-blue-400">
+                      Tab 8 — VWork steps
+                    </Link>
+                    <Link href="/admin/tagging" className="text-blue-600 hover:underline dark:text-blue-400">
+                      Tagging (run steps)
+                    </Link>
+                  </div>
+                </div>
+              </div>
+
+              <div className="mt-6 rounded-md border border-blue-200 bg-blue-50/60 p-3 text-sm text-zinc-700 dark:border-blue-900 dark:bg-blue-950/30 dark:text-zinc-300">
+                <strong className="text-zinc-900 dark:text-zinc-100">Pipeline reminder:</strong> import tracking →{' '}
+                <code className="rounded bg-white/80 px-1 dark:bg-zinc-800">position_time_nz</code> + fence (
+                <code className="rounded bg-white/80 px-1 dark:bg-zinc-800">geofence_attempted</code>) → ENTER/EXIT tagging (
+                <code className="rounded bg-white/80 px-1 dark:bg-zinc-800">position_time_nz</code>) → derived steps on jobs. Temporal GPS gaps are on{' '}
+                <Link href="/admin/data-checks?tab=gps-gaps" className="text-blue-600 hover:underline dark:text-blue-400">
+                  Tab 1 — GPS Tracking Gaps
+                </Link>
+                .
+              </div>
+            </>
+          )}
+        </section>
+        )}
 
         {activeTab === 'gps-gaps' && (
         <section className="mt-0 rounded-b-lg border border-zinc-200 border-t-0 bg-white p-6 shadow-sm dark:border-zinc-700 dark:bg-zinc-900">
@@ -787,8 +1438,10 @@ function DataChecksPageContent() {
             GPS tracking gaps
           </h2>
           <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
-            Find breaks in <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">position_time_nz</code> per
-            device (ordered by device_name, position_time_nz). Report by date and device with largest gap in minutes.
+            Find breaks in <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">position_time</code> per device
+            (ordered by device_name, position_time). Gap length uses consecutive points in that order. Date filter and report
+            date use <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">position_time::date</code>. From_NZ / To_NZ
+            columns show the NZ timestamps on the same boundary rows for reference.
           </p>
 
           <div className="mt-4 flex flex-wrap items-end gap-4">
@@ -985,10 +1638,10 @@ function DataChecksPageContent() {
                           <td className="px-3 py-2 font-mono text-xs text-zinc-700 dark:text-zinc-300" title="position_time first read after gap">
                             {row.gap_to != null ? formatGapDateTime(row.gap_to) : '—'}
                           </td>
-                          <td className="px-3 py-2 font-mono text-xs text-zinc-700 dark:text-zinc-300" title="position_time_nz last read before gap">
+                          <td className="px-3 py-2 font-mono text-xs text-zinc-700 dark:text-zinc-300" title="position_time_nz on row before gap (reference)">
                             {formatGapDateTime(row.gap_from_nz)}
                           </td>
-                          <td className="px-3 py-2 font-mono text-xs text-zinc-700 dark:text-zinc-300" title="position_time_nz first read after gap">
+                          <td className="px-3 py-2 font-mono text-xs text-zinc-700 dark:text-zinc-300" title="position_time_nz on row after gap (reference)">
                             {formatGapDateTime(row.gap_to_nz)}
                           </td>
                         </tr>
@@ -1172,9 +1825,9 @@ function DataChecksPageContent() {
 
         {activeTab === 'winery-fixes' && (
         <section className="mt-0 rounded-b-lg border border-zinc-200 border-t-0 bg-white p-6 shadow-sm dark:border-zinc-700 dark:bg-zinc-900">
-          <h2 className="text-lg font-medium text-zinc-900 dark:text-zinc-100">Winery/Vineyard Name Fixes</h2>
+          <h2 className="text-lg font-medium text-zinc-900 dark:text-zinc-100">Winery / Vineyard / Driver name fixes</h2>
           <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
-            Map old vwork names to new names. Winery fixes use <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">tbl_wine_mapp</code> and <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">delivery_winery</code>; vineyard fixes use <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">tbl_vine_mapp</code> and <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">vineyard_name</code>. Run the SQL migrations once if columns or tables are missing.
+            Map old vwork names to new names. Winery: <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">tbl_wine_mapp</code> → <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">delivery_winery</code>; vineyard: <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">tbl_vine_mapp</code> → <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">vineyard_name</code>; driver: <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">tbl_driver_mapp</code> → <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">worker</code>. Run SQL migrations once if columns or tables are missing.
           </p>
 
           <h3 className="mt-6 text-base font-medium text-zinc-800 dark:text-zinc-200">Winery name fixes</h3>
@@ -1544,6 +2197,193 @@ function DataChecksPageContent() {
               </div>
             )}
           </div>
+
+          <h3 className="mt-10 border-t border-zinc-200 pt-8 text-base font-medium text-zinc-800 dark:border-zinc-700 dark:text-zinc-200">
+            Driver name fixes
+          </h3>
+          <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
+            Map old driver (worker) names to new names in <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">tbl_driver_mapp</code>.{' '}
+            <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">Run Fixes</code> sets <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">worker_old</code>, then <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">worker</code>. Use <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">add_worker_old_tbl_vworkjobs.sql</code> if <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">worker_old</code> is missing.
+          </p>
+
+          <div className="mt-4 flex flex-wrap items-end gap-4 rounded border border-zinc-200 bg-zinc-50/50 p-4 dark:border-zinc-700 dark:bg-zinc-800/30">
+            <label className="flex flex-col gap-1">
+              <span className="text-xs font-medium text-zinc-500 dark:text-zinc-400">Old name</span>
+              <input
+                type="text"
+                list="driver-mapp-old-list"
+                value={driverMappNewOld}
+                onChange={(e) => setDriverMappNewOld(e.target.value)}
+                placeholder="Select or type old driver name"
+                className="w-56 rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+              />
+              <datalist id="driver-mapp-old-list">
+                {workerNamesList.map((w) => (
+                  <option key={w} value={w} />
+                ))}
+              </datalist>
+            </label>
+            <label className="flex flex-col gap-1">
+              <span className="text-xs font-medium text-zinc-500 dark:text-zinc-400">New name</span>
+              <input
+                type="text"
+                list="driver-mapp-new-list"
+                value={driverMappNewNew}
+                onChange={(e) => setDriverMappNewNew(e.target.value)}
+                placeholder="Select or type new driver name"
+                className="w-56 rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+              />
+              <datalist id="driver-mapp-new-list">
+                {workerNamesList.map((w) => (
+                  <option key={w} value={w} />
+                ))}
+              </datalist>
+            </label>
+            <button
+              type="button"
+              onClick={createDriverMapp}
+              disabled={driverMappSaving}
+              className="rounded bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50 dark:bg-blue-700 dark:hover:bg-blue-600"
+            >
+              {driverMappSaving ? 'Saving…' : 'Add fix'}
+            </button>
+            <button
+              type="button"
+              onClick={runDriverFixes}
+              disabled={runDriverFixesLoading || driverMappRows.length === 0}
+              className="rounded bg-amber-600 px-4 py-2 text-sm font-medium text-white hover:bg-amber-700 disabled:opacity-50 dark:bg-amber-700 dark:hover:bg-amber-600"
+              title="Update tbl_vworkjobs: set worker_old = current worker, worker = new name where worker = old name"
+            >
+              {runDriverFixesLoading ? 'Running…' : 'Run Fixes'}
+            </button>
+          </div>
+
+          {runDriverFixesResult != null && (
+            <div className="mt-4 rounded border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-800 dark:border-emerald-800 dark:bg-emerald-950/50 dark:text-emerald-200">
+              Updated {runDriverFixesResult.totalUpdated} row(s) in tbl_vworkjobs (worker).
+              {runDriverFixesResult.perMapping.length > 0 && (
+                <ul className="mt-1 list-inside list-disc">
+                  {runDriverFixesResult.perMapping.map((m) => (
+                    <li key={m.id}>
+                      <code className="rounded bg-emerald-100 px-0.5 dark:bg-emerald-900/50">{m.oldvworkname}</code> →{' '}
+                      <code className="rounded bg-emerald-100 px-0.5 dark:bg-emerald-900/50">{m.newvworkname}</code>: {m.updated}{' '}
+                      row(s)
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
+
+          {driverMappError && (
+            <div className="mt-4 rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-800 dark:bg-red-950/50 dark:text-red-200">
+              {driverMappError}
+            </div>
+          )}
+
+          <div className="mt-6">
+            {driverMappLoading ? (
+              <p className="text-sm text-zinc-500 dark:text-zinc-400">Loading driver fixes…</p>
+            ) : (
+              <div className="overflow-x-auto rounded border border-zinc-200 dark:border-zinc-700">
+                <table className="w-full min-w-[480px] border-collapse text-left text-sm">
+                  <thead>
+                    <tr className="border-b border-zinc-200 bg-zinc-100/80 dark:border-zinc-700 dark:bg-zinc-800/80">
+                      <th className="px-3 py-2 font-medium text-zinc-700 dark:text-zinc-300">Old name</th>
+                      <th className="px-3 py-2 font-medium text-zinc-700 dark:text-zinc-300">New name</th>
+                      <th className="px-3 py-2 text-right font-medium text-zinc-700 dark:text-zinc-300">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {driverMappRows.length === 0 ? (
+                      <tr>
+                        <td colSpan={3} className="px-3 py-4 text-center text-zinc-500 dark:text-zinc-400">
+                          No driver name fixes yet. Add one above.
+                        </td>
+                      </tr>
+                    ) : (
+                      driverMappRows.map((row) => (
+                        <tr key={row.id} className="border-b border-zinc-100 dark:border-zinc-800">
+                          {driverEditingId === row.id ? (
+                            <>
+                              <td className="px-3 py-2">
+                                <input
+                                  type="text"
+                                  list={`driver-mapp-edit-old-${row.id}`}
+                                  value={driverEditOld}
+                                  onChange={(e) => setDriverEditOld(e.target.value)}
+                                  className="w-full rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+                                />
+                                <datalist id={`driver-mapp-edit-old-${row.id}`}>
+                                  {workerNamesList.map((w) => (
+                                    <option key={w} value={w} />
+                                  ))}
+                                </datalist>
+                              </td>
+                              <td className="px-3 py-2">
+                                <input
+                                  type="text"
+                                  list={`driver-mapp-edit-new-${row.id}`}
+                                  value={driverEditNew}
+                                  onChange={(e) => setDriverEditNew(e.target.value)}
+                                  className="w-full rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+                                />
+                                <datalist id={`driver-mapp-edit-new-${row.id}`}>
+                                  {workerNamesList.map((w) => (
+                                    <option key={w} value={w} />
+                                  ))}
+                                </datalist>
+                              </td>
+                              <td className="px-3 py-2 text-right">
+                                <button
+                                  type="button"
+                                  onClick={() => updateDriverMapp(row.id)}
+                                  disabled={driverMappSaving}
+                                  className="mr-2 rounded bg-emerald-600 px-2 py-1 text-xs font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
+                                >
+                                  Save
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setDriverEditingId(null)}
+                                  className="rounded border border-zinc-300 bg-white px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-100 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700"
+                                >
+                                  Cancel
+                                </button>
+                              </td>
+                            </>
+                          ) : (
+                            <>
+                              <td className="px-3 py-2 text-zinc-900 dark:text-zinc-100">{row.oldvworkname}</td>
+                              <td className="px-3 py-2 text-zinc-900 dark:text-zinc-100">{row.newvworkname}</td>
+                              <td className="px-3 py-2 text-right">
+                                <button
+                                  type="button"
+                                  onClick={() => startEditDriver(row)}
+                                  disabled={driverMappSaving}
+                                  className="mr-2 rounded border border-zinc-300 bg-white px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-100 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700"
+                                >
+                                  Edit
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => deleteDriverMapp(row.id)}
+                                  disabled={driverMappSaving}
+                                  className="rounded border border-red-200 bg-white px-2 py-1 text-xs font-medium text-red-700 hover:bg-red-50 dark:border-red-800 dark:bg-zinc-800 dark:text-red-300 dark:hover:bg-red-950/30"
+                                >
+                                  Delete
+                                </button>
+                              </td>
+                            </>
+                          )}
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
         </section>
         )}
 
@@ -1582,9 +2422,10 @@ function DataChecksPageContent() {
 
         {activeTab === 'gps-integrity' && (
         <section className="mt-0 min-w-0 max-w-full rounded-b-lg border border-zinc-200 border-t-0 bg-white p-6 shadow-sm dark:border-zinc-700 dark:bg-zinc-900">
-          <h2 className="text-lg font-medium text-zinc-900 dark:text-zinc-100">GPS Integrity Check</h2>
+          <h2 className="text-lg font-medium text-zinc-900 dark:text-zinc-100">GPS Integrity (API)</h2>
           <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
-            Rows = dates, columns = all devices (HK). Each cell: 3 checks vs <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">tbl_tracking.position_time</code> — 1st time, last time, row count (API vs DB). Green = pass, red = fail, — = no API data.
+            Rows = devices (HK), columns = UTC dates. Each cell: 3 checks vs{' '}
+            <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">tbl_tracking.position_time</code> — first time, last time, row count (API vs DB). Green = pass, red = fail, — = no API data. The table fills row-by-row as each device finishes (several API calls run in parallel per device).
           </p>
           <div className="mt-4 flex flex-wrap items-end gap-4">
             <label className="flex flex-col gap-1">
@@ -1607,31 +2448,7 @@ function DataChecksPageContent() {
             </label>
             <button
               type="button"
-              onClick={() => {
-                setGpsIntegrityError(null);
-                setGpsIntegrityGrid(null);
-                if (!gpsIntegrityFrom || !gpsIntegrityTo) {
-                  setGpsIntegrityError('From and To dates required');
-                  return;
-                }
-                setGpsIntegrityLoading(true);
-                fetch('/api/admin/data-checks/gps-integrity', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({
-                    dateFrom: gpsIntegrityFrom,
-                    dateTo: gpsIntegrityTo,
-                    grid: true,
-                  }),
-                })
-                  .then((r) => {
-                    if (!r.ok) return r.json().then((d) => Promise.reject(new Error(d?.error ?? r.statusText)));
-                    return r.json();
-                  })
-                  .then((data: GpsIntegrityGridResponse) => setGpsIntegrityGrid(data))
-                  .catch((e) => setGpsIntegrityError(e instanceof Error ? e.message : String(e)))
-                  .finally(() => setGpsIntegrityLoading(false));
-              }}
+              onClick={() => void runGpsIntegrityCheck()}
               disabled={gpsIntegrityLoading}
               className="rounded bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50 dark:bg-blue-700 dark:hover:bg-blue-600"
             >
@@ -1643,8 +2460,13 @@ function DataChecksPageContent() {
               {gpsIntegrityError}
             </div>
           )}
-          {gpsIntegrityGrid && gpsIntegrityGrid.rows.length > 0 && (
+          {gpsIntegrityGrid && gpsIntegrityGrid.dates.length > 0 && (
             <div className="mt-4">
+              {gpsIntegrityLoading && (
+                <p className="mb-2 text-xs text-zinc-500 dark:text-zinc-400">
+                  Loading… {gpsIntegrityGrid.rows.length} / {gpsIntegrityGrid.devices.length} device(s) complete.
+                </p>
+              )}
               <p className="mb-2 text-xs text-zinc-500 dark:text-zinc-400">
                 Each cell shows 1st time, last time, and row count (or API/DB when mismatch). Green = pass, red = fail. — = no API data.
               </p>
@@ -1652,17 +2474,19 @@ function DataChecksPageContent() {
                 <table className="w-max min-w-full border-collapse text-left text-sm">
                   <thead>
                     <tr className="border-b border-zinc-200 bg-zinc-100/80 dark:border-zinc-700 dark:bg-zinc-800/80">
-                      <th className="sticky left-0 z-10 border-r border-zinc-200 bg-zinc-100/80 px-2 py-2 font-medium text-zinc-700 dark:border-zinc-700 dark:bg-zinc-800/80 dark:text-zinc-300">Date</th>
-                      {gpsIntegrityGrid.devices.map((d) => (
-                        <th key={d} className="px-2 py-2 font-medium text-zinc-700 dark:text-zinc-300">{d}</th>
+                      <th className="sticky left-0 z-10 border-r border-zinc-200 bg-zinc-100/80 px-2 py-2 font-medium text-zinc-700 dark:border-zinc-700 dark:bg-zinc-800/80 dark:text-zinc-300">Device</th>
+                      {gpsIntegrityGrid.dates.map((d) => (
+                        <th key={d} className="whitespace-nowrap px-2 py-2 font-mono text-xs font-medium text-zinc-700 dark:text-zinc-300">
+                          {d}
+                        </th>
                       ))}
                     </tr>
                   </thead>
                   <tbody>
                     {gpsIntegrityGrid.rows.map((row) => (
-                      <tr key={row.date} className="border-b border-zinc-100 dark:border-zinc-700">
-                        <td className="sticky left-0 z-10 border-r border-zinc-200 bg-white px-2 py-1.5 font-mono text-xs text-zinc-700 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300">
-                          {row.date}
+                      <tr key={row.device} className="border-b border-zinc-100 dark:border-zinc-700">
+                        <td className="sticky left-0 z-10 max-w-[12rem] border-r border-zinc-200 bg-white px-2 py-1.5 text-xs text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100">
+                          {row.device}
                         </td>
                         {row.cells.map((cell, j) => {
                           if (cell.status === 'no_data') {
@@ -1691,6 +2515,209 @@ function DataChecksPageContent() {
                   </tbody>
                 </table>
               </div>
+            </div>
+          )}
+        </section>
+        )}
+
+        {activeTab === 'db-check' && (
+        <section className="mt-0 min-w-0 max-w-full rounded-b-lg border border-zinc-200 border-t-0 bg-white p-6 shadow-sm dark:border-zinc-700 dark:bg-zinc-900">
+          <h2 className="text-lg font-medium text-zinc-900 dark:text-zinc-100">DB Check</h2>
+          <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
+            No API calls. Per device and UTC calendar day: row count and min/max{' '}
+            <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">position_time</code> in{' '}
+            <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">tbl_tracking</code>. Empty cells = no rows that day (gap alert).
+          </p>
+          <div className="mt-4 flex flex-wrap items-end gap-4">
+            <label className="flex flex-col gap-1">
+              <span className="text-xs font-medium text-zinc-500 dark:text-zinc-400">From</span>
+              <input
+                type="date"
+                value={dbCheckFrom}
+                onChange={(e) => setDbCheckFrom(e.target.value)}
+                className="w-40 rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+              />
+            </label>
+            <label className="flex flex-col gap-1">
+              <span className="text-xs font-medium text-zinc-500 dark:text-zinc-400">To</span>
+              <input
+                type="date"
+                value={dbCheckTo}
+                onChange={(e) => setDbCheckTo(e.target.value)}
+                className="w-40 rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+              />
+            </label>
+            <button
+              type="button"
+              onClick={() => {
+                setDbCheckError(null);
+                setDbCheckGrid(null);
+                if (!dbCheckFrom || !dbCheckTo) {
+                  setDbCheckError('From and To dates required');
+                  return;
+                }
+                setDbCheckLoading(true);
+                fetch('/api/admin/data-checks/db-check', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ dateFrom: dbCheckFrom, dateTo: dbCheckTo }),
+                })
+                  .then((r) => {
+                    if (!r.ok) return r.json().then((d) => Promise.reject(new Error(d?.error ?? r.statusText)));
+                    return r.json();
+                  })
+                  .then((data: DbCheckGridResponse) => setDbCheckGrid(data))
+                  .catch((e) => setDbCheckError(e instanceof Error ? e.message : String(e)))
+                  .finally(() => setDbCheckLoading(false));
+              }}
+              disabled={dbCheckLoading}
+              className="rounded bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50 dark:bg-blue-700 dark:hover:bg-blue-600"
+            >
+              {dbCheckLoading ? 'Running…' : 'Run check'}
+            </button>
+          </div>
+          {dbCheckError && (
+            <div className="mt-4 rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-800 dark:bg-red-950/50 dark:text-red-200">
+              {dbCheckError}
+            </div>
+          )}
+          {dbCheckGrid && dbCheckGrid.rows.length > 0 && (
+            <div className="mt-4 max-w-full overflow-x-auto rounded border border-zinc-200 dark:border-zinc-700">
+              <table className="w-max min-w-full border-collapse text-left text-sm">
+                <thead>
+                  <tr className="border-b border-zinc-200 bg-zinc-100/80 dark:border-zinc-700 dark:bg-zinc-800/80">
+                    <th className="sticky left-0 z-10 border-r border-zinc-200 bg-zinc-100/80 px-2 py-2 font-medium text-zinc-700 dark:border-zinc-700 dark:bg-zinc-800/80 dark:text-zinc-300">Device</th>
+                    {dbCheckGrid.dates.map((d) => (
+                      <th key={d} className="whitespace-nowrap px-2 py-2 font-mono text-xs font-medium text-zinc-700 dark:text-zinc-300">{d}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {dbCheckGrid.rows.map((row) => (
+                    <tr key={row.device} className="border-b border-zinc-100 dark:border-zinc-700">
+                      <td className="sticky left-0 z-10 max-w-[12rem] border-r border-zinc-200 bg-white px-2 py-1.5 text-xs text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100">{row.device}</td>
+                      {row.cells.map((cell, j) =>
+                        cell.status === 'empty' ? (
+                          <td key={j} className="px-2 py-1.5 text-center text-zinc-400 dark:text-zinc-500">—</td>
+                        ) : (
+                          <td
+                            key={j}
+                            className="px-2 py-1.5 font-mono text-xs text-zinc-800 dark:text-zinc-200"
+                            title={`min ${cell.minTime} | max ${cell.maxTime}`}
+                          >
+                            <div className="flex flex-col gap-0.5">
+                              <span className="font-medium">{cell.count}</span>
+                              <span className="text-[10px] leading-tight text-zinc-500 dark:text-zinc-400">{formatGapDateTime(cell.minTime)}</span>
+                              <span className="text-[10px] leading-tight text-zinc-500 dark:text-zinc-400">{formatGapDateTime(cell.maxTime)}</span>
+                            </div>
+                          </td>
+                        )
+                      )}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          {dbCheckGrid && dbCheckGrid.rows.length === 0 && !dbCheckLoading && (
+            <p className="mt-4 text-sm text-zinc-500 dark:text-zinc-400">No devices with tracking rows in this range.</p>
+          )}
+        </section>
+        )}
+
+        {activeTab === 'db-check-simple' && (
+        <section className="mt-0 min-w-0 max-w-full rounded-b-lg border border-zinc-200 border-t-0 bg-white p-6 shadow-sm dark:border-zinc-700 dark:bg-zinc-900">
+          <h2 className="text-lg font-medium text-zinc-900 dark:text-zinc-100">DB Check Simple</h2>
+          <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
+            High-level check: one row per UTC day — total row count and min/max{' '}
+            <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">position_time</code> across all devices in{' '}
+            <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">tbl_tracking</code>. Use this first; then use DB Check for per-device gaps.
+          </p>
+          <div className="mt-4 flex flex-wrap items-end gap-4">
+            <label className="flex flex-col gap-1">
+              <span className="text-xs font-medium text-zinc-500 dark:text-zinc-400">From</span>
+              <input
+                type="date"
+                value={dbCheckSimpleFrom}
+                onChange={(e) => setDbCheckSimpleFrom(e.target.value)}
+                className="w-40 rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+              />
+            </label>
+            <label className="flex flex-col gap-1">
+              <span className="text-xs font-medium text-zinc-500 dark:text-zinc-400">To</span>
+              <input
+                type="date"
+                value={dbCheckSimpleTo}
+                onChange={(e) => setDbCheckSimpleTo(e.target.value)}
+                className="w-40 rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+              />
+            </label>
+            <button
+              type="button"
+              onClick={() => {
+                setDbCheckSimpleError(null);
+                setDbCheckSimpleResult(null);
+                if (!dbCheckSimpleFrom || !dbCheckSimpleTo) {
+                  setDbCheckSimpleError('From and To dates required');
+                  return;
+                }
+                setDbCheckSimpleLoading(true);
+                fetch('/api/admin/data-checks/db-check-simple', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ dateFrom: dbCheckSimpleFrom, dateTo: dbCheckSimpleTo }),
+                })
+                  .then((r) => {
+                    if (!r.ok) return r.json().then((d) => Promise.reject(new Error(d?.error ?? r.statusText)));
+                    return r.json();
+                  })
+                  .then((data: DbCheckSimpleResponse) => setDbCheckSimpleResult(data))
+                  .catch((e) => setDbCheckSimpleError(e instanceof Error ? e.message : String(e)))
+                  .finally(() => setDbCheckSimpleLoading(false));
+              }}
+              disabled={dbCheckSimpleLoading}
+              className="rounded bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50 dark:bg-blue-700 dark:hover:bg-blue-600"
+            >
+              {dbCheckSimpleLoading ? 'Running…' : 'Run check'}
+            </button>
+          </div>
+          {dbCheckSimpleError && (
+            <div className="mt-4 rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-800 dark:bg-red-950/50 dark:text-red-200">
+              {dbCheckSimpleError}
+            </div>
+          )}
+          {dbCheckSimpleResult && dbCheckSimpleResult.rows.length > 0 && (
+            <div className="mt-4 max-w-full overflow-x-auto rounded border border-zinc-200 dark:border-zinc-700">
+              <table className="w-full min-w-[480px] border-collapse text-left text-sm">
+                <thead>
+                  <tr className="border-b border-zinc-200 bg-zinc-100/80 dark:border-zinc-700 dark:bg-zinc-800/80">
+                    <th className="px-3 py-2 font-medium text-zinc-700 dark:text-zinc-300">Date (UTC)</th>
+                    <th className="px-3 py-2 text-right font-medium text-zinc-700 dark:text-zinc-300">Rows</th>
+                    <th className="px-3 py-2 font-medium text-zinc-700 dark:text-zinc-300">Min position_time</th>
+                    <th className="px-3 py-2 font-medium text-zinc-700 dark:text-zinc-300">Max position_time</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {dbCheckSimpleResult.rows.map((row) => (
+                    <tr key={row.date} className="border-b border-zinc-100 dark:border-zinc-700">
+                      <td className="px-3 py-2 font-mono text-xs text-zinc-900 dark:text-zinc-100">{row.date}</td>
+                      {row.status === 'empty' ? (
+                        <>
+                          <td className="px-3 py-2 text-right text-zinc-400 dark:text-zinc-500">—</td>
+                          <td className="px-3 py-2 text-zinc-400 dark:text-zinc-500">—</td>
+                          <td className="px-3 py-2 text-zinc-400 dark:text-zinc-500">—</td>
+                        </>
+                      ) : (
+                        <>
+                          <td className="px-3 py-2 text-right font-mono text-zinc-800 dark:text-zinc-200">{row.count}</td>
+                          <td className="px-3 py-2 font-mono text-xs text-zinc-800 dark:text-zinc-200">{row.minTime}</td>
+                          <td className="px-3 py-2 font-mono text-xs text-zinc-800 dark:text-zinc-200">{row.maxTime}</td>
+                        </>
+                      )}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
             </div>
           )}
         </section>
@@ -1907,6 +2934,508 @@ function DataChecksPageContent() {
               </div>
             )}
           </div>
+        </section>
+        )}
+
+        {activeTab === 'vwork-stale' && (
+        <section className="mt-0 rounded-b-lg border border-zinc-200 border-t-0 bg-white p-6 shadow-sm dark:border-zinc-700 dark:bg-zinc-900">
+          <h2 className="text-lg font-medium text-zinc-900 dark:text-zinc-100">VWork GPS steps</h2>
+          <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
+            Two separate checks (pick one): <strong>Stage 1</strong> lists jobs with no derived step times yet (not stepped).{' '}
+            <strong>Stage 2</strong> lists jobs that need a re-run by aging (<code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">steps_fetched</code> /{' '}
+            <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">steps_fetched_when</code> threshold). Both require a worker and{' '}
+            <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">actual_start_time</code>. Use{' '}
+            <a href="/query/inspect" className="text-blue-600 underline dark:text-blue-400">Inspect</a> or API Test Step 4 to run derived steps.
+          </p>
+          <fieldset className="mt-4 space-y-2">
+            <legend className="text-xs font-medium text-zinc-500 dark:text-zinc-400">Mode</legend>
+            <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:gap-x-6 sm:gap-y-2">
+              <label className="flex cursor-pointer items-start gap-2 text-sm text-zinc-800 dark:text-zinc-200">
+                <input
+                  type="radio"
+                  name="vworkStaleMode"
+                  checked={vworkStaleMode === 'stage1'}
+                  onChange={() => setVworkStaleMode('stage1')}
+                  className="mt-1"
+                />
+                <span>
+                  <strong>Stage 1 — Not stepped</strong> —{' '}
+                  <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">step_1_actual_time</code> through{' '}
+                  <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">step_5_actual_time</code> all null. Optional date range. Does not use stale/aging logic.
+                </span>
+              </label>
+              <label className="flex cursor-pointer items-start gap-2 text-sm text-zinc-800 dark:text-zinc-200">
+                <input
+                  type="radio"
+                  name="vworkStaleMode"
+                  checked={vworkStaleMode === 'stage2'}
+                  onChange={() => setVworkStaleMode('stage2')}
+                  className="mt-1"
+                />
+                <span>
+                  <strong>Stage 2 — Stale / aging</strong> — jobs needing a GPS steps run by threshold (never fetched, missing timestamp, or last run older than N hours).
+                </span>
+              </label>
+            </div>
+          </fieldset>
+          <div className="mt-4 flex flex-wrap items-end gap-4">
+            {vworkStaleMode === 'stage2' && (
+              <label className="flex flex-col gap-1">
+                <span className="text-xs font-medium text-zinc-500 dark:text-zinc-400">Stale if older than (hours)</span>
+                <input
+                  type="number"
+                  min={0}
+                  value={vworkStaleHours}
+                  onChange={(e) => setVworkStaleHours(e.target.value)}
+                  className="w-28 rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+                />
+              </label>
+            )}
+            <label className="flex flex-col gap-1">
+              <span className="text-xs font-medium text-zinc-500 dark:text-zinc-400">actual_start from (optional)</span>
+              <input
+                type="date"
+                value={vworkStaleFrom}
+                onChange={(e) => setVworkStaleFrom(e.target.value)}
+                className="rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+              />
+            </label>
+            <label className="flex flex-col gap-1">
+              <span className="text-xs font-medium text-zinc-500 dark:text-zinc-400">actual_start to (optional)</span>
+              <input
+                type="date"
+                value={vworkStaleTo}
+                onChange={(e) => setVworkStaleTo(e.target.value)}
+                className="rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+              />
+            </label>
+            <button
+              type="button"
+              onClick={() => {
+                setVworkStaleError(null);
+                setVworkStaleResult(null);
+                const q = new URLSearchParams();
+                if (vworkStaleMode === 'stage1') {
+                  q.set('noStepActuals', '1');
+                  q.set('staleHours', '48');
+                } else {
+                  const h = parseInt(vworkStaleHours, 10);
+                  if (Number.isNaN(h) || h < 0) {
+                    setVworkStaleError('Stale hours must be a non-negative number');
+                    return;
+                  }
+                  q.set('staleHours', String(h));
+                }
+                if (vworkStaleFrom) q.set('dateFrom', vworkStaleFrom);
+                if (vworkStaleTo) q.set('dateTo', vworkStaleTo);
+                setVworkStaleLoading(true);
+                fetch(`/api/admin/data-checks/vwork-stale?${q}`)
+                  .then((r) => {
+                    if (!r.ok) return r.json().then((d) => Promise.reject(new Error((d as { error?: string })?.error ?? r.statusText)));
+                    return r.json();
+                  })
+                  .then((data: VworkStaleResponse) => setVworkStaleResult(data))
+                  .catch((e) => setVworkStaleError(e instanceof Error ? e.message : String(e)))
+                  .finally(() => setVworkStaleLoading(false));
+              }}
+              disabled={vworkStaleLoading}
+              className="rounded bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50 dark:bg-blue-700 dark:hover:bg-blue-600"
+            >
+              {vworkStaleLoading ? 'Running…' : vworkStaleMode === 'stage1' ? 'Run stage 1' : 'Run stage 2'}
+            </button>
+          </div>
+          {vworkStaleError && (
+            <div className="mt-4 rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-800 dark:bg-red-950/50 dark:text-red-200">
+              {vworkStaleError}
+            </div>
+          )}
+          {vworkStaleResult && (
+            <div className="mt-4">
+              <p className="text-sm text-zinc-600 dark:text-zinc-400">
+                {vworkStaleResult.noStepActuals ? (
+                  <>
+                    <strong>Stage 1 — Not stepped:</strong> all of{' '}
+                    <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">step_1_actual_time</code>–
+                    <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">step_5_actual_time</code> are null —{' '}
+                    {vworkStaleResult.count} job(s)
+                    {vworkStaleResult.dateFrom || vworkStaleResult.dateTo
+                      ? ` (actual_start ${vworkStaleResult.dateFrom ?? '…'} … ${vworkStaleResult.dateTo ?? '…'})`
+                      : ''}
+                    . (Stage 1 only — no aging threshold.)
+                  </>
+                ) : (
+                  <>
+                    <strong>Stage 2 — Stale / aging:</strong> threshold {vworkStaleResult.staleHours} h since{' '}
+                    <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">steps_fetched_when</code> — {vworkStaleResult.count} job(s)
+                    {vworkStaleResult.dateFrom || vworkStaleResult.dateTo
+                      ? ` (actual_start ${vworkStaleResult.dateFrom ?? '…'} … ${vworkStaleResult.dateTo ?? '…'})`
+                      : ''}
+                    .
+                  </>
+                )}
+              </p>
+              <div className="mt-4 max-w-full overflow-x-auto rounded border border-zinc-200 dark:border-zinc-700">
+                <table className="w-full min-w-[960px] border-collapse text-left text-sm">
+                  <thead>
+                    <tr className="border-b border-zinc-200 bg-zinc-100/80 dark:border-zinc-700 dark:bg-zinc-800/80">
+                      <th className="px-3 py-2 font-medium text-zinc-700 dark:text-zinc-300">Issue</th>
+                      <th className="px-3 py-2 font-medium text-zinc-700 dark:text-zinc-300">job_id</th>
+                      <th className="px-3 py-2 font-medium text-zinc-700 dark:text-zinc-300">Worker</th>
+                      <th className="px-3 py-2 font-medium text-zinc-700 dark:text-zinc-300">Vineyard</th>
+                      <th className="px-3 py-2 font-medium text-zinc-700 dark:text-zinc-300">Winery</th>
+                      <th className="px-3 py-2 font-medium text-zinc-700 dark:text-zinc-300">actual_start</th>
+                      <th className="px-3 py-2 font-medium text-zinc-700 dark:text-zinc-300">steps_fetched</th>
+                      <th className="px-3 py-2 font-medium text-zinc-700 dark:text-zinc-300">steps_fetched_when</th>
+                      <th className="px-3 py-2 font-medium text-zinc-700 dark:text-zinc-300">Hours ago</th>
+                      <th className="px-3 py-2 font-medium text-zinc-700 dark:text-zinc-300">Open</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {vworkStaleResult.rows.length === 0 ? (
+                      <tr>
+                        <td colSpan={10} className="px-3 py-4 text-center text-zinc-500 dark:text-zinc-400">
+                          {vworkStaleResult.noStepActuals
+                            ? 'No jobs with all step 1–5 actual times null in this filter (limit 500).'
+                            : 'No stale jobs in this filter (limit 500).'}
+                        </td>
+                      </tr>
+                    ) : (
+                      vworkStaleResult.rows.map((row) => (
+                        <tr key={row.job_id} className="border-b border-zinc-100 dark:border-zinc-700">
+                          <td className="px-3 py-2 text-xs text-zinc-800 dark:text-zinc-200">{row.issue}</td>
+                          <td className="px-3 py-2 font-mono text-xs text-zinc-900 dark:text-zinc-100">{row.job_id}</td>
+                          <td className="px-3 py-2 text-xs">{row.worker ?? '—'}</td>
+                          <td className="px-3 py-2 text-xs">{row.vineyard_name ?? '—'}</td>
+                          <td className="px-3 py-2 text-xs">{row.delivery_winery ?? '—'}</td>
+                          <td className="px-3 py-2 font-mono text-xs">{row.actual_start_time ?? '—'}</td>
+                          <td className="px-3 py-2 text-xs">{row.steps_fetched === true ? 'true' : row.steps_fetched === false ? 'false' : '—'}</td>
+                          <td className="px-3 py-2 font-mono text-xs">{row.steps_fetched_when ?? '—'}</td>
+                          <td className="px-3 py-2 text-right text-xs">{row.hours_since_steps != null ? row.hours_since_steps : '—'}</td>
+                          <td className="px-3 py-2">
+                            <a
+                              href={`/query/inspect?jobId=${encodeURIComponent(row.job_id)}`}
+                              className="text-blue-600 underline dark:text-blue-400"
+                            >
+                              Inspect
+                            </a>
+                          </td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+        </section>
+        )}
+
+        {activeTab === 'geofence-gaps' && (
+        <section className="mt-0 rounded-b-lg border border-zinc-200 border-t-0 bg-white p-6 shadow-sm dark:border-zinc-700 dark:bg-zinc-900">
+          <h2 className="text-lg font-medium text-zinc-900 dark:text-zinc-100">Geofence gaps</h2>
+          <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
+            Device-days where any <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">tbl_tracking</code> row still has{' '}
+            <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">geofence_attempted</code> false or null (same condition as{' '}
+            <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">store_fences_for_date_scoped</code> for a normal run). Day boundary is{' '}
+            <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">position_time::date</code>. Use{' '}
+            <strong>Days only</strong> for a short list of calendar days to rerun end-to-end (mapping, entry/exit, steps) for the whole day.
+          </p>
+          <div className="mt-4 flex flex-wrap items-end gap-4">
+            <label className="flex flex-col gap-1">
+              <span className="text-xs font-medium text-zinc-500 dark:text-zinc-400">From (day)</span>
+              <input
+                type="date"
+                value={geofenceGapsFrom}
+                onChange={(e) => setGeofenceGapsFrom(e.target.value)}
+                className="rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+              />
+            </label>
+            <label className="flex flex-col gap-1">
+              <span className="text-xs font-medium text-zinc-500 dark:text-zinc-400">To (day)</span>
+              <input
+                type="date"
+                value={geofenceGapsTo}
+                onChange={(e) => setGeofenceGapsTo(e.target.value)}
+                className="rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+              />
+            </label>
+            <label className="flex flex-col gap-1">
+              <span className="text-xs font-medium text-zinc-500 dark:text-zinc-400">
+                Min points ({geofenceGapsDaysOnly ? 'total that day' : 'per device-day'})
+              </span>
+              <input
+                type="number"
+                min={1}
+                value={geofenceGapsMinPoints}
+                onChange={(e) => setGeofenceGapsMinPoints(e.target.value)}
+                className="w-28 rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+                title={
+                  geofenceGapsDaysOnly
+                    ? 'Minimum total tracking rows that calendar day (all devices)'
+                    : 'Minimum rows per device per day'
+                }
+              />
+            </label>
+            <label className="flex cursor-pointer items-center gap-2 text-sm text-zinc-700 dark:text-zinc-300">
+              <input
+                type="checkbox"
+                checked={geofenceGapsDaysOnly}
+                onChange={(e) => setGeofenceGapsDaysOnly(e.target.checked)}
+                className="rounded border-zinc-300 text-blue-600 dark:border-zinc-600"
+              />
+              Days only (rerun list)
+            </label>
+            <button
+              type="button"
+              onClick={() => {
+                setGeofenceGapsError(null);
+                setGeofenceGapsResult(null);
+                if (!geofenceGapsFrom || !geofenceGapsTo) {
+                  setGeofenceGapsError('From and To dates required');
+                  return;
+                }
+                const mp = parseInt(geofenceGapsMinPoints, 10);
+                if (Number.isNaN(mp) || mp < 1) {
+                  setGeofenceGapsError('Min points must be at least 1');
+                  return;
+                }
+                const q = new URLSearchParams({
+                  dateFrom: geofenceGapsFrom,
+                  dateTo: geofenceGapsTo,
+                  minPoints: String(mp),
+                });
+                if (geofenceGapsDaysOnly) q.set('view', 'by-day');
+                setGeofenceGapsLoading(true);
+                fetch(`/api/admin/data-checks/geofence-gaps?${q}`)
+                  .then((r) => {
+                    if (!r.ok) return r.json().then((d) => Promise.reject(new Error((d as { error?: string })?.error ?? r.statusText)));
+                    return r.json();
+                  })
+                  .then((data: GeofenceGapsResponse) => setGeofenceGapsResult(data))
+                  .catch((e) => setGeofenceGapsError(e instanceof Error ? e.message : String(e)))
+                  .finally(() => setGeofenceGapsLoading(false));
+              }}
+              disabled={geofenceGapsLoading}
+              className="rounded bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50 dark:bg-blue-700 dark:hover:bg-blue-600"
+            >
+              {geofenceGapsLoading ? 'Running…' : 'Run check'}
+            </button>
+          </div>
+          {geofenceGapsError && (
+            <div className="mt-4 rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-800 dark:bg-red-950/50 dark:text-red-200">
+              {geofenceGapsError}
+            </div>
+          )}
+          {geofenceGapsResult && (
+            <div className="mt-4">
+              <p className="text-sm text-zinc-600 dark:text-zinc-400">
+                {geofenceGapsResult.view === 'by-day'
+                  ? `${geofenceGapsResult.count} calendar day(s) with unattempted points (whole-day rerun list); min total points ${geofenceGapsResult.minPoints}.`
+                  : `${geofenceGapsResult.count} device-day row(s); min points per device-day ${geofenceGapsResult.minPoints}.`}
+              </p>
+              <div className="mt-4 max-w-full overflow-x-auto rounded border border-zinc-200 dark:border-zinc-700">
+                {geofenceGapsResult.view === 'by-day' ? (
+                  <table className="w-full min-w-[560px] border-collapse text-left text-sm">
+                    <thead>
+                      <tr className="border-b border-zinc-200 bg-zinc-100/80 dark:border-zinc-700 dark:bg-zinc-800/80">
+                        <th className="px-3 py-2 font-medium text-zinc-700 dark:text-zinc-300">Day</th>
+                        <th className="px-3 py-2 text-right font-medium text-zinc-700 dark:text-zinc-300">Devices</th>
+                        <th className="px-3 py-2 text-right font-medium text-zinc-700 dark:text-zinc-300">Points</th>
+                        <th className="px-3 py-2 text-right font-medium text-zinc-700 dark:text-zinc-300">Unattempted</th>
+                        <th className="px-3 py-2 text-right font-medium text-zinc-700 dark:text-zinc-300">Attempted</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {geofenceGapsResult.rows.length === 0 ? (
+                        <tr>
+                          <td colSpan={5} className="px-3 py-4 text-center text-zinc-500 dark:text-zinc-400">
+                            No gaps found for this range (limit 500 rows).
+                          </td>
+                        </tr>
+                      ) : (
+                        geofenceGapsResult.rows.map((row) => (
+                          <tr key={row.day} className="border-b border-zinc-100 dark:border-zinc-700">
+                            <td className="px-3 py-2 font-mono text-xs font-medium text-zinc-900 dark:text-zinc-100">{row.day}</td>
+                            <td className="px-3 py-2 text-right font-mono text-xs">{row.device_count}</td>
+                            <td className="px-3 py-2 text-right font-mono text-xs">{row.point_count}</td>
+                            <td className="px-3 py-2 text-right font-mono text-xs text-amber-700 dark:text-amber-400">{row.unattempted_count}</td>
+                            <td className="px-3 py-2 text-right font-mono text-xs">{row.attempted_count}</td>
+                          </tr>
+                        ))
+                      )}
+                    </tbody>
+                  </table>
+                ) : (
+                  <table className="w-full min-w-[720px] border-collapse text-left text-sm">
+                    <thead>
+                      <tr className="border-b border-zinc-200 bg-zinc-100/80 dark:border-zinc-700 dark:bg-zinc-800/80">
+                        <th className="px-3 py-2 font-medium text-zinc-700 dark:text-zinc-300">Day (position_time)</th>
+                        <th className="px-3 py-2 font-medium text-zinc-700 dark:text-zinc-300">Device</th>
+                        <th className="px-3 py-2 text-right font-medium text-zinc-700 dark:text-zinc-300">Points</th>
+                        <th className="px-3 py-2 text-right font-medium text-zinc-700 dark:text-zinc-300">Unattempted</th>
+                        <th className="px-3 py-2 text-right font-medium text-zinc-700 dark:text-zinc-300">Attempted</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {geofenceGapsResult.rows.length === 0 ? (
+                        <tr>
+                          <td colSpan={5} className="px-3 py-4 text-center text-zinc-500 dark:text-zinc-400">
+                            No gaps found for this range (limit 500 rows).
+                          </td>
+                        </tr>
+                      ) : (
+                        geofenceGapsResult.rows.map((row) => (
+                          <tr key={`${row.device_name}-${row.day}`} className="border-b border-zinc-100 dark:border-zinc-700">
+                            <td className="px-3 py-2 font-mono text-xs">{row.day}</td>
+                            <td className="px-3 py-2 text-xs">{row.device_name}</td>
+                            <td className="px-3 py-2 text-right font-mono text-xs">{row.point_count}</td>
+                            <td className="px-3 py-2 text-right font-mono text-xs text-amber-700 dark:text-amber-400">{row.unattempted_count}</td>
+                            <td className="px-3 py-2 text-right font-mono text-xs">{row.attempted_count}</td>
+                          </tr>
+                        ))
+                      )}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+            </div>
+          )}
+        </section>
+        )}
+
+        {activeTab === 'geofence-enter-exit-gaps' && (
+        <section className="mt-0 rounded-b-lg border border-zinc-200 border-t-0 bg-white p-6 shadow-sm dark:border-zinc-700 dark:bg-zinc-900">
+          <h2 className="text-lg font-medium text-zinc-900 dark:text-zinc-100">Geofence Enter/Exit gaps</h2>
+          <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
+            <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">device_name</code> + calendar day (
+            <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">position_time::date</code>) with enough tracking
+            points but <strong>no</strong> rows tagged <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">ENTER</code> or{' '}
+            <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">EXIT</code>. Sorted by day (newest first), then driver.
+            Usually means that day was not run through{' '}
+            <a href="/admin/tagging" className="text-blue-600 underline dark:text-blue-400">Entry/Exit Tagging</a>
+            , so GPS steps will be thin. Run geofence mapping first if needed. Click <strong>Points</strong> to open{' '}
+            <Link href="/query/gpsdata" className="text-blue-600 underline dark:text-blue-400">GPS Tracking</Link> in a new tab
+            (that device, calendar day from <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">position_time</code>, sorted ascending, paginated).
+          </p>
+          <div className="mt-4 flex flex-wrap items-end gap-4">
+            <label className="flex flex-col gap-1">
+              <span className="text-xs font-medium text-zinc-500 dark:text-zinc-400">From (day)</span>
+              <input
+                type="date"
+                value={eeGapsFrom}
+                onChange={(e) => setEeGapsFrom(e.target.value)}
+                className="rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+              />
+            </label>
+            <label className="flex flex-col gap-1">
+              <span className="text-xs font-medium text-zinc-500 dark:text-zinc-400">To (day)</span>
+              <input
+                type="date"
+                value={eeGapsTo}
+                onChange={(e) => setEeGapsTo(e.target.value)}
+                className="rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+              />
+            </label>
+            <label className="flex flex-col gap-1">
+              <span className="text-xs font-medium text-zinc-500 dark:text-zinc-400">Min points / device-day</span>
+              <input
+                type="number"
+                min={1}
+                value={eeGapsMinPoints}
+                onChange={(e) => setEeGapsMinPoints(e.target.value)}
+                className="w-28 rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+              />
+            </label>
+            <button
+              type="button"
+              onClick={() => {
+                setEeGapsError(null);
+                setEeGapsResult(null);
+                if (!eeGapsFrom || !eeGapsTo) {
+                  setEeGapsError('From and To dates required');
+                  return;
+                }
+                const mp = parseInt(eeGapsMinPoints, 10);
+                if (Number.isNaN(mp) || mp < 1) {
+                  setEeGapsError('Min points must be at least 1');
+                  return;
+                }
+                const q = new URLSearchParams({
+                  dateFrom: eeGapsFrom,
+                  dateTo: eeGapsTo,
+                  minPoints: String(mp),
+                });
+                setEeGapsLoading(true);
+                fetch(`/api/admin/data-checks/geofence-enter-exit-gaps?${q}`)
+                  .then((r) => {
+                    if (!r.ok) return r.json().then((d) => Promise.reject(new Error((d as { error?: string })?.error ?? r.statusText)));
+                    return r.json();
+                  })
+                  .then((data: GeofenceEnterExitGapsResponse) => setEeGapsResult(data))
+                  .catch((e) => setEeGapsError(e instanceof Error ? e.message : String(e)))
+                  .finally(() => setEeGapsLoading(false));
+              }}
+              disabled={eeGapsLoading}
+              className="rounded bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50 dark:bg-blue-700 dark:hover:bg-blue-600"
+            >
+              {eeGapsLoading ? 'Running…' : 'Run check'}
+            </button>
+          </div>
+          {eeGapsError && (
+            <div className="mt-4 rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-800 dark:bg-red-950/50 dark:text-red-200">
+              {eeGapsError}
+            </div>
+          )}
+          {eeGapsResult && (
+            <div className="mt-4">
+              <p className="text-sm text-zinc-600 dark:text-zinc-400">
+                {eeGapsResult.count} device-day row(s) with zero ENTER/EXIT; min points {eeGapsResult.minPoints}. Sorted by day
+                (newest first), then driver.
+              </p>
+              <div className="mt-4 max-w-full overflow-x-auto rounded border border-zinc-200 dark:border-zinc-700">
+                <table className="w-full min-w-[640px] border-collapse text-left text-sm">
+                  <thead>
+                    <tr className="border-b border-zinc-200 bg-zinc-100/80 dark:border-zinc-700 dark:bg-zinc-800/80">
+                      <th className="px-3 py-2 font-medium text-zinc-700 dark:text-zinc-300">Day</th>
+                      <th className="px-3 py-2 font-medium text-zinc-700 dark:text-zinc-300">Driver (device_name)</th>
+                      <th className="px-3 py-2 text-right font-medium text-zinc-700 dark:text-zinc-300" title="Opens GPS Tracking (new tab)">
+                        Points
+                      </th>
+                      <th className="px-3 py-2 text-right font-medium text-zinc-700 dark:text-zinc-300">ENTER/EXIT rows</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {eeGapsResult.rows.length === 0 ? (
+                      <tr>
+                        <td colSpan={4} className="px-3 py-4 text-center text-zinc-500 dark:text-zinc-400">
+                          No gaps in this range (limit 500 rows).
+                        </td>
+                      </tr>
+                    ) : (
+                      eeGapsResult.rows.map((row) => (
+                        <tr key={`${row.device_name}-${row.day}`} className="border-b border-zinc-100 dark:border-zinc-700">
+                          <td className="px-3 py-2 font-mono text-xs">{row.day}</td>
+                          <td className="px-3 py-2 text-xs text-zinc-900 dark:text-zinc-100">{row.device_name}</td>
+                          <td className="px-3 py-2 text-right font-mono text-xs">
+                            <Link
+                              href={`/query/gpsdata?device=${encodeURIComponent(row.device_name)}&day=${encodeURIComponent(row.day)}&orderBy=position_time&orderDir=asc`}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="text-blue-600 underline dark:text-blue-400"
+                              title="tbl_tracking: this device and day, position_time ASC (500 rows per page)"
+                            >
+                              {row.point_count}
+                            </Link>
+                          </td>
+                          <td className="px-3 py-2 text-right font-mono text-xs text-amber-700 dark:text-amber-400">{row.enter_exit_count}</td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
         </section>
         )}
       </div>
