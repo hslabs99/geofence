@@ -7,7 +7,7 @@ alwaysApply: true
 
 **All timestamps in this project are raw and verbatim.** We do NOT alter data for timezones. We do NOT convert API timestamps to "local" or "UTC" for storage. What we get from the API must arrive in `position_time` 100% as we get it. If we receive any timezone information (from geofence API or our own API), ignore it; treat all dates and times as verbatim. Nothing should ever be adjusted.
 
-The only exception: one small piece of code populates `position_time_nz` via SQL UPDATE (e.g. `position_time + interval '13 hours'`). That is the only derivation. We never alter API → `position_time`.
+The only exception: one small piece of code populates `position_time_nz` via SQL UPDATE (e.g. `(position_time AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific/Auckland')` where `position_time_nz` is null). That is the only derivation. We never alter API → `position_time`.
 
 ## Rules
 

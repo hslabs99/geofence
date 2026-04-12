@@ -7,6 +7,11 @@ import {
   GPSPLUS_GROWTH_NAME,
   GPSPLUS_TIME_NAME,
 } from '@/lib/gps-fence-settings-names';
+import {
+  VWORK_TT_LOAD_SIZE_DEFAULT,
+  VWORK_TT_LOAD_SIZE_SETTING_NAME,
+  VWORK_TT_LOAD_SIZE_SETTINGS_TYPE,
+} from '@/lib/vwork-tt-load-size-setting-names';
 
 const SETTING_TYPE = 'System';
 const GPS_START_BUFFER_NAME = 'GPSstartbuffer';
@@ -20,6 +25,7 @@ export default function SettingsPage() {
   const [gpsStdTime, setGpsStdTime] = useState<string>('');
   const [gpsplusGrowth, setGpsplusGrowth] = useState<string>('');
   const [gpsplusTime, setGpsplusTime] = useState<string>('');
+  const [ttLoadSize, setTtLoadSize] = useState<string>('');
   const [loading, setLoading] = useState(true);
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
 
@@ -33,8 +39,11 @@ export default function SettingsPage() {
       fetch(`/api/settings?${new URLSearchParams({ type: fenceType, name: GPS_STD_TIME_NAME })}`).then((r) => r.json()),
       fetch(`/api/settings?${new URLSearchParams({ type: fenceType, name: GPSPLUS_GROWTH_NAME })}`).then((r) => r.json()),
       fetch(`/api/settings?${new URLSearchParams({ type: fenceType, name: GPSPLUS_TIME_NAME })}`).then((r) => r.json()),
+      fetch(
+        `/api/settings?${new URLSearchParams({ type: VWORK_TT_LOAD_SIZE_SETTINGS_TYPE, name: VWORK_TT_LOAD_SIZE_SETTING_NAME })}`
+      ).then((r) => r.json()),
     ])
-      .then(([data1, data2, data3, dataStd, data4, data5]) => {
+      .then(([data1, data2, data3, dataStd, data4, data5, dataTtLoad]) => {
         const v1 = data1?.settingvalue;
         setGpsStartBuffer(v1 != null && v1 !== '' ? String(v1) : '15');
         const v2 = data2?.settingvalue;
@@ -47,6 +56,12 @@ export default function SettingsPage() {
         setGpsplusGrowth(v4 != null && v4 !== '' ? String(v4) : '10');
         const v5 = data5?.settingvalue;
         setGpsplusTime(v5 != null && String(v5).trim() !== '' ? String(v5).trim() : '');
+        const vTt = dataTtLoad?.settingvalue;
+        setTtLoadSize(
+          vTt != null && String(vTt).trim() !== ''
+            ? String(vTt).trim()
+            : String(VWORK_TT_LOAD_SIZE_DEFAULT)
+        );
       })
       .catch(() => {
         setGpsStartBuffer('15');
@@ -55,6 +70,7 @@ export default function SettingsPage() {
         setGpsStdTime('');
         setGpsplusGrowth('10');
         setGpsplusTime('');
+        setTtLoadSize(String(VWORK_TT_LOAD_SIZE_DEFAULT));
       })
       .finally(() => setLoading(false));
   }, []);
@@ -176,6 +192,31 @@ export default function SettingsPage() {
         if (r.ok) {
           setSaveStatus('saved');
           setGpsplusGrowth(String(meters));
+        } else setSaveStatus('error');
+      })
+      .catch(() => setSaveStatus('error'))
+      .finally(() => {
+        setTimeout(() => setSaveStatus('idle'), 2000);
+      });
+  };
+
+  const saveTtLoadSize = () => {
+    const n = Number.parseFloat(String(ttLoadSize).replace(',', '.'));
+    if (!Number.isFinite(n) || n < 0) return;
+    setSaveStatus('saving');
+    fetch('/api/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        type: VWORK_TT_LOAD_SIZE_SETTINGS_TYPE,
+        settingname: VWORK_TT_LOAD_SIZE_SETTING_NAME,
+        settingvalue: String(n),
+      }),
+    })
+      .then((r) => {
+        if (r.ok) {
+          setSaveStatus('saved');
+          setTtLoadSize(String(n));
         } else setSaveStatus('error');
       })
       .catch(() => setSaveStatus('error'))
@@ -347,6 +388,38 @@ export default function SettingsPage() {
                 <button
                   type="button"
                   onClick={saveGpsplusGrowth}
+                  disabled={saveStatus === 'saving'}
+                  className="rounded bg-zinc-200 px-3 py-2 text-sm font-medium hover:bg-zinc-300 disabled:opacity-50 dark:bg-zinc-700 dark:hover:bg-zinc-600"
+                >
+                  {saveStatus === 'saving' ? 'Saving…' : saveStatus === 'saved' ? 'Saved' : saveStatus === 'error' ? 'Save failed' : 'Save'}
+                </button>
+              </div>
+            </label>
+          </div>
+          <div className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900">
+            <label className="block">
+              <span className="text-sm font-medium text-zinc-700 dark:text-zinc-300">TT Load Size</span>
+              <p className="mt-0.5 text-xs text-zinc-500">
+                Data fix “Trailermode from load size” only updates rows with <code className="rounded bg-zinc-100 px-0.5 dark:bg-zinc-800">loadsize</code> not null and greater than zero; it sets{' '}
+                <code className="rounded bg-zinc-100 px-0.5 dark:bg-zinc-800">trailermode</code> to <strong>TT</strong> when loadsize is greater than this value, and{' '}
+                <strong>T</strong> when loadsize is less than or equal to it. Run “Set Trailer Type” first for other rows. Stored in tbl_settings (
+                <code className="rounded bg-zinc-100 px-0.5 dark:bg-zinc-800">{VWORK_TT_LOAD_SIZE_SETTING_NAME}</code>
+                ).
+              </p>
+              <div className="mt-2 flex flex-wrap items-center gap-2">
+                <input
+                  type="number"
+                  min={0}
+                  step="0.1"
+                  value={ttLoadSize}
+                  onChange={(e) => setTtLoadSize(e.target.value)}
+                  onBlur={saveTtLoadSize}
+                  className="w-28 rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+                />
+                <span className="text-sm text-zinc-500">(numeric, e.g. 25.5)</span>
+                <button
+                  type="button"
+                  onClick={saveTtLoadSize}
                   disabled={saveStatus === 'saving'}
                   className="rounded bg-zinc-200 px-3 py-2 text-sm font-medium hover:bg-zinc-300 disabled:opacity-50 dark:bg-zinc-700 dark:hover:bg-zinc-600"
                 >

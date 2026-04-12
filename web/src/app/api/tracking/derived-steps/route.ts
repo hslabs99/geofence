@@ -9,6 +9,8 @@ import {
   getVineyardFenceIdsForVworkName,
   type JobForDerivedSteps,
   normalizeTimestampString,
+  vineyardBufferWidensPolygonGps,
+  type StepVia,
 } from '@/lib/derived-steps';
 import { runStepsPlusQuery } from '@/lib/steps-plus-query';
 import { getStepsPlusSettings } from '@/lib/steps-plus-settings';
@@ -187,9 +189,9 @@ export async function GET(request: Request) {
     /** Steps+ merged multiple buffered segments (GPS* rule); append calcnotes GPS*: on write-back. */
     let stepsPlusGpsStarMerge = false;
 
-    // Steps+ (buffered vineyard fence): if standard derivation still misses VWork step 2 or 3, try expanded polygons.
+    // Steps+ (buffered vineyard fence): fill missing step 2/3 (VineFence+), or widen polygon ENTER/EXIT (VineFenceV+).
     const vineyardName = job.vineyard_name ? String(job.vineyard_name).trim() : '';
-    if (writeBack && vineyardName && (result.step2Gps == null || result.step3Gps == null)) {
+    if (writeBack && vineyardName) {
       const mappings = await query<{ vwname: string | null; gpsname: string | null }>(
         `SELECT vwname, gpsname FROM tbl_gpsmappings WHERE type = 'Vineyard'
          AND (
@@ -230,6 +232,7 @@ export async function GET(request: Request) {
                 return ent != null && ext != null && ent < vworkEnd && ext < vworkEnd;
               });
         if (staysInJob.length >= 1) {
+          const hadBothPolygonGps = result.step2Gps != null && result.step3Gps != null;
           const vineyardFenceIds = await getVineyardFenceIdsForVworkName(vineyardName);
           const merged = await aggregateStepsPlusBufferedSegments(
             staysInJob,
@@ -238,34 +241,47 @@ export async function GET(request: Request) {
             stepsPlusEnd,
             vineyardFenceIds
           );
-          stepsPlusGpsStarMerge = merged.usedGpsStarMerge;
-          const derivedAfterPlus = await deriveGpsLayerAfterVineFencePlus(
-            job,
-            {
-              windowMinutes,
-              device: deviceForTracking,
-              positionAfter: positionAfter.trim(),
-              positionBefore: effectivePositionBefore,
-            },
-            {
-              step1:
-                result.step1Gps != null
-                  ? { value: result.step1Gps, trackingId: result.step1TrackingId }
-                  : null,
-              step2: { value: merged.enter, trackingId: null },
-              step3: { value: merged.exit, trackingId: null },
-            },
-            result.debug
-          );
-          const fin = finalizeDerivedSteps(
-            {
-              ...derivedAfterPlus,
-              step2Via: 'VineFence+',
-              step3Via: 'VineFence+',
-            },
-            job
-          );
-          result = { ...fin, debug: result.debug };
+          let bufferVia: StepVia = 'VineFence+';
+          let applyBuffer = !hadBothPolygonGps;
+          if (hadBothPolygonGps) {
+            applyBuffer = vineyardBufferWidensPolygonGps(
+              merged.enter,
+              merged.exit,
+              result.step2Gps!,
+              result.step3Gps!
+            );
+            bufferVia = 'VineFenceV+';
+          }
+          if (applyBuffer) {
+            stepsPlusGpsStarMerge = merged.usedGpsStarMerge;
+            const derivedAfterPlus = await deriveGpsLayerAfterVineFencePlus(
+              job,
+              {
+                windowMinutes,
+                device: deviceForTracking,
+                positionAfter: positionAfter.trim(),
+                positionBefore: effectivePositionBefore,
+              },
+              {
+                step1:
+                  result.step1Gps != null
+                    ? { value: result.step1Gps, trackingId: result.step1TrackingId }
+                    : null,
+                step2: { value: merged.enter, trackingId: null },
+                step3: { value: merged.exit, trackingId: null },
+              },
+              result.debug
+            );
+            const fin = finalizeDerivedSteps(
+              {
+                ...derivedAfterPlus,
+                step2Via: bufferVia,
+                step3Via: bufferVia,
+              },
+              job
+            );
+            result = { ...fin, debug: result.debug };
+          }
         }
       }
     }
@@ -348,9 +364,23 @@ export async function GET(request: Request) {
             [jobId]
           );
         }
+        if (result.step2Via === 'VineFenceV+' || result.step3Via === 'VineFenceV+') {
+          await execute(
+            `UPDATE tbl_vworkjobs SET calcnotes = COALESCE(TRIM(calcnotes) || ' ', '') || 'VineFenceV+:'
+             WHERE job_id::text = $1`,
+            [jobId]
+          );
+        }
         if (result.step3Via === 'GPS*' || stepsPlusGpsStarMerge) {
           await execute(
             `UPDATE tbl_vworkjobs SET calcnotes = COALESCE(TRIM(calcnotes) || ' ', '') || 'GPS*:'
+             WHERE job_id::text = $1`,
+            [jobId]
+          );
+        }
+        if (result.step2Via === 'VineSR1' || result.step3Via === 'VineSR1') {
+          await execute(
+            `UPDATE tbl_vworkjobs SET calcnotes = COALESCE(TRIM(calcnotes) || ' ', '') || 'VineSR1:'
              WHERE job_id::text = $1`,
             [jobId]
           );

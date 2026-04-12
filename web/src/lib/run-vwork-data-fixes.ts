@@ -1,5 +1,6 @@
 import { query, execute } from '@/lib/db';
 import { ensureDriverMappSchema } from '@/lib/ensure-driver-mapp-schema';
+import { getTtLoadSizeThreshold } from '@/lib/vwork-tt-load-size-setting';
 
 type MappRow = {
   id: number;
@@ -157,3 +158,43 @@ export async function runSetTrailerType(): Promise<SetTrailerTypeResult> {
   );
   return { ok: true, updatedTT, updatedT, totalUpdated: updatedTT + updatedT };
 }
+
+export type SetTrailermodeFromLoadsizeResult = {
+  ok: true;
+  /** Threshold from tbl_settings (or default if unset/invalid). */
+  threshold: number;
+  updatedTT: number;
+  updatedT: number;
+  totalUpdated: number;
+};
+
+/**
+ * Set tbl_vworkjobs.trailermode from loadsize vs Settings "TT Load Size" threshold.
+ * Only rows with loadsize present and > 0 (tracked load size) are updated; null/0 leave
+ * trailermode unchanged (e.g. from Set Trailer Type). TT when loadsize > threshold;
+ * T when 0 < loadsize <= threshold.
+ * Runs after rego-based set-trailer-type so loadsize can refine mode where applicable.
+ */
+export async function runSetTrailermodeFromLoadsize(): Promise<SetTrailermodeFromLoadsizeResult> {
+  const threshold = await getTtLoadSizeThreshold();
+  const updatedTT = await execute(
+    `UPDATE tbl_vworkjobs SET trailermode = 'TT'
+     WHERE loadsize IS NOT NULL AND loadsize > 0 AND loadsize > $1::numeric`,
+    [threshold]
+  );
+  const updatedT = await execute(
+    `UPDATE tbl_vworkjobs SET trailermode = 'T'
+     WHERE loadsize IS NOT NULL AND loadsize > 0 AND loadsize <= $1::numeric`,
+    [threshold]
+  );
+  return {
+    ok: true,
+    threshold,
+    updatedTT,
+    updatedT,
+    totalUpdated: updatedTT + updatedT,
+  };
+}
+
+export type { Step4to5NormalAllResult } from '@/lib/step4to5-fix';
+export { runStep4to5NormalAllEligible } from '@/lib/step4to5-fix';

@@ -4,7 +4,7 @@ import { execute, query } from '@/lib/db';
 /**
  * VERBATIM TIMES — position_time_nz is the only derived time.
  * We do NOT alter position_time (that stays exactly as from the API). Here we only run a SQL UPDATE
- * to set position_time_nz = position_time + interval '13 hours' for display. Never alter API timestamps.
+ * to set position_time_nz = (position_time AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific/Auckland') where nz is null. Never alter API timestamps.
  */
 /** YYYY-MM-DD list from fromDate to toDate inclusive. Uses local date only (no UTC). */
 function dateRange(fromDate: string, toDate: string): string[] {
@@ -70,7 +70,7 @@ export async function POST(req: Request) {
 
     const positionTimeNzUpdated = await execute(
       `UPDATE public.tbl_tracking
-       SET position_time_nz = position_time + interval '13 hours'
+       SET position_time_nz = (position_time AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific/Auckland')
        WHERE position_time IS NOT NULL
          AND position_time_nz IS NULL
          AND position_time::date >= $1::date

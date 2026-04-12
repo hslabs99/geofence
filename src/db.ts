@@ -98,14 +98,40 @@ export async function getMappings(
     const dbcolumnname = (row as { dbcolumnname: string }).dbcolumnname;
     const dbmaxlength = (row as { dbmaxlength: number | null }).dbmaxlength;
     if (filefieldname && dbcolumnname) {
-      const norm = filefieldname.trim().toLowerCase().replace(/\s+/g, ' ').trim();
-      if (norm) headerToColumn[norm] = dbcolumnname;
+      const fileKey = filefieldname.trim().toLowerCase().replace(/\s+/g, ' ').trim();
+      /** PG column names are case-insensitive unless quoted; JS mapped row keys must match code (always lowercase). */
+      const sqlCol = dbcolumnname.trim().toLowerCase().replace(/\s+/g, ' ').trim();
+      if (fileKey && sqlCol) headerToColumn[fileKey] = sqlCol;
     }
     if (dbcolumnname && dbmaxlength != null) {
-      columnMaxLengths[dbcolumnname] = dbmaxlength;
+      const sqlCol = dbcolumnname.trim().toLowerCase().replace(/\s+/g, ' ').trim();
+      if (sqlCol) columnMaxLengths[sqlCol] = dbmaxlength;
     }
   }
   return { headerToColumn, columnMaxLengths };
+}
+
+/** Distinct normalized `dbcolumnname` values for active VW mappings (source of truth for which job columns we import). */
+export async function getVworkMappingDbcolumnNames(client: PoolClient): Promise<Set<string>> {
+  const res = await client.query<{ col: string }>(
+    `SELECT DISTINCT lower(regexp_replace(trim(dbcolumnname), '\\s+', ' ', 'g')) AS col
+     FROM tbl_mappings
+     WHERE type = 'VW' AND is_active = true
+       AND dbcolumnname IS NOT NULL AND trim(dbcolumnname) <> ''`
+  );
+  return new Set(res.rows.map((r) => String(r.col)));
+}
+
+/** Insertable columns: `tbl_mappings` (VW) targets ∩ physical table only. */
+export function buildVworkAllowedInsertColumns(
+  mappingDbcolumns: Set<string>,
+  tableColumns: Set<string>
+): Set<string> {
+  const allowed = new Set<string>();
+  for (const c of mappingDbcolumns) {
+    if (tableColumns.has(c)) allowed.add(c);
+  }
+  return allowed;
 }
 
 export async function insertLog(
@@ -123,6 +149,71 @@ export async function insertLog(
 
 export interface MappedRow {
   [column: string]: unknown;
+}
+
+/**
+ * Lowercase physical column names on `public.tbl_vworkjobs` (pg_catalog; omits dropped attributes).
+ * Uses schema `public` explicitly so pooled connections with a non-default `search_path` still match INSERT targets.
+ */
+export async function getTblVworkjobsColumns(client: PoolClient): Promise<Set<string>> {
+  const res = await client.query<{ column_name: string }>(
+    `SELECT a.attname::text AS column_name
+     FROM pg_catalog.pg_attribute a
+     INNER JOIN pg_catalog.pg_class c ON a.attrelid = c.oid
+     INNER JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid
+     WHERE n.nspname = 'public'
+       AND c.relname = 'tbl_vworkjobs'
+       AND a.attnum > 0
+       AND NOT a.attisdropped`
+  );
+  return new Set(res.rows.map((r) => String(r.column_name).toLowerCase()));
+}
+
+const PG_UNDEFINED_COLUMN = '42703';
+
+/** Best-effort parse of PostgreSQL undefined-column messages (quoted or not). */
+function parseUndefinedColumnName(message: string): string | null {
+  let m = message.match(/column "([^"]+)" of relation/i);
+  if (m) return m[1].toLowerCase();
+  m = message.match(/column\s+([a-zA-Z_][a-zA-Z0-9_]*)\s+of\s+relation/i);
+  if (m) return m[1].toLowerCase();
+  return null;
+}
+
+function isPostgresUndefinedColumnError(err: unknown, message: string): boolean {
+  const code =
+    typeof err === 'object' && err !== null && 'code' in err
+      ? String((err as { code: unknown }).code)
+      : '';
+  if (code === PG_UNDEFINED_COLUMN) return true;
+  return /\bcolumn\b[\s\S]{0,120}\bdoes not exist\b/i.test(message);
+}
+
+/**
+ * Drop mapped keys that are not real columns on `tbl_vworkjobs` (must run after catalog load).
+ * Keeps primary key column only if present.
+ */
+export function stripMappedVworkRowToAllowedColumns(mapped: MappedRow, allowed: Set<string>): void {
+  const pkCol = vworkPkColumn(mapped);
+  const pkLow = pkCol.toLowerCase();
+  for (const k of [...Object.keys(mapped)]) {
+    const low = k.toLowerCase();
+    if (low === pkLow) continue;
+    if (!allowed.has(low)) delete mapped[k];
+  }
+}
+
+/** Mapped keys present in export rows that are not actual table columns (values were not stored). */
+export function vworkMappedKeysNotInTable(mapped: MappedRow[], tableColumns: Set<string>): string[] {
+  const seen = new Set<string>();
+  for (const row of mapped) {
+    for (const k of Object.keys(row)) {
+      const low = k.toLowerCase();
+      if (low === 'batchnumber' || low === 'raw_row') continue;
+      if (!tableColumns.has(low)) seen.add(low);
+    }
+  }
+  return [...seen].sort();
 }
 
 /** Columns that expect bigint/integer - coerce to number or null. job_id is varchar(20), so not numeric. */
@@ -225,6 +316,21 @@ function formatGpsTimestamp(v: unknown): string | null {
   return null;
 }
 
+/**
+ * Parse "Load Size" cell: first number wins (e.g. "3 t" → 3, "approx 2.5" → 2.5). Dates → null.
+ * Exported for Drive backfill; also used in coerceValue for column loadsize.
+ */
+export function parseLoadSizeNumeric(v: unknown): number | null {
+  if (v === '' || v == null) return null;
+  const s = String(v).trim();
+  if (!s) return null;
+  if (/^\d{1,4}[\/\-]\d{1,2}[\/\-]\d{1,4}/.test(s)) return null;
+  const m = s.match(/-?\d+(?:\.\d+)?/);
+  if (!m) return null;
+  const n = parseFloat(m[0]);
+  return Number.isFinite(n) ? n : null;
+}
+
 function coerceValue(
   col: string,
   v: unknown,
@@ -233,6 +339,10 @@ function coerceValue(
   if (v === '' || v == null) return null;
   const s = String(v).trim();
   if (!s) return null;
+
+  if (col === 'loadsize') {
+    return parseLoadSizeNumeric(v);
+  }
 
   if (NUMERIC_COLUMNS.has(col)) {
     const n = Number(v);
@@ -256,48 +366,126 @@ function vworkPkColumn(mapped: MappedRow): string {
   return 'job_id';
 }
 
+/**
+ * Hard gate: drop every non-PK field whose name is not an active VW `dbcolumnname` in `tbl_mappings`.
+ * Run after parse so nothing (including parser bugs / old defaults) can reach INSERT.
+ */
+export function enforceVworkMappedRowMappingTargetsOnly(
+  mapped: MappedRow,
+  mappingDbcolumnNames: Set<string>
+): void {
+  const pkCol = vworkPkColumn(mapped);
+  const pkLow = pkCol.toLowerCase();
+  for (const k of [...Object.keys(mapped)]) {
+    const low = k.toLowerCase();
+    if (low === pkLow) continue;
+    if (!mappingDbcolumnNames.has(low)) delete mapped[k];
+  }
+}
+
+/** Trimmed job id string for UPDATEs, or null if missing. */
+export function getVworkJobPkString(mapped: MappedRow, maxLengths?: Record<string, number>): string | null {
+  const pkCol = vworkPkColumn(mapped);
+  const pkVal = coerceValue(pkCol, mapped[pkCol], maxLengths);
+  if (pkVal == null) return null;
+  const t = String(pkVal).trim();
+  return t || null;
+}
+
+/** Sets only loadsize; does not touch other columns. Returns row count (0 or 1). */
+export async function updateVworkJobLoadsizeOnly(
+  client: PoolClient,
+  jobIdTrimmed: string,
+  loadsize: number
+): Promise<number> {
+  const res = await client.query(
+    `UPDATE tbl_vworkjobs SET loadsize = $2::numeric WHERE trim(job_id::text) = $1`,
+    [jobIdTrimmed, loadsize]
+  );
+  return res.rowCount ?? 0;
+}
+
 /** Returns true if row was inserted, false if skipped (job_id already exists). */
 export async function upsertVworkJob(
   client: PoolClient,
   mapped: MappedRow,
   rawRow: Record<string, unknown>,
   batchnumber: number,
+  /** Mutable: physical columns; 42703 may shrink for the rest of the import run. */
+  tableColumns: Set<string>,
+  /** Active VW `dbcolumnname` set from `tbl_mappings` — non-PK INSERT columns must be listed here. */
+  mappingDbcolumnNames: Set<string>,
   maxLengths?: Record<string, number>
 ): Promise<boolean> {
   const pkCol = vworkPkColumn(mapped);
   const pkVal = coerceValue(pkCol, mapped[pkCol], maxLengths);
   if (pkVal == null) return false;
 
-  const dataCols = Object.keys(mapped)
-    .filter((k) => k !== pkCol && k !== 'batchnumber' && k !== 'raw_row')
-    .sort();
-  // tbl_vworkjobs has no raw_row or raw_row is integer; do not insert JSON
-  const allCols = [pkCol, 'batchnumber', ...dataCols];
-  const values: unknown[] = [pkVal, batchnumber];
-  for (const col of dataCols) {
-    const v = coerceValue(col, mapped[col], maxLengths);
-    values.push(v === '' ? null : v);
+  const pkSql = pkCol.toLowerCase();
+  if (!tableColumns.has(pkSql)) {
+    const msg = `primary key column "${pkSql}" not found on tbl_vworkjobs`;
+    logger.db({ [pkCol]: pkVal, batchnumber, pg_error: msg }, `upsert skipped: ${msg}`);
+    throw new Error(msg);
   }
 
-  const placeholders = values.map((_, i) => `$${i + 1}`).join(', ');
   const toSqlCol = (c: string) => c.toLowerCase();
-  const sqlCols = allCols.map(toSqlCol).join(', ');
 
-  try {
-    const res = await client.query(
-      `INSERT INTO tbl_vworkjobs (${sqlCols}) VALUES (${placeholders})
-       ON CONFLICT (${toSqlCol(pkCol)}) DO NOTHING`,
-      values
-    );
-    return (res.rowCount ?? 0) > 0;
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    logger.db(
-      { [pkCol]: pkVal, batchnumber, columns: allCols, values_preview: values.slice(0, 5), pg_error: msg },
-      `upsert failed: ${msg}`
-    );
-    throw err;
+  for (let attempt = 0; attempt < 96; attempt++) {
+    const dataCols = Object.keys(mapped)
+      .filter((k) => k !== pkCol && k !== 'batchnumber' && k !== 'raw_row')
+      .filter((k) => mappingDbcolumnNames.has(k.toLowerCase()))
+      .filter((k) => tableColumns.has(k.toLowerCase()))
+      .sort();
+    // tbl_vworkjobs has no raw_row or raw_row is integer; do not insert JSON
+    const allCols = [pkCol, 'batchnumber', ...dataCols];
+    const values: unknown[] = [pkVal, batchnumber];
+    for (const col of dataCols) {
+      const v = coerceValue(col, mapped[col], maxLengths);
+      values.push(v === '' ? null : v);
+    }
+
+    const placeholders = values.map((_, i) => `$${i + 1}`).join(', ');
+    const sqlCols = allCols.map(toSqlCol).join(', ');
+
+    try {
+      const res = await client.query(
+        `INSERT INTO tbl_vworkjobs (${sqlCols}) VALUES (${placeholders})
+         ON CONFLICT (${toSqlCol(pkCol)}) DO NOTHING`,
+        values
+      );
+      return (res.rowCount ?? 0) > 0;
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (isPostgresUndefinedColumnError(err, msg)) {
+        const bad = parseUndefinedColumnName(msg);
+        if (bad) {
+          const removedFromSet = tableColumns.delete(bad);
+          mappingDbcolumnNames.delete(bad);
+          for (const k of [...Object.keys(mapped)]) {
+            if (k.toLowerCase() === bad) delete mapped[k];
+          }
+          logger.db(
+            {
+              [pkCol]: pkVal,
+              batchnumber,
+              droppedColumn: bad,
+              removedFromAllowedSet: removedFromSet,
+              pg_error: msg,
+            },
+            'tbl_vworkjobs INSERT: undefined column; dropped from allowed set and/or mapped row, retrying'
+          );
+          continue;
+        }
+      }
+      logger.db(
+        { [pkCol]: pkVal, batchnumber, columns: allCols, values_preview: values.slice(0, 5), pg_error: msg },
+        `upsert failed: ${msg}`
+      );
+      throw err;
+    }
   }
+
+  throw new Error('upsertVworkJob: too many undefined-column retries');
 }
 
 // --- tbl_gpsdata ---

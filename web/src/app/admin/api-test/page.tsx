@@ -215,6 +215,7 @@ export default function ApiTestPage() {
   const [fencePrepError, setFencePrepError] = useState<string | null>(null);
   const [maxDates, setMaxDates] = useState<{
     maxVworkjobsActualStart: string | null;
+    maxTrackingPositionTime: string | null;
     maxTrackingPositionTimeNz: string | null;
   } | null>(null);
   const [maxDatesLoading, setMaxDatesLoading] = useState(false);
@@ -268,6 +269,7 @@ export default function ApiTestPage() {
       }
       setMaxDates({
         maxVworkjobsActualStart: data.maxVworkjobsActualStart ?? null,
+        maxTrackingPositionTime: data.maxTrackingPositionTime ?? null,
         maxTrackingPositionTimeNz: data.maxTrackingPositionTimeNz ?? null,
       });
     } catch (e) {
@@ -1429,12 +1431,20 @@ export default function ApiTestPage() {
             </span>
           ) : maxDates ? (
             <span className="text-sm text-zinc-600 dark:text-zinc-400">
-              <span title={`tbl_vworkjobs.actual_start_time: ${maxDates.maxVworkjobsActualStart ?? '—'}`}>
-                vworkjobs max: <strong className="font-mono">{maxDates.maxVworkjobsActualStart ? maxDates.maxVworkjobsActualStart.slice(0, 10) : '—'}</strong>
+              <span title="tbl_vworkjobs.actual_start_time (max)">
+                vworkjobs max:{' '}
+                <strong className="font-mono tabular-nums">{maxDates.maxVworkjobsActualStart ?? '—'}</strong>
               </span>
               {' · '}
-              <span title={`tbl_tracking.position_time_nz: ${maxDates.maxTrackingPositionTimeNz ?? '—'}`}>
-                tracking max: <strong className="font-mono">{maxDates.maxTrackingPositionTimeNz ? maxDates.maxTrackingPositionTimeNz.slice(0, 10) : '—'}</strong>
+              <span title="tbl_tracking — max(position_time), max(position_time_nz)">
+                tracking max:{' '}
+                <strong className="font-mono tabular-nums">
+                  position_time {maxDates.maxTrackingPositionTime ?? '—'}
+                </strong>
+                {' · '}
+                <strong className="font-mono tabular-nums">
+                  position_time_nz {maxDates.maxTrackingPositionTimeNz ?? '—'}
+                </strong>
               </span>
               <button
                 type="button"

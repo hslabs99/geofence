@@ -5,6 +5,10 @@
 import { query } from '@/lib/db';
 import { dateToLiteral } from '@/lib/utils';
 
+/** Vineyard special rule 1: Bankhouse South — if step 2/3 missing for South fences, use Bankhouse fences (tag VineSR1). */
+const VINE_SR1_SOUTH_NAME = 'Bankhouse South';
+const VINE_SR1_FALLBACK_VINEYARD_NAME = 'Bankhouse';
+
 /** Same as tracking API: parse to YYYY-MM-DD HH:mm:ss only — no timezone in output. Handles Date (e.g. from DB) and strings; strips GMT+1300 etc. so PostgreSQL never sees them. */
 export function normalizeTimestampString(s: string | Date | null): string | null {
   if (s == null) return null;
@@ -32,7 +36,8 @@ export function normalizeTimestampString(s: string | Date | null): string | null
     const pad = (n: number) => String(n).padStart(2, '0');
     return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
   }
-  return t.slice(0, 19);
+  // Do not return t.slice(0, 19) — English month strings truncate to invalid SQL (e.g. "Thu Mar 19 2026 02:").
+  return null;
 }
 
 export type FenceResolutionDebug = {
@@ -470,9 +475,11 @@ export type FetchedGpsCandidates = {
   step5: GpsStepCandidate | null;
   /** Step 3 used GPS* vineyard re-exit aggregation (tbl_vworkjobs.step_3_via / calcnotes). */
   step3GpsStar?: boolean;
+  /** Step 2/3 resolved via Bankhouse fallback (VineSR1) for Bankhouse South. */
+  vineSr1Fallback?: boolean;
 };
 
-export type StepVia = 'GPS' | 'VW' | 'RULE' | 'ORIDE' | 'VineFence+' | 'GPS*';
+export type StepVia = 'GPS' | 'VW' | 'RULE' | 'ORIDE' | 'VineFence+' | 'VineFenceV+' | 'GPS*' | 'VineSR1';
 
 export type DerivedStepsResult = {
   /** Raw GPS times from tbl_tracking (Step_N_GPS_completed_at). */
@@ -492,7 +499,7 @@ export type DerivedStepsResult = {
   step3TrackingId: number | null;
   step4TrackingId: number | null;
   step5TrackingId: number | null;
-  /** Steps+ may set before finalizeDerivedSteps so applyOrides keeps VineFence+. */
+  /** Steps+ may set before finalizeDerivedSteps so applyOrides keeps VineFence+ / VineFenceV+. */
   step2Via?: StepVia;
   step3Via?: StepVia;
 };
@@ -516,6 +523,8 @@ export type DerivedStepsDebug = {
   };
   /** Step 3 extended via same-vineyard re-entry smoothing (GPS*). */
   step3GpsStar?: boolean;
+  /** True when VineSR1 fallback (Bankhouse South → Bankhouse) produced step 2/3. */
+  vineSr1?: boolean;
 };
 
 /** After cleanup: when step1 vwork > step2 gps we set step1_actual = step2_gps - travel_min (step4−step3); Via = RULE. */
@@ -564,6 +573,25 @@ export type DerivedStepsOptions = {
  * Guardrail — step 4: must be strictly &gt; max(GPS step1, step2, step3) among non-null steps so “arrive winery” cannot precede leaving the vineyard (or an earlier winery exit).
  * Guardrail — VWork job end: GPS steps 1–3 must be strictly **before** VWork step 5 (job completed). Stops picking the next job’s winery exit as step 1, or vineyard enter/exit from after job end.
  */
+
+/**
+ * Buffered vineyard stay (Steps+) is no tighter than polygon ENTER/EXIT GPS and strictly wider on at least one end
+ * (earlier enter and/or later exit). Used to apply VineFenceV+ only when the buffer actually widens the window.
+ */
+export function vineyardBufferWidensPolygonGps(
+  mergedEnter: string,
+  mergedExit: string,
+  polygonEnter: string,
+  polygonExit: string
+): boolean {
+  const e = normalizeTimestampString(mergedEnter);
+  const x = normalizeTimestampString(mergedExit);
+  const pe = normalizeTimestampString(polygonEnter);
+  const px = normalizeTimestampString(polygonExit);
+  if (!e || !x || !pe || !px) return false;
+  if (e > pe || x < px) return false;
+  return e < pe || x > px;
+}
 
 /** Lexicographic max for YYYY-MM-DD HH:mm:ss strings; ignores nulls. */
 function maxTimestampString(...vals: (string | null | undefined)[]): string | null {
@@ -727,6 +755,68 @@ async function fetchGpsStepCandidates(
         }
       }
     }
+
+    // VineSR1: Bankhouse South — if polygon step 2/3 not both found for South, try "Bankhouse" vineyard fences only.
+    if (
+      vineyardName === VINE_SR1_SOUTH_NAME &&
+      (candidates.step2 == null || candidates.step3 == null)
+    ) {
+      candidates.step2 = null;
+      candidates.step3 = null;
+      delete candidates.step3GpsStar;
+      delete debug.step3GpsStar;
+      step2Value = null;
+      step3Value = null;
+      const { fenceIds: sr1FenceIds, debug: sr1VineyardDebug } = await getFenceIdsForVworkNameWithDebug(
+        'Vineyard',
+        VINE_SR1_FALLBACK_VINEYARD_NAME
+      );
+      Object.assign(debug.vineyard, sr1VineyardDebug);
+      if (sr1FenceIds.length > 0) {
+        const sr1Step2 = await getFirstTrackingInWindowWithDebug(
+          truckId,
+          positionAfter,
+          positionBefore,
+          sr1FenceIds,
+          'ENTER'
+        );
+        step2Value = sr1Step2.value;
+        debug.vineyard.step2 = sr1Step2.debug;
+        if (sr1Step2.value != null) {
+          candidates.step2 = { value: sr1Step2.value, trackingId: sr1Step2.trackingId };
+        }
+        const sr1Step3After = step2Value ?? positionAfter;
+        const sr1Step3 = await getFirstTrackingInWindowWithDebug(
+          truckId,
+          sr1Step3After,
+          positionBefore,
+          sr1FenceIds,
+          'EXIT'
+        );
+        step3Value = sr1Step3.value;
+        debug.vineyard.step3 = sr1Step3.debug;
+        if (sr1Step3.value != null) {
+          candidates.step3 = { value: sr1Step3.value, trackingId: sr1Step3.trackingId };
+        }
+        if (candidates.step2 != null && candidates.step3 != null) {
+          const eventRowsSr1 = await listFenceEnterExitEventsInWindow(truckId, positionAfter, positionBefore);
+          const starSr1 = tryGpsStarVineyardExit(
+            eventRowsSr1,
+            sr1FenceIds,
+            candidates.step2,
+            candidates.step3,
+            positionBefore
+          );
+          candidates.step3 = starSr1.step3;
+          if (starSr1.usedGpsStar) {
+            candidates.step3GpsStar = true;
+            debug.step3GpsStar = true;
+          }
+          candidates.vineSr1Fallback = true;
+          debug.vineSr1 = true;
+        }
+      }
+    }
   }
 
   if (deliveryWinery) {
@@ -756,10 +846,62 @@ async function fetchGpsStepCandidates(
     }
   }
   applyGpsGuardrails(candidates, job);
+  if (candidates.vineSr1Fallback && (candidates.step2 == null || candidates.step3 == null)) {
+    delete candidates.vineSr1Fallback;
+    delete debug.vineSr1;
+  }
   if (!candidates.step3GpsStar) {
     delete debug.step3GpsStar;
   }
   return candidates;
+}
+
+/**
+ * Outbound leg only: after the same Part 1 fetch + guardrails as full derived steps, return winery EXIT (step 1)
+ * and vineyard ENTER (step 2) anchors for distance-on-map (tbl_distances harvest). Same window + mappings as steps.
+ */
+export async function fetchOutboundLegAnchors(
+  job: JobForDerivedSteps,
+  options: DerivedStepsOptions
+): Promise<{
+  wineryExit: GpsStepCandidate | null;
+  vineyardEnter: GpsStepCandidate | null;
+  debug: DerivedStepsDebug;
+}> {
+  const debug: DerivedStepsDebug = {
+    jobId: String(job.job_id ?? ''),
+    windowMinutes: options.windowMinutes,
+    truckId: options.device,
+    actualStartTime: job.actual_start_time != null ? String(job.actual_start_time).trim() : '',
+    actualEndTime: job.actual_end_time != null ? String(job.actual_end_time).trim() : null,
+    positionAfter: options.positionAfter,
+    positionBefore: options.positionBefore,
+    vineyard: {
+      type: 'Vineyard',
+      vworkName: job.vineyard_name ? String(job.vineyard_name).trim() : '',
+      mappingsFound: [],
+      fenceNamesInList: [],
+      fenceIds: [],
+      resolvedFenceNames: [],
+    },
+    winery: {
+      type: 'Winery',
+      vworkName: job.delivery_winery ? String(job.delivery_winery).trim() : '',
+      mappingsFound: [],
+      fenceNamesInList: [],
+      fenceIds: [],
+      resolvedFenceNames: [],
+    },
+  };
+  if (!options.device || !options.positionAfter) {
+    return { wineryExit: null, vineyardEnter: null, debug };
+  }
+  const candidates = await fetchGpsStepCandidates(job, options, debug);
+  return {
+    wineryExit: candidates.step1,
+    vineyardEnter: candidates.step2,
+    debug,
+  };
 }
 
 /**
@@ -794,8 +936,9 @@ function minutesBetween(tsEarlier: string, tsLater: string): number {
 /**
  * VWork job-start time for cleanup rules: `step_1_completed_at` when set, otherwise `actual_start_time`
  * (many jobs only have actual start populated; without this, cleanup_start / travel rule never run).
+ * Exported for GPS distance harvest when tbl_tracking has no Winery EXIT but we still need a path start.
  */
-function vworkStep1TimeForCleanup(job: JobForDerivedSteps): string | null {
+export function vworkStep1TimeForCleanup(job: JobForDerivedSteps): string | null {
   const s1 =
     job.step_1_completed_at != null && String(job.step_1_completed_at).trim() !== ''
       ? job.step_1_completed_at
@@ -892,12 +1035,18 @@ function applyOrides(
   };
   const step1Via: StepVia = orides[0] != null ? 'ORIDE' : step1CleanupApplied ? 'RULE' : (gps.step1Gps != null ? 'GPS' : 'VW');
   const step2Via: StepVia =
-    orides[1] != null ? 'ORIDE' : gps.step2Via === 'VineFence+' ? 'VineFence+' : (gps.step2Gps != null ? 'GPS' : 'VW');
+    orides[1] != null
+      ? 'ORIDE'
+      : gps.step2Via === 'VineFence+' || gps.step2Via === 'VineFenceV+' || gps.step2Via === 'VineSR1'
+        ? gps.step2Via
+        : gps.step2Gps != null
+          ? 'GPS'
+          : 'VW';
   const step3Via: StepVia =
     orides[2] != null
       ? 'ORIDE'
-      : gps.step3Via === 'VineFence+'
-        ? 'VineFence+'
+      : gps.step3Via === 'VineFence+' || gps.step3Via === 'VineFenceV+' || gps.step3Via === 'VineSR1'
+        ? gps.step3Via
         : gps.step3Via === 'GPS*'
           ? 'GPS*'
           : gps.step3Gps != null
@@ -945,6 +1094,12 @@ function decideFinalSteps(candidates: FetchedGpsCandidates, job: JobForDerivedSt
   if (candidates.step3GpsStar) {
     result.step3Via = 'GPS*';
   }
+  if (candidates.vineSr1Fallback && candidates.step2 && candidates.step3) {
+    result.step2Via = 'VineSR1';
+    if (!candidates.step3GpsStar) {
+      result.step3Via = 'VineSR1';
+    }
+  }
   if (candidates.step4) {
     result.step4Gps = candidates.step4.value;
     result.step4TrackingId = candidates.step4.trackingId;
@@ -960,7 +1115,7 @@ function decideFinalSteps(candidates: FetchedGpsCandidates, job: JobForDerivedSt
 }
 
 /**
- * After VineFence+ (Steps+) sets vineyard enter/exit, re-query winery steps 4–5 so the max(step1–3) floor uses
+ * After VineFence+ / VineFenceV+ (Steps+) sets vineyard enter/exit, re-query winery steps 4–5 so the max(step1–3) floor uses
  * those times (not step 4/5 from the first pass with missing or fence-only step 2/3).
  */
 export async function deriveGpsLayerAfterVineFencePlus(

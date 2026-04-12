@@ -7,6 +7,8 @@ export const HEADER_TO_COLUMN: Record<string, string> = {
   // Job & client
   'job id': 'job_id',
   'client name': 'customer',
+  /** Same as "Client name" — exports often use "Customer" (case-insensitive via normalizeHeader). */
+  customer: 'customer',
   'when': 'planned_start_time',
   // Planned
   'planned start (d/m/y)': 'planned_start_time',
@@ -63,7 +65,7 @@ export const HEADER_TO_COLUMN: Record<string, string> = {
   'comments': 'comments',
   // Vehicle
   'vinename': 'vinename',
-  'load size': 'load_size',
+  'load size': 'loadsize',
   'number of loads': 'number_of_loads',
   'trailer rego': 'trailer_rego',
   'truck id': 'truck_id',
@@ -73,6 +75,31 @@ export const HEADER_TO_COLUMN: Record<string, string> = {
   'worker': 'worker',
   'worker duration (mins)': 'worker_duration_mins',
 };
+
+/**
+ * Merge hardcoded defaults with DB `tbl_mappings` (DB wins on key). Used only for ad-hoc tools;
+ * **Drive vWork import uses `mappings.headerToColumn` from DB only** — no merge — so new CSV columns
+ * never pick up stray hardcoded targets.
+ */
+export function mergeVworkHeaderToColumn(dbHeaderToColumn: Record<string, string>): Record<string, string> {
+  return { ...HEADER_TO_COLUMN, ...dbHeaderToColumn };
+}
+
+/**
+ * Keep only header→column pairs whose target `dbcolumnname` exists in `tbl_mappings` (VW active rows).
+ * Stops hardcoded HEADER_TO_COLUMN targets from being used when that column was removed from `tbl_mappings`.
+ */
+export function filterHeaderToColumnByMappingTargets(
+  headerToColumn: Record<string, string>,
+  mappingDbcolumnNames: Set<string>
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [headerKey, col] of Object.entries(headerToColumn)) {
+    const c = col.trim().toLowerCase().replace(/\s+/g, ' ').trim();
+    if (c && mappingDbcolumnNames.has(c)) out[headerKey] = col;
+  }
+  return out;
+}
 
 /**
  * Maps normalized header names to tbl_gpsdata column names.

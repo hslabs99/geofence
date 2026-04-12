@@ -1,9 +1,11 @@
 'use client';
 
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useSearchParams } from 'next/navigation';
+import { usePathname, useRouter, useSearchParams } from 'next/navigation';
 import { formatColumnLabel, formatDateNZ, computeColumnWidths } from '@/lib/utils';
+import { formatIntNz } from '@/lib/format-nz';
 import { addMinutesToTimestampAsNZ, runFetchStepsForJobs } from '@/lib/fetch-steps';
+import { buildInspectGpsWindowForJob } from '@/lib/inspect-gps-window';
 
 type Row = Record<string, unknown>;
 
@@ -12,7 +14,11 @@ const COLUMN_ORDER_TABLE = 'tbl_vworkjobs_inspect';
 const SORT_SETTING_TYPE = 'System';
 const SORT_SETTING_NAME = 'Inspectsort';
 
-const PRIORITY_COLUMNS = ['job_id', 'planned_start_time', 'worker', 'trailermode', 'truck_id', 'truck_rego'];
+const PRIORITY_COLUMNS = [
+  'job_id', 'planned_start_time', 'customer', 'template',
+  'delivery_winery', 'vineyard_name', 'trailertype', 'loadsize', 'trailermode', 'worker',
+  'truck_id', 'truck_rego',
+];
 
 const DATE_COLUMNS = new Set([
   'planned_start_time', 'actual_start_time', 'actual_end_time', 'gps_start_time', 'gps_end_time',
@@ -20,9 +26,9 @@ const DATE_COLUMNS = new Set([
 ]);
 
 const INSPECT_PAGE_SIZE = 100;
-
-/** columnDateCol API whitelist — matches route COLUMN_DATE_WHITELIST */
-const INSPECT_COLUMN_DATE_COLS = new Set(['planned_start_time', 'actual_start_time', 'actual_end_time']);
+/** Must match API cap on repeated `jobId=` (Data Audit → Inspect). */
+const MAX_AUDIT_JOB_FILTER_IDS = 5000;
+const AUDIT_JOBS_STORAGE_PREFIX = 'geodata_inspect_audit_jobs_';
 
 function isIsoDateString(v: unknown): v is string {
   return typeof v === 'string' && /^\d{4}-\d{2}-\d{2}/.test(v);
@@ -62,6 +68,58 @@ function minutesBetweenInspect(prev: unknown, curr: unknown): number | null {
   return Math.round((msB - msA) / 60000);
 }
 
+/** Tokens appended to tbl_vworkjobs.calcnotes (suffix “:”, space-separated). Longest match first in regex. */
+const CALCNOTE_KNOWN_TAG_RE = /(VineFenceV\+:|VineFence\+:|GPS\*:|VineSR1:)/g;
+
+const CALCNOTE_TAG_HINTS: Record<string, string> = {
+  'VineFence+:':
+    'Steps+ used a buffered vineyard fence: step 2 and/or 3 had no raw ENTER/EXIT in the job window, so times were taken from GPS points inside an expanded polygon buffer.',
+  'VineFenceV+:':
+    'Steps+ widened the vineyard window: raw polygon ENTER/EXIT existed, but the buffered stay started earlier and/or ended later, so step 2 and/or 3 were adjusted to that wider interval.',
+  'GPS*:':
+    'Same-vineyard re-entry smoothing: the driver briefly left and re-entered the vineyard fence set with no other fence ENTER/EXIT between; step 3 uses the last EXIT in the chain (up to a few loops).',
+  'VineSR1:':
+    'Bankhouse South rule: when South vineyard polygons did not yield both step 2 and 3, times were taken from the mapped Bankhouse fence set instead.',
+};
+
+/** Hover or keyboard focus shows an explanation overlay for each known calcnote token. */
+function CalcNotesRichText({ text }: { text: string }) {
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return <span className="text-sm text-zinc-500 dark:text-zinc-400">—</span>;
+  }
+  const segments = trimmed.split(CALCNOTE_KNOWN_TAG_RE).filter((s) => s.length > 0);
+  return (
+    <span className="inline-flex flex-wrap items-baseline gap-x-0 text-sm text-zinc-800 dark:text-zinc-200">
+      {segments.map((seg, i) => {
+        const hint = CALCNOTE_TAG_HINTS[seg];
+        if (hint != null) {
+          return (
+            <span
+              key={`cn-${i}-${seg}`}
+              tabIndex={0}
+              className="group relative inline cursor-help rounded-sm border-b border-dotted border-zinc-400 outline-none focus-visible:ring-2 focus-visible:ring-blue-500/60 dark:border-zinc-500 dark:focus-visible:ring-amber-500/50"
+            >
+              {seg}
+              <span
+                role="tooltip"
+                className="pointer-events-none absolute left-0 top-full z-[60] mt-1.5 hidden max-h-[min(40vh,16rem)] w-[min(22rem,calc(100vw-2rem))] overflow-y-auto rounded-md border border-zinc-200 bg-white px-2.5 py-2 text-left text-xs font-normal leading-snug text-zinc-700 shadow-lg group-hover:block group-focus-visible:block dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-200"
+              >
+                {hint}
+              </span>
+            </span>
+          );
+        }
+        return (
+          <span key={`cn-t-${i}`} className="whitespace-pre-wrap">
+            {seg}
+          </span>
+        );
+      })}
+    </span>
+  );
+}
+
 function compare(a: unknown, b: unknown, col: string): number {
   const va = a == null ? '' : a;
   const vb = b == null ? '' : b;
@@ -94,25 +152,51 @@ function mergeColumnOrder(apiColumns: string[], saved: string[] | null): string[
   return ordered;
 }
 
+/** Keep Trailer Type, Load Size, Trailer (trailermode) immediately after Vineyard when present (Inspect default). */
+function normalizeInspectColumnOrder(ordered: string[]): string[] {
+  if (!ordered.includes('vineyard_name')) return ordered;
+  const tt = 'trailertype';
+  const ls = 'loadsize';
+  const tm = 'trailermode';
+  const insert = [tt, ls, tm].filter((c) => ordered.includes(c));
+  if (insert.length === 0) return ordered;
+  const rest = ordered.filter((c) => c !== tt && c !== ls && c !== tm);
+  const vi = rest.indexOf('vineyard_name');
+  if (vi === -1) return ordered;
+  rest.splice(vi + 1, 0, ...insert);
+  return rest;
+}
+
 function InspectContent() {
+  const router = useRouter();
+  const pathname = usePathname();
   const searchParams = useSearchParams();
   const jobIdParam = searchParams.get('jobId');
   const locateJobIdParam = searchParams.get('locateJobId');
   const paramToLocate = locateJobIdParam ?? jobIdParam;
   const [rows, setRows] = useState<Row[]>([]);
-  const [loading, setLoading] = useState(true);
+  /** False until first jobs list fetch finishes (success or error). */
+  const [hasCompletedInitialFetch, setHasCompletedInitialFetch] = useState(false);
+  /** True while refetching after filters/sort/page (keeps grid visible). */
+  const [listRefreshing, setListRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [errorDetail, setErrorDetail] = useState<{ hint?: string; code?: string } | null>(null);
   const [sortColumns, setSortColumns] = useState<[string, string, string]>(['', '', '']);
   const sortColumnsInitialized = useRef(false);
-  const [dateFilterCol, setDateFilterCol] = useState<string>('');
-  const [dateFrom, setDateFrom] = useState<string>('');
-  const [dateTo, setDateTo] = useState<string>('');
+  /** Column-date filter for `actual_end_time` only (datetime-local → API columnDate*). */
+  const [filterActualEndFrom, setFilterActualEndFrom] = useState<string>('');
+  const [filterActualEndTo, setFilterActualEndTo] = useState<string>('');
   const [filterCustomer, setFilterCustomer] = useState<string>('');
   const [filterTemplate, setFilterTemplate] = useState<string>('');
   const [filterTruckId, setFilterTruckId] = useState<string>('');
   const [filterTrailermode, setFilterTrailermode] = useState<string>('');
+  const [filterWinery, setFilterWinery] = useState<string>('');
+  const [filterVineyard, setFilterVineyard] = useState<string>('');
+  const [filterTrailerType, setFilterTrailerType] = useState<string>('');
+  const [filterLoadsize, setFilterLoadsize] = useState<string>('');
+  /** Committed value sent to API; draft updates while typing and applies on Enter only (avoids DB load per keystroke). */
   const [filterJobId, setFilterJobId] = useState<string>('');
+  const [filterJobIdDraft, setFilterJobIdDraft] = useState<string>('');
   const [filterPlannedFrom, setFilterPlannedFrom] = useState<string>('');
   const [filterPlannedTo, setFilterPlannedTo] = useState<string>('');
   const [filterActualFrom, setFilterActualFrom] = useState<string>('');
@@ -124,15 +208,25 @@ function InspectContent() {
   const [locateJobNotFound, setLocateJobNotFound] = useState(false);
   const [truckIdsOptions, setTruckIdsOptions] = useState<string[]>([]);
   const [trailermodeOptions, setTrailermodeOptions] = useState<string[]>([]);
+  const [wineryOptions, setWineryOptions] = useState<string[]>([]);
+  const [vineyardOptions, setVineyardOptions] = useState<string[]>([]);
+  const [trailerTypeOptions, setTrailerTypeOptions] = useState<string[]>([]);
+  const [loadsizeOptions, setLoadsizeOptions] = useState<string[]>([]);
   const [customersOptions, setCustomersOptions] = useState<string[]>([]);
   const [templateOptions, setTemplateOptions] = useState<string[]>([]);
+  /** Data Audit pivot → Inspect: job IDs only (other form filters ignored for the list). */
+  const [auditJobFilterIds, setAuditJobFilterIds] = useState<string[] | null>(null);
+  const auditUrlHandledRef = useRef<string | null>(null);
   const skipJobsPageFetchRef = useRef(false);
+  const jobsListFetchedOnceRef = useRef(false);
   const prevFilterKeyRef = useRef('');
   const locateResolveDoneRef = useRef(false);
   const userClearedLocateRef = useRef(false);
   const [columnOrder, setColumnOrder] = useState<string[]>([]);
   const [hiddenColumns, setHiddenColumns] = useState<Set<string>>(new Set());
   const [showColumnConfig, setShowColumnConfig] = useState(false);
+  /** Row counts, pagination summary, full API query string + debug — hidden by default (saves space). */
+  const [showListInfoApiDebug, setShowListInfoApiDebug] = useState(false);
   const columnOrderInitialized = useRef(false);
   const [selectedRowIndex, setSelectedRowIndex] = useState(0);
   const selectedRowRef = useRef<HTMLTableRowElement>(null);
@@ -164,6 +258,9 @@ function InspectContent() {
     step1oride: '', step2oride: '', step3oride: '', step4oride: '', step5oride: '',
   });
   const [steporidecomment, setSteporidecomment] = useState('');
+  /** excluded=1: omit from Summary rollups; still listed on By Job. */
+  const [excludedFromSummaries, setExcludedFromSummaries] = useState(false);
+  const [excludednotes, setExcludednotes] = useState('');
   const [saveOverridesStatus, setSaveOverridesStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const apiColumns = useMemo(
     () => (rows.length > 0 ? Object.keys(rows[0]) : []),
@@ -178,28 +275,37 @@ function InspectContent() {
         filterTemplate,
         filterTruckId,
         filterTrailermode,
+        filterWinery,
+        filterVineyard,
+        filterTrailerType,
+        filterLoadsize,
         filterJobId,
         filterPlannedFrom,
         filterPlannedTo,
         filterActualFrom,
         filterActualTo,
-        dateFilterCol,
-        dateFrom,
-        dateTo,
+        filterActualEndFrom,
+        filterActualEndTo,
+        auditJobIdsKey:
+          auditJobFilterIds && auditJobFilterIds.length > 0 ? auditJobFilterIds.join('\u0001') : '',
       }),
     [
       filterCustomer,
       filterTemplate,
       filterTruckId,
       filterTrailermode,
+      filterWinery,
+      filterVineyard,
+      filterTrailerType,
+      filterLoadsize,
       filterJobId,
       filterPlannedFrom,
       filterPlannedTo,
       filterActualFrom,
       filterActualTo,
-      dateFilterCol,
-      dateFrom,
-      dateTo,
+      filterActualEndFrom,
+      filterActualEndTo,
+      auditJobFilterIds,
     ],
   );
 
@@ -223,6 +329,35 @@ function InspectContent() {
     locateResolveDoneRef.current = false;
   }, [paramToLocate]);
 
+  useEffect(() => {
+    const ref = searchParams.get('auditJobIdsRef')?.trim();
+    if (!ref) return;
+    if (auditUrlHandledRef.current === ref) return;
+    auditUrlHandledRef.current = ref;
+    try {
+      const raw = localStorage.getItem(`${AUDIT_JOBS_STORAGE_PREFIX}${ref}`);
+      if (raw) {
+        const parsed = JSON.parse(raw) as { ids?: unknown };
+        const ids = Array.isArray(parsed.ids)
+          ? parsed.ids.map((x) => String(x).trim()).filter(Boolean)
+          : [];
+        const cap = ids.slice(0, MAX_AUDIT_JOB_FILTER_IDS);
+        if (cap.length > 0) setAuditJobFilterIds(cap);
+      }
+    } catch {
+      /* ignore */
+    }
+    try {
+      localStorage.removeItem(`${AUDIT_JOBS_STORAGE_PREFIX}${ref}`);
+    } catch {
+      /* ignore */
+    }
+    const next = new URLSearchParams(searchParams.toString());
+    next.delete('auditJobIdsRef');
+    const q = next.toString();
+    router.replace(q ? `${pathname}?${q}` : pathname, { scroll: false });
+  }, [searchParams, pathname, router]);
+
   /** Recent jobs / Summary link: primary sort by actual start (sort init may have already run without locate). */
   useEffect(() => {
     if (!locateJobIdParam?.trim()) return;
@@ -237,17 +372,30 @@ function InspectContent() {
   }, []);
 
   useEffect(() => {
-    fetch('/api/vworkjobs/filter-options')
+    const c = filterCustomer.trim();
+    const q = c ? `?customer=${encodeURIComponent(c)}` : '';
+    const ac = new AbortController();
+    fetch(`/api/vworkjobs/filter-options${q}`, { signal: ac.signal })
       .then((r) => r.json())
       .then((d) => {
         setTruckIdsOptions(Array.isArray(d?.truckIds) ? d.truckIds : []);
         setTrailermodeOptions(Array.isArray(d?.trailermodes) ? d.trailermodes : []);
+        setWineryOptions(Array.isArray(d?.deliveryWineries) ? d.deliveryWineries : []);
+        setVineyardOptions(Array.isArray(d?.vineyardNames) ? d.vineyardNames : []);
+        setTrailerTypeOptions(Array.isArray(d?.trailerTypes) ? d.trailerTypes : []);
+        setLoadsizeOptions(Array.isArray(d?.loadSizes) ? d.loadSizes : []);
       })
-      .catch(() => {
+      .catch((err) => {
+        if ((err as Error).name === 'AbortError') return;
         setTruckIdsOptions([]);
         setTrailermodeOptions([]);
+        setWineryOptions([]);
+        setVineyardOptions([]);
+        setTrailerTypeOptions([]);
+        setLoadsizeOptions([]);
       });
-  }, []);
+    return () => ac.abort();
+  }, [filterCustomer]);
 
   useEffect(() => {
     const c = filterCustomer.trim();
@@ -255,10 +403,15 @@ function InspectContent() {
       setTemplateOptions([]);
       return;
     }
-    fetch(`/api/vworkjobs/templates?customer=${encodeURIComponent(c)}`)
+    const ac = new AbortController();
+    fetch(`/api/vworkjobs/templates?customer=${encodeURIComponent(c)}`, { signal: ac.signal })
       .then((r) => r.json())
       .then((d) => setTemplateOptions(Array.isArray(d?.templates) ? d.templates : []))
-      .catch(() => setTemplateOptions([]));
+      .catch((err) => {
+        if ((err as Error).name === 'AbortError') return;
+        setTemplateOptions([]);
+      });
+    return () => ac.abort();
   }, [filterCustomer]);
 
   useEffect(() => {
@@ -272,13 +425,13 @@ function InspectContent() {
         const saved = Array.isArray(data?.columnOrder) && data.columnOrder.every((x: unknown) => typeof x === 'string')
           ? (data.columnOrder as string[])
           : null;
-        setColumnOrder(mergeColumnOrder(cols, saved));
+        setColumnOrder(normalizeInspectColumnOrder(mergeColumnOrder(cols, saved)));
         const hidden = Array.isArray(data?.hiddenColumns) && data.hiddenColumns.every((x: unknown) => typeof x === 'string')
           ? new Set(data.hiddenColumns as string[])
           : new Set<string>();
         setHiddenColumns(hidden);
       })
-      .catch(() => setColumnOrder(getDefaultColumnOrder(cols)));
+      .catch(() => setColumnOrder(normalizeInspectColumnOrder(getDefaultColumnOrder(cols))));
   }, [apiColumns.length, apiColumns]);
 
   useEffect(() => {
@@ -378,14 +531,12 @@ function InspectContent() {
   };
 
   const resetColumnConfig = () => {
-    const defaultOrder = getDefaultColumnOrder(apiColumns);
+    const defaultOrder = normalizeInspectColumnOrder(getDefaultColumnOrder(apiColumns));
     setColumnOrder(defaultOrder);
     setHiddenColumns(new Set());
     saveColumnConfig(defaultOrder, new Set());
     setShowColumnConfig(false);
   };
-
-  const dateColumns = useMemo(() => columns.filter((c) => DATE_COLUMNS.has(c)), [columns]);
 
   const [dragCol, setDragCol] = useState<string | null>(null);
   const [dropTargetCol, setDropTargetCol] = useState<string | null>(null);
@@ -425,6 +576,20 @@ function InspectContent() {
 
   const buildInspectApiParams = useCallback(
     (opts: { resolveJobId: string | null }) => {
+      if (auditJobFilterIds && auditJobFilterIds.length > 0) {
+        const p = new URLSearchParams();
+        p.set('limit', String(INSPECT_PAGE_SIZE));
+        p.set('offset', String(jobsPage * INSPECT_PAGE_SIZE));
+        const c1 = sortColumns[0]?.trim() || 'actual_start_time';
+        p.set('sortColumn', c1);
+        p.set('sortDir', 'asc');
+        const cap = auditJobFilterIds.slice(0, MAX_AUDIT_JOB_FILTER_IDS);
+        for (const id of cap) {
+          const t = id.trim();
+          if (t) p.append('jobId', t);
+        }
+        return p;
+      }
       const p = new URLSearchParams();
       p.set('limit', String(INSPECT_PAGE_SIZE));
       p.set('offset', String(jobsPage * INSPECT_PAGE_SIZE));
@@ -436,20 +601,22 @@ function InspectContent() {
       if (filterTemplate.trim()) p.set('template', filterTemplate.trim());
       if (filterTruckId.trim()) p.set('truck_id', filterTruckId.trim());
       if (filterTrailermode.trim()) p.set('trailermode', filterTrailermode.trim());
+      if (filterWinery.trim()) p.set('winery', filterWinery.trim());
+      if (filterVineyard.trim()) p.set('vineyard', filterVineyard.trim());
+      if (filterTrailerType.trim()) p.set('trailertype', filterTrailerType.trim());
+      if (filterLoadsize.trim()) p.set('loadsize', filterLoadsize.trim());
       if (filterJobId.trim()) p.set('jobIdContains', filterJobId.trim());
-      const useColumnDate =
-        !!dateFilterCol && INSPECT_COLUMN_DATE_COLS.has(dateFilterCol) && !!(dateFrom || dateTo);
-      if (useColumnDate) {
-        p.set('columnDateCol', dateFilterCol);
-        const df = dateFrom?.slice(0, 10);
-        const dt = dateTo?.slice(0, 10);
+      if (filterPlannedFrom?.trim() && /^\d{4}-\d{2}-\d{2}/.test(filterPlannedFrom)) p.set('plannedDateFrom', filterPlannedFrom.slice(0, 10));
+      if (filterPlannedTo?.trim() && /^\d{4}-\d{2}-\d{2}/.test(filterPlannedTo)) p.set('plannedDateTo', filterPlannedTo.slice(0, 10));
+      if (filterActualFrom?.trim() && /^\d{4}-\d{2}-\d{2}/.test(filterActualFrom)) p.set('dateFrom', filterActualFrom.slice(0, 10));
+      if (filterActualTo?.trim() && /^\d{4}-\d{2}-\d{2}/.test(filterActualTo)) p.set('dateTo', filterActualTo.slice(0, 10));
+      const hasActualEndColFilter = !!(filterActualEndFrom?.trim() || filterActualEndTo?.trim());
+      if (hasActualEndColFilter) {
+        p.set('columnDateCol', 'actual_end_time');
+        const df = filterActualEndFrom?.trim().slice(0, 10);
+        const dt = filterActualEndTo?.trim().slice(0, 10);
         if (df && /^\d{4}-\d{2}-\d{2}$/.test(df)) p.set('columnDateFrom', df);
         if (dt && /^\d{4}-\d{2}-\d{2}$/.test(dt)) p.set('columnDateTo', dt);
-      } else {
-        if (filterActualFrom?.trim() && /^\d{4}-\d{2}-\d{2}/.test(filterActualFrom)) p.set('dateFrom', filterActualFrom.slice(0, 10));
-        if (filterActualTo?.trim() && /^\d{4}-\d{2}-\d{2}/.test(filterActualTo)) p.set('dateTo', filterActualTo.slice(0, 10));
-        if (filterPlannedFrom?.trim() && /^\d{4}-\d{2}-\d{2}/.test(filterPlannedFrom)) p.set('plannedDateFrom', filterPlannedFrom.slice(0, 10));
-        if (filterPlannedTo?.trim() && /^\d{4}-\d{2}-\d{2}/.test(filterPlannedTo)) p.set('plannedDateTo', filterPlannedTo.slice(0, 10));
       }
       const fromUrl = searchParams.get('actualFrom') ?? '';
       const toUrl = searchParams.get('actualTo') ?? '';
@@ -460,7 +627,7 @@ function InspectContent() {
         toUrl &&
         /^\d{4}-\d{2}-\d{2}$/.test(fromUrl) &&
         /^\d{4}-\d{2}-\d{2}$/.test(toUrl) &&
-        !useColumnDate &&
+        !hasActualEndColFilter &&
         !filterActualFrom?.trim() &&
         !filterActualTo?.trim()
       ) {
@@ -476,15 +643,19 @@ function InspectContent() {
       filterTemplate,
       filterTruckId,
       filterTrailermode,
+      filterWinery,
+      filterVineyard,
+      filterTrailerType,
+      filterLoadsize,
       filterJobId,
       filterPlannedFrom,
       filterPlannedTo,
       filterActualFrom,
       filterActualTo,
-      dateFilterCol,
-      dateFrom,
-      dateTo,
+      filterActualEndFrom,
+      filterActualEndTo,
       searchParams,
+      auditJobFilterIds,
     ],
   );
 
@@ -529,10 +700,12 @@ function InspectContent() {
     }
     let cancelled = false;
     const want = (paramToLocate ?? '').trim();
-    const useResolve = !!want && !userClearedLocateRef.current && !locateResolveDoneRef.current;
+    const auditActive = !!(auditJobFilterIds && auditJobFilterIds.length > 0);
+    const useResolve =
+      !auditActive && !!want && !userClearedLocateRef.current && !locateResolveDoneRef.current;
     const params = buildInspectApiParams({ resolveJobId: useResolve ? want : null });
     const qs = params.toString();
-    setLoading(true);
+    if (jobsListFetchedOnceRef.current) setListRefreshing(true);
     fetch(`/api/vworkjobs?${qs}`)
       .then(async (res) => {
         const data = await res.json();
@@ -561,16 +734,45 @@ function InspectContent() {
         if (!cancelled) setError(e.message);
       })
       .finally(() => {
-        if (!cancelled) setLoading(false);
+        if (!cancelled) {
+          jobsListFetchedOnceRef.current = true;
+          setHasCompletedInitialFetch(true);
+          setListRefreshing(false);
+        }
       });
     return () => {
       cancelled = true;
     };
-  }, [inspectDataKey, jobsPage, buildInspectApiParams, paramToLocate]);
+  }, [inspectDataKey, jobsPage, buildInspectApiParams, paramToLocate, auditJobFilterIds]);
 
   useEffect(() => {
     setFilterTemplate('');
+    setFilterWinery('');
+    setFilterVineyard('');
+    setFilterTrailerType('');
+    setFilterLoadsize('');
   }, [filterCustomer]);
+
+  const clearAllFilters = useCallback(() => {
+    setFilterCustomer('');
+    setFilterTemplate('');
+    setFilterTruckId('');
+    setFilterTrailermode('');
+    setFilterWinery('');
+    setFilterVineyard('');
+    setFilterTrailerType('');
+    setFilterLoadsize('');
+    setFilterJobId('');
+    setFilterJobIdDraft('');
+    setFilterPlannedFrom('');
+    setFilterPlannedTo('');
+    setFilterActualFrom('');
+    setFilterActualTo('');
+    setFilterActualEndFrom('');
+    setFilterActualEndTo('');
+    setAuditJobFilterIds(null);
+    setJobsPage(0);
+  }, []);
 
   /** Server applies filters + primary sort; secondary/tertiary sort columns only (within page). */
   const sortedRows = useMemo(() => {
@@ -626,20 +828,27 @@ function InspectContent() {
       setFilterCustomer('');
       setFilterTemplate('');
       setFilterTrailermode('');
+      setFilterWinery('');
+      setFilterVineyard('');
+      setFilterTrailerType('');
+      setFilterLoadsize('');
       setFilterJobId('');
+      setFilterJobIdDraft('');
       setFilterPlannedFrom('');
       setFilterPlannedTo('');
       setFilterActualFrom('');
       setFilterActualTo('');
-      setDateFilterCol('');
-      setDateFrom('');
-      setDateTo('');
+      setFilterActualEndFrom('');
+      setFilterActualEndTo('');
       setFilterTruckId(truck);
     } else {
       if (truck) setFilterTruckId(truck);
       if (actualFrom) setFilterActualFrom(actualFrom);
       if (actualTo) setFilterActualTo(actualTo);
-      if (jobId && !locateJobId) setFilterJobId(jobId);
+      if (jobId && !locateJobId) {
+        setFilterJobId(jobId);
+        setFilterJobIdDraft(jobId);
+      }
     }
   }, [searchParams]);
 
@@ -661,13 +870,13 @@ function InspectContent() {
 
   /** Hyperlink arrival: apply filters first (URL effect above), then after data + sort are ready, locate the job. Re-run whenever sortedRows changes so when sort/column config loads we re-locate; stop once user has selected a different row. */
   useEffect(() => {
-    if (!paramToLocate || loading || sortedRows.length === 0 || userClearedLocateRef.current) return;
+    if (!paramToLocate || !hasCompletedInitialFetch || sortedRows.length === 0 || userClearedLocateRef.current) return;
     const want = paramToLocate.trim();
     const idx = sortedRows.findIndex((r) => String(r.job_id ?? '').trim() === want);
     if (idx >= 0) {
       setSelectedRowIndex(idx);
     }
-  }, [paramToLocate, loading, sortedRows]);
+  }, [paramToLocate, hasCompletedInitialFetch, sortedRows]);
 
   /** Scroll to the located job row once it's rendered (paramToLocate = locateJobId or jobId from URL). */
   useEffect(() => {
@@ -703,6 +912,10 @@ function InspectContent() {
       step5oride: raw('step5oride'),
     });
     setSteporidecomment(raw('steporidecomment'));
+    const ex = selectedRow.excluded;
+    setExcludedFromSummaries(Number(selectedRow.excluded) === 1);
+    const en = selectedRow.excludednotes;
+    setExcludednotes(en != null && String(en) !== '' ? String(en).slice(0, 250) : '');
   }, [selectedRow?.job_id]);
 
   const vineyardName = selectedRow ? String(selectedRow.vineyard_name ?? '') : '';
@@ -829,14 +1042,28 @@ function InspectContent() {
     setTrackingLoading(true);
     const offset = (trackingPage - 1) * trackingPageSize;
     const useOverride = gpsWindowOverride != null;
-    const totalStartLess = startLessMinutes + (useOverride ? 0 : displayExpandBefore);
-    const totalEndPlus = endPlusMinutes + (useOverride ? 0 : displayExpandAfter);
-    const positionAfter = useOverride
-      ? gpsWindowOverride.positionAfter
-      : addMinutesToTimestampAsNZ(actualStartTime.trim(), -totalStartLess);
-    const positionBefore = useOverride
-      ? gpsWindowOverride.positionBefore
-      : (actualEndTime.trim() ? addMinutesToTimestampAsNZ(actualEndTime.trim(), totalEndPlus) : null);
+    let positionAfter: string;
+    let positionBefore: string | null;
+    if (useOverride) {
+      positionAfter = gpsWindowOverride.positionAfter;
+      positionBefore = gpsWindowOverride.positionBefore;
+    } else {
+      const win = buildInspectGpsWindowForJob(selectedRow as Record<string, unknown>, {
+        startLessMinutes,
+        endPlusMinutes,
+        displayExpandBefore,
+        displayExpandAfter,
+      });
+      if (win.error) {
+        setTrackingRows([]);
+        setTrackingSql('');
+        setTrackingTotal(0);
+        setTrackingLoading(false);
+        return () => abort.abort();
+      }
+      positionAfter = win.positionAfter;
+      positionBefore = win.positionBefore;
+    }
     const params = new URLSearchParams({
       device: deviceForTracking,
       positionAfter,
@@ -866,11 +1093,35 @@ function InspectContent() {
       })
       .finally(() => setTrackingLoading(false));
     return () => abort.abort();
-  }, [deviceForTracking, actualStartTime, actualEndTime, trackingPage, trackingPageSize, trackingTableView, startLessMinutes, endPlusMinutes, trackingRefreshKey, gpsWindowOverride]);
+  }, [
+    deviceForTracking,
+    actualStartTime,
+    actualEndTime,
+    trackingPage,
+    trackingPageSize,
+    trackingTableView,
+    startLessMinutes,
+    endPlusMinutes,
+    displayExpandBefore,
+    displayExpandAfter,
+    trackingRefreshKey,
+    gpsWindowOverride,
+    selectedRow,
+  ]);
 
   useEffect(() => {
     setTrackingPage(1);
-  }, [deviceForTracking, actualStartTime, actualEndTime, trackingTableView, startLessMinutes, endPlusMinutes, gpsWindowOverride]);
+  }, [
+    deviceForTracking,
+    actualStartTime,
+    actualEndTime,
+    trackingTableView,
+    startLessMinutes,
+    endPlusMinutes,
+    displayExpandBefore,
+    displayExpandAfter,
+    gpsWindowOverride,
+  ]);
 
   /** Clear step-time filter when job changes so we don't keep a stale window. */
   useEffect(() => {
@@ -1019,11 +1270,200 @@ function InspectContent() {
     [columns, sortedRows],
   );
 
+  /** Per-column filter controls aligned above each data column (filter row in thead). */
+  const renderColumnFilter = (col: string) => {
+    const fi =
+      'w-full min-w-0 rounded border border-zinc-300 bg-white px-1 py-0.5 text-[10px] dark:border-zinc-600 dark:bg-zinc-800';
+
+    switch (col) {
+      case 'job_id':
+        return (
+          <input
+            type="text"
+            value={filterJobIdDraft}
+            onChange={(e) => setFilterJobIdDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key !== 'Enter') return;
+              e.preventDefault();
+              const t = filterJobIdDraft.trim();
+              setFilterJobId(t);
+              setFilterJobIdDraft(t);
+            }}
+            list="filter-job-id-list"
+            placeholder="Id · Enter"
+            className={fi}
+            title="Prefix, then Enter to query"
+          />
+        );
+      case 'customer':
+      case 'Customer':
+        return (
+          <select value={filterCustomer} onChange={(e) => setFilterCustomer(e.target.value)} className={fi} title="Customer">
+            <option value="">All</option>
+            {customersOptions.map((c) => (
+              <option key={c} value={c}>
+                {c}
+              </option>
+            ))}
+          </select>
+        );
+      case 'template':
+        return (
+          <select
+            value={filterTemplate}
+            onChange={(e) => setFilterTemplate(e.target.value)}
+            className={fi}
+            disabled={!filterCustomer}
+            title="Template"
+          >
+            <option value="">All</option>
+            {templateOptions.map((t) => (
+              <option key={t} value={t}>
+                {t}
+              </option>
+            ))}
+          </select>
+        );
+      case 'delivery_winery':
+        return (
+          <select value={filterWinery} onChange={(e) => setFilterWinery(e.target.value)} className={fi} title="delivery_winery">
+            <option value="">All</option>
+            {wineryOptions.map((w) => (
+              <option key={w} value={w}>
+                {w}
+              </option>
+            ))}
+          </select>
+        );
+      case 'vineyard_name':
+        return (
+          <select value={filterVineyard} onChange={(e) => setFilterVineyard(e.target.value)} className={fi} title="vineyard_name">
+            <option value="">All</option>
+            {vineyardOptions.map((v) => (
+              <option key={v} value={v}>
+                {v}
+              </option>
+            ))}
+          </select>
+        );
+      case 'trailertype':
+        return (
+          <select value={filterTrailerType} onChange={(e) => setFilterTrailerType(e.target.value)} className={fi} title="trailertype">
+            <option value="">All</option>
+            {trailerTypeOptions.map((t) => (
+              <option key={t} value={t}>
+                {t}
+              </option>
+            ))}
+          </select>
+        );
+      case 'loadsize':
+        return (
+          <select value={filterLoadsize} onChange={(e) => setFilterLoadsize(e.target.value)} className={fi} title="loadsize">
+            <option value="">All</option>
+            {loadsizeOptions.map((s) => (
+              <option key={s} value={s}>
+                {s}
+              </option>
+            ))}
+          </select>
+        );
+      case 'truck_id':
+        return (
+          <select value={filterTruckId} onChange={(e) => setFilterTruckId(e.target.value)} className={fi} title="Truck">
+            <option value="">All</option>
+            {truckIdsOptions.map((id) => (
+              <option key={id} value={id}>
+                {id}
+              </option>
+            ))}
+          </select>
+        );
+      case 'trailermode':
+        return (
+          <select value={filterTrailermode} onChange={(e) => setFilterTrailermode(e.target.value)} className={fi} title="trailermode">
+            <option value="">All</option>
+            {trailermodeOptions.map((t) => (
+              <option key={t} value={t}>
+                {t}
+              </option>
+            ))}
+          </select>
+        );
+      case 'planned_start_time':
+        return (
+          <div className="flex min-w-[6.5rem] flex-col gap-0.5">
+            <input
+              type="date"
+              value={filterPlannedFrom}
+              onChange={(e) => setFilterPlannedFrom(e.target.value)}
+              className={fi}
+              title="Planned from"
+            />
+            <input type="date" value={filterPlannedTo} onChange={(e) => setFilterPlannedTo(e.target.value)} className={fi} title="Planned to" />
+          </div>
+        );
+      case 'actual_start_time':
+        return (
+          <div className="flex min-w-[6.5rem] flex-col gap-0.5">
+            <input
+              type="date"
+              value={filterActualFrom}
+              onChange={(e) => setFilterActualFrom(e.target.value)}
+              className={fi}
+              title="Actual start from"
+            />
+            <input type="date" value={filterActualTo} onChange={(e) => setFilterActualTo(e.target.value)} className={fi} title="Actual start to" />
+          </div>
+        );
+      case 'actual_end_time':
+        return (
+          <div className="flex min-w-[6.5rem] flex-col gap-0.5">
+            <input
+              type="datetime-local"
+              value={filterActualEndFrom}
+              onChange={(e) => setFilterActualEndFrom(e.target.value)}
+              className={fi}
+              title="actual_end_time from"
+            />
+            <input
+              type="datetime-local"
+              value={filterActualEndTo}
+              onChange={(e) => setFilterActualEndTo(e.target.value)}
+              className={fi}
+              title="actual_end_time to"
+            />
+          </div>
+        );
+      default:
+        return <span className="block min-h-[1.25rem]" aria-hidden />;
+    }
+  };
+
   return (
     <div className="w-full min-w-0 p-6">
       <h1 className="mb-4 text-2xl font-semibold text-zinc-900 dark:text-zinc-100">Inspect Data Vwork&gt;GPS</h1>
       <p className="mb-4 text-sm text-zinc-500">Jobs grid (branched from Vwork — will evolve into merged jobs + GPS view)</p>
-      {loading && <p className="text-zinc-600">Loading…</p>}
+      {auditJobFilterIds && auditJobFilterIds.length > 0 && (
+        <div className="mb-4 flex flex-wrap items-center gap-2 rounded-lg border border-sky-200 bg-sky-50 px-3 py-2 text-sm dark:border-sky-800 dark:bg-sky-950/50">
+          <span className="text-sky-900 dark:text-sky-100">
+            Data Audit: listing <strong>{formatIntNz(auditJobFilterIds.length)}</strong> job
+            {auditJobFilterIds.length !== 1 ? 's' : ''} from the pivot. Other filters below do not apply to this list until
+            cleared.
+          </span>
+          <button
+            type="button"
+            onClick={() => {
+              setAuditJobFilterIds(null);
+              setJobsPage(0);
+            }}
+            className="rounded border border-sky-300 bg-white px-2 py-1 text-xs font-medium text-sky-900 hover:bg-sky-100 dark:border-sky-700 dark:bg-sky-900 dark:text-sky-100 dark:hover:bg-sky-800"
+          >
+            Clear audit filter
+          </button>
+        </div>
+      )}
+      {!hasCompletedInitialFetch && !error && <p className="text-zinc-600">Loading…</p>}
       {error && (
         <div className="rounded bg-red-100 p-3 text-red-800 dark:bg-red-900/30 dark:text-red-200">
           <p className="font-medium">{error}</p>
@@ -1031,242 +1471,142 @@ function InspectContent() {
           {errorDetail?.code && <p className="mt-1 text-xs">Code: {errorDetail.code}</p>}
         </div>
       )}
-      {!loading && !error && rows.length === 0 && <p className="text-zinc-600">No rows.</p>}
-      {!loading && !error && rows.length > 0 && (
+      {hasCompletedInitialFetch && !error && rows.length === 0 && (
+        <p className="text-zinc-600">{listRefreshing ? 'Updating…' : 'No rows.'}</p>
+      )}
+      {hasCompletedInitialFetch && !error && rows.length > 0 && (
         <>
-          <div className="mb-4 flex flex-wrap items-end gap-4 rounded-lg border border-zinc-200 bg-white p-3 dark:border-zinc-700 dark:bg-zinc-900">
-            <div>
-              <label className="mb-1 block text-xs font-medium text-zinc-500">Sort 1</label>
+          <div className="mb-2 flex flex-wrap items-center gap-2 rounded-lg border border-zinc-200 bg-white px-3 py-2 dark:border-zinc-700 dark:bg-zinc-900">
+            <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1">
+              <span className="text-[10px] font-medium uppercase tracking-wide text-zinc-400">Sort</span>
+              <span className="text-[10px] text-zinc-400">1</span>
               <select
                 value={sortColumns[0]}
                 onChange={(e) => setSortColumn(0, e.target.value)}
-                className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+                className="max-w-[8.5rem] rounded border border-zinc-200 bg-white px-1 py-0.5 text-[11px] text-zinc-600 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-300"
+                title="Primary sort (API)"
               >
-                <option value="">— None —</option>
-                {allColumns.map((c) => <option key={c} value={c}>{formatColumnLabel(c)}</option>)}
+                <option value="">—</option>
+                {allColumns.map((c) => (
+                  <option key={c} value={c}>
+                    {formatColumnLabel(c)}
+                  </option>
+                ))}
               </select>
-            </div>
-            <div>
-              <label className="mb-1 block text-xs font-medium text-zinc-500">Sort 2</label>
+              <span className="text-[10px] text-zinc-400">2</span>
               <select
                 value={sortColumns[1]}
                 onChange={(e) => setSortColumn(1, e.target.value)}
-                className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+                className="max-w-[8.5rem] rounded border border-zinc-200 bg-white px-1 py-0.5 text-[11px] text-zinc-600 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-300"
+                title="Secondary (page)"
               >
-                <option value="">— None —</option>
-                {allColumns.map((c) => <option key={c} value={c}>{formatColumnLabel(c)}</option>)}
+                <option value="">—</option>
+                {allColumns.map((c) => (
+                  <option key={c} value={c}>
+                    {formatColumnLabel(c)}
+                  </option>
+                ))}
               </select>
-            </div>
-            <div>
-              <label className="mb-1 block text-xs font-medium text-zinc-500">Sort 3</label>
+              <span className="text-[10px] text-zinc-400">3</span>
               <select
                 value={sortColumns[2]}
                 onChange={(e) => setSortColumn(2, e.target.value)}
-                className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+                className="max-w-[8.5rem] rounded border border-zinc-200 bg-white px-1 py-0.5 text-[11px] text-zinc-600 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-300"
+                title="Tertiary (page)"
               >
-                <option value="">— None —</option>
-                {allColumns.map((c) => <option key={c} value={c}>{formatColumnLabel(c)}</option>)}
+                <option value="">—</option>
+                {allColumns.map((c) => (
+                  <option key={c} value={c}>
+                    {formatColumnLabel(c)}
+                  </option>
+                ))}
               </select>
-            </div>
-            <div>
-              <label className="mb-1 block text-xs font-medium text-zinc-500 invisible">Save</label>
               <button
                 type="button"
                 onClick={() => saveSortColumns(sortColumns)}
                 disabled={sortSaveStatus === 'saving'}
-                className="rounded bg-green-600 px-3 py-1.5 text-sm text-white hover:bg-green-700 disabled:opacity-70 dark:bg-green-700 dark:hover:bg-green-600"
+                className="ml-1 rounded border border-zinc-200 bg-transparent px-1.5 py-0.5 text-[11px] text-zinc-500 hover:bg-zinc-100 disabled:opacity-60 dark:border-zinc-600 dark:hover:bg-zinc-800"
               >
-                {sortSaveStatus === 'saving' ? 'Saving…' : sortSaveStatus === 'saved' ? 'Saved ✓' : sortSaveStatus === 'error' ? 'Save failed' : 'Save sort config'}
+                {sortSaveStatus === 'saving' ? '…' : sortSaveStatus === 'saved' ? 'Saved' : sortSaveStatus === 'error' ? 'Error' : 'Save'}
               </button>
-            </div>
-            <div className="relative">
-              <button
-                type="button"
-                onClick={() => setShowColumnConfig((v) => !v)}
-                className="rounded bg-zinc-200 px-3 py-1.5 text-sm hover:bg-zinc-300 dark:bg-zinc-700 dark:hover:bg-zinc-600"
-              >
-                Columns
-              </button>
-              {showColumnConfig && (
-                <>
-                  <div
-                    className="fixed inset-0 z-40"
-                    onClick={() => setShowColumnConfig(false)}
-                    aria-hidden="true"
-                  />
-                  <div className="absolute left-0 top-full z-50 mt-1 min-w-[220px] rounded-lg border border-zinc-200 bg-white p-3 shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
-                    <div className="mb-2 flex items-center justify-between gap-2">
-                      <span className="text-xs font-medium text-zinc-500">Show/hide columns</span>
-                      <div className="flex gap-2">
-                        <button type="button" onClick={showAllColumns} className="text-xs text-blue-600 hover:underline dark:text-blue-400">
-                          Show all
-                        </button>
-                        <button type="button" onClick={resetColumnConfig} className="text-xs text-zinc-500 hover:underline">
-                          Reset
-                        </button>
+              <div className="relative">
+                <button
+                  type="button"
+                  onClick={() => setShowColumnConfig((v) => !v)}
+                  className="rounded border border-zinc-200 bg-transparent px-1.5 py-0.5 text-[11px] text-zinc-500 hover:bg-zinc-100 dark:border-zinc-600 dark:hover:bg-zinc-800"
+                >
+                  Columns
+                </button>
+                {showColumnConfig && (
+                  <>
+                    <div
+                      className="fixed inset-0 z-40"
+                      onClick={() => setShowColumnConfig(false)}
+                      aria-hidden="true"
+                    />
+                    <div className="absolute left-0 top-full z-50 mt-1 min-w-[220px] rounded-lg border border-zinc-200 bg-white p-3 shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
+                      <div className="mb-2 flex items-center justify-between gap-2">
+                        <span className="text-xs font-medium text-zinc-500">Show/hide columns</span>
+                        <div className="flex gap-2">
+                          <button type="button" onClick={showAllColumns} className="text-xs text-blue-600 hover:underline dark:text-blue-400">
+                            Show all
+                          </button>
+                          <button type="button" onClick={resetColumnConfig} className="text-xs text-zinc-500 hover:underline">
+                            Reset
+                          </button>
+                        </div>
                       </div>
+                      <div className="max-h-64 space-y-1 overflow-y-auto">
+                        {allColumns.map((col) => (
+                          <label key={col} className="flex cursor-pointer items-center gap-2 rounded px-2 py-1 hover:bg-zinc-100 dark:hover:bg-zinc-800">
+                            <input
+                              type="checkbox"
+                              checked={!hiddenColumns.has(col)}
+                              onChange={() => toggleColumnVisibility(col)}
+                              className="rounded"
+                            />
+                            <span className="text-sm">{formatColumnLabel(col)}</span>
+                          </label>
+                        ))}
+                      </div>
+                      <p className="mt-2 text-xs text-zinc-500">
+                        {columns.length} of {allColumns.length} visible · drag headers to reorder
+                      </p>
                     </div>
-                    <div className="max-h-64 overflow-y-auto space-y-1">
-                      {allColumns.map((col) => (
-                        <label key={col} className="flex cursor-pointer items-center gap-2 rounded px-2 py-1 hover:bg-zinc-100 dark:hover:bg-zinc-800">
-                          <input
-                            type="checkbox"
-                            checked={!hiddenColumns.has(col)}
-                            onChange={() => toggleColumnVisibility(col)}
-                            className="rounded"
-                          />
-                          <span className="text-sm">{formatColumnLabel(col)}</span>
-                        </label>
-                      ))}
-                    </div>
-                    <p className="mt-2 text-xs text-zinc-500">
-                      {columns.length} of {allColumns.length} visible · drag headers to reorder
-                    </p>
-                  </div>
-                </>
-              )}
+                  </>
+                )}
+              </div>
             </div>
-            <div>
-              <label className="mb-1 block text-xs font-medium text-zinc-500">Customer</label>
-              <select
-                value={filterCustomer}
-                onChange={(e) => setFilterCustomer(e.target.value)}
-                className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800"
-              >
-                <option value="">— All —</option>
-                {customersOptions.map((c) => <option key={c} value={c}>{c}</option>)}
-              </select>
-            </div>
-            <div>
-              <label className="mb-1 block text-xs font-medium text-zinc-500">Template</label>
-              <select
-                value={filterTemplate}
-                onChange={(e) => setFilterTemplate(e.target.value)}
-                className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800"
-                disabled={!filterCustomer}
-              >
-                <option value="">— All —</option>
-                {templateOptions.map((t) => <option key={t} value={t}>{t}</option>)}
-              </select>
-            </div>
-            <div>
-              <label className="mb-1 block text-xs font-medium text-zinc-500">Date column</label>
-              <select
-                value={dateFilterCol}
-                onChange={(e) => setDateFilterCol(e.target.value)}
-                className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800"
-              >
-                <option value="">— None —</option>
-                {dateColumns.map((c) => <option key={c} value={c}>{formatColumnLabel(c)}</option>)}
-              </select>
-            </div>
-            <div>
-              <label className="mb-1 block text-xs font-medium text-zinc-500">From</label>
-              <input type="datetime-local" value={dateFrom} onChange={(e) => setDateFrom(e.target.value)}
-                className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800" />
-            </div>
-            <div>
-              <label className="mb-1 block text-xs font-medium text-zinc-500">To</label>
-              <input type="datetime-local" value={dateTo} onChange={(e) => setDateTo(e.target.value)}
-                className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800" />
-            </div>
+            {listRefreshing && (
+              <span className="text-[10px] text-zinc-400" aria-live="polite">
+                Updating…
+              </span>
+            )}
+          </div>
+          <div className="mb-1 flex justify-end">
+            <button
+              type="button"
+              onClick={clearAllFilters}
+              className="rounded border border-zinc-300 bg-zinc-50 px-2 py-0.5 text-[11px] text-zinc-600 hover:bg-zinc-100 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700"
+            >
+              Clear all filters
+            </button>
           </div>
           <datalist id="filter-job-id-list" />
-          <div className="max-h-[28rem] overflow-auto rounded-lg border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900">
+          <div
+            className={`max-h-[28rem] overflow-auto rounded-lg border border-zinc-200 bg-white transition-opacity dark:border-zinc-700 dark:bg-zinc-900 ${listRefreshing ? 'opacity-75' : ''}`}
+          >
             <table className="w-max table-fixed text-left text-sm">
               <colgroup>
                 {columns.map((col) => (
                   <col key={col} style={{ width: columnWidths[col], minWidth: columnWidths[col] }} />
                 ))}
               </colgroup>
-              <thead className="sticky top-0 z-10">
-                <tr className="border-b border-zinc-200 bg-zinc-50 dark:border-zinc-800 dark:bg-zinc-900/50">
+              <thead>
+                <tr className="border-b border-zinc-200 bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-900/95">
                   {columns.map((col) => (
-                    <th key={`filter-${col}`} className="px-1 py-1.5 align-bottom">
-                      {col === 'truck_id' && (
-                        <select
-                          value={filterTruckId}
-                          onChange={(e) => setFilterTruckId(e.target.value)}
-                          onClick={(e) => e.stopPropagation()}
-                          className="w-full max-w-full rounded border border-zinc-300 bg-white px-1.5 py-1 text-xs dark:border-zinc-600 dark:bg-zinc-800"
-                          title="Filter by Truck ID"
-                        >
-                          <option value="">— All —</option>
-                          {truckIdsOptions.map((id) => (
-                            <option key={id} value={id}>{id}</option>
-                          ))}
-                        </select>
-                      )}
-                      {col === 'trailermode' && (
-                        <select
-                          value={filterTrailermode}
-                          onChange={(e) => setFilterTrailermode(e.target.value)}
-                          onClick={(e) => e.stopPropagation()}
-                          className="w-full max-w-full rounded border border-zinc-300 bg-white px-1.5 py-1 text-xs dark:border-zinc-600 dark:bg-zinc-800"
-                          title="Filter by trailermode (TT)"
-                        >
-                          <option value="">— All —</option>
-                          {trailermodeOptions.map((t) => (
-                            <option key={t} value={t}>{t}</option>
-                          ))}
-                        </select>
-                      )}
-                      {col === 'job_id' && (
-                        <input
-                          type="text"
-                          value={filterJobId}
-                          onChange={(e) => setFilterJobId(e.target.value)}
-                          onClick={(e) => e.stopPropagation()}
-                          list="filter-job-id-list"
-                          placeholder="Filter…"
-                          className="w-full min-w-0 rounded border border-zinc-300 bg-white px-1.5 py-1 text-xs dark:border-zinc-600 dark:bg-zinc-800"
-                          title="Filter by Job ID (autofill)"
-                        />
-                      )}
-                      {col === 'planned_start_time' && (
-                        <div className="flex flex-col gap-0.5">
-                          <input
-                            type="date"
-                            value={filterPlannedFrom}
-                            onChange={(e) => setFilterPlannedFrom(e.target.value)}
-                            onClick={(e) => e.stopPropagation()}
-                            placeholder="From"
-                            className="w-full rounded border border-zinc-300 bg-white px-1.5 py-0.5 text-xs dark:border-zinc-600 dark:bg-zinc-800"
-                            title="Planned start from"
-                          />
-                          <input
-                            type="date"
-                            value={filterPlannedTo}
-                            onChange={(e) => setFilterPlannedTo(e.target.value)}
-                            onClick={(e) => e.stopPropagation()}
-                            placeholder="To"
-                            className="w-full rounded border border-zinc-300 bg-white px-1.5 py-0.5 text-xs dark:border-zinc-600 dark:bg-zinc-800"
-                            title="Planned start to"
-                          />
-                        </div>
-                      )}
-                      {col === 'actual_start_time' && (
-                        <div className="flex flex-col gap-0.5">
-                          <input
-                            type="date"
-                            value={filterActualFrom}
-                            onChange={(e) => setFilterActualFrom(e.target.value)}
-                            onClick={(e) => e.stopPropagation()}
-                            placeholder="From"
-                            className="w-full rounded border border-zinc-300 bg-white px-1.5 py-0.5 text-xs dark:border-zinc-600 dark:bg-zinc-800"
-                            title="Actual start from"
-                          />
-                          <input
-                            type="date"
-                            value={filterActualTo}
-                            onChange={(e) => setFilterActualTo(e.target.value)}
-                            onClick={(e) => e.stopPropagation()}
-                            placeholder="To"
-                            className="w-full rounded border border-zinc-300 bg-white px-1.5 py-0.5 text-xs dark:border-zinc-600 dark:bg-zinc-800"
-                            title="Actual start to"
-                          />
-                        </div>
-                      )}
+                    <th key={`f-${col}`} className="align-top px-1.5 py-1.5 font-normal">
+                      {renderColumnFilter(col)}
                     </th>
                   ))}
                 </tr>
@@ -1281,9 +1621,15 @@ function InspectContent() {
                       onDrop={(e) => handleColumnDrop(e, col)}
                       onDragEnd={handleColumnDragEnd}
                       className={`cursor-grab select-none whitespace-nowrap bg-zinc-100 px-3 py-2 font-medium text-zinc-900 hover:bg-zinc-200 dark:bg-zinc-800 dark:text-zinc-100 dark:hover:bg-zinc-700 ${dropTargetCol === col ? 'bg-blue-200 dark:bg-blue-800' : ''} ${dragCol === col ? 'opacity-60' : ''}`}
-                      title="Drag to reorder · Use Sort dropdowns above"
+                      title="Drag to reorder"
                     >
-                      {col === 'trailermode' ? 'TT' : formatColumnLabel(col)}
+                      {col === 'trailermode'
+                        ? 'Trailer'
+                        : col === 'trailertype'
+                          ? 'Trailer Type'
+                          : col === 'loadsize'
+                            ? 'Load Size'
+                            : formatColumnLabel(col)}
                     </th>
                   ))}
                 </tr>
@@ -1312,16 +1658,34 @@ function InspectContent() {
               </tbody>
             </table>
           </div>
-          <div className="mt-3 flex flex-wrap items-center justify-between gap-3 text-sm text-zinc-500">
-            <p>
-              {sortedRows.length} row{sortedRows.length !== 1 ? 's' : ''} on this page · {totalJobsFromApi} total matching filters · page {jobsPage + 1} of{' '}
-              {Math.max(1, Math.ceil(totalJobsFromApi / INSPECT_PAGE_SIZE) || 1)} · click row to select
-            </p>
+          <div className="mt-3 flex flex-wrap items-start justify-between gap-3">
+            <div className="min-w-0 flex-1 space-y-2">
+              <button
+                type="button"
+                onClick={() => setShowListInfoApiDebug((v) => !v)}
+                className="text-left text-xs text-zinc-500 underline decoration-zinc-400/70 underline-offset-2 hover:text-zinc-700 dark:text-zinc-400 dark:hover:text-zinc-200"
+                aria-expanded={showListInfoApiDebug}
+              >
+                {showListInfoApiDebug ? 'Hide' : 'Show'} list info & API query
+              </button>
+              {showListInfoApiDebug && (
+                <>
+                  <p className="text-sm text-zinc-500 dark:text-zinc-400">
+                    {sortedRows.length} row{sortedRows.length !== 1 ? 's' : ''} on this page · {totalJobsFromApi} total matching filters · page {jobsPage + 1} of{' '}
+                    {Math.max(1, Math.ceil(totalJobsFromApi / INSPECT_PAGE_SIZE) || 1)} · click row to select
+                  </p>
+                  <p className="font-mono text-[11px] leading-snug text-zinc-400 break-all dark:text-zinc-500">
+                    API query: /api/vworkjobs?{lastApiQueryString || '—'}
+                    {apiDebugFromResponse != null && <> · debug: {JSON.stringify(apiDebugFromResponse)}</>}
+                  </p>
+                </>
+              )}
+            </div>
             {totalJobsFromApi > INSPECT_PAGE_SIZE && (
-              <div className="flex items-center gap-2">
+              <div className="flex shrink-0 items-center gap-2">
                 <button
                   type="button"
-                  disabled={jobsPage <= 0 || loading}
+                  disabled={jobsPage <= 0 || listRefreshing || !hasCompletedInitialFetch}
                   onClick={() => setJobsPage((p) => Math.max(0, p - 1))}
                   className="rounded border border-zinc-300 px-2 py-1 text-xs disabled:opacity-50 dark:border-zinc-600"
                 >
@@ -1329,7 +1693,7 @@ function InspectContent() {
                 </button>
                 <button
                   type="button"
-                  disabled={loading || jobsPage >= Math.max(0, Math.ceil(totalJobsFromApi / INSPECT_PAGE_SIZE) - 1)}
+                  disabled={listRefreshing || !hasCompletedInitialFetch || jobsPage >= Math.max(0, Math.ceil(totalJobsFromApi / INSPECT_PAGE_SIZE) - 1)}
                   onClick={() => setJobsPage((p) => p + 1)}
                   className="rounded border border-zinc-300 px-2 py-1 text-xs disabled:opacity-50 dark:border-zinc-600"
                 >
@@ -1340,22 +1704,17 @@ function InspectContent() {
           </div>
           {locateJobNotFound && (paramToLocate ?? '').trim() !== '' && (
             <p className="mt-2 text-sm text-amber-700 dark:text-amber-300">
-              Job ID {(paramToLocate ?? '').trim()} was not found for the current API filters (see query below). Adjust filters or check the job exists for this truck.
+              Job ID {(paramToLocate ?? '').trim()} was not found for the current API filters
+              {showListInfoApiDebug ? ' (see query below).' : ' (use “Show list info & API query” for the request URL).'} Adjust filters or check the job exists for this truck.
             </p>
           )}
-          <p className="mt-2 font-mono text-[11px] leading-snug text-zinc-400 break-all">
-            API query: /api/vworkjobs?{lastApiQueryString || '—'}
-            {apiDebugFromResponse != null && <> · debug: {JSON.stringify(apiDebugFromResponse)}</>}
-          </p>
           <section className="mt-6 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900">
             {selectedRow && (
               <div className="mb-3">
                 <span className="text-xs font-medium text-zinc-500 dark:text-zinc-400">CalcNotes: </span>
-                <span className="text-sm text-zinc-800 dark:text-zinc-200">
-                  {(selectedRow.calcnotes ?? selectedRow.calc_notes ?? selectedRow.CalcNotes ?? '') !== ''
-                    ? String(selectedRow.calcnotes ?? selectedRow.calc_notes ?? selectedRow.CalcNotes ?? '').trim()
-                    : '—'}
-                </span>
+                <CalcNotesRichText
+                  text={String(selectedRow.calcnotes ?? selectedRow.calc_notes ?? selectedRow.CalcNotes ?? '')}
+                />
               </div>
             )}
             <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
@@ -1538,7 +1897,29 @@ function InspectContent() {
               <tfoot>
                 <tr>
                   <td colSpan={4} className="px-2 py-1.5" />
-                  <td className="align-top px-2 py-1.5">
+                  <td className="align-top px-2 py-1.5" colSpan={2}>
+                    <div className="mb-3 flex flex-col gap-2 rounded border border-zinc-200 bg-zinc-50/80 px-2 py-2 dark:border-zinc-600 dark:bg-zinc-800/40">
+                      <label className="flex cursor-pointer items-center gap-2 text-sm text-zinc-800 dark:text-zinc-200">
+                        <input
+                          type="checkbox"
+                          checked={excludedFromSummaries}
+                          onChange={(e) => setExcludedFromSummaries(e.target.checked)}
+                          className="rounded border-zinc-300 dark:border-zinc-600"
+                        />
+                        <span>Exclude from summaries</span>
+                      </label>
+                      <div>
+                        <label className="mb-1 block text-xs font-medium text-zinc-500">Exclude notes (optional)</label>
+                        <textarea
+                          value={excludednotes}
+                          onChange={(e) => setExcludednotes(e.target.value.slice(0, 250))}
+                          placeholder="Why this job is excluded from daily/season rollups…"
+                          rows={2}
+                          maxLength={250}
+                          className="w-full min-w-[12rem] rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+                        />
+                      </div>
+                    </div>
                     <div className="flex items-end gap-2">
                       <div className="min-w-0 flex-1">
                         <label className="mb-1 block text-xs font-medium text-zinc-500">Comment (what you changed)</label>
@@ -1568,6 +1949,8 @@ function InspectContent() {
                                 step4oride: stepOverrides.step4oride || null,
                                 step5oride: stepOverrides.step5oride || null,
                                 steporidecomment: steporidecomment || null,
+                                excluded: excludedFromSummaries ? 1 : 0,
+                                excludednotes: excludednotes.trim() ? excludednotes.trim().slice(0, 250) : null,
                               }),
                             });
                             const data = await res.json().catch(() => ({}));
@@ -1592,6 +1975,9 @@ function InspectContent() {
                               });
                               const c = s.steporidecomment;
                               setSteporidecomment(c != null && String(c).trim() !== '' ? String(c) : '');
+                              setExcludedFromSummaries(Number(s.excluded) === 1);
+                              const en = s.excludednotes;
+                              setExcludednotes(en != null && String(en) !== '' ? String(en).slice(0, 250) : '');
                             }
                             await refreshJobRowFromApi(selectedRow.job_id);
                             setSaveOverridesStatus('saved');
@@ -1608,7 +1994,7 @@ function InspectContent() {
                       </button>
                     </div>
                   </td>
-                  <td colSpan={2} className="px-2 py-1.5" />
+                  <td className="px-2 py-1.5" />
                 </tr>
               </tfoot>
             </table>
@@ -1902,6 +2288,62 @@ function InspectContent() {
                           })}
                         </tbody>
                       </table>
+                    </div>
+                    <div className="mt-2 flex flex-wrap items-center gap-4">
+                      <span className="text-sm text-zinc-500">
+                        Showing {(trackingPage - 1) * trackingPageSize + 1}–{(trackingPage - 1) * trackingPageSize + trackingRows.length} of {trackingTotal}
+                      </span>
+                      <label className="flex items-center gap-2 text-sm">
+                        <span className="text-zinc-500">Per page</span>
+                        <select
+                          value={trackingPageSize}
+                          onChange={(e) => { setTrackingPageSize(Number(e.target.value)); setTrackingPage(1); }}
+                          className="rounded border border-zinc-300 bg-white px-2 py-1 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+                        >
+                          {[25, 50, 100, 200].map((n) => (
+                            <option key={n} value={n}>{n}</option>
+                          ))}
+                        </select>
+                      </label>
+                      <span className="flex items-center gap-1 text-sm">
+                        <button
+                          type="button"
+                          disabled={trackingPage <= 1 || trackingLoading}
+                          onClick={() => setTrackingPage((p) => Math.max(1, p - 1))}
+                          className="rounded border border-zinc-300 bg-white px-2 py-1 text-sm disabled:opacity-50 dark:border-zinc-600 dark:bg-zinc-800"
+                        >
+                          Prev
+                        </button>
+                        <span className="px-2 text-zinc-600 dark:text-zinc-400">Page {trackingPage} of {Math.max(1, Math.ceil(trackingTotal / trackingPageSize))}</span>
+                        <button
+                          type="button"
+                          disabled={trackingPage >= Math.ceil(trackingTotal / trackingPageSize) || trackingLoading}
+                          onClick={() => setTrackingPage((p) => p + 1)}
+                          className="rounded border border-zinc-300 bg-white px-2 py-1 text-sm disabled:opacity-50 dark:border-zinc-600 dark:bg-zinc-800"
+                        >
+                          Next
+                        </button>
+                      </span>
+                      <label className="flex items-center gap-2 text-sm">
+                        <span className="text-zinc-500">Sort by</span>
+                        <select
+                          value={trackingSortCol}
+                          onChange={(e) => setTrackingSortCol(e.target.value)}
+                          className="rounded border border-zinc-300 bg-white px-2 py-1 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+                        >
+                          {TRACKING_DISPLAY_COLUMNS.map((col) => (
+                            <option key={col} value={col}>{formatColumnLabel(col)}</option>
+                          ))}
+                        </select>
+                        <select
+                          value={trackingSortDir}
+                          onChange={(e) => setTrackingSortDir(e.target.value as 'asc' | 'desc')}
+                          className="rounded border border-zinc-300 bg-white px-2 py-1 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+                        >
+                          <option value="asc">Ascending</option>
+                          <option value="desc">Descending</option>
+                        </select>
+                      </label>
                     </div>
                   </>
                 )}

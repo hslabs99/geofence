@@ -3,7 +3,8 @@ import { execute } from '@/lib/db';
 
 /**
  * POST: Save manual step overrides (orides) and recalc actuals.
- * Body: job_id, step1oride..step5oride (nullable string), steporidecomment (nullable string).
+ * Body: job_id, step1oride..step5oride (nullable string), steporidecomment (nullable string),
+ * excluded (0 | 1 | boolean), excludednotes (optional string, max 250).
  * Updates oride columns; for each step where oride is present, sets step_N_actual_time = oride and step_N_via = 'ORIDE'.
  * Steps with no oride keep existing step_N_actual_time and step_N_via.
  */
@@ -21,6 +22,18 @@ export async function POST(request: Request) {
     const step5oride = body.step5oride != null && body.step5oride !== '' ? String(body.step5oride).trim() : null;
     const steporidecomment = body.steporidecomment != null ? String(body.steporidecomment) : null;
 
+    const exRaw = body?.excluded;
+    const excluded =
+      exRaw === true || exRaw === 1 || exRaw === '1'
+        ? 1
+        : exRaw === false || exRaw === 0 || exRaw === '0' || exRaw == null || exRaw === ''
+          ? 0
+          : Number(exRaw) === 1
+            ? 1
+            : 0;
+    const notesRaw = body?.excludednotes != null ? String(body.excludednotes) : '';
+    const excludednotes = notesRaw.trim() === '' ? null : notesRaw.trim().slice(0, 250);
+
     // Pass orides as text so PostgreSQL deduces one type; use ::text in CASE and cast to timestamp only when assigning.
     // Match job_id with trim so client string matches DB text/numeric job_id consistently.
     const rowCount = await execute(
@@ -31,6 +44,8 @@ export async function POST(request: Request) {
         step4oride = CASE WHEN $4::text IS NOT NULL AND trim($4::text) <> '' THEN ($4::text)::timestamp ELSE NULL END,
         step5oride = CASE WHEN $5::text IS NOT NULL AND trim($5::text) <> '' THEN ($5::text)::timestamp ELSE NULL END,
         steporidecomment = $6,
+        excluded = $8,
+        excludednotes = $9,
         step_1_actual_time = CASE WHEN $1::text IS NOT NULL AND trim($1::text) <> '' THEN ($1::text)::timestamp ELSE step_1_actual_time END,
         step_1_via = CASE WHEN $1::text IS NOT NULL AND trim($1::text) <> '' THEN 'ORIDE' ELSE step_1_via END,
         step_2_actual_time = CASE WHEN $2::text IS NOT NULL AND trim($2::text) <> '' THEN ($2::text)::timestamp ELSE step_2_actual_time END,
@@ -42,7 +57,17 @@ export async function POST(request: Request) {
         step_5_actual_time = CASE WHEN $5::text IS NOT NULL AND trim($5::text) <> '' THEN ($5::text)::timestamp ELSE step_5_actual_time END,
         step_5_via = CASE WHEN $5::text IS NOT NULL AND trim($5::text) <> '' THEN 'ORIDE' ELSE step_5_via END
       WHERE trim(job_id::text) = trim($7::text)`,
-      [step1oride ?? null, step2oride ?? null, step3oride ?? null, step4oride ?? null, step5oride ?? null, steporidecomment ?? null, jobId]
+      [
+        step1oride ?? null,
+        step2oride ?? null,
+        step3oride ?? null,
+        step4oride ?? null,
+        step5oride ?? null,
+        steporidecomment ?? null,
+        jobId,
+        excluded,
+        excludednotes,
+      ]
     );
 
     if (rowCount === 0) {
@@ -62,6 +87,8 @@ export async function POST(request: Request) {
         step4oride,
         step5oride,
         steporidecomment,
+        excluded,
+        excludednotes,
       },
     });
   } catch (err) {

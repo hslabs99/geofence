@@ -12,8 +12,10 @@ function excelDateToSql(d: Date): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
-function normalizeHeader(h: string): string {
+/** Normalize sheet/CSV header: BOM strip, case-insensitive, collapse spaces. */
+export function normalizeHeader(h: string): string {
   const s = String(h ?? '')
+    .replace(/^\uFEFF/, '')
     .trim()
     .toLowerCase()
     .replace(/\s+/g, ' ')
@@ -22,15 +24,44 @@ function normalizeHeader(h: string): string {
   return s;
 }
 
+function effectiveVworkHeaderToColumn(headerToColumn?: Record<string, string>): Record<string, string> {
+  if (headerToColumn === undefined) return HEADER_TO_COLUMN;
+  return headerToColumn;
+}
+
+/**
+ * Normalized CSV/XLSX header names that appear in the file but have no mapping (ignored; not inserted).
+ */
+export function collectUnmappedCsvHeaderNorms(
+  rows: Record<string, string | undefined>[],
+  headerToColumn?: Record<string, string>
+): string[] {
+  const h2c = effectiveVworkHeaderToColumn(headerToColumn);
+  const seen = new Set<string>();
+  for (const r of rows) {
+    for (const headerKey of Object.keys(r)) {
+      const norm = normalizeHeader(headerKey);
+      if (!norm) continue;
+      if (h2c[norm] === undefined) seen.add(norm);
+    }
+  }
+  return [...seen].sort();
+}
+
 /**
  * Convert raw header -> value record to mapped column -> value.
  * Planned Duration (hrs) -> planned_duration_mins: multiply by 60.
  */
+/**
+ * @param headerToColumn — Omit for full `HEADER_TO_COLUMN`. Pass an explicit map (even `{}`) after
+ *   `filterHeaderToColumnByMappingTargets`; never fall back to defaults when an object is passed — otherwise
+ *   empty filters would re-enable every hardcoded column (e.g. `field_notes`).
+ */
 export function mapRow(
   row: Record<string, string | undefined>,
-  headerToColumn: Record<string, string> = HEADER_TO_COLUMN
+  headerToColumn?: Record<string, string>
 ): MappedRow {
-  const h2c = Object.keys(headerToColumn).length ? headerToColumn : HEADER_TO_COLUMN;
+  const h2c = headerToColumn === undefined ? HEADER_TO_COLUMN : headerToColumn;
   const mapped: MappedRow = {};
   for (const [header, value] of Object.entries(row)) {
     const norm = normalizeHeader(header);
@@ -124,7 +155,11 @@ export async function parseFile(
   buffer: Buffer,
   filename: string,
   headerToColumn?: Record<string, string>
-): Promise<{ mapped: MappedRow[]; raw: Record<string, unknown>[] }> {
+): Promise<{
+  mapped: MappedRow[];
+  raw: Record<string, unknown>[];
+  unmappedCsvHeaders: string[];
+}> {
   const lower = filename.toLowerCase();
   let rows: Record<string, string | undefined>[];
 
@@ -139,9 +174,9 @@ export async function parseFile(
   const mapped: MappedRow[] = [];
   const raw: Record<string, unknown>[] = [];
 
-  const h2c = headerToColumn ?? {};
+  const unmappedCsvHeaders = collectUnmappedCsvHeaderNorms(rows, headerToColumn);
   for (const r of rows) {
-    const m = mapRow(r, h2c);
+    const m = mapRow(r, headerToColumn);
     if (Object.keys(m).length === 0) continue;
     const rawRow: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(r)) {
@@ -151,7 +186,7 @@ export async function parseFile(
     raw.push(rawRow);
   }
 
-  return { mapped, raw };
+  return { mapped, raw, unmappedCsvHeaders };
 }
 
 /**

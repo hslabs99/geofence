@@ -1,6 +1,15 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
+import { haversineMeters } from '@/lib/haversine-meters';
+import { formatColumnLabel, formatDateNZ } from '@/lib/utils';
+
+function isIsoDateString(v: unknown): v is string {
+  return typeof v === 'string' && /^\d{4}-\d{2}-\d{2}/.test(v);
+}
+
+/** Same column set as Inspect → GPS table (raw/entry_exit data rows). */
+const TRACKING_DISPLAY_COLUMNS = ['device_name', 'fence_name', 'geofence_type', 'position_time_nz', 'position_time', 'lat', 'lon'] as const;
 
 type GpsMapping = {
   id: number;
@@ -58,6 +67,13 @@ export default function GpsMappingsPage() {
   const [trackingRows, setTrackingRows] = useState<TrackingRow[]>([]);
   const [trackingLoading, setTrackingLoading] = useState(false);
   const [trackingError, setTrackingError] = useState<string | null>(null);
+
+  const formatGpsCell = useCallback((v: unknown): string => {
+    if (v == null || v === '') return '—';
+    if (isIsoDateString(v)) return formatDateNZ(String(v));
+    if (typeof v === 'number' && !Number.isNaN(v)) return String(v);
+    return String(v);
+  }, []);
 
   const vwnameOptions = newRow.type === 'Winery'
     ? options?.deliveryWineries ?? []
@@ -893,45 +909,57 @@ export default function GpsMappingsPage() {
               {!trackingLoading && !trackingError && trackingRows.length > 0 && (
                 <div className="overflow-x-auto max-h-[28rem] overflow-y-auto">
                   <table className="min-w-full border-collapse text-left text-xs">
-                    <thead className="sticky top-0 bg-zinc-100 dark:bg-zinc-800">
+                    <thead className="sticky top-0 z-10 bg-zinc-100 dark:bg-zinc-800">
                       <tr className="border-b border-zinc-200 dark:border-zinc-700">
-                        <th className="px-2 py-1.5 font-medium text-zinc-700 dark:text-zinc-300">position_time</th>
-                        <th className="px-2 py-1.5 font-medium text-zinc-700 dark:text-zinc-300">position_time_nz</th>
-                        <th className="px-2 py-1.5 font-medium text-zinc-700 dark:text-zinc-300">device_name</th>
-                        <th className="px-2 py-1.5 font-medium text-zinc-700 dark:text-zinc-300">fence_name</th>
-                        <th className="px-2 py-1.5 font-medium text-zinc-700 dark:text-zinc-300">geofence_type</th>
-                        <th className="px-2 py-1.5 font-medium text-zinc-700 dark:text-zinc-300 text-right">lat</th>
-                        <th className="px-2 py-1.5 font-medium text-zinc-700 dark:text-zinc-300 text-right">lon</th>
-                        <th className="px-2 py-1.5 font-medium text-zinc-700 dark:text-zinc-300 text-center">Map</th>
+                        {TRACKING_DISPLAY_COLUMNS.map((col) => (
+                          <th key={col} className="whitespace-nowrap px-2 py-1.5 font-medium text-zinc-700 dark:text-zinc-300">
+                            {formatColumnLabel(col)}
+                          </th>
+                        ))}
+                        <th className="whitespace-nowrap px-2 py-1.5 font-medium text-zinc-700 dark:text-zinc-300">Distance (m)</th>
+                        <th className="whitespace-nowrap px-2 py-1.5 font-medium text-zinc-700 dark:text-zinc-300">Map</th>
                       </tr>
                     </thead>
                     <tbody className="text-zinc-700 dark:text-zinc-300">
-                      {trackingRows.map((r, i) => (
-                        <tr key={i} className="border-b border-zinc-100 dark:border-zinc-800 hover:bg-zinc-50 dark:hover:bg-zinc-800/50">
-                          <td className="whitespace-nowrap px-2 py-1 font-mono text-zinc-800 dark:text-zinc-200">{r.position_time ?? '—'}</td>
-                          <td className="whitespace-nowrap px-2 py-1 font-mono text-zinc-800 dark:text-zinc-200">{r.position_time_nz ?? '—'}</td>
-                          <td className="whitespace-nowrap px-2 py-1">{r.device_name ?? '—'}</td>
-                          <td className="whitespace-nowrap px-2 py-1">{r.fence_name ?? '—'}</td>
-                          <td className="whitespace-nowrap px-2 py-1">{r.geofence_type ?? '—'}</td>
-                          <td className="whitespace-nowrap px-2 py-1 text-right font-mono text-zinc-600 dark:text-zinc-400">{r.lat != null ? r.lat : '—'}</td>
-                          <td className="whitespace-nowrap px-2 py-1 text-right font-mono text-zinc-600 dark:text-zinc-400">{r.lon != null ? r.lon : '—'}</td>
-                          <td className="whitespace-nowrap px-2 py-1 text-center">
-                            {r.lat != null && r.lon != null ? (
-                              <a
-                                href={`https://www.google.com/maps?q=${r.lat},${r.lon}`}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                className="text-blue-600 dark:text-blue-400 hover:underline"
-                                title={`Open ${r.lat}, ${r.lon} in Google Maps`}
-                              >
-                                Map
-                              </a>
-                            ) : (
-                              '—'
-                            )}
-                          </td>
-                        </tr>
-                      ))}
+                      {trackingRows.map((r, i) => {
+                        const rec = r as Record<string, unknown>;
+                        const lat = r.lat != null ? Number(r.lat) : NaN;
+                        const lon = r.lon != null ? Number(r.lon) : NaN;
+                        const hasCoords = !Number.isNaN(lat) && !Number.isNaN(lon);
+                        const prev = i > 0 ? trackingRows[i - 1] : null;
+                        const prevLat = prev && prev.lat != null ? Number(prev.lat) : NaN;
+                        const prevLon = prev && prev.lon != null ? Number(prev.lon) : NaN;
+                        const distanceM =
+                          prev && Number.isFinite(prevLat) && Number.isFinite(prevLon) && hasCoords
+                            ? haversineMeters(prevLat, prevLon, lat, lon)
+                            : null;
+                        return (
+                          <tr key={i} className="border-b border-zinc-100 dark:border-zinc-800 hover:bg-zinc-50 dark:hover:bg-zinc-800/50">
+                            {TRACKING_DISPLAY_COLUMNS.map((col) => (
+                              <td key={col} className="whitespace-nowrap px-2 py-1.5 text-zinc-600 dark:text-zinc-400">
+                                {formatGpsCell(rec[col])}
+                              </td>
+                            ))}
+                            <td className="whitespace-nowrap px-2 py-1.5 text-zinc-600 dark:text-zinc-400 tabular-nums">
+                              {distanceM != null ? `${Math.round(distanceM)}` : '—'}
+                            </td>
+                            <td className="whitespace-nowrap px-2 py-1.5">
+                              {hasCoords ? (
+                                <a
+                                  href={`https://www.google.com/maps?q=${lat},${lon}`}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="text-blue-600 underline hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300"
+                                >
+                                  View
+                                </a>
+                              ) : (
+                                <span className="text-zinc-400">—</span>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
                     </tbody>
                   </table>
                 </div>

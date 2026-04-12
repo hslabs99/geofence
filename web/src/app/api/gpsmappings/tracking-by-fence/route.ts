@@ -5,7 +5,7 @@ import { query } from '@/lib/db';
  * GET: Return tbl_tracking rows for a given fence_id (for in-page table on GPS Mappings).
  * Query params: fenceId (required).
  * Returns rows with position_time, position_time_nz, fence_name, geofence_type, lat, lon, device_name.
- * Limit 500.
+ * Sorted by worker (device_name), then position_time_nz. Limit 500.
  */
 export async function GET(request: Request) {
   try {
@@ -35,7 +35,7 @@ export async function GET(request: Request) {
        FROM tbl_tracking t
        LEFT JOIN tbl_geofences g ON g.fence_id = t.geofence_id
        WHERE t.geofence_id = $1
-       ORDER BY t.position_time_nz ASC
+       ORDER BY t.device_name ASC NULLS LAST, t.position_time_nz ASC NULLS LAST
        LIMIT 500`,
       [fenceId]
     );

@@ -1,6 +1,7 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useSearchParams } from 'next/navigation';
 import { formatColumnLabel, formatDateNZ, computeColumnWidths } from '@/lib/utils';
 
 type Row = Record<string, unknown>;
@@ -11,12 +12,15 @@ const TABLE_NAME = 'tbl_vworkjobs';
 const SORT_SETTING_TYPE = 'System';
 const SORT_SETTING_NAME = 'VWsort';
 
-const PRIORITY_COLUMNS = ['job_id', 'planned_start_time', 'truck_id', 'truck_rego'];
+const PRIORITY_COLUMNS = ['job_id', 'planned_start_time', 'truck_id', 'truck_rego', 'step4to5'];
 
 const DATE_COLUMNS = new Set([
   'planned_start_time', 'actual_start_time', 'gps_start_time', 'gps_end_time',
   'step_1_completed_at', 'step_2_completed_at', 'step_3_completed_at', 'step_4_completed_at',
 ]);
+
+/** Server-side date filter columns supported by /api/vworkjobs (columnDateCol / columnDateFrom / columnDateTo). */
+const API_COLUMN_DATE_COLS = new Set(['planned_start_time', 'actual_start_time', 'actual_end_time']);
 
 function isIsoDateString(v: unknown): v is string {
   return typeof v === 'string' && /^\d{4}-\d{2}-\d{2}/.test(v);
@@ -54,9 +58,14 @@ function mergeColumnOrder(apiColumns: string[], saved: string[] | null): string[
   return ordered;
 }
 
-export default function VworkPage() {
+function VworkPageContent() {
+  const searchParams = useSearchParams();
   const [rows, setRows] = useState<Row[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
+  const [dataLoadedOnce, setDataLoadedOnce] = useState(false);
+  const jobFetchGenRef = useRef(0);
+  const [customerOptions, setCustomerOptions] = useState<string[]>([]);
+  const [templateOptions, setTemplateOptions] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [errorDetail, setErrorDetail] = useState<{ hint?: string; code?: string } | null>(null);
   const [dbHealth, setDbHealth] = useState<DbHealth>(null);
@@ -68,6 +77,10 @@ export default function VworkPage() {
   const [dateTo, setDateTo] = useState<string>('');
   const [filterCustomer, setFilterCustomer] = useState<string>('');
   const [filterTemplate, setFilterTemplate] = useState<string>('');
+  /** API: step4to5=0 | step4to5=1 */
+  const [filterStep4to5, setFilterStep4to5] = useState<'0' | '1' | ''>('');
+  /** Step4→5 blocked preset from Data Checks deep link */
+  const [blockedView, setBlockedView] = useState<'normal' | 'rerun' | ''>('');
   const [columnOrder, setColumnOrder] = useState<string[]>([]);
   const [hiddenColumns, setHiddenColumns] = useState<Set<string>>(new Set());
   const [showColumnConfig, setShowColumnConfig] = useState(false);
@@ -177,32 +190,137 @@ export default function VworkPage() {
     setShowColumnConfig(false);
   };
 
-  const dateColumns = useMemo(() => columns.filter((c) => DATE_COLUMNS.has(c)), [columns]);
-
-  const distinctCustomers = useMemo(() => {
-    const set = new Set<string>();
-    for (const row of rows) {
-      const v = row.Customer ?? row.customer;
-      if (v != null && String(v).trim() !== '') set.add(String(v).trim());
-    }
-    return Array.from(set).sort();
-  }, [rows]);
-
-  const distinctTemplates = useMemo(() => {
-    if (!filterCustomer.trim()) return [];
-    const set = new Set<string>();
-    for (const row of rows) {
-      const cust = row.Customer ?? row.customer;
-      if (cust == null || String(cust).trim() !== filterCustomer) continue;
-      const v = row.template;
-      if (v != null && String(v).trim() !== '') set.add(String(v).trim());
-    }
-    return Array.from(set).sort();
-  }, [rows, filterCustomer]);
+  /** Date filters sent to API only support a subset of columns; always offer those before first load. */
+  const dateColumns = useMemo(() => {
+    const fromLoaded = columns.filter((c) => DATE_COLUMNS.has(c) && API_COLUMN_DATE_COLS.has(c));
+    if (fromLoaded.length > 0) return fromLoaded;
+    return ['planned_start_time', 'actual_start_time', 'actual_end_time'];
+  }, [columns]);
 
   useEffect(() => {
-    setFilterTemplate('');
+    fetch('/api/vworkjobs/customers', { cache: 'no-store' })
+      .then((r) => r.json())
+      .then((d) => setCustomerOptions(Array.isArray(d?.customers) ? d.customers : []))
+      .catch(() => setCustomerOptions([]));
+  }, []);
+
+  useEffect(() => {
+    const c = filterCustomer.trim();
+    if (!c) {
+      setTemplateOptions([]);
+      return;
+    }
+    fetch(`/api/vworkjobs/templates?customer=${encodeURIComponent(c)}`, { cache: 'no-store' })
+      .then((r) => r.json())
+      .then((d) => setTemplateOptions(Array.isArray(d?.templates) ? d.templates : []))
+      .catch(() => setTemplateOptions([]));
   }, [filterCustomer]);
+
+  const canLoadVworkJobs = useMemo(() => {
+    if (!filterCustomer.trim()) return false;
+    if (filterTemplate.trim()) return true;
+    if (
+      dateFilterCol &&
+      API_COLUMN_DATE_COLS.has(dateFilterCol) &&
+      (dateFrom.trim().slice(0, 10) !== '' || dateTo.trim().slice(0, 10) !== '')
+    ) {
+      return true;
+    }
+    return false;
+  }, [filterCustomer, filterTemplate, dateFilterCol, dateFrom, dateTo]);
+
+  useEffect(() => {
+    jobFetchGenRef.current += 1;
+    setLoading(false);
+    setRows([]);
+    setError(null);
+    setDataLoadedOnce(false);
+  }, [filterCustomer, filterTemplate, dateFilterCol, dateFrom, dateTo, filterStep4to5, blockedView]);
+
+  const buildVworkJobsParams = useCallback((): URLSearchParams | null => {
+    if (!canLoadVworkJobs) return null;
+    const params = new URLSearchParams();
+    params.set('customer', filterCustomer.trim());
+    if (filterTemplate.trim()) params.set('template', filterTemplate.trim());
+    if (filterStep4to5 === '0' || filterStep4to5 === '1') params.set('step4to5', filterStep4to5);
+    if (blockedView === 'normal' || blockedView === 'rerun') params.set('blockedView', blockedView);
+    if (dateFilterCol && API_COLUMN_DATE_COLS.has(dateFilterCol)) {
+      const df = dateFrom.trim().slice(0, 10);
+      const dt = dateTo.trim().slice(0, 10);
+      if (df || dt) {
+        params.set('columnDateCol', dateFilterCol);
+        if (df) params.set('columnDateFrom', df);
+        if (dt) params.set('columnDateTo', dt);
+      }
+    }
+    return params;
+  }, [
+    canLoadVworkJobs,
+    filterCustomer,
+    filterTemplate,
+    filterStep4to5,
+    blockedView,
+    dateFilterCol,
+    dateFrom,
+    dateTo,
+  ]);
+
+  const runVworkJobsFetch = useCallback((params: URLSearchParams) => {
+    const gen = ++jobFetchGenRef.current;
+    setLoading(true);
+    fetch(`/api/vworkjobs?${params}`, { cache: 'no-store' })
+      .then(async (res) => {
+        const data = await res.json();
+        if (!res.ok) {
+          setErrorDetail({ hint: data?.hint, code: data?.code });
+          throw new Error(data?.error ?? res.statusText);
+        }
+        return data;
+      })
+      .then((data) => {
+        if (gen !== jobFetchGenRef.current) return;
+        setRows(data.rows ?? []);
+        setError(null);
+        setErrorDetail(null);
+        setDataLoadedOnce(true);
+      })
+      .catch((e) => {
+        if (gen !== jobFetchGenRef.current) return;
+        setError(e.message);
+        setDataLoadedOnce(true);
+      })
+      .finally(() => {
+        if (gen === jobFetchGenRef.current) setLoading(false);
+      });
+  }, []);
+
+  const loadVworkJobs = useCallback(() => {
+    const params = buildVworkJobsParams();
+    if (!params) return;
+    runVworkJobsFetch(params);
+  }, [buildVworkJobsParams, runVworkJobsFetch]);
+
+  const urlHydratedRef = useRef(false);
+  useEffect(() => {
+    if (urlHydratedRef.current) return;
+    urlHydratedRef.current = true;
+    const c = searchParams.get('customer')?.trim() ?? '';
+    const t = searchParams.get('template')?.trim() ?? '';
+    if (c) setFilterCustomer(c);
+    if (t) setFilterTemplate(t);
+    const s45 = searchParams.get('step4to5')?.trim();
+    if (s45 === '0' || s45 === '1') setFilterStep4to5(s45);
+    const bv = searchParams.get('blockedView')?.trim().toLowerCase();
+    if (bv === 'normal' || bv === 'rerun') setBlockedView(bv);
+    const auto = searchParams.get('autoLoad') === '1';
+    if (!auto || !c || !t) return;
+    const params = new URLSearchParams();
+    params.set('customer', c);
+    params.set('template', t);
+    if (s45 === '0' || s45 === '1') params.set('step4to5', s45);
+    if (bv === 'normal' || bv === 'rerun') params.set('blockedView', bv);
+    runVworkJobsFetch(params);
+  }, [searchParams, runVworkJobsFetch]);
 
   const [dragCol, setDragCol] = useState<string | null>(null);
   const [dropTargetCol, setDropTargetCol] = useState<string | null>(null);
@@ -232,25 +350,6 @@ export default function VworkPage() {
     setDragCol(null);
     setDropTargetCol(null);
   };
-
-  useEffect(() => {
-    fetch('/api/vworkjobs')
-      .then(async (res) => {
-        const data = await res.json();
-        if (!res.ok) {
-          setErrorDetail({ hint: data?.hint, code: data?.code });
-          throw new Error(data?.error ?? res.statusText);
-        }
-        return data;
-      })
-      .then((data) => {
-        setRows(data.rows ?? []);
-        setError(null);
-        setErrorDetail(null);
-      })
-      .catch((e) => setError(e.message))
-      .finally(() => setLoading(false));
-  }, []);
 
   const filteredRows = useMemo(() => {
     return rows.filter((row) => {
@@ -343,16 +442,129 @@ export default function VworkPage() {
   return (
     <div className="w-full min-w-0 p-6">
       <h1 className="mb-4 text-2xl font-semibold text-zinc-900 dark:text-zinc-100">tbl_vworkjobs</h1>
-      {loading && <p className="text-zinc-600">Loading…</p>}
       {error && (
-        <div className="rounded bg-red-100 p-3 text-red-800 dark:bg-red-900/30 dark:text-red-200">
+        <div className="mb-4 rounded bg-red-100 p-3 text-red-800 dark:bg-red-900/30 dark:text-red-200">
           <p className="font-medium">{error}</p>
           {errorDetail?.hint && <p className="mt-2 text-sm opacity-90">{errorDetail.hint}</p>}
           {errorDetail?.code && <p className="mt-1 text-xs">Code: {errorDetail.code}</p>}
         </div>
       )}
-      {!loading && !error && rows.length === 0 && <p className="text-zinc-600">No rows.</p>}
-      {!loading && !error && rows.length > 0 && (
+      {loading && <p className="mb-2 text-zinc-600 dark:text-zinc-400">Loading jobs…</p>}
+      <div className="mb-4 flex flex-wrap items-end gap-4 rounded-lg border border-zinc-200 bg-white p-3 dark:border-zinc-700 dark:bg-zinc-900">
+        <div>
+          <label className="mb-1 block text-xs font-medium text-zinc-500">Customer</label>
+          <select
+            value={filterCustomer}
+            onChange={(e) => {
+              setFilterCustomer(e.target.value);
+              setFilterTemplate('');
+            }}
+            className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+          >
+            <option value="">— Select —</option>
+            {customerOptions.map((c) => (
+              <option key={c} value={c}>{c}</option>
+            ))}
+          </select>
+        </div>
+        <div>
+          <label className="mb-1 block text-xs font-medium text-zinc-500">Template</label>
+          <select
+            value={filterTemplate}
+            onChange={(e) => setFilterTemplate(e.target.value)}
+            className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+            disabled={!filterCustomer.trim()}
+          >
+            <option value="">— All —</option>
+            {templateOptions.map((t) => (
+              <option key={t} value={t}>{t}</option>
+            ))}
+          </select>
+        </div>
+        <div>
+          <label className="mb-1 block text-xs font-medium text-zinc-500">step4to5</label>
+          <select
+            value={filterStep4to5}
+            onChange={(e) => setFilterStep4to5((e.target.value === '0' || e.target.value === '1' ? e.target.value : '') as '' | '0' | '1')}
+            className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+            disabled={!filterCustomer.trim()}
+            title="Step4→5 migration flag on tbl_vworkjobs"
+          >
+            <option value="">— All —</option>
+            <option value="0">Not migrated (0)</option>
+            <option value="1">Migrated (1)</option>
+          </select>
+        </div>
+        <div>
+          <label className="mb-1 block text-xs font-medium text-zinc-500">Date column</label>
+          <select
+            value={dateFilterCol}
+            onChange={(e) => setDateFilterCol(e.target.value)}
+            className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+          >
+            <option value="">— None —</option>
+            {dateColumns.map((c) => (
+              <option key={c} value={c}>{formatColumnLabel(c)}</option>
+            ))}
+          </select>
+        </div>
+        <div>
+          <label className="mb-1 block text-xs font-medium text-zinc-500">From</label>
+          <input
+            type="datetime-local"
+            value={dateFrom}
+            onChange={(e) => setDateFrom(e.target.value)}
+            className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+          />
+        </div>
+        <div>
+          <label className="mb-1 block text-xs font-medium text-zinc-500">To</label>
+          <input
+            type="datetime-local"
+            value={dateTo}
+            onChange={(e) => setDateTo(e.target.value)}
+            className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+          />
+        </div>
+        <div>
+          <label className="mb-1 block text-xs font-medium text-zinc-500">Jobs</label>
+          <button
+            type="button"
+            onClick={() => loadVworkJobs()}
+            disabled={!canLoadVworkJobs || loading}
+            className="rounded bg-blue-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50 dark:bg-blue-700 dark:hover:bg-blue-600"
+          >
+            {loading ? 'Loading…' : 'Load'}
+          </button>
+        </div>
+      </div>
+      {blockedView && (
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-950 dark:border-amber-700 dark:bg-amber-950/40 dark:text-amber-100">
+          <span>
+            <strong>Blocked filter</strong> (Step4→5){' '}
+            {blockedView === 'normal'
+              ? '— step4to5 = 0 but step_4 is not Job Completed, or step_5 name is Job Completed, or step_5_completed_at is set (normal Fix skips these).'
+              : '— step4to5 = 1 but not the done layout (step_4 Arrive Winery + step_5 Job Completed).'}
+          </span>
+          <button
+            type="button"
+            onClick={() => setBlockedView('')}
+            className="shrink-0 rounded border border-amber-600 px-2 py-1 text-xs font-medium hover:bg-amber-100 dark:border-amber-500 dark:hover:bg-amber-900/50"
+          >
+            Clear blocked filter
+          </button>
+        </div>
+      )}
+      {!dataLoadedOnce && !loading && (
+        <p className="mb-4 text-sm text-zinc-500 dark:text-zinc-400">
+          Select a customer, then choose a template or set a date column (planned/actual start or end) with from/to, then click Load. Nothing is fetched until you load.
+          Optional: filter by <code className="rounded bg-zinc-200 px-1 text-xs dark:bg-zinc-700">step4to5</code>. Open blocked rows from Data Checks → Step4→5 via the metrics table.
+        </p>
+      )}
+      {dataLoadedOnce && rows.length === 0 && !loading && !error && (
+        <p className="mb-4 text-zinc-600 dark:text-zinc-400">No rows match.</p>
+      )}
+      {rows.length > 0 && (
         <>
           <div className="mb-4 flex flex-wrap items-end gap-4 rounded-lg border border-zinc-200 bg-white p-3 dark:border-zinc-700 dark:bg-zinc-900">
             <div>
@@ -446,50 +658,6 @@ export default function VworkPage() {
                 </>
               )}
             </div>
-            <div>
-              <label className="mb-1 block text-xs font-medium text-zinc-500">Customer</label>
-              <select
-                value={filterCustomer}
-                onChange={(e) => setFilterCustomer(e.target.value)}
-                className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800"
-              >
-                <option value="">— All —</option>
-                {distinctCustomers.map((c) => <option key={c} value={c}>{c}</option>)}
-              </select>
-            </div>
-            <div>
-              <label className="mb-1 block text-xs font-medium text-zinc-500">Template</label>
-              <select
-                value={filterTemplate}
-                onChange={(e) => setFilterTemplate(e.target.value)}
-                className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800"
-                disabled={!filterCustomer}
-              >
-                <option value="">— All —</option>
-                {distinctTemplates.map((t) => <option key={t} value={t}>{t}</option>)}
-              </select>
-            </div>
-            <div>
-              <label className="mb-1 block text-xs font-medium text-zinc-500">Date column</label>
-              <select
-                value={dateFilterCol}
-                onChange={(e) => setDateFilterCol(e.target.value)}
-                className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800"
-              >
-                <option value="">— None —</option>
-                {dateColumns.map((c) => <option key={c} value={c}>{formatColumnLabel(c)}</option>)}
-              </select>
-            </div>
-            <div>
-              <label className="mb-1 block text-xs font-medium text-zinc-500">From</label>
-              <input type="datetime-local" value={dateFrom} onChange={(e) => setDateFrom(e.target.value)}
-                className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800" />
-            </div>
-            <div>
-              <label className="mb-1 block text-xs font-medium text-zinc-500">To</label>
-              <input type="datetime-local" value={dateTo} onChange={(e) => setDateTo(e.target.value)}
-                className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800" />
-            </div>
           </div>
           <div className="max-h-[56rem] overflow-auto rounded-lg border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900">
             <table className="w-max table-fixed text-left text-sm">
@@ -530,9 +698,12 @@ export default function VworkPage() {
               </tbody>
             </table>
           </div>
-          <p className="mt-3 text-zinc-500">
+          <p className="mt-3 text-zinc-500 dark:text-zinc-400">
             {sortedRows.length} row{sortedRows.length !== 1 ? 's' : ''}
-            {(filterCustomer || filterTemplate || dateFilterCol) && ` (filtered from ${rows.length})`} · all jobs from API
+            {(filterCustomer || filterTemplate || dateFilterCol) && rows.length !== sortedRows.length
+              ? ` (client filter ${sortedRows.length} of ${rows.length} loaded)`
+              : ''}{' '}
+            · loaded with current API filters
           </p>
         </>
       )}
@@ -548,5 +719,13 @@ export default function VworkPage() {
         {debugInfo !== null && <pre className="mt-2 overflow-auto rounded bg-zinc-100 p-2 text-xs dark:bg-zinc-800">{JSON.stringify(debugInfo, null, 2)}</pre>}
       </section>
     </div>
+  );
+}
+
+export default function VworkPage() {
+  return (
+    <Suspense fallback={<div className="w-full min-w-0 p-6 text-zinc-500 dark:text-zinc-400">Loading…</div>}>
+      <VworkPageContent />
+    </Suspense>
   );
 }

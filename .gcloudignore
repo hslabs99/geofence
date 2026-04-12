@@ -3,3 +3,6 @@
 node_modules
 .env
 *.log
+
+# Next.js app — not part of geodata-import; .next/dev/lock breaks gcloud upload if dev server is running
+web/

@@ -410,6 +410,14 @@ export default function Sidebar() {
               Data Checks
             </Link>
             <Link
+              href="/admin/rules-notes"
+              className={`rounded px-3 py-2 text-sm ${
+                pathname === '/admin/rules-notes' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
+              }`}
+            >
+              Rules notes
+            </Link>
+            <Link
               href="/admin/import-geofences"
               className={`rounded px-3 py-2 text-sm ${
                 pathname === '/admin/import-geofences' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
@@ -432,6 +440,14 @@ export default function Sidebar() {
               }`}
             >
               Winery Minutes
+            </Link>
+            <Link
+              href="/admin/distances"
+              className={`rounded px-3 py-2 text-sm ${
+                pathname === '/admin/distances' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
+              }`}
+            >
+              Distances
             </Link>
             <Link
               href="/admin/settings"

@@ -8,7 +8,7 @@ import { query, execute } from '@/lib/db';
 import { runStateMachine, type ScanRow, type TagUpdate } from './stateMachine';
 import { taggingRange } from './dateWindow';
 
-const ALGO_VERSION = '2.0';
+const ALGO_VERSION = '2.1';
 
 const DEFAULT_BUFFER_HOURS = 1;
 

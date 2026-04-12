@@ -11,13 +11,24 @@ import {
   updateImportFileSuccess,
   updateImportFileError,
   upsertVworkJob,
+  getTblVworkjobsColumns,
+  getVworkMappingDbcolumnNames,
+  buildVworkAllowedInsertColumns,
+  stripMappedVworkRowToAllowedColumns,
+  enforceVworkMappedRowMappingTargetsOnly,
   insertGpsDataRow,
   insertTrackingRow,
   insertLog,
   type TrackingMappedRow,
 } from './db';
 import { listImportableFiles, listAuto2026Files, listTrackFiles, downloadFile } from './drive';
+import { filterHeaderToColumnByMappingTargets } from './mapping';
 import { parseFile, parseFileForGpsData, parseFileForTracking } from './parser';
+import {
+  vworkLoadsizeBackfillList,
+  vworkLoadsizeBackfillProcessFile,
+  vworkLoadsizeBackfillSampleScan,
+} from './vwork-loadsize-backfill';
 
 const app = express();
 app.use(express.json());
@@ -26,7 +37,21 @@ const PORT = parseInt(process.env.PORT ?? '8080', 10);
 
 const DEFAULT_DRIVE_FOLDER_ID = '1EcWF7MEx6hi3unN4TTh9z7PuUyiZTgZD';
 
-type ResultItem = { file: string; status: string; rows?: number; error?: string };
+type ResultItem = {
+  file: string;
+  status: string;
+  rows?: number;
+  error?: string;
+  /** Mapped export columns not stored: not on `tbl_vworkjobs` or dropped after PG 42703 during this run. */
+  omittedDbColumns?: string[];
+  /** CSV headers (normalized) with no mapping — values ignored. */
+  unmappedCsvHeaders?: string[];
+  /** `dbcolumnname` in tbl_mappings (VW) with no column on the server table yet. */
+  mappingTargetsMissingFromTable?: string[];
+  /** Rows that failed after parse (DB/other); other rows in the file still commit. */
+  rowFailureCount?: number;
+  rowFailureSamples?: { row: number; error: string }[];
+};
 
 app.get('/health', (_req: Request, res: Response) => {
   res.json({ ok: true });
@@ -107,6 +132,15 @@ async function runVworkImport(folderIdParam?: string): Promise<{ ok: boolean; re
       return { ok: true, results: [{ file: '(none)', status: 'no_files', rows: 0 }] };
     }
     const mappings = await getMappings(client, 'VW');
+    const mappingDbcolumnNames = await getVworkMappingDbcolumnNames(client);
+    /** Mutable copy: 42703 may drop a name for the rest of the run (same as table column set). */
+    const mappingColsForRun = new Set(mappingDbcolumnNames);
+    const vworkTableColumns = await getTblVworkjobsColumns(client);
+    /** tbl_mappings targets ∩ physical columns (mutable if INSERT hits 42703). */
+    const allowedColsForRun = buildVworkAllowedInsertColumns(mappingDbcolumnNames, vworkTableColumns);
+    const mappingTargetsMissingFromTable = [...mappingDbcolumnNames]
+      .filter((c) => !vworkTableColumns.has(c))
+      .sort();
     const results: ResultItem[] = [];
 
     for (const file of files) {
@@ -122,25 +156,99 @@ async function runVworkImport(folderIdParam?: string): Promise<{ ok: boolean; re
         await insertLog(client, 'Import', 'VW', file.name, JSON.stringify({ status: 'opening' }));
         logger.file({ filename: file.name, driveFileId: file.id }, 'parse start');
         const buffer = await downloadFile(file.id);
-        const { mapped, raw } = await parseFile(buffer, file.name, mappings.headerToColumn);
+        /** Only `tbl_mappings` (VW): no hardcoded HEADER_TO_COLUMN merge — unknown CSV headers are ignored. */
+        const h2c = filterHeaderToColumnByMappingTargets(
+          mappings.headerToColumn,
+          mappingDbcolumnNames
+        );
+        const { mapped, raw, unmappedCsvHeaders } = await parseFile(buffer, file.name, h2c);
         logger.file({ filename: file.name, rowCount: mapped.length, sampleHeaders: mapped[0] ? Object.keys(mapped[0]) : [] }, 'parse done');
-        const batchnumber = await getNextBatchNumber(client);
-        let inserted = 0;
-        for (let i = 0; i < mapped.length; i++) {
-          try {
-            if (await upsertVworkJob(client, mapped[i], raw[i], batchnumber, mappings.columnMaxLengths)) inserted++;
-          } catch (err) {
-            logger.row(
-              { filename: file.name, rowIndex: i + 1, pk: mapped[i]?.Job_Id ?? mapped[i]?.job_id, raw_preview: raw[i] },
-              `row failed: ${err instanceof Error ? err.message : String(err)}`
-            );
-            throw err;
+        for (const row of mapped) {
+          enforceVworkMappedRowMappingTargetsOnly(row, mappingDbcolumnNames);
+        }
+        const allMappedKeysFromFile = new Set<string>();
+        for (const row of mapped) {
+          for (const k of Object.keys(row)) {
+            const low = k.toLowerCase();
+            if (low === 'batchnumber' || low === 'raw_row') continue;
+            allMappedKeysFromFile.add(low);
           }
         }
+        for (const row of mapped) {
+          stripMappedVworkRowToAllowedColumns(row, allowedColsForRun);
+        }
+        const batchnumber = await getNextBatchNumber(client);
+        let inserted = 0;
+        let rowFailureCount = 0;
+        const rowFailureSamples: { row: number; error: string }[] = [];
+        const MAX_FAILURE_SAMPLES = 40;
+        for (let i = 0; i < mapped.length; i++) {
+          const sp = `vwr_${i}`;
+          await client.query(`SAVEPOINT ${sp}`);
+          try {
+            const ok = await upsertVworkJob(
+              client,
+              mapped[i]!,
+              raw[i]!,
+              batchnumber,
+              allowedColsForRun,
+              mappingColsForRun,
+              mappings.columnMaxLengths
+            );
+            if (ok) inserted++;
+            await client.query(`RELEASE SAVEPOINT ${sp}`);
+          } catch (err) {
+            await client.query(`ROLLBACK TO SAVEPOINT ${sp}`);
+            await client.query(`RELEASE SAVEPOINT ${sp}`);
+            rowFailureCount += 1;
+            const msg = err instanceof Error ? err.message : String(err);
+            logger.row(
+              {
+                filename: file.name,
+                rowIndex: i + 1,
+                pk: mapped[i]?.Job_Id ?? mapped[i]?.job_id,
+                raw_preview: raw[i],
+              },
+              `row skipped: ${msg}`
+            );
+            if (rowFailureSamples.length < MAX_FAILURE_SAMPLES) {
+              rowFailureSamples.push({ row: i + 1, error: msg });
+            }
+          }
+        }
+        const omittedDbColumns = [...allMappedKeysFromFile]
+          .filter((k) => !allowedColsForRun.has(k))
+          .sort();
         await updateImportFileSuccess(client, file.id, inserted, batchnumber);
-        await insertLog(client, 'Import', 'VW', file.name, JSON.stringify({ rows: inserted, status: 'processed', batchnumber }));
+        await insertLog(
+          client,
+          'Import',
+          'VW',
+          file.name,
+          JSON.stringify({
+            rows: inserted,
+            status: 'processed',
+            batchnumber,
+            ...(omittedDbColumns.length ? { omittedDbColumns } : {}),
+            ...(unmappedCsvHeaders.length ? { unmappedCsvHeaders } : {}),
+            ...(mappingTargetsMissingFromTable.length
+              ? { mappingTargetsMissingFromTable }
+              : {}),
+            ...(rowFailureCount ? { rowFailureCount, rowFailureSamples } : {}),
+          })
+        );
         await client.query('COMMIT');
-        results.push({ file: file.name, status: 'processed', rows: inserted });
+        results.push({
+          file: file.name,
+          status: 'processed',
+          rows: inserted,
+          ...(omittedDbColumns.length ? { omittedDbColumns } : {}),
+          ...(unmappedCsvHeaders.length ? { unmappedCsvHeaders } : {}),
+          ...(mappingTargetsMissingFromTable.length
+            ? { mappingTargetsMissingFromTable }
+            : {}),
+          ...(rowFailureCount ? { rowFailureCount, rowFailureSamples } : {}),
+        });
       } catch (err) {
         await client.query('ROLLBACK').catch(() => {});
         const msg = err instanceof Error ? err.message : String(err);
@@ -372,6 +480,75 @@ app.post('/import/vwork', async (req: Request, res: Response) => {
       return;
     }
     res.json(out);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    res.status(500).json({ error: msg });
+  }
+});
+
+/**
+ * One-off / admin: re-scan all Drive export CSVs (ignores import_file skip) and UPDATE only loadsize
+ * for rows where Customer contains "indevin" (case-insensitive).
+ * POST JSON { action: "list" | "file" | "sample", driveFolderId?: string, fileIndex?: number, maxRows?: number }
+ */
+app.post('/import/vwork-backfill-loadsize', async (req: Request, res: Response) => {
+  try {
+    const body = (req.body ?? {}) as {
+      action?: string;
+      driveFolderId?: string;
+      fileIndex?: number;
+      maxRows?: number;
+      maxFiles?: number;
+    };
+    const folderId =
+      typeof body.driveFolderId === 'string' && body.driveFolderId.trim()
+        ? body.driveFolderId.trim()
+        : process.env.DRIVE_FOLDER_ID ?? DEFAULT_DRIVE_FOLDER_ID;
+
+    if (body.action === 'list') {
+      const out = await vworkLoadsizeBackfillList(folderId);
+      if ('error' in out) {
+        res.status(400).json(out);
+        return;
+      }
+      res.json(out);
+      return;
+    }
+
+    if (body.action === 'file') {
+      const idx = body.fileIndex;
+      if (idx == null || !Number.isInteger(idx)) {
+        res.status(400).json({ error: 'fileIndex (integer) is required when action is "file"' });
+        return;
+      }
+      const out = await vworkLoadsizeBackfillProcessFile(folderId, idx);
+      if ('error' in out) {
+        res.status(400).json(out);
+        return;
+      }
+      res.json(out);
+      return;
+    }
+
+    if (body.action === 'sample') {
+      const rawMax = body.maxRows;
+      const maxRows =
+        typeof rawMax === 'number' && Number.isFinite(rawMax) ? Math.floor(rawMax) : 15_000;
+      const rawMaxFiles = body.maxFiles;
+      const maxFiles =
+        typeof rawMaxFiles === 'number' && Number.isFinite(rawMaxFiles)
+          ? Math.floor(rawMaxFiles)
+          : undefined;
+      const out = await vworkLoadsizeBackfillSampleScan(folderId, maxRows, maxFiles);
+      if ('error' in out) {
+        res.status(400).json(out);
+        return;
+      }
+      res.json(out);
+      return;
+    }
+
+    res.status(400).json({ error: 'action must be "list", "file", or "sample"' });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     res.status(500).json({ error: msg });

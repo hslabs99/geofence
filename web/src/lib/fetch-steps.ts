@@ -12,12 +12,31 @@
 
 /**
  * Add deltaMinutes to a timestamp string. Input and output are YYYY-MM-DD HH:mm:ss (or ISO with T).
- * Uses only string parsing and arithmetic — no Date, no timezone, no UTC. Raw times only.
+ * Uses string parsing + UTC instant arithmetic for the numeric core (same as before).
+ *
+ * Never use `.replace('T', ' ')` on arbitrary strings — that turns `Thu...` into ` hu...` and
+ * `.slice(0, 19)` then yields garbage for PostgreSQL (`invalid input syntax for type timestamp`).
  */
 export function addMinutesToRawNZ(ts: string, deltaMinutes: number): string {
-  const s = String(ts).trim().replace('T', ' ').slice(0, 19);
+  const trimmed = String(ts).trim();
+  let s: string;
+  const iso = trimmed.match(/^(\d{4})-(\d{2})-(\d{2})[T\s](\d{2}):(\d{2}):(\d{2})/);
+  if (iso) {
+    s = `${iso[1]}-${iso[2]}-${iso[3]} ${iso[4]}:${iso[5]}:${iso[6]}`;
+  } else if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(trimmed)) {
+    s = trimmed.slice(0, 19);
+  } else {
+    const noTz = trimmed.replace(/\s+(?:GMT|UTC)[+-]\d{3,4}.*$/i, '').trim();
+    const d = new Date(noTz);
+    if (Number.isNaN(d.getTime())) {
+      return trimmed;
+    }
+    const pad = (n: number) => String(n).padStart(2, '0');
+    s = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  }
+
   const m = s.match(/^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2}):(\d{2})$/);
-  if (!m) return s;
+  if (!m) return trimmed;
   const [, yStr, moStr, dStr, hStr, minStr, secStr] = m;
   const year = parseInt(yStr!, 10);
   const month = parseInt(moStr!, 10);
@@ -98,8 +117,12 @@ export function mapApiStepViaToDisplay(code: string | undefined | null): string 
       return 'GPS';
     case 'VineFence+':
       return 'GPS+';
+    case 'VineFenceV+':
+      return 'GPS+V';
     case 'GPS*':
       return 'GPS*';
+    case 'VineSR1':
+      return 'VineSR1';
     case 'ORIDE':
       return 'Manual';
     case 'RULE':

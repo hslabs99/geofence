@@ -1,13 +1,33 @@
 'use client';
 
-import React, { Suspense, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import React, { Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import Link from 'next/link';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { useViewMode } from '@/contexts/ViewModeContext';
 import { useSummaryHistory } from '@/contexts/SummaryHistoryContext';
 import { getSummaryHistoryEntry, type SummaryHistoryPayload } from '@/lib/summary-history-storage';
+import SummaryDataAuditPivot from '@/components/SummaryDataAuditPivot';
+import { formatIntNz } from '@/lib/format-nz';
 
 type Row = Record<string, unknown>;
+
+/** Integer table/chart display; null/NaN → em dash. */
+function fmtNz(n: number | null | undefined): string {
+  if (n == null || (typeof n === 'number' && Number.isNaN(n))) return '—';
+  return formatIntNz(n);
+}
+
+function sortVineyardNames(arr: readonly string[]): string[] {
+  return [...new Set(arr.map((x) => String(x).trim()).filter(Boolean))].sort((a, b) => a.localeCompare(b));
+}
+
+/** Summary rollups and job counts: excluded=1 omits job (still visible on By Job). */
+function includedInRollup(row: Row): boolean {
+  const ex = row.excluded;
+  if (ex == null || ex === '') return true;
+  return Number(ex) !== 1;
+}
 
 const SORT_SETTING_TYPE = 'System';
 const SORT_SETTING_NAME = 'SummarySort';
@@ -27,6 +47,7 @@ const BY_JOB_LEAD_COLUMNS = [
   { key: 'job_id', label: 'Job ID' },
   { key: 'worker', label: 'Worker' },
   { key: 'trailermode', label: 'TT' },
+  { key: 'loadsize', label: 'Load' },
   { key: 'limits_breached', label: 'Limits' },
   { key: 'delivery_winery', label: 'Winery' },
   { key: 'vineyard_name', label: 'Vineyard' },
@@ -112,6 +133,57 @@ function totalMins(row: Row): number | null {
   return (m2 ?? 0) + (m3 ?? 0) + (m4 ?? 0) + (m5 ?? 0);
 }
 
+/** Same quad math as season rollup (empty → av 0). */
+function rollupQuadFromValues(values: number[]): { total: number; max: number; min: number; av: number } {
+  const valid = values.filter((v) => v != null && !Number.isNaN(v));
+  const n = valid.length;
+  const total = valid.reduce((a, b) => a + b, 0);
+  return {
+    total,
+    max: n ? Math.max(...valid) : 0,
+    min: n ? Math.min(...valid) : 0,
+    av: n ? Math.round(total / n) : 0,
+  };
+}
+
+/** T / TT for season average charts; TTT and unknown → other (excluded from T / TT / T+TT average charts). */
+function jobTrailerChartBucket(row: Row): 'T' | 'TT' | 'other' {
+  const raw = (row.trailermode ?? row.trailertype ?? '').toString().trim().toUpperCase().replace(/\s+/g, '');
+  if (raw === 'TT' || raw === 'T_T' || raw === 'T+T' || raw === 'T&T') return 'TT';
+  if (raw === 'T') return 'T';
+  return 'other';
+}
+
+function jobIsTOrTT(row: Row): boolean {
+  const b = jobTrailerChartBucket(row);
+  return b === 'T' || b === 'TT';
+}
+
+/** Per-job average AVs for Travel / In Vineyard / In Winery / Total (for bar charts). */
+function seasonChartAverageAvs(jobs: Row[]) {
+  const travelVals = jobs.map((row) => travelMins(row)).filter((v): v is number => v != null);
+  const m3 = jobs.map((row) => minsBetween(row, 2, 3)).filter((v): v is number => v != null);
+  const m5 = jobs.map((row) => minsBetween(row, 4, 5)).filter((v): v is number => v != null);
+  const tot = jobs.map((row) => totalMins(row)).filter((v): v is number => v != null);
+  const tq = rollupQuadFromValues(travelVals);
+  const q3 = rollupQuadFromValues(m3);
+  const q5 = rollupQuadFromValues(m5);
+  const qt = rollupQuadFromValues(tot);
+  return { travel: tq.av, inVineyard: q3.av, inWinery: q5.av, total: qt.av };
+}
+
+type SeasonChartAvs = ReturnType<typeof seasonChartAverageAvs>;
+
+/** True when T vs TT average bars match on all four phases (cloned limits / identical rollups). */
+function seasonChartAvsEqual(a: SeasonChartAvs, b: SeasonChartAvs): boolean {
+  return (
+    a.travel === b.travel &&
+    a.inVineyard === b.inVineyard &&
+    a.inWinery === b.inWinery &&
+    a.total === b.total
+  );
+}
+
 /** Row-level outlier flag on Job ID / Daily date (not per-cell; keeps limit reds on cells). */
 const SUMMARY_OUTLIER_RED = 'bg-red-200 text-red-900 dark:bg-red-900/40 dark:text-red-200';
 const SUMMARY_OUTLIER_YELLOW = 'bg-yellow-200 text-yellow-900 dark:bg-yellow-900/35 dark:text-yellow-100';
@@ -140,6 +212,8 @@ function timeOutlierSeverity(values: number[]): 'red' | 'yellow' | null {
 
 type RollupQuads = {
   jobs: Row[];
+  /** Jobs included in minute rollups (for By Day outlier / empty checks). */
+  rollupJobCount?: number;
   mins_2: { total: number; max: number; min: number; av: number };
   mins_3: { total: number; max: number; min: number; av: number };
   mins_4: { total: number; max: number; min: number; av: number };
@@ -149,7 +223,8 @@ type RollupQuads = {
 };
 
 function dayRollupOutlierSeverity(r: RollupQuads): 'red' | 'yellow' | null {
-  if (r.jobs.length === 0) return null;
+  const rollN = r.rollupJobCount ?? r.jobs.filter(includedInRollup).length;
+  if (rollN === 0) return null;
   const keys = ['mins_2', 'mins_3', 'mins_4', 'mins_5', 'travel', 'total'] as const;
   const vals: number[] = [];
   for (const k of keys) {
@@ -169,6 +244,350 @@ function footerStatsOutlierSeverity(
     vals.push(q.total, q.max, q.min, q.av);
   }
   return timeOutlierSeverity(vals);
+}
+
+/** Season charts: bar order Travel → Vineyard → Winery → Total. */
+const SEASON_PHASE_BAR_FILLS = ['rgb(34 197 94)', 'rgb(234 179 8)', 'rgb(239 68 68)', 'rgb(59 130 246)'] as const;
+
+function seasonBarChartSpecs(travel: number, inVineyard: number, inWinery: number, total: number) {
+  return [
+    { label: 'Travel', value: travel, fill: SEASON_PHASE_BAR_FILLS[0] },
+    { label: 'In Vineyard', value: inVineyard, fill: SEASON_PHASE_BAR_FILLS[1] },
+    { label: 'In Winery', value: inWinery, fill: SEASON_PHASE_BAR_FILLS[2] },
+    { label: 'Total', value: total, fill: SEASON_PHASE_BAR_FILLS[3] },
+  ];
+}
+
+/** Integer % of total mins for Travel / Vineyard / Winery; always sums to 100 (largest remainder). */
+function phaseMinutesPercents(
+  travel: number,
+  inVineyard: number,
+  inWinery: number,
+  totalMins: number,
+): [number, number, number] {
+  if (totalMins <= 0) return [0, 0, 0];
+  const raw = [travel, inVineyard, inWinery].map((p) => (p / totalMins) * 100);
+  const floors = raw.map((r) => Math.floor(r));
+  let remainder = 100 - floors.reduce((s, t) => s + t, 0);
+  const order = [0, 1, 2].sort((i, j) => raw[j] - floors[j] - (raw[i] - floors[i]));
+  const out: [number, number, number] = [floors[0], floors[1], floors[2]];
+  for (let r = 0; r < remainder; r++) {
+    out[order[r]]++;
+  }
+  return out;
+}
+
+function SeasonSummaryBarSvg({
+  bars,
+  title,
+  /** When set (e.g. split season), all charts in the row use this max so bar heights are comparable. */
+  valueMax,
+  /** Smaller SVG for stacked T / TT / Both average charts (~75% scale via viewBox). */
+  compact,
+  /** Same length as bars: integer % of total mins (Total mins bars only); null = minutes only. */
+  barPercents,
+}: {
+  bars: ReturnType<typeof seasonBarChartSpecs>;
+  title: string;
+  valueMax?: number;
+  compact?: boolean;
+  barPercents?: (number | null)[];
+}) {
+  const barMax = valueMax != null && valueMax > 0 ? valueMax : Math.max(...bars.map((b) => b.value), 1);
+  return (
+    <div className={`flex w-full flex-col items-center gap-1 ${compact ? 'min-w-0' : ''}`}>
+      <span
+        className={`text-center font-medium leading-tight text-zinc-600 dark:text-zinc-400 ${compact ? 'text-[10px] md:text-[11px]' : 'text-xs'}`}
+      >
+        {title}
+      </span>
+      <svg
+        width={compact ? undefined : 320}
+        height={compact ? undefined : 180}
+        viewBox="0 0 320 180"
+        preserveAspectRatio="xMidYMid meet"
+        className={
+          compact
+            ? 'h-[min(32vw,118px)] w-full sm:h-[min(30vw,128px)] md:h-[min(28vw,142px)]'
+            : 'max-w-full overflow-visible'
+        }
+      >
+        <line x1={40} y1={140} x2={300} y2={140} stroke="rgb(161 161 170)" strokeWidth={1} />
+        <line x1={40} y1={20} x2={40} y2={140} stroke="rgb(161 161 170)" strokeWidth={1} />
+        {bars.map((b, i) => {
+          const x = 50 + i * 68;
+          const h = barMax > 0 ? (b.value / barMax) * 100 : 0;
+          const pct = barPercents?.[i];
+          /** With phase %: bold % above bar, minutes in brackets below. Minutes-only charts: single value line. */
+          const pctY = pct != null ? 124 - h : 135 - h;
+          const minsY = pct != null ? 136 - h : 135 - h;
+          return (
+            <g key={b.label}>
+              <rect x={x} y={140 - h} width={48} height={h} fill={b.fill} stroke="rgb(255 255 255)" strokeWidth={1} />
+              <text x={x + 24} y={155} textAnchor="middle" className="fill-zinc-600 text-[10px] font-medium dark:fill-zinc-400">
+                {b.label}
+              </text>
+              {pct != null ? (
+                <>
+                  <text
+                    x={x + 24}
+                    y={pctY}
+                    textAnchor="middle"
+                    className="fill-zinc-900 text-[11px] font-bold dark:fill-zinc-100"
+                  >
+                    {pct}%
+                  </text>
+                  <text
+                    x={x + 24}
+                    y={minsY}
+                    textAnchor="middle"
+                    className="fill-zinc-500 text-[9px] font-medium dark:fill-zinc-400"
+                  >
+                    ({formatIntNz(b.value)})
+                  </text>
+                </>
+              ) : (
+                <text x={x + 24} y={135 - h} textAnchor="middle" className="fill-zinc-800 text-[10px] font-medium dark:fill-zinc-200">
+                  {formatIntNz(b.value)}
+                </text>
+              )}
+            </g>
+          );
+        })}
+      </svg>
+    </div>
+  );
+}
+
+function SeasonSummaryPieBlock({
+  travel,
+  inVineyard,
+  inWinery,
+  totalMins,
+  title,
+}: {
+  travel: number;
+  inVineyard: number;
+  inWinery: number;
+  totalMins: number;
+  title: string;
+}) {
+  const size = 200;
+  const cx = size / 2;
+  const cy = size / 2;
+  const r = size / 2 - 4;
+  const pieSum = travel + inVineyard + inWinery;
+  const denomPct = totalMins > 0 ? totalMins : pieSum;
+  const [pctTravel, pctVineyard, pctWinery] = phaseMinutesPercents(travel, inVineyard, inWinery, denomPct);
+  const pieSegments =
+    pieSum > 0
+      ? [
+          {
+            start: 0,
+            sweep: (travel / pieSum) * 360,
+            fill: 'rgb(34 197 94)',
+            pct: pctTravel,
+            mins: travel,
+          },
+          {
+            start: (travel / pieSum) * 360,
+            sweep: (inVineyard / pieSum) * 360,
+            fill: 'rgb(234 179 8)',
+            pct: pctVineyard,
+            mins: inVineyard,
+          },
+          {
+            start: ((travel + inVineyard) / pieSum) * 360,
+            sweep: (inWinery / pieSum) * 360,
+            fill: 'rgb(239 68 68)',
+            pct: pctWinery,
+            mins: inWinery,
+          },
+        ]
+      : [];
+  const labelR = r * 0.58;
+  return (
+    <div className="flex w-full flex-col items-center gap-1">
+      <span className="text-center text-xs font-medium text-zinc-600 dark:text-zinc-400">{title}</span>
+      <span className="text-center text-[11px] text-zinc-500 dark:text-zinc-400">Travel + Vineyard + Winery = total mins</span>
+      <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} className="overflow-visible">
+        {pieSum <= 0 ? (
+          <circle cx={cx} cy={cy} r={r} fill="rgb(228 228 231)" stroke="rgb(161 161 170)" strokeWidth={1} />
+        ) : (
+          pieSegments.map((seg, i) => {
+            const startDeg = seg.start - 90;
+            const endDeg = startDeg + seg.sweep;
+            const x1 = cx + r * Math.cos((startDeg * Math.PI) / 180);
+            const y1 = cy + r * Math.sin((startDeg * Math.PI) / 180);
+            const x2 = cx + r * Math.cos((endDeg * Math.PI) / 180);
+            const y2 = cy + r * Math.sin((endDeg * Math.PI) / 180);
+            const large = seg.sweep > 180 ? 1 : 0;
+            const d = `M ${cx} ${cy} L ${x1} ${y1} A ${r} ${r} 0 ${large} 1 ${x2} ${y2} Z`;
+            const midDeg = startDeg + seg.sweep / 2;
+            const midRad = (midDeg * Math.PI) / 180;
+            const lx = cx + labelR * Math.cos(midRad);
+            const ly = cy + labelR * Math.sin(midRad);
+            const showSlicePct = seg.sweep >= 14;
+            const yellowSlice = i === 1;
+            const pctFill = yellowSlice ? '#18181b' : '#fafafa';
+            const pctStroke = yellowSlice ? 'rgba(255,255,255,0.55)' : 'rgba(0,0,0,0.35)';
+            const minsFill = yellowSlice ? '#3f3f46' : 'rgba(250,250,250,0.9)';
+            const minsStroke = yellowSlice ? 'rgba(255,255,255,0.45)' : 'rgba(0,0,0,0.3)';
+            return (
+              <g key={i}>
+                <path d={d} fill={seg.fill} stroke="rgb(255 255 255)" strokeWidth={1} />
+                {showSlicePct && (
+                  <>
+                    <text
+                      x={lx}
+                      y={ly - 5}
+                      textAnchor="middle"
+                      dominantBaseline="middle"
+                      fill={pctFill}
+                      stroke={pctStroke}
+                      strokeWidth={0.45}
+                      paintOrder="stroke fill"
+                      fontSize={12}
+                      fontWeight={700}
+                      className="pointer-events-none"
+                    >
+                      {seg.pct}%
+                    </text>
+                    <text
+                      x={lx}
+                      y={ly + 8}
+                      textAnchor="middle"
+                      dominantBaseline="middle"
+                      fill={minsFill}
+                      stroke={minsStroke}
+                      strokeWidth={0.3}
+                      paintOrder="stroke fill"
+                      fontSize={9}
+                      fontWeight={500}
+                      className="pointer-events-none"
+                    >
+                      ({formatIntNz(seg.mins)})
+                    </text>
+                  </>
+                )}
+              </g>
+            );
+          })
+        )}
+        <circle cx={cx} cy={cy} r={r} fill="none" stroke="rgb(161 161 170)" strokeWidth={1} />
+      </svg>
+      <div className="flex flex-wrap justify-center gap-3 text-xs">
+        <span className="flex flex-wrap items-baseline gap-x-1 gap-y-0">
+          <span className="inline-block h-3 w-3 shrink-0 rounded-sm bg-green-500" />
+          <span className="text-zinc-600 dark:text-zinc-400">Travel:</span>{' '}
+          <span className="font-bold text-zinc-900 dark:text-zinc-100">{pctTravel}%</span>{' '}
+          <span className="text-zinc-500 dark:text-zinc-400">({formatIntNz(travel)})</span>
+        </span>
+        <span className="flex flex-wrap items-baseline gap-x-1 gap-y-0">
+          <span className="inline-block h-3 w-3 shrink-0 rounded-sm bg-yellow-500" />
+          <span className="text-zinc-600 dark:text-zinc-400">In Vineyard:</span>{' '}
+          <span className="font-bold text-zinc-900 dark:text-zinc-100">{pctVineyard}%</span>{' '}
+          <span className="text-zinc-500 dark:text-zinc-400">({formatIntNz(inVineyard)})</span>
+        </span>
+        <span className="flex flex-wrap items-baseline gap-x-1 gap-y-0">
+          <span className="inline-block h-3 w-3 shrink-0 rounded-sm bg-red-500" />
+          <span className="text-zinc-600 dark:text-zinc-400">In Winery:</span>{' '}
+          <span className="font-bold text-zinc-900 dark:text-zinc-100">{pctWinery}%</span>{' '}
+          <span className="text-zinc-500 dark:text-zinc-400">({formatIntNz(inWinery)})</span>
+        </span>
+        <span className="flex flex-wrap items-baseline gap-x-1">
+          <span className="text-zinc-600 dark:text-zinc-400">Total:</span>{' '}
+          {denomPct > 0 ? (
+            <>
+              <span className="font-bold text-zinc-900 dark:text-zinc-100">100%</span>{' '}
+              <span className="text-zinc-500 dark:text-zinc-400">({formatIntNz(totalMins)})</span>
+            </>
+          ) : (
+            <span className="text-zinc-500 dark:text-zinc-400">—</span>
+          )}
+        </span>
+      </div>
+    </div>
+  );
+}
+
+/** Backgrounds for Over Allowance | Within Allowance | Season chart columns (split mode). */
+const SEASON_CHART_COLUMN_BG: [string, string, string] = [
+  'rounded-lg bg-zinc-50 px-2 py-4 ring-1 ring-inset ring-zinc-200/90 dark:bg-zinc-800/45 dark:ring-zinc-600/50 md:px-3',
+  'rounded-lg bg-white px-2 py-4 ring-1 ring-inset ring-zinc-200/70 dark:bg-zinc-900 dark:ring-zinc-700/70 md:px-3',
+  'rounded-lg bg-zinc-100/90 px-2 py-4 ring-1 ring-inset ring-zinc-200/90 dark:bg-zinc-800/60 dark:ring-zinc-600/50 md:px-3',
+];
+
+/** One column: T | TT | Average Total bars in one row → total pie → total bars (Season tab). Hides Average T when T and TT averages match on all four phases (clone). */
+function SeasonSummaryChartColumn({
+  rowType,
+  jobs,
+  travel,
+  mins_3,
+  mins_5,
+  total,
+  sharedAvgBarMax,
+  /** 0 = Over Allowance, 1 = Within Allowance, 2 = Season total — alternating panel background when split. */
+  columnStripeIndex,
+}: {
+  rowType: string;
+  jobs: Row[];
+  travel: { total: number; av: number };
+  mins_3: { total: number; av: number };
+  mins_5: { total: number; av: number };
+  total: { total: number; av: number };
+  /** Same vertical scale for every average bar (all columns × T / TT / Both). */
+  sharedAvgBarMax?: number;
+  columnStripeIndex?: number;
+}) {
+  const jobsT = jobs.filter((j) => jobTrailerChartBucket(j) === 'T');
+  const jobsTT = jobs.filter((j) => jobTrailerChartBucket(j) === 'TT');
+  const jobsTPlusTT = jobs.filter(jobIsTOrTT);
+  const avT = seasonChartAverageAvs(jobsT);
+  const avTT = seasonChartAverageAvs(jobsTT);
+  const avBoth = seasonChartAverageAvs(jobsTPlusTT);
+  const hideDuplicateTAvg = seasonChartAvsEqual(avT, avTT);
+  const barsT = seasonBarChartSpecs(avT.travel, avT.inVineyard, avT.inWinery, avT.total);
+  const barsTT = seasonBarChartSpecs(avTT.travel, avTT.inVineyard, avTT.inWinery, avTT.total);
+  const barsBoth = seasonBarChartSpecs(avBoth.travel, avBoth.inVineyard, avBoth.inWinery, avBoth.total);
+  const totBars = seasonBarChartSpecs(travel.total, mins_3.total, mins_5.total, total.total);
+  const denomTot =
+    total.total > 0 ? total.total : travel.total + mins_3.total + mins_5.total;
+  let totBarPercents: (number | null)[] = [null, null, null, null];
+  if (denomTot > 0) {
+    const [a, b, c] = phaseMinutesPercents(travel.total, mins_3.total, mins_5.total, denomTot);
+    totBarPercents = [a, b, c, 100];
+  }
+  const stripeClass =
+    columnStripeIndex != null ? SEASON_CHART_COLUMN_BG[columnStripeIndex % SEASON_CHART_COLUMN_BG.length] : '';
+  return (
+    <div
+      className={`flex min-w-0 flex-col items-center gap-5 border-b border-zinc-200 pb-8 last:border-b-0 dark:border-zinc-700 md:border-b-0 md:pb-0 ${stripeClass}`}
+    >
+      <span className="text-sm font-semibold text-zinc-800 dark:text-zinc-200">{rowType}</span>
+      <div className="flex w-full max-w-full flex-row flex-nowrap items-start justify-center gap-0.5 sm:gap-1">
+        {!hideDuplicateTAvg && (
+          <div className="min-w-0 flex-[1_1_0]" title="Average minutes per job — T (truck only)">
+            <SeasonSummaryBarSvg bars={barsT} title="Average T" valueMax={sharedAvgBarMax} compact />
+          </div>
+        )}
+        <div className="min-w-0 flex-[1_1_0]" title="Average minutes per job — TT (truck & trailer)">
+          <SeasonSummaryBarSvg bars={barsTT} title="Average TT" valueMax={sharedAvgBarMax} compact />
+        </div>
+        <div className="min-w-0 flex-[1_1_0]" title="Average minutes per job — T + TT combined">
+          <SeasonSummaryBarSvg bars={barsBoth} title="Average Total" valueMax={sharedAvgBarMax} compact />
+        </div>
+      </div>
+      <SeasonSummaryPieBlock
+        travel={travel.total}
+        inVineyard={mins_3.total}
+        inWinery={mins_5.total}
+        totalMins={total.total}
+        title="Total mins (pie)"
+      />
+      <SeasonSummaryBarSvg bars={totBars} title="Total mins (bars)" barPercents={totBarPercents} />
+    </div>
+  );
 }
 
 function compare(a: unknown, b: unknown): number {
@@ -209,6 +628,43 @@ function inspectUrlForRow(row: Row): string {
   return `/query/inspect?${params.toString()}`;
 }
 
+function timeLimitRowTravelVal(r: {
+  ToVineMins?: number | null;
+  ToWineMins?: number | null;
+}): number | null {
+  const toV = r.ToVineMins != null ? Number(r.ToVineMins) : null;
+  const toW = r.ToWineMins != null ? Number(r.ToWineMins) : null;
+  if (toV == null && toW == null) return null;
+  return (toV ?? 0) + (toW ?? 0);
+}
+
+/** Same limits + grouping as another row (compare without TT) — for hiding duplicate T when TT exists. */
+function timeLimitRowComparableKey(r: {
+  Customer?: string | null;
+  Template?: string | null;
+  Winery?: string | null;
+  vineyardgroup?: string | null;
+  ToVineMins?: number | null;
+  InVineMins?: number | null;
+  ToWineMins?: number | null;
+  InWineMins?: number | null;
+  TotalMins?: number | null;
+}): string {
+  const tv = timeLimitRowTravelVal(r);
+  return [
+    String(r.Customer ?? '').trim(),
+    String(r.Template ?? '').trim(),
+    String(r.Winery ?? '').trim(),
+    String(r.vineyardgroup ?? '').trim(),
+    r.ToVineMins ?? '',
+    r.InVineMins ?? '',
+    r.ToWineMins ?? '',
+    r.InWineMins ?? '',
+    r.TotalMins ?? '',
+    tv ?? '',
+  ].join('\u0001');
+}
+
 function SummaryPageInner() {
   const [rows, setRows] = useState<Row[]>([]);
   const [loading, setLoading] = useState(true);
@@ -234,10 +690,26 @@ function SummaryPageInner() {
   clientCustomerLockedRef.current = clientCustomerLocked;
   /** Customer always mirrors sidebar selection (single source of truth; avoids disconnect in admin/super). */
   const effectiveCustomer = clientCustomer;
-  const [summaryTab, setSummaryTab] = useState<'season' | 'by_day' | 'by_job'>('season');
+  const [summaryTab, setSummaryTab] = useState<'season' | 'by_day' | 'by_job' | 'data_audit'>('season');
   const [filterWinery, setFilterWinery] = useState('');
   const [filterVineyardGroup, setFilterVineyardGroup] = useState('');
-  const [filterVineyard, setFilterVineyard] = useState('');
+  const [filterVineyards, setFilterVineyards] = useState<string[]>([]);
+  const [vineyardPickerOpen, setVineyardPickerOpen] = useState(false);
+  /** Edits apply to the jobs filter only when the picker closes (outside click or toggle button). */
+  const [vineyardPickerDraft, setVineyardPickerDraft] = useState<string[]>([]);
+  const vineyardPickerDraftRef = useRef<string[]>([]);
+  vineyardPickerDraftRef.current = vineyardPickerDraft;
+  const vineyardPickerAnchorRef = useRef<HTMLDivElement | null>(null);
+  const vineyardPickerPanelRef = useRef<HTMLDivElement | null>(null);
+  /** All vineyard_name values for the customer (from filter-options), independent of vineyard filter — avoids “stuck” list after reload. */
+  const [vineyardOptionsAll, setVineyardOptionsAll] = useState<string[]>([]);
+  const vineyardFilterSet = useMemo(() => new Set(filterVineyards), [filterVineyards]);
+  const vineyardDraftSet = useMemo(() => new Set(vineyardPickerDraft), [vineyardPickerDraft]);
+
+  const commitVineyardPicker = useCallback(() => {
+    setFilterVineyards(sortVineyardNames(vineyardPickerDraftRef.current));
+    setVineyardPickerOpen(false);
+  }, []);
   const [splitByLimits, setSplitByLimits] = useState(false);
   const [minsThresholds, setMinsThresholds] = useState<Record<string, string>>({
     '2': '', '3': '', '4': '', '5': '', travel: '', in_vineyard: '', in_winery: '', total: '',
@@ -260,6 +732,19 @@ function SummaryPageInner() {
     TotalMins?: number | null;
   };
   const [timeLimitRows, setTimeLimitRows] = useState<TimeLimitRow[]>([]);
+  /** Hide T row when a TT row has identical limit columns (visual only). */
+  const timeLimitRowsForTable = useMemo(() => {
+    const rows = timeLimitRows;
+    const ttKeys = new Set<string>();
+    for (const r of rows) {
+      if (String(r.TT ?? '').trim() !== 'TT') continue;
+      ttKeys.add(timeLimitRowComparableKey(r));
+    }
+    return rows.filter((r) => {
+      if (String(r.TT ?? '').trim() !== 'T') return true;
+      return !ttKeys.has(timeLimitRowComparableKey(r));
+    });
+  }, [timeLimitRows]);
   /** When user clicks a Time Limits row, we show that row's limits in the header white boxes (for info only). */
   const [selectedTimeLimitRowId, setSelectedTimeLimitRowId] = useState<number | null>(null);
   /** Show/hide the Time Limits table (can get in the way). */
@@ -321,7 +806,16 @@ function SummaryPageInner() {
     setSummaryTab(s.summaryTab ?? 'season');
     setFilterWinery(s.filterWinery ?? '');
     setFilterVineyardGroup(s.filterVineyardGroup ?? '');
-    setFilterVineyard(s.filterVineyard ?? '');
+    {
+      const legacy = s as SummaryHistoryPayload & { filterVineyard?: string };
+      let fv: string[] = [];
+      if (Array.isArray(legacy.filterVineyards) && legacy.filterVineyards.length > 0) {
+        fv = legacy.filterVineyards.map((x) => String(x).trim()).filter(Boolean);
+      } else if (typeof legacy.filterVineyard === 'string' && legacy.filterVineyard.trim()) {
+        fv = [legacy.filterVineyard.trim()];
+      }
+      setFilterVineyards(fv);
+    }
     setSplitByLimits(Boolean(s.splitByLimits));
     if (s.minsThresholds && typeof s.minsThresholds === 'object') {
       setMinsThresholds((prev) => ({ ...prev, ...s.minsThresholds }));
@@ -350,7 +844,7 @@ function SummaryPageInner() {
       return;
     }
     setJobsPage(0);
-  }, [effectiveCustomer, filterTemplate, filterActualFrom, filterActualTo, filterWinery, filterVineyardGroup, filterVineyard, filterTruckId, filterWorker, filterTrailermode]);
+  }, [effectiveCustomer, filterTemplate, filterActualFrom, filterActualTo, filterWinery, filterVineyardGroup, filterVineyards, filterTruckId, filterWorker, filterTrailermode]);
 
   useEffect(() => {
     const params = new URLSearchParams();
@@ -360,13 +854,16 @@ function SummaryPageInner() {
     if (filterActualTo?.trim()) params.set('dateTo', filterActualTo.trim().slice(0, 10));
     if (filterWinery.trim()) params.set('winery', filterWinery.trim());
     if (filterVineyardGroup.trim()) params.set('vineyard_group', filterVineyardGroup.trim());
-    if (filterVineyard.trim()) params.set('vineyard', filterVineyard.trim());
+    for (const v of filterVineyards) {
+      const t = v.trim();
+      if (t) params.append('vineyard', t);
+    }
     if (filterTruckId.trim()) params.set('truck_id', filterTruckId.trim());
     if (filterWorker.trim()) params.set('worker', filterWorker.trim());
     if (filterTrailermode.trim()) params.set('trailermode', filterTrailermode.trim());
     /** Full result set for rollups; By Job tab paginates client-side (was capped at 500 rows server-side). */
     setLoading(true);
-    fetch(`/api/vworkjobs?${params}`)
+    fetch(`/api/vworkjobs?${params}`, { cache: 'no-store' })
       .then(async (res) => {
         const data = await res.json();
         if (!res.ok) throw new Error(data?.error ?? res.statusText);
@@ -388,7 +885,66 @@ function SummaryPageInner() {
       })
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false));
-  }, [effectiveCustomer, filterTemplate, filterActualFrom, filterActualTo, filterWinery, filterVineyardGroup, filterVineyard, filterTruckId, filterWorker, filterTrailermode]);
+  }, [effectiveCustomer, filterTemplate, filterActualFrom, filterActualTo, filterWinery, filterVineyardGroup, filterVineyards, filterTruckId, filterWorker, filterTrailermode]);
+
+  useEffect(() => {
+    if (!vineyardPickerOpen) return;
+    const onDocClick = (e: MouseEvent) => {
+      const t = e.target as Node | null;
+      if (!t) return;
+      if (vineyardPickerAnchorRef.current?.contains(t)) return;
+      if (vineyardPickerPanelRef.current?.contains(t)) return;
+      commitVineyardPicker();
+    };
+    document.addEventListener('click', onDocClick);
+    return () => document.removeEventListener('click', onDocClick);
+  }, [vineyardPickerOpen, commitVineyardPicker]);
+
+  useEffect(() => {
+    const c = effectiveCustomer.trim();
+    if (!c) {
+      setVineyardOptionsAll([]);
+      return;
+    }
+    let cancelled = false;
+    fetch(`/api/vworkjobs/filter-options?${new URLSearchParams({ customer: c })}`, { cache: 'no-store' })
+      .then((r) => r.json())
+      .then((data) => {
+        if (cancelled || data?.error) return;
+        const names = data?.vineyardNames;
+        if (Array.isArray(names)) {
+          setVineyardOptionsAll(
+            names.map((x: unknown) => String(x).trim()).filter((s: string) => s !== ''),
+          );
+        } else {
+          setVineyardOptionsAll([]);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setVineyardOptionsAll([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [effectiveCustomer]);
+
+  /** Picker list: every vineyard for the customer, plus any saved/draft picks not in that list. */
+  const vineyardPickerOptions = useMemo(() => {
+    const set = new Set<string>();
+    for (const v of vineyardOptionsAll) {
+      const t = String(v).trim();
+      if (t) set.add(t);
+    }
+    for (const v of filterVineyards) {
+      const t = String(v).trim();
+      if (t) set.add(t);
+    }
+    for (const v of vineyardPickerDraft) {
+      const t = String(v).trim();
+      if (t) set.add(t);
+    }
+    return Array.from(set).sort((a, b) => a.localeCompare(b));
+  }, [vineyardOptionsAll, filterVineyards, vineyardPickerDraft]);
 
   /** Keep latest Summary state for sidebar history when navigating away from /query/summary. */
   useEffect(() => {
@@ -406,7 +962,7 @@ function SummaryPageInner() {
       summaryTab,
       filterWinery,
       filterVineyardGroup,
-      filterVineyard,
+      filterVineyards,
       splitByLimits,
       minsThresholds: { ...minsThresholds },
       selectedTimeLimitRowId,
@@ -431,7 +987,7 @@ function SummaryPageInner() {
     summaryTab,
     filterWinery,
     filterVineyardGroup,
-    filterVineyard,
+    filterVineyards,
     splitByLimits,
     minsThresholds,
     selectedTimeLimitRowId,
@@ -471,9 +1027,10 @@ function SummaryPageInner() {
         const v = (row as Record<string, unknown>).vineyard_group;
         if (v == null || String(v).trim() !== filterVineyardGroup) continue;
       }
-      if (filterVineyard) {
+      if (filterVineyards.length > 0) {
         const v = row.vineyard_name;
-        if (v == null || String(v).trim() !== filterVineyard) continue;
+        const s = v == null ? '' : String(v).trim();
+        if (!vineyardFilterSet.has(s)) continue;
       }
       if (filterTruckId) {
         const v = row.truck_id;
@@ -494,7 +1051,7 @@ function SummaryPageInner() {
       if (w != null && String(w).trim() !== '') set.add(String(w).trim());
     }
     return Array.from(set).sort();
-  }, [rows, effectiveCustomer, filterTemplate, filterWinery, filterVineyardGroup, filterVineyard, filterTruckId, filterActualFrom, filterActualTo]);
+  }, [rows, effectiveCustomer, filterTemplate, filterWinery, filterVineyardGroup, filterVineyards, vineyardFilterSet, filterTruckId, filterActualFrom, filterActualTo]);
 
   /** Distinct trailermode values in the current summary result set (same filters as distinctWorkers). */
   const distinctTrailermodes = useMemo(() => {
@@ -516,9 +1073,10 @@ function SummaryPageInner() {
         const v = (row as Record<string, unknown>).vineyard_group;
         if (v == null || String(v).trim() !== filterVineyardGroup) continue;
       }
-      if (filterVineyard) {
+      if (filterVineyards.length > 0) {
         const v = row.vineyard_name;
-        if (v == null || String(v).trim() !== filterVineyard) continue;
+        const s = v == null ? '' : String(v).trim();
+        if (!vineyardFilterSet.has(s)) continue;
       }
       if (filterTruckId) {
         const v = row.truck_id;
@@ -539,16 +1097,7 @@ function SummaryPageInner() {
       if (t != null && String(t).trim() !== '') set.add(String(t).trim());
     }
     return Array.from(set).sort();
-  }, [rows, effectiveCustomer, filterTemplate, filterWinery, filterVineyardGroup, filterVineyard, filterTruckId, filterActualFrom, filterActualTo]);
-
-  const distinctCustomers = useMemo(() => {
-    const set = new Set<string>();
-    for (const row of rows) {
-      const v = row.Customer ?? row.customer;
-      if (v != null && String(v).trim() !== '') set.add(String(v).trim());
-    }
-    return Array.from(set).sort();
-  }, [rows]);
+  }, [rows, effectiveCustomer, filterTemplate, filterWinery, filterVineyardGroup, filterVineyards, vineyardFilterSet, filterTruckId, filterActualFrom, filterActualTo]);
 
   /** Templates only for the effective customer (template dropdown is dependent on customer). */
   const distinctTemplates = useMemo(() => {
@@ -589,19 +1138,6 @@ function SummaryPageInner() {
     return Array.from(set).sort();
   }, [rows, effectiveCustomer]);
 
-  /** Vineyards (vineyard_name) only for the effective customer. */
-  const distinctVineyards = useMemo(() => {
-    if (!effectiveCustomer.trim()) return [];
-    const set = new Set<string>();
-    for (const row of rows) {
-      const cust = row.Customer ?? row.customer;
-      if (cust == null || String(cust).trim() !== effectiveCustomer) continue;
-      const v = row.vineyard_name;
-      if (v != null && String(v).trim() !== '') set.add(String(v).trim());
-    }
-    return Array.from(set).sort();
-  }, [rows, effectiveCustomer]);
-
   /**
    * Clear template, winery, … when the *user* changes customer in the sidebar.
    * Skip: (1) once after session restore; (2) transition empty → non-empty (Client: refreshUser runs after
@@ -627,7 +1163,9 @@ function SummaryPageInner() {
     setFilterTemplate('');
     setFilterWinery('');
     setFilterVineyardGroup('');
-    setFilterVineyard('');
+    setFilterVineyards([]);
+    setVineyardPickerDraft([]);
+    setVineyardPickerOpen(false);
     setFilterWorker('');
     setFilterTrailermode('');
   }, [effectiveCustomer]);
@@ -718,9 +1256,10 @@ function SummaryPageInner() {
         const v = (row as Record<string, unknown>).vineyard_group;
         if (v == null || String(v).trim() !== filterVineyardGroup) return false;
       }
-      if (filterVineyard) {
+      if (filterVineyards.length > 0) {
         const v = row.vineyard_name;
-        if (v == null || String(v).trim() !== filterVineyard) return false;
+        const s = v == null ? '' : String(v).trim();
+        if (!vineyardFilterSet.has(s)) return false;
       }
       if (filterTruckId) {
         const v = row.truck_id;
@@ -748,7 +1287,7 @@ function SummaryPageInner() {
       }
       return true;
     });
-  }, [rows, effectiveCustomer, filterTemplate, filterWinery, filterVineyardGroup, filterVineyard, filterTruckId, filterWorker, filterTrailermode, filterActualFrom, filterActualTo]);
+  }, [rows, effectiveCustomer, filterTemplate, filterWinery, filterVineyardGroup, filterVineyards, vineyardFilterSet, filterTruckId, filterWorker, filterTrailermode, filterActualFrom, filterActualTo]);
 
   /** Find the time limit row that matches this job's delivery_winery, vineyard_group, and trailer type (tbl_vworkjobs = tbl_wineryminutes; customer/template already applied to timeLimitRows). Limit row with null/empty vineyardgroup matches any job vineyard_group. If no T or TT row exists for the job's trailermode, fall back to a TTT row (some wineries only have TTT). */
   const getMatchingLimitsRow = (job: Row): TimeLimitRow | null => {
@@ -841,7 +1380,7 @@ function SummaryPageInner() {
 
   type MinsQuad = { total: number; max: number; min: number; av: number };
 
-  /** By Day: one row per day, or when splitByLimits three rows per day (Over Limit, Within Limit, Daily Total). */
+  /** By Day: one row per day, or when splitByLimits three rows per day (Over Allowance, Within Allowance, Daily Total). */
   const rowsByDay = useMemo(() => {
     const { min, max } = dayRange;
     if (min == null || max == null || min > max) return [];
@@ -857,7 +1396,8 @@ function SummaryPageInner() {
       };
     };
     type DayRow = {
-      date: string; dateLabel: string; rowType?: 'Over Limit' | 'Within Limit' | 'Daily Total'; jobs: Row[];
+      date: string; dateLabel: string; rowType?: 'Over Allowance' | 'Within Allowance' | 'Daily Total'; jobs: Row[];
+      rollupJobCount: number;
       mins_2: MinsQuad; mins_3: MinsQuad; mins_4: MinsQuad; mins_5: MinsQuad; travel: MinsQuad; total: MinsQuad;
     };
     const out: DayRow[] = [];
@@ -874,25 +1414,28 @@ function SummaryPageInner() {
       const dateStr = `${y}-${mo}-${day}`;
       const dateLabel = `${day}/${mo}/${String(y).slice(2)}`;
       const dayJobs = sourceRows.filter((row) => getRowDate(row) === dateStr);
+      if (dayJobs.length === 0) continue;
       if (splitByLimits) {
         const overJobs = dayJobs.filter((row) => (row as Row & { limits_breached?: string }).limits_breached === 'X');
         const withinJobs = dayJobs.filter((row) => (row as Row & { limits_breached?: string }).limits_breached === '-');
         for (const { label, jobs } of [
-          { label: 'Over Limit' as const, jobs: overJobs },
-          { label: 'Within Limit' as const, jobs: withinJobs },
+          { label: 'Over Allowance' as const, jobs: overJobs },
+          { label: 'Within Allowance' as const, jobs: withinJobs },
           { label: 'Daily Total' as const, jobs: dayJobs },
         ]) {
-          const m2vals = jobs.map((row) => minsBetween(row, 1, 2)).filter((v): v is number => v != null);
-          const m3vals = jobs.map((row) => minsBetween(row, 2, 3)).filter((v): v is number => v != null);
-          const m4vals = jobs.map((row) => minsBetween(row, 3, 4)).filter((v): v is number => v != null);
-          const m5vals = jobs.map((row) => minsBetween(row, 4, 5)).filter((v): v is number => v != null);
-          const travelVals = jobs.map((row) => travelMins(row)).filter((v): v is number => v != null);
-          const totalVals = jobs.map((row) => totalMins(row)).filter((v): v is number => v != null);
+          const roll = jobs.filter(includedInRollup);
+          const m2vals = roll.map((row) => minsBetween(row, 1, 2)).filter((v): v is number => v != null);
+          const m3vals = roll.map((row) => minsBetween(row, 2, 3)).filter((v): v is number => v != null);
+          const m4vals = roll.map((row) => minsBetween(row, 3, 4)).filter((v): v is number => v != null);
+          const m5vals = roll.map((row) => minsBetween(row, 4, 5)).filter((v): v is number => v != null);
+          const travelVals = roll.map((row) => travelMins(row)).filter((v): v is number => v != null);
+          const totalVals = roll.map((row) => totalMins(row)).filter((v): v is number => v != null);
           out.push({
             date: dateStr,
             dateLabel,
             rowType: label,
             jobs,
+            rollupJobCount: roll.length,
             mins_2: fromValues(m2vals),
             mins_3: fromValues(m3vals),
             mins_4: fromValues(m4vals),
@@ -903,16 +1446,18 @@ function SummaryPageInner() {
         }
       } else {
         const jobs = dayJobs;
-        const m2vals = jobs.map((row) => minsBetween(row, 1, 2)).filter((v): v is number => v != null);
-        const m3vals = jobs.map((row) => minsBetween(row, 2, 3)).filter((v): v is number => v != null);
-        const m4vals = jobs.map((row) => minsBetween(row, 3, 4)).filter((v): v is number => v != null);
-        const m5vals = jobs.map((row) => minsBetween(row, 4, 5)).filter((v): v is number => v != null);
-        const travelVals = jobs.map((row) => travelMins(row)).filter((v): v is number => v != null);
-        const totalVals = jobs.map((row) => totalMins(row)).filter((v): v is number => v != null);
+        const roll = jobs.filter(includedInRollup);
+        const m2vals = roll.map((row) => minsBetween(row, 1, 2)).filter((v): v is number => v != null);
+        const m3vals = roll.map((row) => minsBetween(row, 2, 3)).filter((v): v is number => v != null);
+        const m4vals = roll.map((row) => minsBetween(row, 3, 4)).filter((v): v is number => v != null);
+        const m5vals = roll.map((row) => minsBetween(row, 4, 5)).filter((v): v is number => v != null);
+        const travelVals = roll.map((row) => travelMins(row)).filter((v): v is number => v != null);
+        const totalVals = roll.map((row) => totalMins(row)).filter((v): v is number => v != null);
         out.push({
           date: dateStr,
           dateLabel,
           jobs,
+          rollupJobCount: roll.length,
           mins_2: fromValues(m2vals),
           mins_3: fromValues(m3vals),
           mins_4: fromValues(m4vals),
@@ -925,32 +1470,23 @@ function SummaryPageInner() {
     return out;
   }, [filteredRows, rowsWithLimits, splitByLimits, dayRange]);
 
-  const fromValuesToQuad = (values: number[]): MinsQuad => {
-    const valid = values.filter((v) => v != null && !Number.isNaN(v));
-    const n = valid.length;
-    const total = valid.reduce((a, b) => a + b, 0);
-    return {
-      total,
-      max: n ? Math.max(...valid) : 0,
-      min: n ? Math.min(...valid) : 0,
-      av: n ? Math.round(total / n) : 0,
-    };
-  };
+  const fromValuesToQuad = (values: number[]): MinsQuad => rollupQuadFromValues(values);
 
-  /** Season uses same job set as Daily / By Job: all filters (API + filteredRows). */
+  /** Season rollups: only jobs with excluded ≠ 1 (same filters as Daily / By Job). */
   const seasonRollup = useMemo((): {
     jobs: Row[];
     mins_2: MinsQuad; mins_3: MinsQuad; mins_4: MinsQuad; mins_5: MinsQuad; travel: MinsQuad; total: MinsQuad;
   } | null => {
     if (filteredRows.length === 0) return null;
-    const m2vals = filteredRows.map((row) => minsBetween(row, 1, 2)).filter((v): v is number => v != null);
-    const m3vals = filteredRows.map((row) => minsBetween(row, 2, 3)).filter((v): v is number => v != null);
-    const m4vals = filteredRows.map((row) => minsBetween(row, 3, 4)).filter((v): v is number => v != null);
-    const m5vals = filteredRows.map((row) => minsBetween(row, 4, 5)).filter((v): v is number => v != null);
-    const travelVals = filteredRows.map((row) => travelMins(row)).filter((v): v is number => v != null);
-    const totalVals = filteredRows.map((row) => totalMins(row)).filter((v): v is number => v != null);
+    const roll = filteredRows.filter(includedInRollup);
+    const m2vals = roll.map((row) => minsBetween(row, 1, 2)).filter((v): v is number => v != null);
+    const m3vals = roll.map((row) => minsBetween(row, 2, 3)).filter((v): v is number => v != null);
+    const m4vals = roll.map((row) => minsBetween(row, 3, 4)).filter((v): v is number => v != null);
+    const m5vals = roll.map((row) => minsBetween(row, 4, 5)).filter((v): v is number => v != null);
+    const travelVals = roll.map((row) => travelMins(row)).filter((v): v is number => v != null);
+    const totalVals = roll.map((row) => totalMins(row)).filter((v): v is number => v != null);
     return {
-      jobs: filteredRows,
+      jobs: roll,
       mins_2: fromValuesToQuad(m2vals),
       mins_3: fromValuesToQuad(m3vals),
       mins_4: fromValuesToQuad(m4vals),
@@ -960,13 +1496,17 @@ function SummaryPageInner() {
     };
   }, [filteredRows]);
 
-  /** When splitByLimits: 3 rows (Over Limit, Within Limit, Season Total). Otherwise same as seasonRollup in single row. */
-  type SeasonRollupRow = { rowType: 'Over Limit' | 'Within Limit' | 'Season Total'; jobs: Row[]; mins_2: MinsQuad; mins_3: MinsQuad; mins_4: MinsQuad; mins_5: MinsQuad; travel: MinsQuad; total: MinsQuad };
+  /** When splitByLimits: 3 rows (Over Allowance, Within Allowance, Season Total). Otherwise same as seasonRollup in single row. */
+  type SeasonRollupRow = { rowType: 'Over Allowance' | 'Within Allowance' | 'Season Total'; jobs: Row[]; mins_2: MinsQuad; mins_3: MinsQuad; mins_4: MinsQuad; mins_5: MinsQuad; travel: MinsQuad; total: MinsQuad };
   const seasonRollupRows = useMemo((): SeasonRollupRow[] | null => {
     if (filteredRows.length === 0) return null;
     const withLimits = filteredRows.map((r) => ({ ...r, limits_breached: limitsBreachedForRow(r) }));
-    const overJobs = withLimits.filter((r) => (r as Row & { limits_breached?: string }).limits_breached === 'X');
-    const withinJobs = withLimits.filter((r) => (r as Row & { limits_breached?: string }).limits_breached === '-');
+    const overJobs = withLimits.filter(
+      (r) => includedInRollup(r) && (r as Row & { limits_breached?: string }).limits_breached === 'X',
+    );
+    const withinJobs = withLimits.filter(
+      (r) => includedInRollup(r) && (r as Row & { limits_breached?: string }).limits_breached === '-',
+    );
     const build = (jobs: Row[]) => ({
       jobs,
       mins_2: fromValuesToQuad(jobs.map((row) => minsBetween(row, 1, 2)).filter((v): v is number => v != null)),
@@ -978,46 +1518,56 @@ function SummaryPageInner() {
     });
     if (splitByLimits) {
       return [
-        { rowType: 'Over Limit', ...build(overJobs) },
-        { rowType: 'Within Limit', ...build(withinJobs) },
-        { rowType: 'Season Total', ...build(filteredRows) },
+        { rowType: 'Over Allowance', ...build(overJobs) },
+        { rowType: 'Within Allowance', ...build(withinJobs) },
+        { rowType: 'Season Total', ...build(filteredRows.filter(includedInRollup)) },
       ];
     }
     return seasonRollup ? [{ rowType: 'Season Total', ...seasonRollup }] : null;
   }, [filteredRows, seasonRollup, splitByLimits, timeLimitRows]);
 
-  /** By Day footer: Total, Max, Min, Av. When split by limits: one set per type (Over, Within, Daily Total); Av = totalMins / totalJobs (not average of daily Av). */
-  type ByDayFooterSet = { rowType?: 'Over Limit' | 'Within Limit' | 'Daily Total'; jobCount: number; stats: Record<string, MinsQuad> };
+  /** By Day footer: Total, Max, Min, Av. Max/Min across harvest days (rows with ≥1 job). Av = grand total ÷ total jobs (same as each day row: column Total ÷ Jobs), not sum of daily Av cells and not ÷ day count. */
+  type ByDayFooterSet = { rowType?: 'Over Allowance' | 'Within Allowance' | 'Daily Total'; jobCount: number; stats: Record<string, MinsQuad> };
   const byDayFooterSets = useMemo((): ByDayFooterSet[] => {
     const keys = ['mins_2', 'mins_3', 'mins_4', 'mins_5', 'travel', 'total'] as const;
     const build = (rowsForFooter: typeof rowsByDay): ByDayFooterSet => {
-      const jobCount = rowsForFooter.reduce((a, r) => a + r.jobs.length, 0);
+      const jobCount = rowsForFooter.reduce((a, r) => a + r.rollupJobCount, 0);
+      const harvestRows = rowsForFooter.filter((r) => r.rollupJobCount > 0);
       const stats: Record<string, MinsQuad> = {};
       for (const k of keys) {
-        const quads = rowsForFooter.map((r) => r[k]);
-        const sumTotal = quads.reduce((a, q) => a + q.total, 0);
-        const n = rowsForFooter.length;
+        const quadsAll = rowsForFooter.map((r) => r[k]);
+        const sumTotal = quadsAll.reduce((a, q) => a + q.total, 0);
+        const quadsHarvest = harvestRows.map((r) => r[k]);
         stats[k] = {
           total: sumTotal,
-          max: n ? Math.max(...quads.map((q) => q.max)) : 0,
-          min: n ? Math.min(...quads.map((q) => q.min)) : 0,
+          max: quadsHarvest.length ? Math.max(...quadsHarvest.map((q) => q.max)) : 0,
+          min: quadsHarvest.length ? Math.min(...quadsHarvest.map((q) => q.min)) : 0,
           av: jobCount > 0 ? Math.round(sumTotal / jobCount) : 0,
         };
       }
       return { jobCount, stats };
     };
     if (splitByLimits) {
-      const over = rowsByDay.filter((r) => (r as { rowType?: string }).rowType === 'Over Limit');
-      const within = rowsByDay.filter((r) => (r as { rowType?: string }).rowType === 'Within Limit');
+      const over = rowsByDay.filter((r) => (r as { rowType?: string }).rowType === 'Over Allowance');
+      const within = rowsByDay.filter((r) => (r as { rowType?: string }).rowType === 'Within Allowance');
       const dailyTotal = rowsByDay.filter((r) => (r as { rowType?: string }).rowType === 'Daily Total');
       return [
-        { rowType: 'Over Limit', ...build(over) },
-        { rowType: 'Within Limit', ...build(within) },
+        { rowType: 'Over Allowance', ...build(over) },
+        { rowType: 'Within Allowance', ...build(within) },
         { rowType: 'Daily Total', ...build(dailyTotal) },
       ];
     }
     return [{ ...build(rowsByDay) }];
   }, [rowsByDay, splitByLimits]);
+
+  /** Distinct dates with ≥1 non-excluded job in Daily Summary (split-by-limits: 3 rows per date). */
+  const summaryHarvestDayCount = useMemo(() => {
+    const dates = new Set<string>();
+    for (const r of rowsByDay) {
+      if (r.rollupJobCount > 0) dates.add(r.date);
+    }
+    return dates.size;
+  }, [rowsByDay]);
 
   /** Single set for non-split footer (first set). */
   const byDayStats = useMemo(() => byDayFooterSets[0]?.stats ?? ({} as Record<string, MinsQuad>), [byDayFooterSets]);
@@ -1201,33 +1751,36 @@ function SummaryPageInner() {
     return () => clearTimeout(t);
   }, [focusHighlightJobId]);
 
-  /** Sum and average of mins columns over sorted (visible) rows. */
+  /** Sum and average of mins columns over sorted rows (excluded=1 omitted from stats). */
   const columnStats = useMemo(() => {
+    const rollRows = sortedRows.filter(includedInRollup);
     const stats: Record<string, { sum: number; avg: number | null; count: number }> = {};
     for (const n of [2, 3, 4, 5]) {
-      const values = sortedRows.map((r) => minsBetween(r, n - 1, n)).filter((v): v is number => v != null);
+      const values = rollRows.map((r) => minsBetween(r, n - 1, n)).filter((v): v is number => v != null);
       const sum = values.reduce((a, b) => a + b, 0);
       const count = values.length;
       stats[`mins_${n}`] = { sum, avg: count ? Math.round(sum / count) : null, count };
     }
-    const travelValues = sortedRows.map(travelMins).filter((v): v is number => v != null);
+    const travelValues = rollRows.map(travelMins).filter((v): v is number => v != null);
     const travelSum = travelValues.reduce((a, b) => a + b, 0);
     const travelCount = travelValues.length;
     stats.travel = { sum: travelSum, avg: travelCount ? Math.round(travelSum / travelCount) : null, count: travelCount };
-    const inVineyardValues = sortedRows.map((r) => minsBetween(r, 2, 3)).filter((v): v is number => v != null);
+    const inVineyardValues = rollRows.map((r) => minsBetween(r, 2, 3)).filter((v): v is number => v != null);
     const inVineyardSum = inVineyardValues.reduce((a, b) => a + b, 0);
     const inVineyardCount = inVineyardValues.length;
     stats.in_vineyard = { sum: inVineyardSum, avg: inVineyardCount ? Math.round(inVineyardSum / inVineyardCount) : null, count: inVineyardCount };
-    const inWineryValues = sortedRows.map((r) => minsBetween(r, 4, 5)).filter((v): v is number => v != null);
+    const inWineryValues = rollRows.map((r) => minsBetween(r, 4, 5)).filter((v): v is number => v != null);
     const inWinerySum = inWineryValues.reduce((a, b) => a + b, 0);
     const inWineryCount = inWineryValues.length;
     stats.in_winery = { sum: inWinerySum, avg: inWineryCount ? Math.round(inWinerySum / inWineryCount) : null, count: inWineryCount };
-    const totalValues = sortedRows.map(totalMins).filter((v): v is number => v != null);
+    const totalValues = rollRows.map(totalMins).filter((v): v is number => v != null);
     const totalSum = totalValues.reduce((a, b) => a + b, 0);
     const totalCount = totalValues.length;
     stats.total = { sum: totalSum, avg: totalCount ? Math.round(totalSum / totalCount) : null, count: totalCount };
     return stats;
   }, [sortedRows]);
+
+  const rollupJobsCount = useMemo(() => filteredRows.filter(includedInRollup).length, [filteredRows]);
 
   const dayClientView = summaryTab === 'by_day' && viewMode === 'client';
   const jobClientView = summaryTab === 'by_job' && viewMode === 'client';
@@ -1238,7 +1791,7 @@ function SummaryPageInner() {
       <div className="mb-4">
         <h1 className="text-2xl font-semibold text-zinc-900 dark:text-zinc-100">Summary</h1>
       </div>
-      {loading && <p className="text-zinc-600">Loading…</p>}
+      {loading && <p className="text-zinc-600 dark:text-zinc-400">Loading…</p>}
       {error && (
         <div className="rounded bg-red-100 p-3 text-red-800 dark:bg-red-900/30 dark:text-red-200">
           <p className="font-medium">{error}</p>
@@ -1298,20 +1851,89 @@ function SummaryPageInner() {
                 ))}
               </select>
             </div>
-            <div>
+            <div className="relative min-w-[11rem]" ref={vineyardPickerAnchorRef}>
               <label className="mb-1 block text-xs font-medium text-zinc-500">Vineyard</label>
-              <select
-                value={filterVineyard}
-                onChange={(e) => setFilterVineyard(e.target.value)}
+              <button
+                type="button"
                 disabled={!effectiveCustomer.trim()}
-                className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm disabled:cursor-not-allowed disabled:opacity-70 dark:border-zinc-600 dark:bg-zinc-800"
+                onClick={() => {
+                  if (vineyardPickerOpen) {
+                    commitVineyardPicker();
+                  } else {
+                    setVineyardPickerDraft(sortVineyardNames(filterVineyards));
+                    setVineyardPickerOpen(true);
+                  }
+                }}
+                className="flex w-full min-w-0 items-center justify-between gap-2 rounded border border-zinc-300 bg-white px-2 py-1.5 text-left text-sm disabled:cursor-not-allowed disabled:opacity-70 dark:border-zinc-600 dark:bg-zinc-800"
+                title={
+                  filterVineyards.length === 0
+                    ? 'All vineyards'
+                    : filterVineyards.length <= 3
+                      ? filterVineyards.join(', ')
+                      : `${filterVineyards.length} selected`
+                }
               >
-                <option value="">— All —</option>
-                {distinctVineyards.map((v) => (
-                  <option key={v} value={v}>{v}</option>
-                ))}
-              </select>
+                <span className="min-w-0 truncate">
+                  {filterVineyards.length === 0
+                    ? '— All —'
+                    : filterVineyards.length <= 2
+                      ? filterVineyards.join(', ')
+                      : `${filterVineyards.length} selected`}
+                </span>
+                <span className="shrink-0 text-zinc-400" aria-hidden>
+                  ▾
+                </span>
+              </button>
             </div>
+            {vineyardPickerOpen &&
+              effectiveCustomer.trim() &&
+              typeof document !== 'undefined' &&
+              createPortal(
+                <div
+                  ref={vineyardPickerPanelRef}
+                  className="fixed left-1/2 top-1/2 z-[100] flex h-[50vh] w-[50vw] max-h-[50vh] max-w-[50vw] min-w-0 -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-lg border border-zinc-200 bg-white shadow-2xl dark:border-zinc-600 dark:bg-zinc-900"
+                  role="dialog"
+                  aria-label="Choose vineyards"
+                >
+                  <div className="flex shrink-0 justify-end border-b border-zinc-200 px-4 py-3 dark:border-zinc-700">
+                    <button
+                      type="button"
+                      className="rounded border border-zinc-300 px-3 py-1 text-sm hover:bg-zinc-100 dark:border-zinc-600 dark:hover:bg-zinc-800"
+                      onClick={() => setVineyardPickerDraft([])}
+                    >
+                      Clear all
+                    </button>
+                  </div>
+                  <div className="min-h-0 flex-1 overflow-y-auto p-4">
+                    <div className="grid grid-cols-3 gap-x-8 gap-y-2 text-sm">
+                      {vineyardPickerOptions.map((v) => (
+                        <label
+                          key={v}
+                          className="flex cursor-pointer items-center gap-2 rounded px-1 py-1 hover:bg-zinc-50 dark:hover:bg-zinc-800"
+                        >
+                          <input
+                            type="checkbox"
+                            className="shrink-0"
+                            checked={vineyardDraftSet.has(v)}
+                            onChange={() => {
+                              setVineyardPickerDraft((prev) => {
+                                const next = new Set(prev);
+                                if (next.has(v)) next.delete(v);
+                                else next.add(v);
+                                return sortVineyardNames(Array.from(next));
+                              });
+                            }}
+                          />
+                          <span className="min-w-0 whitespace-nowrap" title={v}>
+                            {v}
+                          </span>
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+                </div>,
+                document.body,
+              )}
             <div>
               <label className="mb-1 block text-xs font-medium text-zinc-500">Actual start from</label>
               <input
@@ -1469,10 +2091,8 @@ function SummaryPageInner() {
                         </tr>
                       </thead>
                       <tbody>
-                        {timeLimitRows.map((r) => {
-                          const toV = r.ToVineMins != null ? Number(r.ToVineMins) : null;
-                          const toW = r.ToWineMins != null ? Number(r.ToWineMins) : null;
-                          const travelVal = (toV != null || toW != null) ? (toV ?? 0) + (toW ?? 0) : null;
+                        {timeLimitRowsForTable.map((r) => {
+                          const travelVal = timeLimitRowTravelVal(r);
                           const isSelected = selectedTimeLimitRowId === r.id;
                           const emptyCell = (k: string) => <td key={k} className="border-r border-zinc-200 px-2 py-1.5 dark:border-zinc-700">&nbsp;</td>;
                           return (
@@ -1504,18 +2124,18 @@ function SummaryPageInner() {
                               <td className="border-r border-zinc-200 px-2 py-1.5 text-zinc-700 dark:border-zinc-700 dark:text-zinc-300">{formatCell(r.vineyardgroup)}</td>
                               {emptyCell(`${r.id}-e5`)}
                               <td colSpan={2} className="border-r border-zinc-200 px-2 py-1.5 dark:border-zinc-700">&nbsp;</td>
-                              <td className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[2]}`}>{r.ToVineMins != null ? String(r.ToVineMins) : '—'}</td>
+                              <td className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[2]}`}>{r.ToVineMins != null ? formatIntNz(Number(r.ToVineMins)) : '—'}</td>
                               <td colSpan={2} className={`border-r border-zinc-200 px-2 py-1.5 dark:border-zinc-700 ${STEP_GROUP_BG[2]}`}>&nbsp;</td>
-                              <td className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[3]}`}>{r.InVineMins != null ? String(r.InVineMins) : '—'}</td>
+                              <td className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[3]}`}>{r.InVineMins != null ? formatIntNz(Number(r.InVineMins)) : '—'}</td>
                               <td colSpan={2} className={`border-r border-zinc-200 px-2 py-1.5 dark:border-zinc-700 ${STEP_GROUP_BG[3]}`}>&nbsp;</td>
-                              <td className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[4]}`}>{r.ToWineMins != null ? String(r.ToWineMins) : '—'}</td>
+                              <td className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[4]}`}>{r.ToWineMins != null ? formatIntNz(Number(r.ToWineMins)) : '—'}</td>
                               <td colSpan={2} className={`border-r border-zinc-200 px-2 py-1.5 dark:border-zinc-700 ${STEP_GROUP_BG[4]}`}>&nbsp;</td>
-                              <td className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[5]}`}>{r.InWineMins != null ? String(r.InWineMins) : '—'}</td>
+                              <td className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[5]}`}>{r.InWineMins != null ? formatIntNz(Number(r.InWineMins)) : '—'}</td>
                               <td colSpan={2} className={`border-r border-zinc-200 px-2 py-1.5 dark:border-zinc-700 ${STEP_GROUP_BG[5]}`}>&nbsp;</td>
-                              <td className="border-r border-zinc-200 px-2 py-1.5 tabular-nums text-zinc-600 dark:border-zinc-700 dark:text-zinc-400">{travelVal != null ? String(travelVal) : '—'}</td>
-                              <td className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[3]}`}>{r.InVineMins != null ? String(r.InVineMins) : '—'}</td>
-                              <td className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[5]}`}>{r.InWineMins != null ? String(r.InWineMins) : '—'}</td>
-                              <td className="px-2 py-1.5 tabular-nums font-medium text-zinc-700 dark:text-zinc-300">{r.TotalMins != null ? String(r.TotalMins) : '—'}</td>
+                              <td className="border-r border-zinc-200 px-2 py-1.5 tabular-nums text-zinc-600 dark:border-zinc-700 dark:text-zinc-400">{travelVal != null ? formatIntNz(Number(travelVal)) : '—'}</td>
+                              <td className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[3]}`}>{r.InVineMins != null ? formatIntNz(Number(r.InVineMins)) : '—'}</td>
+                              <td className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[5]}`}>{r.InWineMins != null ? formatIntNz(Number(r.InWineMins)) : '—'}</td>
+                              <td className="px-2 py-1.5 tabular-nums font-medium text-zinc-700 dark:text-zinc-300">{r.TotalMins != null ? formatIntNz(Number(r.TotalMins)) : '—'}</td>
                             </tr>
                           );
                         })}
@@ -1557,6 +2177,13 @@ function SummaryPageInner() {
                 className={`rounded-t px-4 py-2 text-sm font-medium ${summaryTab === 'by_job' ? 'bg-zinc-200 dark:bg-zinc-700 text-zinc-900 dark:text-zinc-100' : 'bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 hover:bg-zinc-150 dark:hover:bg-zinc-750'}`}
               >
                 By Job
+              </button>
+              <button
+                type="button"
+                onClick={() => setSummaryTab('data_audit')}
+                className={`rounded-t px-4 py-2 text-sm font-medium ${summaryTab === 'data_audit' ? 'bg-zinc-200 dark:bg-zinc-700 text-zinc-900 dark:text-zinc-100' : 'bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 hover:bg-zinc-150 dark:hover:bg-zinc-750'}`}
+              >
+                Data Audits
               </button>
             </div>
             {(summaryTab === 'season' || summaryTab === 'by_day') && (
@@ -1635,7 +2262,7 @@ function SummaryPageInner() {
                     </tr>
                   ) : (
                     seasonRollupRows.map((rollup) => {
-                      const isSubTotal = splitByLimits && (rollup.rowType === 'Over Limit' || rollup.rowType === 'Within Limit');
+                      const isSubTotal = splitByLimits && (rollup.rowType === 'Over Allowance' || rollup.rowType === 'Within Allowance');
                       const isSeasonTotal = splitByLimits && rollup.rowType === 'Season Total';
                       const seasonRowClass = [
                         'border-b border-zinc-100 dark:border-zinc-800',
@@ -1650,7 +2277,7 @@ function SummaryPageInner() {
                         <td className="whitespace-nowrap border-r border-zinc-200 px-3 py-2 text-xs font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-400">{rollup.rowType}</td>
                       )}
                       <td className="whitespace-nowrap border-r border-zinc-200 px-3 py-2 tabular-nums text-zinc-500 dark:border-zinc-700 dark:text-zinc-400">
-                        {rollup.jobs.length}
+                        {formatIntNz(rollup.jobs.length)}
                       </td>
                       {!seasonClientView && [rollup.mins_2, rollup.mins_3, rollup.mins_4, rollup.mins_5].map((q, i) =>
                         (['total', 'max', 'min', 'av'] as const).map((key) => {
@@ -1658,7 +2285,7 @@ function SummaryPageInner() {
                           const redClass = key === 'av' ? redIfOverStepCol(q[key], stepNum) : '';
                           return (
                             <td key={`${i}-${key}`} className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 tabular-nums ${redClass ? redClass : `${STEP_GROUP_BG[(i + 2) as 2 | 3 | 4 | 5]} text-zinc-600 dark:text-zinc-400 dark:border-zinc-700`}`}>
-                              {q[key]}
+                              {fmtNz(q[key])}
                             </td>
                           );
                         })
@@ -1667,7 +2294,7 @@ function SummaryPageInner() {
                         const redClass = key === 'av' ? redIfOver(rollup.travel[key], 'travel') : '';
                         return (
                           <td key={`travel-${key}`} className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 tabular-nums ${redClass || 'text-zinc-600 dark:border-zinc-700 dark:text-zinc-400'}`}>
-                            {rollup.travel[key]}
+                            {fmtNz(rollup.travel[key])}
                           </td>
                         );
                       })}
@@ -1675,7 +2302,7 @@ function SummaryPageInner() {
                         const redClass = key === 'av' ? redIfOver(rollup.mins_3[key], 'in_vineyard') : '';
                         return (
                           <td key={`in_vineyard-${key}`} className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 tabular-nums ${redClass ? redClass : `${STEP_GROUP_BG[3]} text-zinc-600 dark:text-zinc-400 dark:border-zinc-700`}`}>
-                            {rollup.mins_3[key]}
+                            {fmtNz(rollup.mins_3[key])}
                           </td>
                         );
                       })}
@@ -1683,7 +2310,7 @@ function SummaryPageInner() {
                         const redClass = key === 'av' ? redIfOver(rollup.mins_5[key], 'in_winery') : '';
                         return (
                           <td key={`in_winery-${key}`} className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 tabular-nums ${redClass ? redClass : `${STEP_GROUP_BG[5]} text-zinc-600 dark:text-zinc-400 dark:border-zinc-700`}`}>
-                            {rollup.mins_5[key]}
+                            {fmtNz(rollup.mins_5[key])}
                           </td>
                         );
                       })}
@@ -1691,7 +2318,7 @@ function SummaryPageInner() {
                         const redClass = key === 'av' ? redIfOver(rollup.total[key], 'total') : '';
                         return (
                           <td key={`total-${key}`} className={`whitespace-nowrap border-zinc-200 px-2 py-2 tabular-nums font-medium ${redClass || 'text-zinc-700 dark:border-zinc-700 dark:text-zinc-300'}`}>
-                            {rollup.total[key]}
+                            {fmtNz(rollup.total[key])}
                           </td>
                         );
                       })}
@@ -1701,84 +2328,61 @@ function SummaryPageInner() {
                 </tbody>
               </table>
               {(() => {
-                /** When split mode: chart for each of Over Limit, Within Limit, Season Total. Otherwise single chart from seasonRollup. */
+                /** Split: 3 columns (Over Allowance | Within Allowance | Season), each: avg bars → total pie → total bars. Non-split: one column. */
                 const chartSources = splitByLimits && seasonRollupRows && seasonRollupRows.length === 3
                   ? seasonRollupRows
-                  : seasonRollup ? [{ rowType: 'Season Total' as const, ...seasonRollup }] : [];
+                  : seasonRollup
+                    ? [{ rowType: 'Season Total' as const, ...seasonRollup }]
+                    : [];
                 if (chartSources.length === 0) return null;
-                const size = 200;
-                const cx = size / 2;
-                const cy = size / 2;
-                const r = size / 2 - 4;
+                const multiCol = chartSources.length === 3;
+                let sharedAvgBarMax = 1;
+                for (const s of chartSources) {
+                  const jobsT = s.jobs.filter((j) => jobTrailerChartBucket(j) === 'T');
+                  const jobsTT = s.jobs.filter((j) => jobTrailerChartBucket(j) === 'TT');
+                  const jobsTPlusTT = s.jobs.filter(jobIsTOrTT);
+                  const avT = seasonChartAverageAvs(jobsT);
+                  const avTT = seasonChartAverageAvs(jobsTT);
+                  const avBoth = seasonChartAverageAvs(jobsTPlusTT);
+                  sharedAvgBarMax = Math.max(
+                    sharedAvgBarMax,
+                    avT.travel,
+                    avT.inVineyard,
+                    avT.inWinery,
+                    avT.total,
+                    avTT.travel,
+                    avTT.inVineyard,
+                    avTT.inWinery,
+                    avTT.total,
+                    avBoth.travel,
+                    avBoth.inVineyard,
+                    avBoth.inWinery,
+                    avBoth.total,
+                  );
+                }
                 return (
-                  <div className="mt-6 flex flex-wrap items-start gap-8 border-t border-zinc-200 px-4 py-6 dark:border-zinc-700">
-                    {chartSources.map((source) => {
-                      const travel = source.travel.total;
-                      const inVineyard = source.mins_3.total;
-                      const inWinery = source.mins_5.total;
-                      const totalMins = source.total.total;
-                      const pieSum = travel + inVineyard + inWinery;
-                      const barValues = [
-                        { label: 'Total', value: totalMins, fill: 'rgb(59 130 246)' },
-                        { label: 'Travel', value: travel, fill: 'rgb(34 197 94)' },
-                        { label: 'In Vineyard', value: inVineyard, fill: 'rgb(234 179 8)' },
-                        { label: 'In Winery', value: inWinery, fill: 'rgb(239 68 68)' },
-                      ];
-                      const barMax = Math.max(...barValues.map((b) => b.value), 1);
-                      const pieSegments = pieSum > 0
-                        ? [
-                            { label: 'Travel', value: travel, start: 0, sweep: (travel / pieSum) * 360, fill: 'rgb(34 197 94)' },
-                            { label: 'In Vineyard', value: inVineyard, start: (travel / pieSum) * 360, sweep: (inVineyard / pieSum) * 360, fill: 'rgb(234 179 8)' },
-                            { label: 'In Winery', value: inWinery, start: ((travel + inVineyard) / pieSum) * 360, sweep: (inWinery / pieSum) * 360, fill: 'rgb(239 68 68)' },
-                          ]
-                        : [];
-                      return (
-                        <div key={source.rowType} className="flex flex-col items-center gap-2">
-                          <span className="text-sm font-semibold text-zinc-800 dark:text-zinc-200">{source.rowType}</span>
-                          <span className="text-xs text-zinc-500 dark:text-zinc-400">Minutes by phase (Travel + Vineyard + Winery = Total)</span>
-                          <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`} className="overflow-visible">
-                            {pieSum <= 0 ? (
-                              <circle cx={cx} cy={cy} r={r} fill="rgb(228 228 231)" stroke="rgb(161 161 170)" strokeWidth={1} />
-                            ) : (
-                              pieSegments.map((seg, i) => {
-                                const startDeg = seg.start - 90;
-                                const endDeg = startDeg + seg.sweep;
-                                const x1 = cx + r * Math.cos((startDeg * Math.PI) / 180);
-                                const y1 = cy + r * Math.sin((startDeg * Math.PI) / 180);
-                                const x2 = cx + r * Math.cos((endDeg * Math.PI) / 180);
-                                const y2 = cy + r * Math.sin((endDeg * Math.PI) / 180);
-                                const large = seg.sweep > 180 ? 1 : 0;
-                                const d = `M ${cx} ${cy} L ${x1} ${y1} A ${r} ${r} 0 ${large} 1 ${x2} ${y2} Z`;
-                                return <path key={i} d={d} fill={seg.fill} stroke="rgb(255 255 255)" strokeWidth={1} />;
-                              })
-                            )}
-                            <circle cx={cx} cy={cy} r={r} fill="none" stroke="rgb(161 161 170)" strokeWidth={1} />
-                          </svg>
-                          <div className="flex flex-wrap justify-center gap-4 text-xs">
-                            <span className="flex items-center gap-1.5"><span className="inline-block h-3 w-3 rounded-sm bg-green-500" /> Travel: {travel}</span>
-                            <span className="flex items-center gap-1.5"><span className="inline-block h-3 w-3 rounded-sm bg-yellow-500" /> In Vineyard: {inVineyard}</span>
-                            <span className="flex items-center gap-1.5"><span className="inline-block h-3 w-3 rounded-sm bg-red-500" /> In Winery: {inWinery}</span>
-                            <span className="font-medium">Total: {totalMins}</span>
-                          </div>
-                          <span className="text-xs text-zinc-500 dark:text-zinc-400">Total, Travel, Vineyard, Winery (mins)</span>
-                          <svg width={320} height={180} viewBox="0 0 320 180" className="overflow-visible">
-                            <line x1={40} y1={140} x2={300} y2={140} stroke="rgb(161 161 170)" strokeWidth={1} />
-                            <line x1={40} y1={20} x2={40} y2={140} stroke="rgb(161 161 170)" strokeWidth={1} />
-                            {barValues.map((b, i) => {
-                              const x = 50 + i * 68;
-                              const h = barMax > 0 ? (b.value / barMax) * 100 : 0;
-                              return (
-                                <g key={b.label}>
-                                  <rect x={x} y={140 - h} width={48} height={h} fill={b.fill} stroke="rgb(255 255 255)" strokeWidth={1} />
-                                  <text x={x + 24} y={155} textAnchor="middle" className="fill-zinc-600 text-[10px] font-medium dark:fill-zinc-400">{b.label}</text>
-                                  <text x={x + 24} y={135 - h} textAnchor="middle" className="fill-zinc-800 text-[10px] font-medium dark:fill-zinc-200">{b.value}</text>
-                                </g>
-                              );
-                            })}
-                          </svg>
-                        </div>
-                      );
-                    })}
+                  <div className="mt-6 border-t border-zinc-200 px-4 py-6 dark:border-zinc-700">
+                    <div
+                      className={
+                        multiCol
+                          ? 'grid grid-cols-1 gap-10 md:grid-cols-3 md:gap-6'
+                          : 'mx-auto flex max-w-sm flex-col'
+                      }
+                    >
+                      {chartSources.map((source, colIdx) => (
+                        <SeasonSummaryChartColumn
+                          key={source.rowType}
+                          rowType={source.rowType}
+                          jobs={source.jobs}
+                          travel={source.travel}
+                          mins_3={source.mins_3}
+                          mins_5={source.mins_5}
+                          total={source.total}
+                          sharedAvgBarMax={sharedAvgBarMax}
+                          columnStripeIndex={multiCol ? colIdx : undefined}
+                        />
+                      ))}
+                    </div>
                   </div>
                 );
               })()}
@@ -1850,7 +2454,7 @@ function SummaryPageInner() {
                       const dailyRowClass = [
                         'border-b border-zinc-100 dark:border-zinc-800',
                         splitByLimits && isFirstRowOfDay ? 'border-t-2 border-zinc-300 dark:border-zinc-600' : '',
-                        splitByLimits && (rowType === 'Over Limit' || rowType === 'Within Limit') ? 'bg-zinc-100 dark:bg-zinc-800/50' : '',
+                        splitByLimits && (rowType === 'Over Allowance' || rowType === 'Within Allowance') ? 'bg-zinc-100 dark:bg-zinc-800/50' : '',
                         splitByLimits && rowType === 'Daily Total' ? 'bg-white dark:bg-zinc-900 font-medium' : '',
                         !splitByLimits ? 'hover:bg-zinc-50 dark:hover:bg-zinc-800/50' : (rowType === 'Daily Total' ? '' : 'hover:bg-zinc-200/50 dark:hover:bg-zinc-700/50'),
                       ].filter(Boolean).join(' ');
@@ -1867,25 +2471,21 @@ function SummaryPageInner() {
                           className={`whitespace-nowrap border-r border-zinc-200 px-3 py-2 dark:border-zinc-700${dateCellFlag ? ` ${dateCellFlag}` : ''}`}
                         >
                           {isFirstRowOfDay ? (
-                            dayClientView ? (
-                              <span className="font-medium text-zinc-700 dark:text-zinc-300">{r.dateLabel}</span>
-                            ) : (
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  setFilterActualFrom(r.date);
-                                  setFilterActualTo(r.date);
-                                  setSummaryTab('by_job');
-                                }}
-                                className={
-                                  dateCellFlag
-                                    ? 'font-medium text-inherit underline decoration-current hover:opacity-90'
-                                    : 'font-medium text-blue-600 underline hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300'
-                                }
-                              >
-                                {r.dateLabel}
-                              </button>
-                            )
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setFilterActualFrom(r.date);
+                                setFilterActualTo(r.date);
+                                setSummaryTab('by_job');
+                              }}
+                              className={
+                                dateCellFlag
+                                  ? 'font-medium text-inherit underline decoration-current hover:opacity-90'
+                                  : 'font-medium text-blue-600 underline hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300'
+                              }
+                            >
+                              {r.dateLabel}
+                            </button>
                           ) : (
                             '\u00A0'
                           )}
@@ -1893,14 +2493,14 @@ function SummaryPageInner() {
                         {splitByLimits && (
                           <td className="whitespace-nowrap border-r border-zinc-200 px-3 py-2 text-xs font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-400">{rowType}</td>
                         )}
-                        <td className="whitespace-nowrap border-r border-zinc-200 px-3 py-2 tabular-nums text-zinc-500 dark:border-zinc-700 dark:text-zinc-400">{r.jobs.length}</td>
+                        <td className="whitespace-nowrap border-r border-zinc-200 px-3 py-2 tabular-nums text-zinc-500 dark:border-zinc-700 dark:text-zinc-400">{formatIntNz(r.rollupJobCount)}</td>
                         {!dayClientView && [r.mins_2, r.mins_3, r.mins_4, r.mins_5].map((q, i) =>
                           (['total', 'max', 'min', 'av'] as const).map((key) => {
                             const stepNum = i + 2;
                             const redClass = key === 'av' ? redIfOverStepCol(q[key], stepNum) : '';
                             return (
                               <td key={`${i}-${key}`} className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 tabular-nums ${redClass ? redClass : `${STEP_GROUP_BG[(i + 2) as 2 | 3 | 4 | 5]} text-zinc-600 dark:text-zinc-400 dark:border-zinc-700`}`}>
-                                {q[key]}
+                                {fmtNz(q[key])}
                               </td>
                             );
                           })
@@ -1909,7 +2509,7 @@ function SummaryPageInner() {
                           const redClass = key === 'av' ? redIfOver(r.travel[key], 'travel') : '';
                           return (
                             <td key={`travel-${key}`} className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 tabular-nums ${redClass || 'text-zinc-600 dark:border-zinc-700 dark:text-zinc-400'}`}>
-                              {r.travel[key]}
+                              {fmtNz(r.travel[key])}
                             </td>
                           );
                         })}
@@ -1917,7 +2517,7 @@ function SummaryPageInner() {
                           const redClass = key === 'av' ? redIfOver(r.mins_3[key], 'in_vineyard') : '';
                           return (
                             <td key={`in_vineyard-${key}`} className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 tabular-nums ${redClass ? redClass : `${STEP_GROUP_BG[3]} text-zinc-600 dark:text-zinc-400 dark:border-zinc-700`}`}>
-                              {r.mins_3[key]}
+                              {fmtNz(r.mins_3[key])}
                             </td>
                           );
                         })}
@@ -1925,7 +2525,7 @@ function SummaryPageInner() {
                           const redClass = key === 'av' ? redIfOver(r.mins_5[key], 'in_winery') : '';
                           return (
                             <td key={`in_winery-${key}`} className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 tabular-nums ${redClass ? redClass : `${STEP_GROUP_BG[5]} text-zinc-600 dark:text-zinc-400 dark:border-zinc-700`}`}>
-                              {r.mins_5[key]}
+                              {fmtNz(r.mins_5[key])}
                             </td>
                           );
                         })}
@@ -1933,7 +2533,7 @@ function SummaryPageInner() {
                           const redClass = key === 'av' ? redIfOver(r.total[key], 'total') : '';
                           return (
                             <td key={`total-${key}`} className={`whitespace-nowrap border-zinc-200 px-2 py-2 tabular-nums font-medium ${redClass || 'text-zinc-700 dark:border-zinc-700 dark:text-zinc-300'}`}>
-                              {r.total[key]}
+                              {fmtNz(r.total[key])}
                             </td>
                           );
                         })}
@@ -1966,7 +2566,7 @@ function SummaryPageInner() {
                             </td>
                           )}
                           <td className="border-r border-zinc-200 px-3 py-1.5 tabular-nums text-xs text-zinc-500 dark:border-zinc-700 dark:text-zinc-400">
-                            {set.jobCount}
+                            {formatIntNz(set.jobCount)}
                           </td>
                           {!dayClientView && [s.mins_2, s.mins_3, s.mins_4, s.mins_5].map((quad, i) =>
                             subKeys.map((key) => {
@@ -1974,7 +2574,7 @@ function SummaryPageInner() {
                               const redClass = key === 'av' && val != null ? redIfOverStepCol(val, i + 2) : '';
                               return (
                                 <td key={`${i}-${key}`} className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-xs ${redClass ? redClass : `${STEP_GROUP_BG[(i + 2) as 2 | 3 | 4 | 5]} text-zinc-600 dark:text-zinc-400 dark:border-zinc-700`}`}>
-                                  {val ?? '—'}
+                                  {val != null ? formatIntNz(val) : '—'}
                                 </td>
                               );
                             })
@@ -1984,7 +2584,7 @@ function SummaryPageInner() {
                             const redClass = key === 'av' && val != null ? redIfOver(val, 'travel') : '';
                             return (
                               <td key={`travel-${key}`} className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-xs ${redClass || (val != null ? 'text-zinc-600 dark:border-zinc-700 dark:text-zinc-400' : 'text-zinc-600 dark:border-zinc-700 dark:text-zinc-400')}`}>
-                                {val ?? '—'}
+                                {val != null ? formatIntNz(val) : '—'}
                               </td>
                             );
                           })}
@@ -1993,7 +2593,7 @@ function SummaryPageInner() {
                             const redClass = key === 'av' && val != null ? redIfOver(val, 'in_vineyard') : '';
                             return (
                               <td key={`in_vineyard-${key}`} className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-xs ${redClass ? redClass : `${STEP_GROUP_BG[3]} text-zinc-600 dark:text-zinc-400 dark:border-zinc-700`}`}>
-                                {val ?? '—'}
+                                {val != null ? formatIntNz(val) : '—'}
                               </td>
                             );
                           })}
@@ -2002,7 +2602,7 @@ function SummaryPageInner() {
                             const redClass = key === 'av' && val != null ? redIfOver(val, 'in_winery') : '';
                             return (
                               <td key={`in_winery-${key}`} className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-xs ${redClass ? redClass : `${STEP_GROUP_BG[5]} text-zinc-600 dark:text-zinc-400 dark:border-zinc-700`}`}>
-                                {val ?? '—'}
+                                {val != null ? formatIntNz(val) : '—'}
                               </td>
                             );
                           })}
@@ -2011,7 +2611,7 @@ function SummaryPageInner() {
                             const redClass = key === 'av' && val != null ? redIfOver(val, 'total') : '';
                             return (
                               <td key={`total-${key}`} className={`border-zinc-200 px-2 py-1.5 tabular-nums text-xs font-medium ${redClass || (val != null ? 'text-zinc-700 dark:border-zinc-700 dark:text-zinc-300' : 'text-zinc-700 dark:border-zinc-700 dark:text-zinc-300')}`}>
-                                {val ?? '—'}
+                                {val != null ? formatIntNz(val) : '—'}
                               </td>
                             );
                           })}
@@ -2031,7 +2631,7 @@ function SummaryPageInner() {
             <table className="w-full min-w-[64rem] text-left text-sm">
               <thead className="sticky top-0 z-10 bg-zinc-100 shadow-[0_1px_0_0_rgba(0,0,0,0.1)] dark:bg-zinc-800 dark:shadow-[0_1px_0_0_rgba(255,255,255,0.08)]">
                 <tr className="border-b border-zinc-200 dark:border-zinc-700">
-                  <th colSpan={9} className="border-r border-zinc-200 px-2 py-1 text-xs font-medium text-zinc-500 dark:border-zinc-700" title={timeLimitRows.length > 0 ? "Per job: red if value > limit from row where Winery = delivery_winery, Vineyard group = vineyard_group, and TT = trailermode (T / TT). Boxes below show selected Time Limits row for reference only." : undefined}>
+                  <th colSpan={10} className="border-r border-zinc-200 px-2 py-1 text-xs font-medium text-zinc-500 dark:border-zinc-700" title={timeLimitRows.length > 0 ? "Per job: red if value > limit from row where Winery = delivery_winery, Vineyard group = vineyard_group, and TT = trailermode (T / TT). Boxes below show selected Time Limits row for reference only." : undefined}>
                     Limit (red if &gt;){timeLimitRows.length > 0 ? ' (per winery)' : ''}
                   </th>
                   {!jobClientView && (
@@ -2056,7 +2656,7 @@ function SummaryPageInner() {
                                 />
                                 {st && st.count > 0 && (
                                   <span className="text-[10px] text-zinc-500 dark:text-zinc-400 tabular-nums">
-                                    Σ {st.sum} · avg {st.avg ?? '—'}
+                                    Σ {formatIntNz(st.sum)} · avg {st.avg != null ? formatIntNz(st.avg) : '—'}
                                   </span>
                                 )}
                               </div>
@@ -2081,7 +2681,7 @@ function SummaryPageInner() {
                       />
                       {columnStats.travel?.count > 0 && (
                         <span className="text-[10px] text-zinc-500 dark:text-zinc-400 tabular-nums">
-                          Σ {columnStats.travel.sum} · avg {columnStats.travel.avg ?? '—'}
+                          Σ {formatIntNz(columnStats.travel.sum)} · avg {columnStats.travel.avg != null ? formatIntNz(columnStats.travel.avg) : '—'}
                         </span>
                       )}
                     </div>
@@ -2100,7 +2700,7 @@ function SummaryPageInner() {
                       />
                       {columnStats.in_vineyard?.count > 0 && (
                         <span className="text-[10px] text-zinc-500 dark:text-zinc-400 tabular-nums">
-                          Σ {columnStats.in_vineyard.sum} · avg {columnStats.in_vineyard.avg ?? '—'}
+                          Σ {formatIntNz(columnStats.in_vineyard.sum)} · avg {columnStats.in_vineyard.avg != null ? formatIntNz(columnStats.in_vineyard.avg) : '—'}
                         </span>
                       )}
                     </div>
@@ -2119,7 +2719,7 @@ function SummaryPageInner() {
                       />
                       {columnStats.in_winery?.count > 0 && (
                         <span className="text-[10px] text-zinc-500 dark:text-zinc-400 tabular-nums">
-                          Σ {columnStats.in_winery.sum} · avg {columnStats.in_winery.avg ?? '—'}
+                          Σ {formatIntNz(columnStats.in_winery.sum)} · avg {columnStats.in_winery.avg != null ? formatIntNz(columnStats.in_winery.avg) : '—'}
                         </span>
                       )}
                     </div>
@@ -2138,24 +2738,34 @@ function SummaryPageInner() {
                       />
                       {columnStats.total?.count > 0 && (
                         <span className="text-[10px] text-zinc-500 dark:text-zinc-400 tabular-nums">
-                          Σ {columnStats.total.sum} · avg {columnStats.total.avg ?? '—'}
+                          Σ {formatIntNz(columnStats.total.sum)} · avg {columnStats.total.avg != null ? formatIntNz(columnStats.total.avg) : '—'}
                         </span>
                       )}
                     </div>
                   </th>
                 </tr>
                 <tr className="border-b border-zinc-200 dark:border-zinc-700">
-                  {BY_JOB_LEAD_COLUMNS.map(({ key, label }) => (
+                  {BY_JOB_LEAD_COLUMNS.map(({ key, label }) => {
+                    const narrowVineyard = key === 'vineyard_name';
+                    const narrowGroup = key === 'vineyard_group';
+                    return (
                     <th
                       key={key}
                       rowSpan={jobClientView ? 1 : 2}
                       onClick={() => handleSort(key)}
-                      className={`cursor-pointer select-none whitespace-nowrap border-b border-r border-zinc-200 px-3 py-2 font-medium text-zinc-900 hover:bg-zinc-200 dark:border-zinc-700 dark:text-zinc-100 dark:hover:bg-zinc-700 ${sortKey === key ? 'bg-zinc-200 dark:bg-zinc-700' : ''}`}
+                      className={`cursor-pointer select-none border-b border-r border-zinc-200 px-3 py-2 font-medium text-zinc-900 hover:bg-zinc-200 dark:border-zinc-700 dark:text-zinc-100 dark:hover:bg-zinc-700 ${sortKey === key ? 'bg-zinc-200 dark:bg-zinc-700' : ''} ${
+                        narrowVineyard
+                          ? 'max-w-[7.5rem] w-[7.5rem] whitespace-normal break-words'
+                          : narrowGroup
+                            ? 'max-w-[4rem] w-[4rem] whitespace-normal break-words text-center leading-tight'
+                            : 'whitespace-nowrap'
+                      }`}
                       title={key === 'limits_breached' ? 'X = total time exceeds winery total limit; click to sort' : 'Click to sort'}
                     >
                       {label} {sortKey === key ? (sortDir === 'asc' ? '↑' : '↓') : ''}
                     </th>
-                  ))}
+                    );
+                  })}
                   {jobClientView && (
                     <th
                       onClick={() => handleSort('step_1_actual_time')}
@@ -2250,7 +2860,7 @@ function SummaryPageInner() {
               <tbody>
                 {sortedRows.length === 0 ? (
                   <tr>
-                    <td colSpan={jobClientView ? 12 : allColumns.length} className="px-3 py-6 text-center text-zinc-500">
+                    <td colSpan={jobClientView ? BY_JOB_LEAD_COLUMNS.length + 1 : allColumns.length} className="px-3 py-6 text-center text-zinc-500">
                       No rows {filterActualFrom || filterActualTo || effectiveCustomer || filterTemplate || filterTruckId || filterWorker.trim() || filterTrailermode ? '(try relaxing filters)' : ''}.
                     </td>
                   </tr>
@@ -2266,6 +2876,7 @@ function SummaryPageInner() {
                         ? ' bg-sky-100 dark:bg-sky-900/45'
                         : '';
                     const jobTimeOutlier = timeOutlierSeverity(jobRowMinuteValues(row));
+                    const ghostExcluded = !includedInRollup(row);
                     return (
                     <tr
                       key={i}
@@ -2274,7 +2885,8 @@ function SummaryPageInner() {
                           ? String(row.job_id).trim()
                           : undefined
                       }
-                      className="border-b border-zinc-100 dark:border-zinc-800 hover:bg-zinc-50 dark:hover:bg-zinc-800/50"
+                      className={`border-b border-zinc-100 dark:border-zinc-800 hover:bg-zinc-50 dark:hover:bg-zinc-800/50${ghostExcluded ? ' opacity-55' : ''}`}
+                      title={ghostExcluded ? 'Excluded from summaries (rollups); still visible here' : undefined}
                     >
                       {BY_JOB_LEAD_COLUMNS.map(({ key }) => {
                         const jobIdOutlierBg =
@@ -2285,16 +2897,24 @@ function SummaryPageInner() {
                                 ? ` ${SUMMARY_OUTLIER_YELLOW}`
                                 : historyPlainLeadHighlight(key)
                             : historyPlainLeadHighlight(key);
+                        const vineyardW =
+                          key === 'vineyard_name'
+                            ? ' max-w-[7.5rem] w-[7.5rem] whitespace-normal break-words'
+                            : key === 'vineyard_group'
+                              ? ' max-w-[4rem] w-[4rem] whitespace-normal break-words'
+                              : '';
                         return (
                         <td
                           key={key}
-                          className={`whitespace-nowrap px-3 py-2 text-zinc-700 dark:text-zinc-300${jobIdOutlierBg}${key === 'limits_breached' ? ' text-center font-medium tabular-nums ' + (row.limits_breached === 'X' ? 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-200' : 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-200') : ''}`}
+                          className={`${vineyardW || 'whitespace-nowrap'} px-3 py-2 text-zinc-700 dark:text-zinc-300${jobIdOutlierBg}${key === 'limits_breached' ? ' text-center font-medium tabular-nums ' + (row.limits_breached === 'X' ? 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-200' : 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-200') : ''}`}
                         >
                           {key === 'limits_breached' ? (
                             row.limits_breached ?? '-'
                           ) : key === 'job_id' && viewMode !== 'client' ? (
                             <Link
                               href={inspectUrlForRow(row)}
+                              target="_blank"
+                              rel="noopener noreferrer"
                               onClick={(e) => {
                                 if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) return;
                                 const meta = inspectJumpMetaForRow(row);
@@ -2331,20 +2951,24 @@ function SummaryPageInner() {
                           const viaStr = formatCell(viaVal);
                           const isGps = viaStr.toLowerCase() === 'gps';
                           const isGpsStar = viaStr === 'GPS*' || viaStr.toLowerCase() === 'gps*';
-                          const isVineFencePlus = viaStr.toLowerCase() === 'vinefence+';
+                          const viaLower = viaStr.toLowerCase();
+                          const isVineFencePlus = viaLower === 'vinefence+';
+                          const isVineFenceVPlus = viaLower === 'vinefencev+';
+                          const isVineSr1 = viaLower === 'vinesr1';
                           const isOride = viaStr.toUpperCase() === 'ORIDE';
                           const mins = n >= 2 ? minsBetween(row, n - 1, n) : null;
                           const minsOver = n >= 2 && isOverLimitStepWithRow(mins, limitsRow, n);
                           const groupBg = STEP_GROUP_BG[n];
-                          const viaDisplay = isVineFencePlus ? 'GPS+' : viaStr;
-                          const viaGreen = isGps || isVineFencePlus || isGpsStar;
+                          const viaDisplay = isVineFencePlus ? 'GPS+' : isVineFenceVPlus ? 'GPS+V' : viaStr;
+                          const viaGreen =
+                            isGps || isVineFencePlus || isVineFenceVPlus || isGpsStar || isVineSr1;
                           return (
                             <React.Fragment key={n}>
                               {n >= 2 && (
                                 <td
                                   className={`whitespace-nowrap px-3 py-2 tabular-nums ${minsOver ? 'bg-red-200 text-red-900 dark:bg-red-900/40 dark:text-red-200' : `${groupBg} text-zinc-500 dark:text-zinc-400`}`}
                                 >
-                                  {mins != null ? String(mins) : '—'}
+                                  {mins != null ? formatIntNz(mins) : '—'}
                                 </td>
                               )}
                             <td className={`whitespace-nowrap px-3 py-2 text-zinc-600 dark:text-zinc-400 ${groupBg}`}>
@@ -2370,22 +2994,22 @@ function SummaryPageInner() {
                             <td
                               className={`whitespace-nowrap px-3 py-2 tabular-nums ${isOverLimitWithRow(travel, limitsRow, 'travel') ? 'bg-red-200 text-red-900 dark:bg-red-900/40 dark:text-red-200' : 'text-zinc-500 dark:text-zinc-400'}`}
                             >
-                              {travel != null ? String(travel) : '—'}
+                              {travel != null ? formatIntNz(travel) : '—'}
                             </td>
                             <td
                               className={`whitespace-nowrap px-3 py-2 tabular-nums ${isOverLimitWithRow(inVineyard, limitsRow, 'in_vineyard') ? 'bg-red-200 text-red-900 dark:bg-red-900/40 dark:text-red-200' : 'text-zinc-500 dark:text-zinc-400'}`}
                             >
-                              {inVineyard != null ? String(inVineyard) : '—'}
+                              {inVineyard != null ? formatIntNz(inVineyard) : '—'}
                             </td>
                             <td
                               className={`whitespace-nowrap px-3 py-2 tabular-nums ${isOverLimitWithRow(inWinery, limitsRow, 'in_winery') ? 'bg-red-200 text-red-900 dark:bg-red-900/40 dark:text-red-200' : 'text-zinc-500 dark:text-zinc-400'}`}
                             >
-                              {inWinery != null ? String(inWinery) : '—'}
+                              {inWinery != null ? formatIntNz(inWinery) : '—'}
                             </td>
                             <td
                               className={`whitespace-nowrap px-3 py-2 tabular-nums ${isOverLimitWithRow(total, limitsRow, 'total') ? 'bg-red-200 text-red-900 dark:bg-red-900/40 dark:text-red-200' : 'text-zinc-500 dark:text-zinc-400'}`}
                             >
-                              {total != null ? String(total) : '—'}
+                              {total != null ? formatIntNz(total) : '—'}
                             </td>
                           </React.Fragment>
                         );
@@ -2398,6 +3022,14 @@ function SummaryPageInner() {
             </table>
           </div>
           )}
+          {summaryTab === 'data_audit' && (
+            <div className="max-h-[78vh] overflow-auto rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900">
+              <p className="mb-3 text-sm text-zinc-600 dark:text-zinc-400">
+                Pivot job counts for the same filters as Season / Daily / By Job. Drag dimensions to match how you want to reconcile totals.
+              </p>
+              <SummaryDataAuditPivot jobs={filteredRows} loading={loading} />
+            </div>
+          )}
           <div className="mt-3 flex flex-wrap items-center gap-3 text-zinc-500">
             <span>
               {summaryTab === 'by_job'
@@ -2406,10 +3038,12 @@ function SummaryPageInner() {
                     const start = n === 0 ? 0 : jobsPage * jobsPageSize + 1;
                     const end = Math.min((jobsPage + 1) * jobsPageSize, n);
                     return n > jobsPageSize
-                      ? `${start}–${end} of ${n} jobs`
-                      : `${n} row${n !== 1 ? 's' : ''}`;
+                      ? `${formatIntNz(start)}–${formatIntNz(end)} of ${formatIntNz(n)} jobs`
+                      : `${formatIntNz(n)} row${n !== 1 ? 's' : ''}`;
                   })()
-                : `${rowsByDay.length} day${rowsByDay.length !== 1 ? 's' : ''} · ${filteredRows.length} job${filteredRows.length !== 1 ? 's' : ''}${filteredRows.length !== totalJobsFromApi ? ` (client filter ${filteredRows.length} vs API ${totalJobsFromApi})` : ''}`}
+                : summaryTab === 'data_audit'
+                  ? `Jobs (rollups): ${formatIntNz(rollupJobsCount)}${rollupJobsCount !== filteredRows.length ? ` · ${formatIntNz(filteredRows.length)} loaded` : ''}${filteredRows.length !== totalJobsFromApi ? ` (client filter ${formatIntNz(filteredRows.length)} vs API ${formatIntNz(totalJobsFromApi)})` : ''}`
+                  : `Total harvest days: ${formatIntNz(summaryHarvestDayCount)} · Jobs (rollups): ${formatIntNz(rollupJobsCount)}${rollupJobsCount !== filteredRows.length ? ` · ${formatIntNz(filteredRows.length)} loaded` : ''}${filteredRows.length !== totalJobsFromApi ? ` (client filter ${formatIntNz(filteredRows.length)} vs API ${formatIntNz(totalJobsFromApi)})` : ''}`}
             </span>
             {summaryTab === 'by_job' && sortedRows.length > jobsPageSize && (
               <span className="flex items-center gap-2">
@@ -2422,7 +3056,7 @@ function SummaryPageInner() {
                   Prev
                 </button>
                 <span className="text-xs">
-                  Page {jobsPage + 1} of {Math.ceil(sortedRows.length / jobsPageSize)}
+                  Page {formatIntNz(jobsPage + 1)} of {formatIntNz(Math.ceil(sortedRows.length / jobsPageSize))}
                 </span>
                 <button
                   type="button"
@@ -2435,7 +3069,7 @@ function SummaryPageInner() {
               </span>
             )}
           </div>
-          {jobsQueryDebug && (summaryTab === 'season' || summaryTab === 'by_day') && (
+          {jobsQueryDebug && (summaryTab === 'season' || summaryTab === 'by_day' || summaryTab === 'data_audit') && (
             <details className="mt-4 rounded border border-zinc-200 bg-zinc-50 p-3 text-xs dark:border-zinc-600 dark:bg-zinc-900/50">
               <summary className="cursor-pointer font-medium text-zinc-700 dark:text-zinc-300">
                 Debug: job count SQL (criteria for this summary)

@@ -5,7 +5,7 @@
 export const SUMMARY_HISTORY_STORAGE_KEY = 'geodata_summary_history_v1';
 const MAX_ENTRIES = 25;
 
-export type SummaryTabMode = 'season' | 'by_day' | 'by_job';
+export type SummaryTabMode = 'season' | 'by_day' | 'by_job' | 'data_audit';
 
 /** Full UI state to restore Summary + sidebar customer (admin/super). */
 export type SummaryHistoryPayload = {
@@ -18,7 +18,8 @@ export type SummaryHistoryPayload = {
   summaryTab: SummaryTabMode;
   filterWinery: string;
   filterVineyardGroup: string;
-  filterVineyard: string;
+  /** Selected vineyard_name values (empty = all). */
+  filterVineyards: string[];
   splitByLimits: boolean;
   minsThresholds: Record<string, string>;
   selectedTimeLimitRowId: number | null;
@@ -48,7 +49,13 @@ function stableStringify(p: SummaryHistoryPayload): string {
 
 export function buildSummaryHistoryLabel(p: SummaryHistoryPayload): string {
   const tab =
-    p.summaryTab === 'by_job' ? 'Jobs' : p.summaryTab === 'by_day' ? 'By day' : 'Season';
+    p.summaryTab === 'by_job'
+      ? 'Jobs'
+      : p.summaryTab === 'by_day'
+        ? 'By day'
+        : p.summaryTab === 'data_audit'
+          ? 'Data audit'
+          : 'Season';
   const cust = p.clientCustomer.trim() || '—';
   const tpl = p.filterTemplate.trim() || '—';
   const job = p.focusJobId?.trim();
@@ -65,7 +72,7 @@ export function isSignificantSummaryState(p: SummaryHistoryPayload): boolean {
     p.filterActualTo.trim() !== '' ||
     p.filterWinery.trim() !== '' ||
     p.filterVineyardGroup.trim() !== '' ||
-    p.filterVineyard.trim() !== '' ||
+    (p.filterVineyards?.length ?? 0) > 0 ||
     p.filterTruckId.trim() !== '' ||
     p.filterWorker.trim() !== '' ||
     p.filterTrailermode.trim() !== ''

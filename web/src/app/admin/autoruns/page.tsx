@@ -12,11 +12,21 @@ type LogEntry = {
   logdetails?: string | null;
 };
 
-type ResultItem = { file: string; status: string; rows?: number; error?: string };
+type ResultItem = {
+  file: string;
+  status: string;
+  rows?: number;
+  error?: string;
+  omittedDbColumns?: string[];
+  unmappedCsvHeaders?: string[];
+  mappingTargetsMissingFromTable?: string[];
+  rowFailureCount?: number;
+  rowFailureSamples?: { row: number; error: string }[];
+};
 
 type RunResult = { ok: boolean; results: ResultItem[] } | { error: string };
 
-type FixKey = 'winery' | 'vineyard' | 'vineyardGroup' | 'driver' | 'trailer';
+type FixKey = 'winery' | 'vineyard' | 'vineyardGroup' | 'driver' | 'trailer' | 'loadsizeTm' | 'step4to5';
 
 type BatchStepRow = {
   step: string;
@@ -33,12 +43,74 @@ type BatchAllFixesResult = {
   steps: BatchStepRow[];
 };
 
+/** Must match `VWORK_FIX_BATCH_STEPS` order in `@/lib/vwork-fixes-batch` (labels + logcat2 for UI only). */
+const BATCH_STEP_META = [
+  { label: 'Winery name fixes', logcat2: 'winery-name-fixes' },
+  { label: 'Vineyard name fixes', logcat2: 'vineyard-name-fixes' },
+  { label: 'Vineyard mappings run', logcat2: 'vineyard-group-mapping' },
+  { label: 'Driver name fixes', logcat2: 'driver-name-fixes' },
+  { label: 'Set trailer type', logcat2: 'set-trailer-type' },
+  { label: 'Trailermode from load size', logcat2: 'set-trailermode-from-loadsize' },
+  { label: 'Step4→5 fix (all eligible jobs)', logcat2: 'step4to5-normal-all' },
+] as const;
+
+type BatchRunUiStep = {
+  index: number;
+  label: string;
+  logcat2: string;
+  phase: 'pending' | 'running' | 'done';
+  outcome?: BatchStepRow;
+};
+
+function summarizeBatchStep(row: BatchStepRow): string {
+  if (!row.ok) return row.error ?? 'Failed';
+  const r = row.result;
+  if (!r) return 'OK';
+  switch (row.logcat2) {
+    case 'winery-name-fixes':
+    case 'vineyard-name-fixes':
+    case 'driver-name-fixes':
+      return `Updated ${Number(r.totalUpdated ?? 0)} row(s)`;
+    case 'vineyard-group-mapping':
+      return `Set NA: ${String(r.setToNa ?? '—')}, matched groups: ${String(r.matched ?? '—')}, jobs in table: ${String(r.totalRows ?? '—')}`;
+    case 'set-trailer-type':
+      return `TT: ${String(r.updatedTT ?? '—')}, T: ${String(r.updatedT ?? '—')} (total ${String(r.totalUpdated ?? '—')})`;
+    case 'set-trailermode-from-loadsize':
+      return `Threshold ${String(r.threshold ?? '—')}: TT ${String(r.updatedTT ?? '—')}, T ${String(r.updatedT ?? '—')} (total ${String(r.totalUpdated ?? '—')})`;
+    case 'step4to5-normal-all':
+      return `Updated ${Number(r.updated ?? 0)} job(s)`;
+    default:
+      return 'OK';
+  }
+}
+
 const FIX_ACTIONS: { key: FixKey; label: string; path: string }[] = [
   { key: 'winery', label: 'Winery name fixes', path: '/api/admin/data-checks/wine-mapp/run-fixes' },
   { key: 'vineyard', label: 'Vineyard name fixes', path: '/api/admin/data-checks/vine-mapp/run-fixes' },
   { key: 'vineyardGroup', label: 'Vineyard mappings run', path: '/api/admin/data-checks/update-vineyard-group' },
   { key: 'driver', label: 'Driver name fixes', path: '/api/admin/data-checks/driver-mapp/run-fixes' },
   { key: 'trailer', label: 'Set trailer type', path: '/api/admin/data-checks/set-trailer-type' },
+  {
+    key: 'loadsizeTm',
+    label: 'Trailermode from load size',
+    path: '/api/admin/data-checks/set-trailermode-from-loadsize',
+  },
+  {
+    key: 'step4to5',
+    label: 'Step4→5 fix (all eligible)',
+    path: '/api/admin/data-checks/step4to5-run-all-eligible',
+  },
+];
+
+/** Human-readable order for “Run all fixes” (matches run-all-vwork-fixes STEPS). */
+const RUN_ALL_FIXES_DESCRIPTIONS: string[] = [
+  'Winery names: apply tbl_wine_mapp to delivery_winery on tbl_vworkjobs (save old value in delivery_winery_old).',
+  'Vineyard names: apply tbl_vine_mapp to vineyard_name (vineyard_name_old).',
+  'Vineyard group: set vineyard_group to NA, then fill from tbl_vineyardgroups where winery + vineyard match.',
+  'Driver names: apply tbl_driver_mapp to worker (worker_old).',
+  'Trailer type: set trailermode to TT or T from trailer_rego rules.',
+  'Trailermode from load size: for rows with loadsize > 0 only, set trailermode to TT where loadsize > Settings “TT Load Size” threshold, else T (uses tbl_settings, default 25.5 if unset). Leaves null/0 loadsize unchanged.',
+  'Step4→5: for every eligible job (step4to5=0, step 4 “Job Completed”, step 5 not completed, no step_5_completed_at, step_4_completed_at set), migrate to Arrive Winery / Job Completed layout, synthetic step 4 time, step4to5=1, clear step GPS and fetched flags.',
 ];
 
 export default function AutoRunsPage() {
@@ -59,6 +131,7 @@ export default function AutoRunsPage() {
   const [allFixesRunning, setAllFixesRunning] = useState(false);
   const [batchFixesResult, setBatchFixesResult] = useState<BatchAllFixesResult | null>(null);
   const [batchFixesError, setBatchFixesError] = useState<string | null>(null);
+  const [batchRunUi, setBatchRunUi] = useState<{ steps: BatchRunUiStep[] } | null>(null);
 
   const loadLogs = (typeOverride?: string) => {
     setLogsLoading(true);
@@ -142,6 +215,7 @@ export default function AutoRunsPage() {
     setFixResult(null);
     setBatchFixesResult(null);
     setBatchFixesError(null);
+    setBatchRunUi(null);
     fetch(action.path, { method: 'POST' })
       .then(async (r) => {
         const data = await r.json().catch(() => ({}));
@@ -155,29 +229,83 @@ export default function AutoRunsPage() {
       .finally(() => setFixRunning(null));
   };
 
-  const runAllFixes = () => {
+  const runAllFixes = async () => {
     setAllFixesRunning(true);
     setBatchFixesResult(null);
     setBatchFixesError(null);
     setFixResult(null);
     setFixError(null);
-    fetch('/api/admin/data-checks/run-all-vwork-fixes', { method: 'POST' })
-      .then(async (r) => {
-        const data = (await r.json().catch(() => ({}))) as BatchAllFixesResult & { error?: string };
+    setBatchRunUi({
+      steps: BATCH_STEP_META.map((m, i) => ({
+        index: i,
+        label: m.label,
+        logcat2: m.logcat2,
+        phase: 'pending',
+      })),
+    });
+
+    const finishedSteps: BatchStepRow[] = [];
+    try {
+      for (let i = 0; i < BATCH_STEP_META.length; i++) {
+        setBatchRunUi((prev) =>
+          prev
+            ? {
+                steps: prev.steps.map((s) =>
+                  s.index === i ? { ...s, phase: 'running' } : s
+                ),
+              }
+            : null
+        );
+
+        const r = await fetch('/api/admin/data-checks/run-all-vwork-fixes/step', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ index: i }),
+        });
+        const data = (await r.json().catch(() => ({}))) as BatchStepRow & { error?: string };
+
+        let row: BatchStepRow;
         if (!r.ok) {
-          setBatchFixesError(typeof data.error === 'string' ? data.error : `HTTP ${r.status}`);
-          return;
+          const meta = BATCH_STEP_META[i]!;
+          row = {
+            step: meta.label,
+            logcat2: meta.logcat2,
+            ok: false,
+            error: typeof data.error === 'string' ? data.error : `HTTP ${r.status}`,
+          };
+        } else {
+          row = {
+            step: data.step,
+            logcat2: data.logcat2,
+            ok: data.ok,
+            result: data.result,
+            error: data.error,
+            logid: data.logid,
+            logdatetime: data.logdatetime,
+          };
         }
-        if (!data.steps || !Array.isArray(data.steps)) {
-          setBatchFixesError('Unexpected response');
-          return;
-        }
-        setBatchFixesResult({ ok: data.ok, steps: data.steps });
-        setLogFilter('AutoRun');
-        loadLogs('AutoRun');
-      })
-      .catch((e) => setBatchFixesError(e.message ?? 'Network error'))
-      .finally(() => setAllFixesRunning(false));
+
+        finishedSteps.push(row);
+        setBatchRunUi((prev) =>
+          prev
+            ? {
+                steps: prev.steps.map((s) =>
+                  s.index === i ? { ...s, phase: 'done', outcome: row } : s
+                ),
+              }
+            : null
+        );
+      }
+
+      setBatchFixesResult({ ok: finishedSteps.every((s) => s.ok), steps: finishedSteps });
+      setLogFilter('AutoRun');
+      loadLogs('AutoRun');
+    } catch (e) {
+      setBatchFixesError(e instanceof Error ? e.message : String(e));
+      setBatchRunUi(null);
+    } finally {
+      setAllFixesRunning(false);
+    }
   };
 
   const parseDetails = (d: string | null | undefined): Record<string, unknown> => {
@@ -243,9 +371,19 @@ export default function AutoRunsPage() {
         </div>
 
         <p className="mt-3 text-sm text-zinc-500 dark:text-zinc-400">
-          Vwork table updates (same actions as Admin → Data checks). These read mapping tables and update{' '}
-          <code className="rounded bg-zinc-100 px-1 text-xs dark:bg-zinc-800">tbl_vworkjobs</code>.
+          Vwork table updates (same actions as Admin → Data checks). Most steps use mapping tables; Step4→5 updates step fields on{' '}
+          <code className="rounded bg-zinc-100 px-1 text-xs dark:bg-zinc-800">tbl_vworkjobs</code> where the row matches the fix rules.
         </p>
+        <div className="mt-3 rounded-lg border border-zinc-200 bg-zinc-50/80 px-3 py-2.5 dark:border-zinc-700 dark:bg-zinc-900/40">
+          <p className="mb-2 text-xs font-medium text-zinc-700 dark:text-zinc-300">
+            Run all fixes runs these seven steps in order:
+          </p>
+          <ol className="list-decimal space-y-1 pl-5 text-xs text-zinc-600 dark:text-zinc-400">
+            {RUN_ALL_FIXES_DESCRIPTIONS.map((line, i) => (
+              <li key={i}>{line}</li>
+            ))}
+          </ol>
+        </div>
         <div className="mt-3 flex flex-wrap items-center gap-2">
           {FIX_ACTIONS.map((a) => (
             <button
@@ -260,15 +398,105 @@ export default function AutoRunsPage() {
           ))}
           <button
             type="button"
-            onClick={runAllFixes}
+            onClick={() => void runAllFixes()}
             disabled={fixRunning !== null || allFixesRunning}
             className="rounded bg-indigo-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-indigo-700 disabled:opacity-50"
           >
             {allFixesRunning ? 'Running all…' : 'Run all fixes'}
           </button>
         </div>
+
+        {batchRunUi && (
+          <div className="mt-4 rounded-lg border border-indigo-200 bg-white p-4 dark:border-indigo-900 dark:bg-zinc-900">
+            <p className="mb-3 text-xs font-medium text-indigo-900 dark:text-indigo-200">
+              Run all fixes — progress
+            </p>
+            <div className="flex flex-wrap items-start justify-center gap-3 sm:justify-start">
+              {batchRunUi.steps.map((s) => {
+                const doneOk = s.phase === 'done' && s.outcome?.ok;
+                const doneFail = s.phase === 'done' && s.outcome && !s.outcome.ok;
+                const circleClass =
+                  s.phase === 'pending'
+                    ? 'border-zinc-300 bg-zinc-50 text-zinc-400 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-500'
+                    : s.phase === 'running'
+                      ? 'border-indigo-500 bg-indigo-50 text-indigo-700 ring-2 ring-indigo-300 dark:border-indigo-400 dark:bg-indigo-950/50 dark:text-indigo-200 dark:ring-indigo-800'
+                      : doneOk
+                        ? 'border-emerald-500 bg-emerald-500 text-white dark:border-emerald-600 dark:bg-emerald-600'
+                        : doneFail
+                          ? 'border-red-500 bg-red-500 text-white dark:border-red-600 dark:bg-red-600'
+                          : 'border-zinc-300 bg-zinc-50 text-zinc-600';
+                return (
+                  <div
+                    key={s.index}
+                    className="flex w-[4.75rem] shrink-0 flex-col items-center gap-1.5"
+                    title={s.outcome ? summarizeBatchStep(s.outcome) : s.label}
+                  >
+                    <div
+                      className={`flex h-10 w-10 items-center justify-center rounded-full border-2 text-sm font-bold transition-colors ${circleClass}`}
+                      aria-label={
+                        s.phase === 'done'
+                          ? `${s.index + 1}: ${s.outcome?.ok ? 'completed' : 'failed'}`
+                          : s.phase === 'running'
+                            ? `${s.index + 1}: running`
+                            : `${s.index + 1}: pending`
+                      }
+                    >
+                      {s.phase === 'done' ? (s.outcome?.ok ? '✓' : '✕') : s.index + 1}
+                    </div>
+                    <span className="line-clamp-2 text-center text-[10px] leading-tight text-zinc-600 dark:text-zinc-400">
+                      {s.label}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+            {(() => {
+              const cur = batchRunUi.steps.find((s) => s.phase === 'running');
+              if (!cur) return null;
+              return (
+                <p className="mt-3 text-xs text-indigo-700 dark:text-indigo-300">
+                  Running step {cur.index + 1} of {batchRunUi.steps.length}:{' '}
+                  <span className="font-medium">{cur.label}</span>…
+                </p>
+              );
+            })()}
+            {batchRunUi.steps.every((s) => s.phase === 'done') && (
+              <ul className="mt-4 space-y-1.5 border-t border-zinc-200 pt-3 text-xs text-zinc-700 dark:border-zinc-700 dark:text-zinc-300">
+                {batchRunUi.steps.map((s) => (
+                  <li key={s.index} className="flex gap-2">
+                    <span
+                      className={`shrink-0 font-mono tabular-nums font-semibold ${
+                        s.outcome?.ok
+                          ? 'text-emerald-700 dark:text-emerald-400'
+                          : 'text-red-600 dark:text-red-400'
+                      }`}
+                    >
+                      {s.index + 1}.
+                    </span>
+                    <span>
+                      {s.outcome ? (
+                        <>
+                          <span className="font-medium">{s.outcome.step}:</span>{' '}
+                          {summarizeBatchStep(s.outcome)}
+                          {s.outcome.logid ? (
+                            <span className="ml-1 font-mono text-zinc-500 dark:text-zinc-500">
+                              log {s.outcome.logid}
+                            </span>
+                          ) : null}
+                        </>
+                      ) : (
+                        '—'
+                      )}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        )}
+
         <p className="mt-2 text-xs text-zinc-500 dark:text-zinc-400">
-          Run all fixes executes the five steps in order and writes one <code className="rounded bg-zinc-100 px-0.5 dark:bg-zinc-800">tbl_logs</code> row per step (
+          Each batch step writes one <code className="rounded bg-zinc-100 px-0.5 dark:bg-zinc-800">tbl_logs</code> row (
           <code className="rounded bg-zinc-100 px-0.5 dark:bg-zinc-800">AutoRun</code> /{' '}
           <code className="rounded bg-zinc-100 px-0.5 dark:bg-zinc-800">vwork-fixes-batch</code>). The log table below switches to AutoRun when finished.
         </p>

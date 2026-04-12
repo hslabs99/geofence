@@ -5,6 +5,7 @@
 INSERT INTO tbl_mappings (type, filefieldname, dbcolumnname, dbmaxlength) VALUES
 ('VW', 'job id', 'job_id', 20),
 ('VW', 'client name', 'customer', 100),
+('VW', 'customer', 'customer', 100),
 ('VW', 'when', 'planned_start_time', NULL),
 ('VW', 'planned start (d/m/y)', 'planned_start_time', NULL),
 ('VW', 'planned duration (hrs)', 'planned_duration_mins', NULL),
@@ -52,7 +53,7 @@ INSERT INTO tbl_mappings (type, filefieldname, dbcolumnname, dbmaxlength) VALUES
 ('VW', 'field notes', 'field_notes', 1000),
 ('VW', 'comments', 'comments', 1000),
 ('VW', 'vinename', 'vinename', 100),
-('VW', 'load size', 'load_size', NULL),
+('VW', 'load size', 'loadsize', NULL),
 ('VW', 'number of loads', 'number_of_loads', NULL),
 ('VW', 'trailer rego', 'trailer_rego', 20),
 ('VW', 'truck id', 'truck_id', 20),

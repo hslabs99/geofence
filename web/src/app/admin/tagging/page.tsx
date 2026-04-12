@@ -155,7 +155,13 @@ export default function TaggingPage() {
   const [vworkStartSummaryLoading, setVworkStartSummaryLoading] = useState(false);
   const [vworkStartSummaryError, setVworkStartSummaryError] = useState<string | null>(null);
 
-  /** Optional Steps filters (tbl_vworkjobs): exact vineyard / winery / device (worker). */
+  /** Optional Steps filters (tbl_vworkjobs): customer / template / vineyard / winery / device (worker). */
+  const [filterCustomer, setFilterCustomer] = useState('');
+  const [filterTemplate, setFilterTemplate] = useState('');
+  const [vworkCustomerOptions, setVworkCustomerOptions] = useState<string[]>([]);
+  const [vworkTemplateOptions, setVworkTemplateOptions] = useState<string[]>([]);
+  const [vworkCustomersLoadError, setVworkCustomersLoadError] = useState<string | null>(null);
+  const [vworkTemplatesLoadError, setVworkTemplatesLoadError] = useState<string | null>(null);
   const [filterVineyard, setFilterVineyard] = useState('');
   const [filterWinery, setFilterWinery] = useState('');
   const [filterDevice, setFilterDevice] = useState('');
@@ -198,6 +204,58 @@ export default function TaggingPage() {
       cancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    setVworkCustomersLoadError(null);
+    fetch('/api/vworkjobs/customers', { cache: 'no-store' })
+      .then(async (r) => {
+        const d = (await r.json()) as { customers?: string[]; error?: string };
+        if (!r.ok) throw new Error(d.error ?? `HTTP ${r.status}`);
+        return d;
+      })
+      .then((d) => {
+        if (!cancelled) setVworkCustomerOptions(Array.isArray(d.customers) ? d.customers : []);
+      })
+      .catch((e: unknown) => {
+        if (!cancelled) {
+          setVworkCustomerOptions([]);
+          setVworkCustomersLoadError(e instanceof Error ? e.message : String(e));
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    const c = filterCustomer.trim();
+    if (!c) {
+      setVworkTemplateOptions([]);
+      setVworkTemplatesLoadError(null);
+      return;
+    }
+    let cancelled = false;
+    setVworkTemplatesLoadError(null);
+    fetch(`/api/vworkjobs/templates?customer=${encodeURIComponent(c)}`, { cache: 'no-store' })
+      .then(async (r) => {
+        const d = (await r.json()) as { templates?: string[]; error?: string };
+        if (!r.ok) throw new Error(d.error ?? `HTTP ${r.status}`);
+        return d;
+      })
+      .then((d) => {
+        if (!cancelled) setVworkTemplateOptions(Array.isArray(d.templates) ? d.templates : []);
+      })
+      .catch((e: unknown) => {
+        if (!cancelled) {
+          setVworkTemplateOptions([]);
+          setVworkTemplatesLoadError(e instanceof Error ? e.message : String(e));
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [filterCustomer]);
 
   useEffect(() => {
     let cancelled = false;
@@ -257,6 +315,8 @@ export default function TaggingPage() {
       u.searchParams.set('dateTo', to);
       u.searchParams.set('countOnly', 'true');
       if (!stepsForce) u.searchParams.set('stepsFetched', 'false');
+      if (filterCustomer.trim()) u.searchParams.set('customer', filterCustomer.trim());
+      if (filterTemplate.trim()) u.searchParams.set('template', filterTemplate.trim());
       if (filterVineyard) u.searchParams.set('vineyard', filterVineyard);
       if (filterWinery) u.searchParams.set('winery', filterWinery);
       if (filterDevice) u.searchParams.set('device', filterDevice);
@@ -279,7 +339,7 @@ export default function TaggingPage() {
       clearTimeout(t);
       ac.abort();
     };
-  }, [dateFrom, dateTo, stepsForce, filterVineyard, filterWinery, filterDevice]);
+  }, [dateFrom, dateTo, stepsForce, filterCustomer, filterTemplate, filterVineyard, filterWinery, filterDevice]);
 
   const loadEntryexitLogs = useCallback(async () => {
     setEntryexitLogsLoading(true);
@@ -623,6 +683,8 @@ export default function TaggingPage() {
     const stepsParams = new URLSearchParams();
     stepsParams.set('date', date);
     if (!stepsForce) stepsParams.set('stepsFetched', 'false');
+    if (filterCustomer.trim()) stepsParams.set('customer', filterCustomer.trim());
+    if (filterTemplate.trim()) stepsParams.set('template', filterTemplate.trim());
     if (filterVineyard) stepsParams.set('vineyard', filterVineyard);
     if (filterWinery) stepsParams.set('winery', filterWinery);
     if (filterDevice) stepsParams.set('device', filterDevice);
@@ -1108,6 +1170,51 @@ export default function TaggingPage() {
                     Could not load dropdown values: {filterOptionsLoadError}
                   </p>
                 )}
+                {vworkCustomersLoadError && (
+                  <p className="w-full text-xs text-red-600 dark:text-red-400">
+                    Could not load customers: {vworkCustomersLoadError}
+                  </p>
+                )}
+                {vworkTemplatesLoadError && (
+                  <p className="w-full text-xs text-red-600 dark:text-red-400">
+                    Could not load templates: {vworkTemplatesLoadError}
+                  </p>
+                )}
+                <label className="flex flex-col gap-1">
+                  <span className="text-xs font-medium text-zinc-600 dark:text-zinc-400">Customer</span>
+                  <select
+                    value={filterCustomer}
+                    onChange={(e) => {
+                      setFilterCustomer(e.target.value);
+                      setFilterTemplate('');
+                    }}
+                    disabled={runStatus === 'running'}
+                    className="min-w-[10rem] max-w-[14rem] rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+                  >
+                    <option value="">Any</option>
+                    {vworkCustomerOptions.map((c) => (
+                      <option key={c} value={c}>
+                        {c}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label className="flex flex-col gap-1">
+                  <span className="text-xs font-medium text-zinc-600 dark:text-zinc-400">Template</span>
+                  <select
+                    value={filterTemplate}
+                    onChange={(e) => setFilterTemplate(e.target.value)}
+                    disabled={runStatus === 'running' || !filterCustomer.trim()}
+                    className="min-w-[10rem] max-w-[14rem] rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm disabled:opacity-60 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+                  >
+                    <option value="">Any</option>
+                    {vworkTemplateOptions.map((t) => (
+                      <option key={t} value={t}>
+                        {t}
+                      </option>
+                    ))}
+                  </select>
+                </label>
                 <label className="flex flex-col gap-1">
                   <span className="text-xs font-medium text-zinc-600 dark:text-zinc-400">Vineyard name</span>
                   <select

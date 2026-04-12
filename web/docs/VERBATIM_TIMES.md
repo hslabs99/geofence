@@ -10,9 +10,10 @@
 
 ## The only exception
 
-- **position_time_nz** is the only derived timestamp. It is set in exactly one place: a **SQL UPDATE** (e.g. `position_time + interval '13 hours'`). That happens in:
-  - `api/admin/tracking/apply-position-time-nz-and-fences`
+- **position_time_nz** is the only derived timestamp. It is set only via **SQL UPDATE** (e.g. `(position_time AT TIME ZONE 'UTC' AT TIME ZONE 'Pacific/Auckland')` where `position_time_nz` is null). That happens in:
+  - `api/admin/tracking/apply-position-time-nz` and `apply-position-time-nz-and-fences`
   - `api/admin/tracking/store-fences-for-date-range`
+  - `lib/fill-position-time-nz` (e.g. after GPS merge)
 - No application code must ever derive `position_time` from API data using `Date`, `toISOString`, `getUTC*`, or any timezone logic. API → `position_time` is **verbatim only**.
 
 ## How we enforce it
