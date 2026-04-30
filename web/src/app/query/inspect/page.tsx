@@ -1,10 +1,12 @@
 'use client';
 
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { usePathname, useRouter, useSearchParams } from 'next/navigation';
 import { formatColumnLabel, formatDateNZ, computeColumnWidths } from '@/lib/utils';
 import { formatIntNz } from '@/lib/format-nz';
 import { addMinutesToTimestampAsNZ, runFetchStepsForJobs } from '@/lib/fetch-steps';
+import { buildInspectDerivedStepsExplanation } from '@/lib/inspect-derived-steps-explanation';
 import { buildInspectGpsWindowForJob } from '@/lib/inspect-gps-window';
 
 type Row = Record<string, unknown>;
@@ -16,14 +18,9 @@ const SORT_SETTING_NAME = 'Inspectsort';
 
 const PRIORITY_COLUMNS = [
   'job_id', 'planned_start_time', 'customer', 'template',
-  'delivery_winery', 'vineyard_name', 'trailertype', 'loadsize', 'trailermode', 'worker',
+  'delivery_winery', 'vineyard_name', 'distance', 'loadsize', 'trailermode', 'worker',
   'truck_id', 'truck_rego',
 ];
-
-const DATE_COLUMNS = new Set([
-  'planned_start_time', 'actual_start_time', 'actual_end_time', 'gps_start_time', 'gps_end_time',
-  'step_1_completed_at', 'step_2_completed_at', 'step_3_completed_at', 'step_4_completed_at',
-]);
 
 const INSPECT_PAGE_SIZE = 100;
 /** Must match API cap on repeated `jobId=` (Data Audit → Inspect). */
@@ -69,21 +66,67 @@ function minutesBetweenInspect(prev: unknown, curr: unknown): number | null {
 }
 
 /** Tokens appended to tbl_vworkjobs.calcnotes (suffix “:”, space-separated). Longest match first in regex. */
-const CALCNOTE_KNOWN_TAG_RE = /(VineFenceV\+:|VineFence\+:|GPS\*:|VineSR1:)/g;
+const CALCNOTE_KNOWN_TAG_RE =
+  /(VineFenceV\+\([^)]+\):|VineFenceV\+:|VineFence\+:|Step3windback:|GPS\*:|VineSR1:)/g;
 
 const CALCNOTE_TAG_HINTS: Record<string, string> = {
+  'Step3windback:':
+    'Cleanup: GPS step 4 (winery ENTER) is trusted; VWork step 3 was after that time. Step 3 actual was set by winding back from step 4 using morning travel (step 2 − step 1), or if that would not stay after step 2, the midpoint between step 2 and step 4.',
   'VineFence+:':
     'Steps+ used a buffered vineyard fence: step 2 and/or 3 had no raw ENTER/EXIT in the job window, so times were taken from GPS points inside an expanded polygon buffer.',
   'VineFenceV+:':
-    'Steps+ widened the vineyard window: raw polygon ENTER/EXIT existed, but the buffered stay started earlier and/or ended later, so step 2 and/or 3 were adjusted to that wider interval.',
+    'Steps+ widened only arrive vineyard: polygon ENTER/EXIT existed; buffered fence pulled step 2 more than 5 minutes earlier than polygon ENTER (queue at gate). Shorter deltas are ignored. Step 3 uses polygon EXIT verbatim.',
   'GPS*:':
     'Same-vineyard re-entry smoothing: the driver briefly left and re-entered the vineyard fence set with no other fence ENTER/EXIT between; step 3 uses the last EXIT in the chain (up to a few loops).',
   'VineSR1:':
     'Bankhouse South rule: when South vineyard polygons did not yield both step 2 and 3, times were taken from the mapped Bankhouse fence set instead.',
 };
 
+function calcnoteHintForSeg(seg: string): string | undefined {
+  const s = seg.trim();
+  const direct = CALCNOTE_TAG_HINTS[s as keyof typeof CALCNOTE_TAG_HINTS];
+  if (direct) return direct;
+  if (/^VineFenceV\+\([^)]+\):$/.test(s)) {
+    return CALCNOTE_TAG_HINTS['VineFenceV+:'];
+  }
+  return undefined;
+}
+
+function readInspectStepGps(row: Row | null | undefined, n: number): string | null {
+  if (!row) return null;
+  const v =
+    row[`step_${n}_gps_completed_at`] ??
+    row[`Step_${n}_GPS_completed_at`] ??
+    row[`Step_${n}_GPS_Completed_At`];
+  if (v == null || v === '') return null;
+  const s = String(v).trim();
+  return s === '' ? null : s;
+}
+
+function readInspectStepVia(row: Row | null | undefined, n: number): string {
+  if (!row) return '';
+  const v = row[`step_${n}_via`] ?? row[`Step_${n}_Via`];
+  if (v == null || v === '') return '';
+  return String(v).trim();
+}
+
+/** Extra lines when tags say VineFence+ but Step 2/3 GPS columns are empty — explains Via vs Step_N_GPS_completed_at. */
+function calcnoteVineFenceGpsGapHint(row: Row | null | undefined, tag: string): string {
+  if (!row) return '';
+  const t = tag.trim();
+  if (t !== 'VineFence+:' && t !== 'VineFenceV+:' && !/^VineFenceV\+\([^)]+\):$/.test(t)) return '';
+  const v2 = readInspectStepVia(row, 2);
+  const v3 = readInspectStepVia(row, 3);
+  const vineFenceVia = v2.includes('VineFence') || v3.includes('VineFence');
+  if (!vineFenceVia) return '';
+  const g2 = readInspectStepGps(row, 2);
+  const g3 = readInspectStepGps(row, 3);
+  if (g2 && g3) return '';
+  return `\n\n— GPS columns vs Via —\nCalcNotes records that Steps+ ran (buffered vineyard). step_2_via / step_3_via can still show VineFence+ while step_2_gps_completed_at / step_3_gps_completed_at are empty if the merged GPS-layer times were cleared by guardrails after merge (e.g. vs job end / ordering) or did not pass Steps+ filters—final step times may then come from VWork. “GPS Step Data” only shows step_N_gps_completed_at from the DB, not Via alone.`;
+}
+
 /** Hover or keyboard focus shows an explanation overlay for each known calcnote token. */
-function CalcNotesRichText({ text }: { text: string }) {
+function CalcNotesRichText({ text, row }: { text: string; row?: Row | null }) {
   const trimmed = text.trim();
   if (!trimmed) {
     return <span className="text-sm text-zinc-500 dark:text-zinc-400">—</span>;
@@ -92,8 +135,9 @@ function CalcNotesRichText({ text }: { text: string }) {
   return (
     <span className="inline-flex flex-wrap items-baseline gap-x-0 text-sm text-zinc-800 dark:text-zinc-200">
       {segments.map((seg, i) => {
-        const hint = CALCNOTE_TAG_HINTS[seg];
+        const hint = calcnoteHintForSeg(seg);
         if (hint != null) {
+          const fullHint = hint + calcnoteVineFenceGpsGapHint(row ?? null, seg);
           return (
             <span
               key={`cn-${i}-${seg}`}
@@ -103,9 +147,9 @@ function CalcNotesRichText({ text }: { text: string }) {
               {seg}
               <span
                 role="tooltip"
-                className="pointer-events-none absolute left-0 top-full z-[60] mt-1.5 hidden max-h-[min(40vh,16rem)] w-[min(22rem,calc(100vw-2rem))] overflow-y-auto rounded-md border border-zinc-200 bg-white px-2.5 py-2 text-left text-xs font-normal leading-snug text-zinc-700 shadow-lg group-hover:block group-focus-visible:block dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-200"
+                className="pointer-events-none absolute left-0 top-full z-[60] mt-1.5 hidden max-h-[min(40vh,16rem)] w-[min(22rem,calc(100vw-2rem))] overflow-y-auto whitespace-pre-wrap rounded-md border border-zinc-200 bg-white px-2.5 py-2 text-left text-xs font-normal leading-snug text-zinc-700 shadow-lg group-hover:block group-focus-visible:block dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-200"
               >
-                {hint}
+                {fullHint}
               </span>
             </span>
           );
@@ -118,23 +162,6 @@ function CalcNotesRichText({ text }: { text: string }) {
       })}
     </span>
   );
-}
-
-function compare(a: unknown, b: unknown, col: string): number {
-  const va = a == null ? '' : a;
-  const vb = b == null ? '' : b;
-  if (va === vb) return 0;
-  if (DATE_COLUMNS.has(col) && isIsoDateString(va) && isIsoDateString(vb)) {
-    return va.localeCompare(vb);
-  }
-  if (typeof va === 'number' && typeof vb === 'number') return va - vb;
-  if (typeof va === 'string' && typeof vb === 'string') {
-    const na = Number(va);
-    const nb = Number(vb);
-    if (!Number.isNaN(na) && !Number.isNaN(nb)) return na - nb;
-    return va.localeCompare(vb);
-  }
-  return String(va).localeCompare(String(vb));
 }
 
 function getDefaultColumnOrder(apiColumns: string[]): string[] {
@@ -152,17 +179,25 @@ function mergeColumnOrder(apiColumns: string[], saved: string[] | null): string[
   return ordered;
 }
 
-/** Keep Trailer Type, Load Size, Trailer (trailermode) immediately after Vineyard when present (Inspect default). */
+/** Keep Distance / Load Size / trailermode (TT) immediately after Vineyard when present (Inspect default). */
 function normalizeInspectColumnOrder(ordered: string[]): string[] {
-  if (!ordered.includes('vineyard_name')) return ordered;
-  const tt = 'trailertype';
+  const mapped = ordered.map((c) => (c === 'trailertype' ? 'trailermode' : c));
+  const deduped: string[] = [];
+  for (const c of mapped) {
+    if (c === 'trailermode' && deduped.includes('trailermode')) continue;
+    deduped.push(c);
+  }
+  if (!deduped.includes('vineyard_name')) return deduped;
+  const dist = 'distance';
   const ls = 'loadsize';
   const tm = 'trailermode';
-  const insert = [tt, ls, tm].filter((c) => ordered.includes(c));
-  if (insert.length === 0) return ordered;
-  const rest = ordered.filter((c) => c !== tt && c !== ls && c !== tm);
+
+  const insert = [dist, ls, tm].filter((c) => deduped.includes(c));
+  if (insert.length === 0) return deduped;
+
+  const rest = deduped.filter((c) => c !== dist && c !== ls && c !== tm);
   const vi = rest.indexOf('vineyard_name');
-  if (vi === -1) return ordered;
+  if (vi === -1) return deduped;
   rest.splice(vi + 1, 0, ...insert);
   return rest;
 }
@@ -189,10 +224,10 @@ function InspectContent() {
   const [filterCustomer, setFilterCustomer] = useState<string>('');
   const [filterTemplate, setFilterTemplate] = useState<string>('');
   const [filterTruckId, setFilterTruckId] = useState<string>('');
+  const [filterWorker, setFilterWorker] = useState<string>('');
   const [filterTrailermode, setFilterTrailermode] = useState<string>('');
   const [filterWinery, setFilterWinery] = useState<string>('');
   const [filterVineyard, setFilterVineyard] = useState<string>('');
-  const [filterTrailerType, setFilterTrailerType] = useState<string>('');
   const [filterLoadsize, setFilterLoadsize] = useState<string>('');
   /** Committed value sent to API; draft updates while typing and applies on Enter only (avoids DB load per keystroke). */
   const [filterJobId, setFilterJobId] = useState<string>('');
@@ -210,10 +245,10 @@ function InspectContent() {
   const [trailermodeOptions, setTrailermodeOptions] = useState<string[]>([]);
   const [wineryOptions, setWineryOptions] = useState<string[]>([]);
   const [vineyardOptions, setVineyardOptions] = useState<string[]>([]);
-  const [trailerTypeOptions, setTrailerTypeOptions] = useState<string[]>([]);
   const [loadsizeOptions, setLoadsizeOptions] = useState<string[]>([]);
   const [customersOptions, setCustomersOptions] = useState<string[]>([]);
   const [templateOptions, setTemplateOptions] = useState<string[]>([]);
+  const [workerOptions, setWorkerOptions] = useState<string[]>([]);
   /** Data Audit pivot → Inspect: job IDs only (other form filters ignored for the list). */
   const [auditJobFilterIds, setAuditJobFilterIds] = useState<string[] | null>(null);
   const auditUrlHandledRef = useRef<string | null>(null);
@@ -247,12 +282,18 @@ function InspectContent() {
   /** Display-only: extra minutes before/after the Settings window for GPS data (does not affect step fetching). */
   const [displayExpandBefore, setDisplayExpandBefore] = useState(0);
   const [displayExpandAfter, setDisplayExpandAfter] = useState(0);
-  const [derivedStepsDebug, setDerivedStepsDebug] = useState<Record<string, unknown> | null>(null);
-  const [showDerivedStepsDebug, setShowDerivedStepsDebug] = useState(false);
+  /** Full JSON from last /api/tracking/derived-steps?writeBack=1 (initialPass + stepsPlusReport + debug + steps). */
+  const [derivedStepsLogPayload, setDerivedStepsLogPayload] = useState<Record<string, unknown> | null>(null);
+  const [derivedStepsLogTab, setDerivedStepsLogTab] = useState<'explanation' | 'json'>('explanation');
   const [showMappingSection, setShowMappingSection] = useState(false);
   const [refetchStepsRunning, setRefetchStepsRunning] = useState(false);
   const [retagAndRefetchRunning, setRetagAndRefetchRunning] = useState(false);
   const [trackingRefreshKey, setTrackingRefreshKey] = useState(0);
+  const [pinJobModalOpen, setPinJobModalOpen] = useState(false);
+  const [pinJobNoteDraft, setPinJobNoteDraft] = useState('');
+  const [pinJobSaving, setPinJobSaving] = useState(false);
+  const [pinJobError, setPinJobError] = useState<string | null>(null);
+  const pinJobNoteRef = useRef<HTMLTextAreaElement>(null);
   /** Manual overrides (oride) per step + comment; synced from selectedRow when it changes. */
   const [stepOverrides, setStepOverrides] = useState<{ step1oride: string; step2oride: string; step3oride: string; step4oride: string; step5oride: string }>({
     step1oride: '', step2oride: '', step3oride: '', step4oride: '', step5oride: '',
@@ -274,10 +315,10 @@ function InspectContent() {
         filterCustomer,
         filterTemplate,
         filterTruckId,
+        filterWorker,
         filterTrailermode,
         filterWinery,
         filterVineyard,
-        filterTrailerType,
         filterLoadsize,
         filterJobId,
         filterPlannedFrom,
@@ -293,10 +334,10 @@ function InspectContent() {
       filterCustomer,
       filterTemplate,
       filterTruckId,
+      filterWorker,
       filterTrailermode,
       filterWinery,
       filterVineyard,
-      filterTrailerType,
       filterLoadsize,
       filterJobId,
       filterPlannedFrom,
@@ -382,8 +423,8 @@ function InspectContent() {
         setTrailermodeOptions(Array.isArray(d?.trailermodes) ? d.trailermodes : []);
         setWineryOptions(Array.isArray(d?.deliveryWineries) ? d.deliveryWineries : []);
         setVineyardOptions(Array.isArray(d?.vineyardNames) ? d.vineyardNames : []);
-        setTrailerTypeOptions(Array.isArray(d?.trailerTypes) ? d.trailerTypes : []);
         setLoadsizeOptions(Array.isArray(d?.loadSizes) ? d.loadSizes : []);
+        setWorkerOptions(Array.isArray(d?.workers) ? d.workers : []);
       })
       .catch((err) => {
         if ((err as Error).name === 'AbortError') return;
@@ -391,8 +432,8 @@ function InspectContent() {
         setTrailermodeOptions([]);
         setWineryOptions([]);
         setVineyardOptions([]);
-        setTrailerTypeOptions([]);
         setLoadsizeOptions([]);
+        setWorkerOptions([]);
       });
     return () => ac.abort();
   }, [filterCustomer]);
@@ -574,15 +615,23 @@ function InspectContent() {
       .catch(() => setGpsMappings([]));
   }, []);
 
+  const appendInspectSortParams = useCallback((p: URLSearchParams) => {
+    const c1 = sortColumns[0]?.trim() || 'actual_start_time';
+    p.set('sortColumn', c1);
+    const c2 = sortColumns[1]?.trim();
+    if (c2) p.set('sortColumn2', c2);
+    const c3 = sortColumns[2]?.trim();
+    if (c3) p.set('sortColumn3', c3);
+    p.set('sortDir', 'asc');
+  }, [sortColumns]);
+
   const buildInspectApiParams = useCallback(
     (opts: { resolveJobId: string | null }) => {
       if (auditJobFilterIds && auditJobFilterIds.length > 0) {
         const p = new URLSearchParams();
         p.set('limit', String(INSPECT_PAGE_SIZE));
         p.set('offset', String(jobsPage * INSPECT_PAGE_SIZE));
-        const c1 = sortColumns[0]?.trim() || 'actual_start_time';
-        p.set('sortColumn', c1);
-        p.set('sortDir', 'asc');
+        appendInspectSortParams(p);
         const cap = auditJobFilterIds.slice(0, MAX_AUDIT_JOB_FILTER_IDS);
         for (const id of cap) {
           const t = id.trim();
@@ -594,16 +643,14 @@ function InspectContent() {
       p.set('limit', String(INSPECT_PAGE_SIZE));
       p.set('offset', String(jobsPage * INSPECT_PAGE_SIZE));
       if (opts.resolveJobId) p.set('resolvePageForJob', opts.resolveJobId);
-      const c1 = sortColumns[0]?.trim() || 'actual_start_time';
-      p.set('sortColumn', c1);
-      p.set('sortDir', 'asc');
+      appendInspectSortParams(p);
       if (filterCustomer.trim()) p.set('customer', filterCustomer.trim());
       if (filterTemplate.trim()) p.set('template', filterTemplate.trim());
       if (filterTruckId.trim()) p.set('truck_id', filterTruckId.trim());
+      if (filterWorker.trim()) p.set('device', filterWorker.trim());
       if (filterTrailermode.trim()) p.set('trailermode', filterTrailermode.trim());
       if (filterWinery.trim()) p.set('winery', filterWinery.trim());
       if (filterVineyard.trim()) p.set('vineyard', filterVineyard.trim());
-      if (filterTrailerType.trim()) p.set('trailertype', filterTrailerType.trim());
       if (filterLoadsize.trim()) p.set('loadsize', filterLoadsize.trim());
       if (filterJobId.trim()) p.set('jobIdContains', filterJobId.trim());
       if (filterPlannedFrom?.trim() && /^\d{4}-\d{2}-\d{2}/.test(filterPlannedFrom)) p.set('plannedDateFrom', filterPlannedFrom.slice(0, 10));
@@ -642,10 +689,10 @@ function InspectContent() {
       filterCustomer,
       filterTemplate,
       filterTruckId,
+      filterWorker,
       filterTrailermode,
       filterWinery,
       filterVineyard,
-      filterTrailerType,
       filterLoadsize,
       filterJobId,
       filterPlannedFrom,
@@ -656,6 +703,7 @@ function InspectContent() {
       filterActualEndTo,
       searchParams,
       auditJobFilterIds,
+      appendInspectSortParams,
     ],
   );
 
@@ -666,9 +714,7 @@ function InspectContent() {
     const p = new URLSearchParams();
     p.set('limit', '1');
     p.set('offset', '0');
-    const c1 = sortColumns[0]?.trim() || 'actual_start_time';
-    p.set('sortColumn', c1);
-    p.set('sortDir', 'asc');
+    appendInspectSortParams(p);
     p.set('jobIdExact', id);
     try {
       const res = await fetch(`/api/vworkjobs?${p.toString()}`, { cache: 'no-store' });
@@ -691,7 +737,7 @@ function InspectContent() {
     } catch (e) {
       console.error('[Inspect refresh job row]', e);
     }
-  }, [sortColumns]);
+  }, [appendInspectSortParams]);
 
   useEffect(() => {
     if (skipJobsPageFetchRef.current) {
@@ -749,18 +795,18 @@ function InspectContent() {
     setFilterTemplate('');
     setFilterWinery('');
     setFilterVineyard('');
-    setFilterTrailerType('');
     setFilterLoadsize('');
+    setFilterWorker('');
   }, [filterCustomer]);
 
   const clearAllFilters = useCallback(() => {
     setFilterCustomer('');
     setFilterTemplate('');
     setFilterTruckId('');
+    setFilterWorker('');
     setFilterTrailermode('');
     setFilterWinery('');
     setFilterVineyard('');
-    setFilterTrailerType('');
     setFilterLoadsize('');
     setFilterJobId('');
     setFilterJobIdDraft('');
@@ -774,21 +820,8 @@ function InspectContent() {
     setJobsPage(0);
   }, []);
 
-  /** Server applies filters + primary sort; secondary/tertiary sort columns only (within page). */
-  const sortedRows = useMemo(() => {
-    const [, c2, c3] = sortColumns;
-    const secondary = [c2, c3].filter(Boolean);
-    if (secondary.length === 0) return rows;
-    const out = [...rows];
-    out.sort((a, b) => {
-      for (const col of secondary) {
-        const c = compare(a[col], b[col], col);
-        if (c !== 0) return c;
-      }
-      return 0;
-    });
-    return out;
-  }, [rows, sortColumns]);
+  /** Row order matches /api/vworkjobs ORDER BY (sortColumn, sortColumn2, sortColumn3). */
+  const sortedRows = rows;
 
   const selectedRow = sortedRows[Math.min(selectedRowIndex, Math.max(0, sortedRows.length - 1))] ?? sortedRows[0] ?? null;
 
@@ -796,7 +829,7 @@ function InspectContent() {
   const refetchStepsForSelectedJob = useCallback(async () => {
     if (!selectedRow) return;
     setRefetchStepsRunning(true);
-    setDerivedStepsDebug(null);
+    setDerivedStepsLogPayload(null);
     try {
       const result = await runFetchStepsForJobs({
         jobs: [selectedRow],
@@ -808,9 +841,8 @@ function InspectContent() {
         setTrackingRefreshKey((k) => k + 1);
       }
       if (result.lastResult != null && typeof result.lastResult === 'object') {
-        const d = (result.lastResult as { debug?: Record<string, unknown> }).debug;
-        setDerivedStepsDebug(d != null ? { ...d, _singleJob: true } : { _singleJob: true, fullResponse: result.lastResult });
-        setShowDerivedStepsDebug(true);
+        setDerivedStepsLogPayload({ ...(result.lastResult as Record<string, unknown>), _inspectSingleJob: true });
+        setDerivedStepsLogTab('explanation');
       }
     } finally {
       setRefetchStepsRunning(false);
@@ -830,8 +862,8 @@ function InspectContent() {
       setFilterTrailermode('');
       setFilterWinery('');
       setFilterVineyard('');
-      setFilterTrailerType('');
       setFilterLoadsize('');
+      setFilterWorker('');
       setFilterJobId('');
       setFilterJobIdDraft('');
       setFilterPlannedFrom('');
@@ -889,12 +921,33 @@ function InspectContent() {
     return () => cancelAnimationFrame(raf);
   }, [paramToLocate, selectedRowIndex, sortedRows]);
 
+  /** Fixed Inspect UI labels (do not use raw VWork step_N_name here). */
   const STEP_ROWS = [
-    { nameKey: 'step_1_name', completedKey: 'step_1_completed_at', actualTimeKey: 'step_1_actual_time' },
-    { nameKey: 'step_2_name', completedKey: 'step_2_completed_at', actualTimeKey: 'step_2_actual_time' },
-    { nameKey: 'step_3_name', completedKey: 'step_3_completed_at', actualTimeKey: 'step_3_actual_time' },
-    { nameKey: 'step_4_name', completedKey: 'step_4_completed_at', actualTimeKey: 'step_4_actual_time' },
-    { nameKey: 'step_5_name', completedKey: 'step_5_completed_at', actualTimeKey: 'step_5_actual_time' },
+    {
+      completedKey: 'step_1_completed_at',
+      actualTimeKey: 'step_1_actual_time',
+      displayLabel: 'Step 1: Start Job (Depart Winery)',
+    },
+    {
+      completedKey: 'step_2_completed_at',
+      actualTimeKey: 'step_2_actual_time',
+      displayLabel: 'Step 2: Arrive Vineyard',
+    },
+    {
+      completedKey: 'step_3_completed_at',
+      actualTimeKey: 'step_3_actual_time',
+      displayLabel: 'Step 3: Depart Vineyard',
+    },
+    {
+      completedKey: 'step_4_completed_at',
+      actualTimeKey: 'step_4_actual_time',
+      displayLabel: 'Step 4: Arrive Winery',
+    },
+    {
+      completedKey: 'step_5_completed_at',
+      actualTimeKey: 'step_5_actual_time',
+      displayLabel: 'Step 5: Complete Job',
+    },
   ] as const;
 
   /** Sync override state from selected job (from API/DB). */
@@ -987,7 +1040,7 @@ function InspectContent() {
     const tagDateFrom = windowStart.slice(0, 10); // YYYY-MM-DD
     const tagDateTo = windowEnd.slice(0, 10);
     setRetagAndRefetchRunning(true);
-    setDerivedStepsDebug(null);
+    setDerivedStepsLogPayload(null);
     try {
       const tagRes = await fetch('/api/admin/tagging/run', {
         method: 'POST',
@@ -1022,14 +1075,53 @@ function InspectContent() {
       }
       setTrackingRefreshKey((k) => k + 1);
       if (result.lastResult != null && typeof result.lastResult === 'object') {
-        const d = (result.lastResult as { debug?: Record<string, unknown> }).debug;
-        setDerivedStepsDebug(d != null ? { ...d, _singleJob: true } : { _singleJob: true, fullResponse: result.lastResult });
-        setShowDerivedStepsDebug(true);
+        setDerivedStepsLogPayload({ ...(result.lastResult as Record<string, unknown>), _inspectSingleJob: true });
+        setDerivedStepsLogTab('explanation');
       }
     } finally {
       setRetagAndRefetchRunning(false);
     }
   }, [selectedRow, deviceForTracking, actualStartTime, startLessMinutes, endPlusMinutes, refreshJobRowFromApi]);
+
+  const submitPinJobToRecent = useCallback(async () => {
+    const jobId = selectedRow?.job_id != null && selectedRow.job_id !== '' ? String(selectedRow.job_id).trim() : '';
+    if (!jobId) return;
+    setPinJobSaving(true);
+    setPinJobError(null);
+    try {
+      const r = await fetch('/api/inspect-history', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ job_id: jobId, note: pinJobNoteDraft.trim() }),
+      });
+      const data = (await r.json().catch(() => ({}))) as { error?: string };
+      if (!r.ok) {
+        setPinJobError(typeof data?.error === 'string' ? data.error : `Failed (${r.status})`);
+        return;
+      }
+      setPinJobModalOpen(false);
+      setPinJobNoteDraft('');
+      window.dispatchEvent(new Event('geodata-inspect-history-changed'));
+    } finally {
+      setPinJobSaving(false);
+    }
+  }, [selectedRow, pinJobNoteDraft]);
+
+  useEffect(() => {
+    if (!pinJobModalOpen) return;
+    const id = requestAnimationFrame(() => pinJobNoteRef.current?.focus());
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setPinJobModalOpen(false);
+        setPinJobError(null);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => {
+      cancelAnimationFrame(id);
+      window.removeEventListener('keydown', onKey);
+    };
+  }, [pinJobModalOpen]);
 
   useEffect(() => {
     if (!deviceForTracking || !actualStartTime.trim()) {
@@ -1217,6 +1309,13 @@ function InspectContent() {
     return String(v);
   }, []);
 
+  const formatDistanceCell = useCallback((v: unknown): string => {
+    if (v == null || v === '') return '—';
+    const n = typeof v === 'number' ? v : Number(v);
+    if (!Number.isFinite(n)) return '—';
+    return n.toFixed(2);
+  }, []);
+
   /** GPS table: format enter_time, outer_time as dd/mm/yy hh:mm:ss (same as vwork grid), no time adjustment. Lat/lon as number. */
   const formatGpsCell = useCallback((v: unknown): string => {
     if (v == null || v === '') return '—';
@@ -1346,17 +1445,6 @@ function InspectContent() {
             ))}
           </select>
         );
-      case 'trailertype':
-        return (
-          <select value={filterTrailerType} onChange={(e) => setFilterTrailerType(e.target.value)} className={fi} title="trailertype">
-            <option value="">All</option>
-            {trailerTypeOptions.map((t) => (
-              <option key={t} value={t}>
-                {t}
-              </option>
-            ))}
-          </select>
-        );
       case 'loadsize':
         return (
           <select value={filterLoadsize} onChange={(e) => setFilterLoadsize(e.target.value)} className={fi} title="loadsize">
@@ -1375,6 +1463,17 @@ function InspectContent() {
             {truckIdsOptions.map((id) => (
               <option key={id} value={id}>
                 {id}
+              </option>
+            ))}
+          </select>
+        );
+      case 'worker':
+        return (
+          <select value={filterWorker} onChange={(e) => setFilterWorker(e.target.value)} className={fi} title="worker (device)">
+            <option value="">All</option>
+            {workerOptions.map((w) => (
+              <option key={w} value={w}>
+                {w}
               </option>
             ))}
           </select>
@@ -1441,6 +1540,7 @@ function InspectContent() {
   };
 
   return (
+    <>
     <div className="w-full min-w-0 p-6">
       <h1 className="mb-4 text-2xl font-semibold text-zinc-900 dark:text-zinc-100">Inspect Data Vwork&gt;GPS</h1>
       <p className="mb-4 text-sm text-zinc-500">Jobs grid (branched from Vwork — will evolve into merged jobs + GPS view)</p>
@@ -1484,7 +1584,7 @@ function InspectContent() {
                 value={sortColumns[0]}
                 onChange={(e) => setSortColumn(0, e.target.value)}
                 className="max-w-[8.5rem] rounded border border-zinc-200 bg-white px-1 py-0.5 text-[11px] text-zinc-600 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-300"
-                title="Primary sort (API)"
+                title="Primary sort (SQL ORDER BY)"
               >
                 <option value="">—</option>
                 {allColumns.map((c) => (
@@ -1498,7 +1598,7 @@ function InspectContent() {
                 value={sortColumns[1]}
                 onChange={(e) => setSortColumn(1, e.target.value)}
                 className="max-w-[8.5rem] rounded border border-zinc-200 bg-white px-1 py-0.5 text-[11px] text-zinc-600 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-300"
-                title="Secondary (page)"
+                title="Secondary sort (SQL)"
               >
                 <option value="">—</option>
                 {allColumns.map((c) => (
@@ -1512,7 +1612,7 @@ function InspectContent() {
                 value={sortColumns[2]}
                 onChange={(e) => setSortColumn(2, e.target.value)}
                 className="max-w-[8.5rem] rounded border border-zinc-200 bg-white px-1 py-0.5 text-[11px] text-zinc-600 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-300"
-                title="Tertiary (page)"
+                title="Tertiary sort (SQL)"
               >
                 <option value="">—</option>
                 {allColumns.map((c) => (
@@ -1624,11 +1724,11 @@ function InspectContent() {
                       title="Drag to reorder"
                     >
                       {col === 'trailermode'
-                        ? 'Trailer'
-                        : col === 'trailertype'
-                          ? 'Trailer Type'
-                          : col === 'loadsize'
+                        ? 'TT'
+                        : col === 'loadsize'
                             ? 'Load Size'
+                            : col === 'distance'
+                                ? 'Distance'
                             : formatColumnLabel(col)}
                     </th>
                   ))}
@@ -1650,7 +1750,7 @@ function InspectContent() {
                   >
                     {columns.map((col) => (
                       <td key={col} className="whitespace-nowrap px-3 py-2 text-zinc-700 dark:text-zinc-300">
-                        {formatCell(row[col])}
+                        {col === 'distance' ? formatDistanceCell(row[col]) : formatCell(row[col])}
                       </td>
                     ))}
                   </tr>
@@ -1711,15 +1811,34 @@ function InspectContent() {
           <section className="mt-6 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900">
             {selectedRow && (
               <div className="mb-3">
-                <span className="text-xs font-medium text-zinc-500 dark:text-zinc-400">CalcNotes: </span>
+                <span
+                  className="text-xs font-medium text-zinc-500 dark:text-zinc-400"
+                  title="Hover each dotted tag (e.g. VineFence+:) for what it means. If Via shows VineFence+ but GPS Step Data is empty, the tag tooltip explains why."
+                >
+                  CalcNotes:{' '}
+                </span>
                 <CalcNotesRichText
                   text={String(selectedRow.calcnotes ?? selectedRow.calc_notes ?? selectedRow.CalcNotes ?? '')}
+                  row={selectedRow}
                 />
               </div>
             )}
             <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
               <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">Step details</h2>
               <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setPinJobError(null);
+                    setPinJobNoteDraft('');
+                    setPinJobModalOpen(true);
+                  }}
+                  disabled={!selectedRow}
+                  className="rounded border border-zinc-300 bg-white px-3 py-1.5 text-sm font-medium text-zinc-800 shadow-sm hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100 dark:hover:bg-zinc-700 dark:disabled:opacity-50"
+                  title="Put this job at the top of Query → Recent jobs, with an optional reminder note."
+                >
+                  Pin job
+                </button>
                 <button
                   type="button"
                   onClick={() => void retagDayAndRefetchSteps()}
@@ -1740,15 +1859,23 @@ function InspectContent() {
                 </button>
               </div>
             </div>
-            <table className="w-full min-w-[56rem] text-left text-sm table-fixed">
+            <table className="w-full min-w-[78rem] text-left text-sm table-fixed">
               <colgroup>
-                <col style={{ width: '14rem' }} /><col style={{ width: '12rem' }} /><col style={{ width: '6rem' }} /><col style={{ width: '6rem' }} /><col style={{ width: '14rem' }} /><col style={{ width: '12rem' }} /><col style={{ width: '5rem' }} />
+                {/* Step name must fit longest label without overflowing into VWork completed; GPS step needs room for NZ datetime + optional "N min" without overlapping GPS row */}
+                <col style={{ width: '19rem' }} />
+                <col style={{ width: '11rem' }} />
+                <col style={{ width: '10.5rem' }} />
+                <col style={{ width: '6.5rem' }} />
+                <col style={{ width: '14rem' }} />
+                <col style={{ width: '12rem' }} />
+                <col style={{ width: '5rem' }} />
               </colgroup>
               <thead>
                 <tr className="border-b border-zinc-200 dark:border-zinc-700">
-                  <th colSpan={2} className="px-2 py-1.5 font-medium text-zinc-500 text-center">
-                    Vwork Data
+                  <th rowSpan={2} className="align-bottom px-2 py-1.5 font-medium text-zinc-500">
+                    Step Name
                   </th>
+                  <th className="px-2 py-1.5 text-left font-medium text-zinc-500">VWork Data</th>
                   <th className="px-2 py-1.5 font-medium text-zinc-500">GPS Step Data</th>
                   <th className="px-2 py-1.5 font-medium text-zinc-500">GPS Row</th>
                   <th className="px-2 py-1.5 font-medium text-zinc-500">Manual Overrides</th>
@@ -1756,7 +1883,6 @@ function InspectContent() {
                   <th className="px-2 py-1.5 font-medium text-zinc-500">Details</th>
                 </tr>
                 <tr className="border-b border-zinc-200 dark:border-zinc-700">
-                  <th className="px-2 py-1.5 font-medium text-zinc-500">Step Name</th>
                   <th className="px-2 py-1.5 font-medium text-zinc-500">Step Completed</th>
                   <th className="px-2 py-1.5 font-medium text-zinc-500">Step Completed</th>
                   <th className="px-2 py-1.5 font-medium text-zinc-500">—</th>
@@ -1766,7 +1892,7 @@ function InspectContent() {
                 </tr>
               </thead>
               <tbody>
-                {STEP_ROWS.map(({ nameKey, completedKey, actualTimeKey }, i) => {
+                {STEP_ROWS.map(({ completedKey, actualTimeKey, displayLabel }, i) => {
                   const n = i + 1;
                   const orideKey = `step${n}oride` as keyof typeof stepOverrides;
                   const gpsCompletedKey = `step_${n}_gps_completed_at` as keyof Row;
@@ -1814,43 +1940,51 @@ function InspectContent() {
                     return `${m[1]}-${m[2]}-${m[3]}T${(m[4] ?? '00').padStart(2, '0')}:${(m[5] ?? '00').padStart(2, '0')}`;
                   };
                   const fromDatetimeLocal = (v: string): string => (v ? `${v.replace('T', ' ')}:00` : '');
+                  const vworkEmpty = !selectedRow || selectedRow[completedKey] == null || selectedRow[completedKey] === '';
+                  const gpsStepEmpty = gpsStepDisplay === '—';
                   return (
                   <tr key={i} className="border-b border-zinc-100 dark:border-zinc-800">
-                    <td className="whitespace-nowrap px-2 py-1.5 text-zinc-700 dark:text-zinc-300">
-                      {selectedRow ? formatCell(selectedRow[nameKey]) : '—'}
+                    <td className="max-w-0 overflow-hidden text-ellipsis whitespace-nowrap px-2 py-1.5 text-zinc-700 dark:text-zinc-300" title={selectedRow ? displayLabel : undefined}>
+                      {selectedRow ? displayLabel : '—'}
                     </td>
                     <td
-                      className={`whitespace-nowrap px-2 py-1.5 text-zinc-700 dark:text-zinc-300 ${vworkClickable ? clickableClass : ''}`}
+                      className={`whitespace-nowrap px-2 py-1.5 ${vworkEmpty ? 'text-zinc-400 dark:text-zinc-500' : 'text-black dark:text-zinc-50'} ${vworkClickable ? clickableClass : ''}`}
                       onClick={vworkClickable ? () => focusGpsOnStepTime(selectedRow![completedKey]) : undefined}
                       title={vworkClickable ? 'Show GPS raw around this time (step −2 min to job end +60)' : undefined}
                     >
                       <span className="inline-flex items-baseline gap-1.5">
                         {selectedRow ? formatCell(selectedRow[completedKey]) : '—'}
-                        {vworkMins != null && <span className="text-xs text-zinc-500 dark:text-zinc-400 tabular-nums">{vworkMins} min</span>}
+                        {vworkMins != null && (
+                          <span className={`text-xs tabular-nums ${vworkEmpty ? 'text-zinc-400 dark:text-zinc-500' : 'text-zinc-600 dark:text-zinc-400'}`}>{vworkMins} min</span>
+                        )}
                       </span>
                     </td>
                     <td
-                      className={`whitespace-nowrap px-2 py-1.5 text-zinc-400 dark:text-zinc-500 ${gpsClickable ? clickableClass : ''}`}
+                      className={`overflow-hidden whitespace-nowrap px-2 py-1.5 ${gpsStepEmpty ? 'text-zinc-400 dark:text-zinc-500' : 'font-medium text-blue-800 dark:text-blue-300'} ${gpsClickable ? clickableClass : ''}`}
                       onClick={gpsClickable ? () => focusGpsOnStepTime(gpsStepValue) : undefined}
                       title={gpsClickable ? 'Show GPS raw around this time (step −2 min to job end +60)' : undefined}
                     >
                       <span className="inline-flex items-baseline gap-1.5">
                         {gpsStepDisplay}
-                        {gpsMins != null && <span className="text-xs text-zinc-500 dark:text-zinc-400 tabular-nums">{gpsMins} min</span>}
+                        {gpsMins != null && (
+                          <span className={`text-xs tabular-nums ${gpsStepEmpty ? 'text-zinc-400 dark:text-zinc-500' : 'font-medium text-blue-700 dark:text-blue-400'}`}>{gpsMins} min</span>
+                        )}
                       </span>
                     </td>
-                    <td className="whitespace-nowrap px-2 py-1.5 text-zinc-400 dark:text-zinc-500 font-mono text-xs" title={gpsRowId != null && gpsRowId !== '' ? `tbl_tracking.id = ${gpsRowId}` : undefined}>{gpsRowDisplay}</td>
-                    <td className="whitespace-nowrap px-2 py-1.5">
+                    <td className="whitespace-nowrap px-2 py-1.5 font-mono text-xs text-zinc-600 dark:text-zinc-400" title={gpsRowId != null && gpsRowId !== '' ? `tbl_tracking.id = ${gpsRowId}` : undefined}>{gpsRowDisplay}</td>
+                    <td className={`whitespace-nowrap px-2 py-1.5 ${orideValue ? 'text-red-800 dark:text-red-300' : 'text-zinc-400 dark:text-zinc-500'}`}>
                       <div className="flex flex-wrap items-center gap-1">
                         <div className="flex items-center gap-1.5">
                           <input
                             type="datetime-local"
                             value={orideValue ? toDatetimeLocal(orideValue) : ''}
                             onChange={(e) => setStepOverrides((prev) => ({ ...prev, [orideKey]: fromDatetimeLocal(e.target.value) }))}
-                            className={`w-[10.8rem] rounded border px-1.5 py-0.5 text-xs ${orideValue ? 'border-zinc-400 bg-white text-zinc-900 font-semibold dark:border-zinc-500 dark:bg-zinc-800 dark:text-zinc-100' : 'border-zinc-200 bg-zinc-50 text-zinc-400 placeholder:text-zinc-400 dark:border-zinc-600 dark:bg-zinc-800/50 dark:text-zinc-500 dark:placeholder:text-zinc-500'}`}
+                            className={`w-[10.8rem] rounded border px-1.5 py-0.5 text-xs ${orideValue ? 'border-red-400 bg-white font-semibold text-red-900 dark:border-red-500 dark:bg-zinc-900 dark:text-red-200' : 'border-zinc-200 bg-zinc-50 text-zinc-400 placeholder:text-zinc-400 dark:border-zinc-600 dark:bg-zinc-800/50 dark:text-zinc-500 dark:placeholder:text-zinc-500'}`}
                             title="Manual override for this step"
                           />
-                          {orideMins != null && <span className="text-xs text-zinc-500 dark:text-zinc-400 tabular-nums whitespace-nowrap">{orideMins} min</span>}
+                          {orideMins != null && (
+                            <span className={`text-xs tabular-nums whitespace-nowrap ${orideValue ? 'text-red-800 dark:text-red-300' : 'text-zinc-400 dark:text-zinc-500'}`}>{orideMins} min</span>
+                          )}
                         </div>
                         <span className="flex gap-0.5">
                           <button
@@ -1881,13 +2015,15 @@ function InspectContent() {
                       </div>
                     </td>
                     <td
-                      className={`whitespace-nowrap px-2 py-1.5 ${finalValue != null && finalValue !== '' ? 'font-semibold text-zinc-900 dark:text-zinc-100' : 'text-zinc-400 dark:text-zinc-500'} ${finalClickable ? clickableClass : ''}`}
+                      className={`whitespace-nowrap px-2 py-1.5 ${finalValue != null && finalValue !== '' ? 'font-semibold text-green-900 dark:text-green-400' : 'text-zinc-400 dark:text-zinc-500'} ${finalClickable ? clickableClass : ''}`}
                       onClick={finalClickable ? () => focusGpsOnStepTime(finalValue) : undefined}
                       title={finalClickable ? 'Show GPS raw around this time (step −2 min to job end +60)' : undefined}
                     >
                       <span className="inline-flex items-baseline gap-1.5">
                         {finalDisplay}
-                        {finalMins != null && <span className="text-xs text-zinc-500 dark:text-zinc-400 tabular-nums">{finalMins} min</span>}
+                        {finalMins != null && (
+                          <span className={`text-xs tabular-nums ${finalValue != null && finalValue !== '' ? 'text-green-800 dark:text-green-500' : 'text-zinc-400 dark:text-zinc-500'}`}>{finalMins} min</span>
+                        )}
                       </span>
                     </td>
                     <td className="whitespace-nowrap px-2 py-1.5 text-zinc-400 dark:text-zinc-500">—</td>
@@ -1999,29 +2135,65 @@ function InspectContent() {
               </tfoot>
             </table>
             <div className="mt-4 rounded border border-zinc-200 bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-800/50">
-              <div className="border-b border-zinc-200 px-3 py-2 text-sm font-medium text-zinc-700 dark:border-zinc-700 dark:text-zinc-300">
-                Log
+              <div className="flex flex-wrap items-center justify-between gap-2 border-b border-zinc-200 px-3 py-2 dark:border-zinc-700">
+                <span className="text-sm font-medium text-zinc-700 dark:text-zinc-300">Steps debug</span>
+                {derivedStepsLogPayload != null && (
+                  <div className="flex rounded border border-zinc-300 bg-white text-xs dark:border-zinc-600 dark:bg-zinc-900">
+                    <button
+                      type="button"
+                      onClick={() => setDerivedStepsLogTab('explanation')}
+                      className={`px-2.5 py-1 font-medium ${
+                        derivedStepsLogTab === 'explanation'
+                          ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100'
+                          : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
+                      }`}
+                    >
+                      Explanation
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setDerivedStepsLogTab('json')}
+                      className={`px-2.5 py-1 font-medium ${
+                        derivedStepsLogTab === 'json'
+                          ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100'
+                          : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
+                      }`}
+                    >
+                      JSON
+                    </button>
+                  </div>
+                )}
               </div>
-              {derivedStepsDebug == null ? (
+              {derivedStepsLogPayload == null ? (
                 <p className="px-3 py-4 text-sm text-zinc-500 dark:text-zinc-400">
                   Refetch steps to see log.
                 </p>
+              ) : derivedStepsLogTab === 'json' ? (
+                <pre className="max-h-[480px] overflow-auto whitespace-pre-wrap break-all px-3 py-3 font-mono text-xs text-zinc-800 dark:text-zinc-200">
+                  {JSON.stringify(derivedStepsLogPayload, null, 2)}
+                </pre>
               ) : (
-                <>
-                  <button
-                    type="button"
-                    onClick={() => setShowDerivedStepsDebug((v) => !v)}
-                    className="flex w-full items-center justify-between px-3 py-1.5 text-left text-xs font-medium text-zinc-600 dark:text-zinc-400"
-                  >
-                    <span>{showDerivedStepsDebug ? 'Hide' : 'Show'} full log</span>
-                    <span>{showDerivedStepsDebug ? '▼' : '▶'}</span>
-                  </button>
-                  {showDerivedStepsDebug && (
-                    <pre className="max-h-[420px] overflow-auto whitespace-pre-wrap break-all px-3 py-2 font-mono text-xs text-zinc-800 dark:text-zinc-200">
-                      {JSON.stringify(derivedStepsDebug, null, 2)}
-                    </pre>
+                <div className="max-h-[480px] divide-y divide-zinc-200 overflow-auto px-2 py-1 text-sm dark:divide-zinc-700">
+                  {buildInspectDerivedStepsExplanation(derivedStepsLogPayload).map((item) =>
+                    item.detail != null && item.detail.length > 0 ? (
+                      <details key={item.id} className="group px-1 py-0.5">
+                        <summary className="cursor-pointer list-none py-2 pl-1 text-sm font-medium text-zinc-900 marker:content-none dark:text-zinc-100 [&::-webkit-details-marker]:hidden">
+                          <span className="inline align-middle text-zinc-400 dark:text-zinc-500">▸ </span>
+                          {item.headline}
+                        </summary>
+                        <ul className="mb-2 ml-4 list-disc space-y-1.5 border-l border-zinc-200 pl-3 text-xs leading-relaxed text-zinc-600 dark:border-zinc-600 dark:text-zinc-400">
+                          {item.detail.map((line, i) => (
+                            <li key={i}>{line}</li>
+                          ))}
+                        </ul>
+                      </details>
+                    ) : (
+                      <div key={item.id} className="py-2 pl-1 text-sm font-medium text-zinc-800 dark:text-zinc-200">
+                        {item.headline}
+                      </div>
+                    )
                   )}
-                </>
+                </div>
               )}
             </div>
           </section>
@@ -2367,6 +2539,75 @@ function InspectContent() {
         </>
       )}
     </div>
+    {pinJobModalOpen &&
+      typeof document !== 'undefined' &&
+      createPortal(
+        <div
+          className="fixed inset-0 z-[10100] flex items-center justify-center bg-black/40 p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="pin-job-title"
+          onClick={() => {
+            if (!pinJobSaving) {
+              setPinJobModalOpen(false);
+              setPinJobError(null);
+            }
+          }}
+        >
+          <div
+            className="w-full max-w-md rounded-lg border border-zinc-200 bg-white p-4 shadow-xl dark:border-zinc-600 dark:bg-zinc-900"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 id="pin-job-title" className="text-base font-semibold text-zinc-900 dark:text-zinc-100">
+              Pin job to Recent jobs
+            </h3>
+            <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
+              This job moves to the top of the sidebar <span className="font-medium text-zinc-800 dark:text-zinc-200">Query → Recent jobs</span>. Add a short note if you want a reminder when you come back to it.
+            </p>
+            {selectedRow?.job_id != null && selectedRow.job_id !== '' ? (
+              <p className="mt-2 font-mono text-xs text-zinc-500 dark:text-zinc-400">Job {String(selectedRow.job_id)}</p>
+            ) : null}
+            <label className="mt-3 block text-xs font-medium text-zinc-600 dark:text-zinc-300" htmlFor="pin-job-note">
+              Note (optional, max 500 characters)
+            </label>
+            <textarea
+              id="pin-job-note"
+              ref={pinJobNoteRef}
+              value={pinJobNoteDraft}
+              onChange={(e) => setPinJobNoteDraft(e.target.value)}
+              rows={4}
+              maxLength={500}
+              placeholder="e.g. Check step 4 vs GPS after rule change…"
+              className="mt-1 w-full resize-y rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm text-zinc-900 placeholder:text-zinc-400 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100 dark:placeholder:text-zinc-500"
+            />
+            <p className="mt-0.5 text-right text-[10px] text-zinc-400">{pinJobNoteDraft.length}/500</p>
+            {pinJobError ? <p className="mt-2 text-sm text-red-600 dark:text-red-400">{pinJobError}</p> : null}
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                type="button"
+                disabled={pinJobSaving}
+                onClick={() => {
+                  setPinJobModalOpen(false);
+                  setPinJobError(null);
+                }}
+                className="rounded border border-zinc-300 bg-white px-3 py-1.5 text-sm font-medium text-zinc-700 hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-200 dark:hover:bg-zinc-700"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={pinJobSaving || !selectedRow}
+                onClick={() => void submitPinJobToRecent()}
+                className="rounded bg-amber-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-amber-700 disabled:opacity-50 dark:bg-amber-700 dark:hover:bg-amber-600"
+              >
+                {pinJobSaving ? 'Saving…' : 'Pin to list'}
+              </button>
+            </div>
+          </div>
+        </div>,
+        document.body
+      )}
+    </>
   );
 }
 

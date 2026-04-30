@@ -8,6 +8,21 @@ import {
   GPSPLUS_TIME_NAME,
 } from '@/lib/gps-fence-settings-names';
 import {
+  JOB_END_CEILING_BUFFER_DEFAULT_MINUTES,
+  JOB_END_CEILING_BUFFER_SETTING_NAME,
+  JOB_END_CEILING_BUFFER_SETTINGS_TYPE,
+} from '@/lib/job-end-ceiling-buffer-setting-names';
+import {
+  STEP5_EXTEND_WINERY_EXIT_DEFAULT_MINUTES,
+  STEP5_EXTEND_WINERY_EXIT_SETTING_NAME,
+  STEP5_EXTEND_WINERY_EXIT_SETTINGS_TYPE,
+} from '@/lib/step5-winery-exit-extend-setting-names';
+import {
+  STEP1_FROM_PREVIOUS_JOB_LIMIT_DEFAULT_MINUTES,
+  STEP1_FROM_PREVIOUS_JOB_LIMIT_SETTING_NAME,
+  STEP1_FROM_PREVIOUS_JOB_LIMIT_SETTINGS_TYPE,
+} from '@/lib/step1-from-previous-job-limit-setting-names';
+import {
   VWORK_TT_LOAD_SIZE_DEFAULT,
   VWORK_TT_LOAD_SIZE_SETTING_NAME,
   VWORK_TT_LOAD_SIZE_SETTINGS_TYPE,
@@ -26,6 +41,9 @@ export default function SettingsPage() {
   const [gpsplusGrowth, setGpsplusGrowth] = useState<string>('');
   const [gpsplusTime, setGpsplusTime] = useState<string>('');
   const [ttLoadSize, setTtLoadSize] = useState<string>('');
+  const [jobEndCeilingBuffer, setJobEndCeilingBuffer] = useState<string>('');
+  const [step5ExtendWineryExit, setStep5ExtendWineryExit] = useState<string>('');
+  const [step1FromPreviousJobLimit, setStep1FromPreviousJobLimit] = useState<string>('');
   const [loading, setLoading] = useState(true);
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
 
@@ -42,8 +60,26 @@ export default function SettingsPage() {
       fetch(
         `/api/settings?${new URLSearchParams({ type: VWORK_TT_LOAD_SIZE_SETTINGS_TYPE, name: VWORK_TT_LOAD_SIZE_SETTING_NAME })}`
       ).then((r) => r.json()),
+      fetch(
+        `/api/settings?${new URLSearchParams({
+          type: JOB_END_CEILING_BUFFER_SETTINGS_TYPE,
+          name: JOB_END_CEILING_BUFFER_SETTING_NAME,
+        })}`
+      ).then((r) => r.json()),
+      fetch(
+        `/api/settings?${new URLSearchParams({
+          type: STEP5_EXTEND_WINERY_EXIT_SETTINGS_TYPE,
+          name: STEP5_EXTEND_WINERY_EXIT_SETTING_NAME,
+        })}`
+      ).then((r) => r.json()),
+      fetch(
+        `/api/settings?${new URLSearchParams({
+          type: STEP1_FROM_PREVIOUS_JOB_LIMIT_SETTINGS_TYPE,
+          name: STEP1_FROM_PREVIOUS_JOB_LIMIT_SETTING_NAME,
+        })}`
+      ).then((r) => r.json()),
     ])
-      .then(([data1, data2, data3, dataStd, data4, data5, dataTtLoad]) => {
+      .then(([data1, data2, data3, dataStd, data4, data5, dataTtLoad, dataJobEndBuf, dataStep5Ext, dataStep1PrevLimit]) => {
         const v1 = data1?.settingvalue;
         setGpsStartBuffer(v1 != null && v1 !== '' ? String(v1) : '15');
         const v2 = data2?.settingvalue;
@@ -62,6 +98,24 @@ export default function SettingsPage() {
             ? String(vTt).trim()
             : String(VWORK_TT_LOAD_SIZE_DEFAULT)
         );
+        const vJeb = dataJobEndBuf?.settingvalue;
+        setJobEndCeilingBuffer(
+          vJeb != null && String(vJeb).trim() !== ''
+            ? String(vJeb).trim()
+            : String(JOB_END_CEILING_BUFFER_DEFAULT_MINUTES)
+        );
+        const vS5 = dataStep5Ext?.settingvalue;
+        setStep5ExtendWineryExit(
+          vS5 != null && String(vS5).trim() !== ''
+            ? String(vS5).trim()
+            : String(STEP5_EXTEND_WINERY_EXIT_DEFAULT_MINUTES)
+        );
+        const vS1Prev = dataStep1PrevLimit?.settingvalue;
+        setStep1FromPreviousJobLimit(
+          vS1Prev != null && String(vS1Prev).trim() !== ''
+            ? String(vS1Prev).trim()
+            : String(STEP1_FROM_PREVIOUS_JOB_LIMIT_DEFAULT_MINUTES)
+        );
       })
       .catch(() => {
         setGpsStartBuffer('15');
@@ -71,6 +125,9 @@ export default function SettingsPage() {
         setGpsplusGrowth('10');
         setGpsplusTime('');
         setTtLoadSize(String(VWORK_TT_LOAD_SIZE_DEFAULT));
+        setJobEndCeilingBuffer(String(JOB_END_CEILING_BUFFER_DEFAULT_MINUTES));
+        setStep5ExtendWineryExit(String(STEP5_EXTEND_WINERY_EXIT_DEFAULT_MINUTES));
+        setStep1FromPreviousJobLimit(String(STEP1_FROM_PREVIOUS_JOB_LIMIT_DEFAULT_MINUTES));
       })
       .finally(() => setLoading(false));
   }, []);
@@ -225,6 +282,84 @@ export default function SettingsPage() {
       });
   };
 
+  const saveJobEndCeilingBuffer = () => {
+    const minutes = Math.max(0, parseInt(jobEndCeilingBuffer, 10));
+    if (Number.isNaN(minutes)) return;
+    const capped = Math.min(24 * 60, minutes);
+    setSaveStatus('saving');
+    fetch('/api/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        type: JOB_END_CEILING_BUFFER_SETTINGS_TYPE,
+        settingname: JOB_END_CEILING_BUFFER_SETTING_NAME,
+        settingvalue: String(capped),
+      }),
+    })
+      .then((r) => {
+        if (r.ok) {
+          setSaveStatus('saved');
+          setJobEndCeilingBuffer(String(capped));
+        } else setSaveStatus('error');
+      })
+      .catch(() => setSaveStatus('error'))
+      .finally(() => {
+        setTimeout(() => setSaveStatus('idle'), 2000);
+      });
+  };
+
+  const saveStep5ExtendWineryExit = () => {
+    const minutes = Math.max(0, parseInt(step5ExtendWineryExit, 10));
+    if (Number.isNaN(minutes)) return;
+    const capped = Math.min(24 * 60, minutes);
+    setSaveStatus('saving');
+    fetch('/api/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        type: STEP5_EXTEND_WINERY_EXIT_SETTINGS_TYPE,
+        settingname: STEP5_EXTEND_WINERY_EXIT_SETTING_NAME,
+        settingvalue: String(capped),
+      }),
+    })
+      .then((r) => {
+        if (r.ok) {
+          setSaveStatus('saved');
+          setStep5ExtendWineryExit(String(capped));
+        } else setSaveStatus('error');
+      })
+      .catch(() => setSaveStatus('error'))
+      .finally(() => {
+        setTimeout(() => setSaveStatus('idle'), 2000);
+      });
+  };
+
+  const saveStep1FromPreviousJobLimit = () => {
+    const minutes = Math.max(0, parseInt(step1FromPreviousJobLimit, 10));
+    if (Number.isNaN(minutes)) return;
+    const capped = Math.min(24 * 60, minutes);
+    setSaveStatus('saving');
+    fetch('/api/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        type: STEP1_FROM_PREVIOUS_JOB_LIMIT_SETTINGS_TYPE,
+        settingname: STEP1_FROM_PREVIOUS_JOB_LIMIT_SETTING_NAME,
+        settingvalue: String(capped),
+      }),
+    })
+      .then((r) => {
+        if (r.ok) {
+          setSaveStatus('saved');
+          setStep1FromPreviousJobLimit(String(capped));
+        } else setSaveStatus('error');
+      })
+      .catch(() => setSaveStatus('error'))
+      .finally(() => {
+        setTimeout(() => setSaveStatus('idle'), 2000);
+      });
+  };
+
   const saveGpsplusTime = () => {
     const sec = Math.max(0, parseInt(gpsplusTime, 10));
     if (Number.isNaN(sec)) return;
@@ -304,6 +439,91 @@ export default function SettingsPage() {
                 <button
                   type="button"
                   onClick={saveInspectStartLess}
+                  disabled={saveStatus === 'saving'}
+                  className="rounded bg-zinc-200 px-3 py-2 text-sm font-medium hover:bg-zinc-300 disabled:opacity-50 dark:bg-zinc-700 dark:hover:bg-zinc-600"
+                >
+                  {saveStatus === 'saving' ? 'Saving…' : saveStatus === 'saved' ? 'Saved' : saveStatus === 'error' ? 'Save failed' : 'Save'}
+                </button>
+              </div>
+            </label>
+          </div>
+          <div className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900">
+            <label className="block">
+              <span className="text-sm font-medium text-zinc-700 dark:text-zinc-300">Job end ceiling buffer (minutes)</span>
+              <p className="mt-0.5 text-xs text-zinc-500">
+                Derived GPS step 3 (Depart Vineyard): allow vineyard EXIT up to this many minutes after VWork job completion
+                when the driver finished the job in the app before leaving the vineyard fence. Steps 1–2 still use a strict job-end ceiling.
+              </p>
+              <div className="mt-2 flex items-center gap-2">
+                <input
+                  type="number"
+                  min={0}
+                  max={1440}
+                  value={jobEndCeilingBuffer}
+                  onChange={(e) => setJobEndCeilingBuffer(e.target.value)}
+                  onBlur={saveJobEndCeilingBuffer}
+                  className="rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+                />
+                <span className="text-sm text-zinc-500">minutes</span>
+                <button
+                  type="button"
+                  onClick={saveJobEndCeilingBuffer}
+                  disabled={saveStatus === 'saving'}
+                  className="rounded bg-zinc-200 px-3 py-2 text-sm font-medium hover:bg-zinc-300 disabled:opacity-50 dark:bg-zinc-700 dark:hover:bg-zinc-600"
+                >
+                  {saveStatus === 'saving' ? 'Saving…' : saveStatus === 'saved' ? 'Saved' : saveStatus === 'error' ? 'Save failed' : 'Save'}
+                </button>
+              </div>
+            </label>
+          </div>
+          <div className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900">
+            <label className="block">
+              <span className="text-sm font-medium text-zinc-700 dark:text-zinc-300">Step 5 extend for winery exit (minutes)</span>
+              <p className="mt-0.5 text-xs text-zinc-500">
+                Derived GPS step 5 (Job Completed): search winery EXIT up to this many minutes after VWork job completion when the driver tapped complete before physically leaving the winery fence (that EXIT can also be the next job start).
+              </p>
+              <div className="mt-2 flex items-center gap-2">
+                <input
+                  type="number"
+                  min={0}
+                  max={1440}
+                  value={step5ExtendWineryExit}
+                  onChange={(e) => setStep5ExtendWineryExit(e.target.value)}
+                  onBlur={saveStep5ExtendWineryExit}
+                  className="rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+                />
+                <span className="text-sm text-zinc-500">minutes</span>
+                <button
+                  type="button"
+                  onClick={saveStep5ExtendWineryExit}
+                  disabled={saveStatus === 'saving'}
+                  className="rounded bg-zinc-200 px-3 py-2 text-sm font-medium hover:bg-zinc-300 disabled:opacity-50 dark:bg-zinc-700 dark:hover:bg-zinc-600"
+                >
+                  {saveStatus === 'saving' ? 'Saving…' : saveStatus === 'saved' ? 'Saved' : saveStatus === 'error' ? 'Save failed' : 'Save'}
+                </button>
+              </div>
+            </label>
+          </div>
+          <div className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900">
+            <label className="block">
+              <span className="text-sm font-medium text-zinc-700 dark:text-zinc-300">Step 1 from previous Job Limit (minutes)</span>
+              <p className="mt-0.5 text-xs text-zinc-500">
+                Step1(lastJobEnd): only use the previous job&apos;s Step 5 time as this job&apos;s start when it is at most this many minutes before this job&apos;s actual start. Larger gaps are ignored (possible outlier).
+              </p>
+              <div className="mt-2 flex items-center gap-2">
+                <input
+                  type="number"
+                  min={0}
+                  max={1440}
+                  value={step1FromPreviousJobLimit}
+                  onChange={(e) => setStep1FromPreviousJobLimit(e.target.value)}
+                  onBlur={saveStep1FromPreviousJobLimit}
+                  className="rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+                />
+                <span className="text-sm text-zinc-500">minutes</span>
+                <button
+                  type="button"
+                  onClick={saveStep1FromPreviousJobLimit}
                   disabled={saveStatus === 'saving'}
                   className="rounded bg-zinc-200 px-3 py-2 text-sm font-medium hover:bg-zinc-300 disabled:opacity-50 dark:bg-zinc-700 dark:hover:bg-zinc-600"
                 >

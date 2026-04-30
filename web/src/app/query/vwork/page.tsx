@@ -16,7 +16,7 @@ const PRIORITY_COLUMNS = ['job_id', 'planned_start_time', 'truck_id', 'truck_reg
 
 const DATE_COLUMNS = new Set([
   'planned_start_time', 'actual_start_time', 'gps_start_time', 'gps_end_time',
-  'step_1_completed_at', 'step_2_completed_at', 'step_3_completed_at', 'step_4_completed_at',
+  'step_1_completed_at', 'step_1_safe', 'step_2_completed_at', 'step_3_completed_at', 'step_4_completed_at',
 ]);
 
 /** Server-side date filter columns supported by /api/vworkjobs (columnDateCol / columnDateFrom / columnDateTo). */
@@ -80,7 +80,7 @@ function VworkPageContent() {
   /** API: step4to5=0 | step4to5=1 */
   const [filterStep4to5, setFilterStep4to5] = useState<'0' | '1' | ''>('');
   /** Step4→5 blocked preset from Data Checks deep link */
-  const [blockedView, setBlockedView] = useState<'normal' | 'rerun' | ''>('');
+  const [blockedView, setBlockedView] = useState<'normal' | 'rerun' | 'ordering' | ''>('');
   const [columnOrder, setColumnOrder] = useState<string[]>([]);
   const [hiddenColumns, setHiddenColumns] = useState<Set<string>>(new Set());
   const [showColumnConfig, setShowColumnConfig] = useState(false);
@@ -243,7 +243,8 @@ function VworkPageContent() {
     params.set('customer', filterCustomer.trim());
     if (filterTemplate.trim()) params.set('template', filterTemplate.trim());
     if (filterStep4to5 === '0' || filterStep4to5 === '1') params.set('step4to5', filterStep4to5);
-    if (blockedView === 'normal' || blockedView === 'rerun') params.set('blockedView', blockedView);
+    if (blockedView === 'normal' || blockedView === 'rerun' || blockedView === 'ordering')
+      params.set('blockedView', blockedView);
     if (dateFilterCol && API_COLUMN_DATE_COLS.has(dateFilterCol)) {
       const df = dateFrom.trim().slice(0, 10);
       const dt = dateTo.trim().slice(0, 10);
@@ -311,14 +312,14 @@ function VworkPageContent() {
     const s45 = searchParams.get('step4to5')?.trim();
     if (s45 === '0' || s45 === '1') setFilterStep4to5(s45);
     const bv = searchParams.get('blockedView')?.trim().toLowerCase();
-    if (bv === 'normal' || bv === 'rerun') setBlockedView(bv);
+    if (bv === 'normal' || bv === 'rerun' || bv === 'ordering') setBlockedView(bv as 'normal' | 'rerun' | 'ordering');
     const auto = searchParams.get('autoLoad') === '1';
     if (!auto || !c || !t) return;
     const params = new URLSearchParams();
     params.set('customer', c);
     params.set('template', t);
     if (s45 === '0' || s45 === '1') params.set('step4to5', s45);
-    if (bv === 'normal' || bv === 'rerun') params.set('blockedView', bv);
+    if (bv === 'normal' || bv === 'rerun' || bv === 'ordering') params.set('blockedView', bv);
     runVworkJobsFetch(params);
   }, [searchParams, runVworkJobsFetch]);
 
@@ -544,7 +545,9 @@ function VworkPageContent() {
             <strong>Blocked filter</strong> (Step4→5){' '}
             {blockedView === 'normal'
               ? '— step4to5 = 0 but step_4 is not Job Completed, or step_5 name is Job Completed, or step_5_completed_at is set (normal Fix skips these).'
-              : '— step4to5 = 1 but not the done layout (step_4 Arrive Winery + step_5 Job Completed).'}
+              : blockedView === 'rerun'
+                ? '— step4to5 = 1 but not the done layout (step_4 Arrive Winery + step_5 Job Completed).'
+                : '— done layout with step_4 already strictly before step_5 (Order fix skips these).'}
           </span>
           <button
             type="button"

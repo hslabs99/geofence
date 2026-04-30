@@ -30,9 +30,9 @@ type SummaryRow = {
  * Rough ETA for Step4→5 bulk UPDATE (many columns per row).
  * Tuned for batches around 500–2000 rows; actual time varies with DB load, disk, and network (if remote).
  */
-function estimateStep4to5FixRange(todoCount: number, rerunOnlyStep4Time?: boolean): { lowSec: number; highSec: number } {
+function estimateStep4to5FixRange(todoCount: number, lightStep4TimeOnly?: boolean): { lowSec: number; highSec: number } {
   if (todoCount <= 0) return { lowSec: 1, highSec: 3 };
-  const scale = rerunOnlyStep4Time ? 0.12 : 1;
+  const scale = lightStep4TimeOnly ? 0.12 : 1;
   const low = Math.max(1, Math.round((0.3 + todoCount * 0.003) * scale));
   const high = Math.max(2, Math.ceil((0.8 + todoCount * 0.012) * scale));
   return { lowSec: low, highSec: high };
@@ -438,6 +438,8 @@ type Step4to5PreviewResponse = {
   ok: true;
   /** Rerun = only recalc step_4_completed_at on done rows (Arrive Winery + Job Completed on 5 + step4to5=1). */
   rerun: boolean;
+  /** Subset rerun: only rows where step_4 is not strictly before step_5 (same capped recalc). */
+  orderingFix?: boolean;
   customer: string;
   template: string;
   /** Normal: step4to5=0 pool. Rerun: done rows eligible for time-only fix. */
@@ -468,8 +470,19 @@ type Step4to5FixResponse = {
   customer: string;
   template: string;
   rerun?: boolean;
+  orderingFix?: boolean;
   afterPreview: Step4to5PreviewResponse;
 };
+
+function step4to5PreviewMatchesMode(
+  p: Step4to5PreviewResponse,
+  mode: 'normal' | 'rerun' | 'ordering',
+): boolean {
+  const ordering = p.orderingFix === true;
+  if (mode === 'ordering') return ordering;
+  if (mode === 'rerun') return p.rerun === true && !ordering;
+  return !p.rerun && !ordering;
+}
 
 type GeofenceGapsRow = {
   device_name: string;
@@ -714,6 +727,8 @@ function DataChecksPageContent() {
   const [healthData, setHealthData] = useState<DataHealthOverviewResponse | null>(null);
   const [healthLoading, setHealthLoading] = useState(false);
   const [healthError, setHealthError] = useState<string | null>(null);
+  const [healthFillNzLoading, setHealthFillNzLoading] = useState(false);
+  const [healthFillNzResult, setHealthFillNzResult] = useState<{ ok: boolean; text: string } | null>(null);
 
   // Winery / vineyard name fixes (tab 2)
   const [wineMappRows, setWineMappRows] = useState<WineMappRow[]>([]);
@@ -851,7 +866,7 @@ function DataChecksPageContent() {
   const [step4to5FixError, setStep4to5FixError] = useState<string | null>(null);
   const [step4to5FixResult, setStep4to5FixResult] = useState<Step4to5FixResponse | null>(null);
   const [step4to5FixConfirmOpen, setStep4to5FixConfirmOpen] = useState(false);
-  const [step4to5Rerun, setStep4to5Rerun] = useState(false);
+  const [step4to5Mode, setStep4to5Mode] = useState<'normal' | 'rerun' | 'ordering'>('normal');
 
   const [sqlRuns, setSqlRuns] = useState<SqlRunRow[]>([]);
   const [sqlRunsLoading, setSqlRunsLoading] = useState(false);
@@ -1045,13 +1060,17 @@ function DataChecksPageContent() {
     }
   }, [loadsizeBackfillConfirm]);
 
-  const runStep4to5Fix = useCallback((c: string, t: string, rerun: boolean) => {
+  const runStep4to5Fix = useCallback((c: string, t: string, mode: 'normal' | 'rerun' | 'ordering') => {
     setStep4to5FixError(null);
     setStep4to5FixLoading(true);
+    const body =
+      mode === 'ordering'
+        ? { customer: c, template: t, orderingFix: true }
+        : { customer: c, template: t, rerun: mode === 'rerun' };
     fetch('/api/admin/vworkjobs/step4to5', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ customer: c, template: t, rerun }),
+      body: JSON.stringify(body),
     })
       .then(async (r) => {
         const d = (await r.json()) as Step4to5FixResponse & { ok?: boolean; error?: string };
@@ -1400,6 +1419,25 @@ function DataChecksPageContent() {
       setHealthLoading(false);
     }
   }, [healthDateFrom, healthDateTo, healthMinPointsEE]);
+
+  const runHealthFillPositionTimeNz = useCallback(async () => {
+    setHealthFillNzResult(null);
+    setHealthFillNzLoading(true);
+    try {
+      const r = await fetch('/api/admin/data-checks/fill-position-time-nz', { method: 'POST' });
+      const d = (await r.json()) as { ok?: boolean; updated?: number; error?: string };
+      if (!r.ok || d.ok !== true) {
+        throw new Error(typeof d.error === 'string' ? d.error : r.statusText);
+      }
+      const n = d.updated ?? 0;
+      setHealthFillNzResult({ ok: true, text: `Updated ${n.toLocaleString()} row(s).` });
+      await fetchHealthOverview();
+    } catch (e) {
+      setHealthFillNzResult({ ok: false, text: e instanceof Error ? e.message : String(e) });
+    } finally {
+      setHealthFillNzLoading(false);
+    }
+  }, [fetchHealthOverview]);
 
   useEffect(() => {
     if (activeTab === 'data-health-overview') {
@@ -2301,7 +2339,8 @@ function DataChecksPageContent() {
             Data Health Overview
           </h2>
           <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
-            DB-only snapshot: tracking coverage, fence assignment backlog, ENTER/EXIT gaps in a date window, and vworkjobs steps coverage. Use the numbered tabs below for detail and actions. Day boundaries for window metrics use{' '}
+            DB-only snapshot: tracking coverage, fence assignment backlog, ENTER/EXIT gaps in a date window, and vworkjobs steps coverage. Use the numbered tabs below for detail and actions. If rows lack{' '}
+            <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">position_time_nz</code>, you can run the same NZ backfill as after GPS import (below). Day boundaries for window metrics use{' '}
             <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">position_time::date</code> (verbatim API date).
           </p>
 
@@ -2384,6 +2423,32 @@ function DataChecksPageContent() {
                       <dd className={`font-mono tabular-nums ${healthData.tracking.rowsMissingPositionTimeNz > 0 ? 'text-amber-700 dark:text-amber-400' : ''}`}>
                         {healthData.tracking.rowsMissingPositionTimeNz.toLocaleString()}
                       </dd>
+                    </div>
+                    <div className="mt-3 rounded-md border border-zinc-200 bg-white/80 p-3 dark:border-zinc-600 dark:bg-zinc-900/40">
+                      <p className="text-xs text-zinc-600 dark:text-zinc-400">
+                        Set <code className="rounded bg-zinc-100 px-0.5 dark:bg-zinc-800">position_time_nz</code> from{' '}
+                        <code className="rounded bg-zinc-100 px-0.5 dark:bg-zinc-800">position_time</code> using{' '}
+                        <span className="font-mono text-[11px] text-zinc-700 dark:text-zinc-300">UTC → Pacific/Auckland</span>{' '}
+                        (DST-aware). Same as post-import backfill; only fills where NZ is null; does not change{' '}
+                        <code className="rounded bg-zinc-100 px-0.5 dark:bg-zinc-800">position_time</code>.
+                      </p>
+                      <div className="mt-2 flex flex-wrap items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => void runHealthFillPositionTimeNz()}
+                          disabled={healthFillNzLoading || healthLoading}
+                          className="rounded bg-amber-700 px-3 py-1.5 text-xs font-medium text-white hover:bg-amber-800 disabled:opacity-50 dark:bg-amber-600 dark:hover:bg-amber-500"
+                        >
+                          {healthFillNzLoading ? 'Running…' : 'Set position_time_nz (missing rows)'}
+                        </button>
+                        {healthFillNzResult && (
+                          <span
+                            className={`text-xs ${healthFillNzResult.ok ? 'text-green-700 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}
+                          >
+                            {healthFillNzResult.text}
+                          </span>
+                        )}
+                      </div>
                     </div>
                     <div className="flex justify-between gap-2">
                       <dt>Geofence not attempted</dt>
@@ -2896,7 +2961,7 @@ function DataChecksPageContent() {
             (<code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">buildInspectGpsWindowForJob</code>):{' '}
             <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">position_time_nz</code> strictly after GPS From, and strictly before GPS To when{' '}
             <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">actual_end_time</code> is set; if not, the upper bound is open (same as Inspect). Reports min/max NZ times in that
-            window, largest internal gap in minutes, and whether any gap is ≥ the threshold (default 10 min). Rows with{' '}
+            window, largest internal gap in minutes, and whether any gap is ≥ the threshold (default 10 min). Gaps between two pings at the same lat/lon (stationary) do not count. Rows with{' '}
             <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">position_time</code> but null{' '}
             <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">position_time_nz</code> in the window are flagged as critical. Step columns show{' '}
             <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">step_*_via</code> only (GPS, VW, etc.).
@@ -5793,28 +5858,70 @@ function DataChecksPageContent() {
             <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">step4to5 = 0</code>,{' '}
             <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">step_4_name</code> is <strong>Job Completed</strong>, and{' '}
             <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">step_5_name</code> is <strong>not</strong> Job Completed, and{' '}
-            <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">step_5_completed_at</code> is <strong>empty</strong> (never push 4→5 if step 5 already has a completed time — rerun only recalculates step 4). Then: copy step 4 → 5, set step 4 to &quot;Arrive Winery&quot; with synthetic time from steps 1–3, clear GPS/actual/orides,{' '}
+            <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">step_5_completed_at</code> is <strong>empty</strong> (never push 4→5 if step 5 already has a completed time — rerun only recalculates step 4). Then: copy step 4 → 5, set step 4 to &quot;Arrive Winery&quot; with synthetic time from steps 1–3 (see guardrail below), clear GPS/actual/orides,{' '}
             <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">steps_fetched = false</code>, <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">step4to5 = 1</code>.{' '}
             <strong className="font-medium text-zinc-800 dark:text-zinc-200">Done</strong> = step 4 Arrive Winery, step 5 Job Completed, step4to5=1.{' '}
-            <strong className="font-medium text-zinc-800 dark:text-zinc-200">Rerun</strong> — on those done rows only: updates <strong>step_4_completed_at</strong> (recalc synthetic time). Run{' '}
+            <strong className="font-medium text-zinc-800 dark:text-zinc-200">Rerun</strong> — on those done rows only: updates <strong>step_4_completed_at</strong> (recalc capped synthetic time).{' '}
+            <strong className="font-medium text-zinc-800 dark:text-zinc-200">Order fix</strong> — same recalc as Rerun, but only rows where <code className="rounded bg-zinc-100 px-0.5 font-mono text-xs dark:bg-zinc-800">step_4_completed_at</code> is null or not strictly before{' '}
+            <code className="rounded bg-zinc-100 px-0.5 font-mono text-xs dark:bg-zinc-800">step_5_completed_at</code> (does not change step 5). Run{' '}
             <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">web/sql/add_step4to5_tbl_vworkjobs.sql</code> if columns are missing.
           </p>
-          <label className="mt-4 flex cursor-pointer items-start gap-2 text-sm text-zinc-800 dark:text-zinc-200">
-            <input
-              type="checkbox"
-              checked={step4to5Rerun}
-              onChange={(e) => {
-                setStep4to5Rerun(e.target.checked);
-                setStep4to5Preview(null);
-                setStep4to5FixResult(null);
-              }}
-              className="mt-1 rounded border-zinc-300 text-amber-600 dark:border-zinc-600"
-            />
-            <span>
-              <strong>Rerun</strong> — rows already <strong>done</strong> (step 4 = Arrive Winery, step 5 = Job Completed, step4to5 = 1): recalculate{' '}
-              <code className="rounded bg-zinc-100 px-0.5 font-mono text-xs dark:bg-zinc-800">step_4_completed_at</code> only; does not copy step 4 → 5.
-            </span>
-          </label>
+          <p className="mt-3 rounded-md border border-zinc-200 bg-zinc-50 px-3 py-2 text-sm text-zinc-800 dark:border-zinc-600 dark:bg-zinc-900/40 dark:text-zinc-200">
+            <strong className="font-medium">Synthetic step 4 (VWork only).</strong> Default: step 3 + (step 2 − step 1). If that would be on or after <code className="rounded bg-zinc-100 px-0.5 font-mono text-xs dark:bg-zinc-800">step_5_completed_at</code>, use halfway between step 3 and step 5 completion. Otherwise no synthetic time (steps 1–3 and valid outbound required).
+          </p>
+          <fieldset className="mt-4 space-y-2 text-sm text-zinc-800 dark:text-zinc-200">
+            <legend className="sr-only">Step4→5 mode</legend>
+            <label className="flex cursor-pointer items-start gap-2">
+              <input
+                type="radio"
+                name="step4to5Mode"
+                checked={step4to5Mode === 'normal'}
+                onChange={() => {
+                  setStep4to5Mode('normal');
+                  setStep4to5Preview(null);
+                  setStep4to5FixResult(null);
+                }}
+                className="mt-1 border-zinc-300 text-amber-600 dark:border-zinc-600"
+              />
+              <span>
+                <strong>Normal</strong> — migrate Job Completed on step 4 into step 5 and set step 4 to Arrive Winery (full column update).
+              </span>
+            </label>
+            <label className="flex cursor-pointer items-start gap-2">
+              <input
+                type="radio"
+                name="step4to5Mode"
+                checked={step4to5Mode === 'rerun'}
+                onChange={() => {
+                  setStep4to5Mode('rerun');
+                  setStep4to5Preview(null);
+                  setStep4to5FixResult(null);
+                }}
+                className="mt-1 border-zinc-300 text-amber-600 dark:border-zinc-600"
+              />
+              <span>
+                <strong>Rerun</strong> — all <strong>done</strong> rows (step 4 = Arrive Winery, step 5 = Job Completed, step4to5 = 1): recalculate{' '}
+                <code className="rounded bg-zinc-100 px-0.5 font-mono text-xs dark:bg-zinc-800">step_4_completed_at</code> only; step 5 unchanged.
+              </span>
+            </label>
+            <label className="flex cursor-pointer items-start gap-2">
+              <input
+                type="radio"
+                name="step4to5Mode"
+                checked={step4to5Mode === 'ordering'}
+                onChange={() => {
+                  setStep4to5Mode('ordering');
+                  setStep4to5Preview(null);
+                  setStep4to5FixResult(null);
+                }}
+                className="mt-1 border-zinc-300 text-amber-600 dark:border-zinc-600"
+              />
+              <span>
+                <strong>Order fix</strong> — done rows where <code className="rounded bg-zinc-100 px-0.5 font-mono text-xs dark:bg-zinc-800">step_5_completed_at</code> is set and{' '}
+                <code className="rounded bg-zinc-100 px-0.5 font-mono text-xs dark:bg-zinc-800">step_4_completed_at</code> is missing or not strictly before it; same recalc as Rerun, only those rows.
+              </span>
+            </label>
+          </fieldset>
           <div className="mt-4 flex flex-wrap items-end gap-4">
             <label className="flex min-w-[200px] flex-col gap-1">
               <span className="text-xs font-medium text-zinc-500 dark:text-zinc-400">Customer</span>
@@ -5870,7 +5977,8 @@ function DataChecksPageContent() {
                 setStep4to5FixResult(null);
                 setStep4to5PreviewLoading(true);
                 const qs = new URLSearchParams({ customer: c, template: t });
-                if (step4to5Rerun) qs.set('rerun', '1');
+                if (step4to5Mode === 'rerun') qs.set('rerun', '1');
+                if (step4to5Mode === 'ordering') qs.set('orderingFix', '1');
                 fetch(`/api/admin/vworkjobs/step4to5?${qs}`)
                   .then(async (r) => {
                     const d = (await r.json()) as Step4to5PreviewResponse & { ok?: boolean; error?: string };
@@ -5899,13 +6007,12 @@ function DataChecksPageContent() {
                   setStep4to5FixError('Select customer and template');
                   return;
                 }
-                if (
-                  !step4to5Preview ||
-                  step4to5Preview.customer !== c ||
-                  step4to5Preview.template !== t ||
-                  step4to5Preview.rerun !== step4to5Rerun
-                ) {
-                  setStep4to5FixError('Run Preview first for this customer, template, and Rerun setting');
+                if (!step4to5Preview || step4to5Preview.customer !== c || step4to5Preview.template !== t) {
+                  setStep4to5FixError('Run Preview first for this customer and template');
+                  return;
+                }
+                if (!step4to5PreviewMatchesMode(step4to5Preview, step4to5Mode)) {
+                  setStep4to5FixError('Run Preview first for the selected mode (Normal / Rerun / Order fix)');
                   return;
                 }
                 setStep4to5FixError(null);
@@ -5942,9 +6049,11 @@ function DataChecksPageContent() {
                       <td className="px-3 py-2">
                         Potential rows{' '}
                         <span className="text-zinc-500 dark:text-zinc-400">
-                          {step4to5Preview.rerun
-                            ? '(done rows: step4to5=1, step_4 Arrive Winery, step_5 Job Completed)'
-                            : '(match: customer, template, step4to5 = 0)'}
+                          {step4to5Preview.orderingFix
+                            ? '(done rows: same pool as Rerun — step4to5=1, Arrive Winery, Job Completed on 5)'
+                            : step4to5Preview.rerun
+                              ? '(done rows: step4to5=1, step_4 Arrive Winery, step_5 Job Completed)'
+                              : '(match: customer, template, step4to5 = 0)'}
                         </span>
                       </td>
                       <td className="px-3 py-2 text-right font-mono tabular-nums font-medium">{step4to5Preview.potentialCount}</td>
@@ -5957,7 +6066,11 @@ function DataChecksPageContent() {
                           customer: step4to5Preview.customer,
                           template: step4to5Preview.template,
                           autoLoad: '1',
-                          blockedView: step4to5Preview.rerun ? 'rerun' : 'normal',
+                          blockedView: step4to5Preview.orderingFix
+                            ? 'ordering'
+                            : step4to5Preview.rerun
+                              ? 'rerun'
+                              : 'normal',
                         });
                         window.open(`/query/vwork?${p.toString()}`, '_blank', 'noopener,noreferrer');
                       }}
@@ -5973,16 +6086,23 @@ function DataChecksPageContent() {
                       <td className="px-3 py-2">
                         Blocked <span className="text-blue-600 dark:text-blue-400">(open in VWork)</span>{' '}
                         <span className="text-zinc-500 dark:text-zinc-400">
-                          {step4to5Preview.rerun
-                            ? '(step4to5=1 but not Arrive Winery + Job Completed on step 5)'
-                            : '(step_4 ≠ Job Completed, or step_5 name/time already set — no 4→5 copy)'}
+                          {step4to5Preview.orderingFix
+                            ? '(done layout with step_4 already strictly before step_5 — nothing to fix)'
+                            : step4to5Preview.rerun
+                              ? '(step4to5=1 but not Arrive Winery + Job Completed on step 5)'
+                              : '(step_4 ≠ Job Completed, or step_5 name/time already set — no 4→5 copy)'}
                         </span>
                       </td>
                       <td className="px-3 py-2 text-right font-mono tabular-nums font-medium">{step4to5Preview.blockedCount}</td>
                     </tr>
                     <tr className="border-b border-zinc-200 bg-zinc-50/80 dark:border-zinc-700 dark:bg-zinc-900/40">
                       <td className="px-3 py-2 font-medium">
-                        Will do <span className="font-normal text-zinc-500 dark:text-zinc-400">(potential − blocked)</span>
+                        Will do{' '}
+                        <span className="font-normal text-zinc-500 dark:text-zinc-400">
+                          {step4to5Preview.orderingFix || step4to5Preview.rerun
+                            ? '(same as rows updated — see below)'
+                            : '(potential − blocked)'}
+                        </span>
                       </td>
                       <td className="px-3 py-2 text-right font-mono tabular-nums font-semibold text-zinc-900 dark:text-zinc-100">
                         {step4to5Preview.willDoCount}
@@ -5992,9 +6112,11 @@ function DataChecksPageContent() {
                       <td className="px-3 py-2">
                         Rows updated on Fix{' '}
                         <span className="text-zinc-500 dark:text-zinc-400">
-                          {step4to5Preview.rerun
-                            ? '(only step_4_completed_at recalculated)'
-                            : '(step_4 Job Completed, step_5 name not Job Completed, step_5_completed_at null, step_4 time set)'}
+                          {step4to5Preview.orderingFix
+                            ? '(only step_4_completed_at — bad order rows only)'
+                            : step4to5Preview.rerun
+                              ? '(only step_4_completed_at recalculated)'
+                              : '(step_4 Job Completed, step_5 name not Job Completed, step_5_completed_at null, step_4 time set)'}
                         </span>
                       </td>
                       <td className="px-3 py-2 text-right font-mono tabular-nums font-medium text-amber-800 dark:text-amber-300">
@@ -6006,15 +6128,18 @@ function DataChecksPageContent() {
               </div>
               <p className="text-xs text-zinc-500 dark:text-zinc-400">
                 {(() => {
-                  const est = estimateStep4to5FixRange(step4to5Preview.todoCount, step4to5Preview.rerun);
+                  const est = estimateStep4to5FixRange(
+                    step4to5Preview.todoCount,
+                    step4to5Preview.rerun || step4to5Preview.orderingFix === true,
+                  );
                   return (
                     <>
                       Rough <strong>Fix</strong> duration for <strong>{step4to5Preview.todoCount}</strong> row(s) touched by UPDATE: about{' '}
                       <strong>
                         {est.lowSec}–{est.highSec} s
                       </strong>{' '}
-                      {step4to5Preview.rerun
-                        ? '(rerun: one column per row — usually quicker.)'
+                      {step4to5Preview.rerun || step4to5Preview.orderingFix
+                        ? '(rerun / order fix: one column per row — usually quicker.)'
                         : '(best guess, tuned for ~500–2000-row batches; remote or loaded DBs can take longer.)'}
                     </>
                   );
@@ -6055,7 +6180,12 @@ function DataChecksPageContent() {
           {step4to5FixResult && (
             <div className="mt-4 rounded border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-900 dark:border-emerald-800 dark:bg-emerald-950/50 dark:text-emerald-200">
               Updated <strong>{step4to5FixResult.updated}</strong> row(s)
-              {step4to5FixResult.afterPreview.rerun ? ' (rerun mode)' : ''}. Remaining rows updated on Fix for this filter:{' '}
+              {step4to5FixResult.afterPreview.orderingFix
+                ? ' (order fix)'
+                : step4to5FixResult.afterPreview.rerun
+                  ? ' (rerun mode)'
+                  : ''}
+              . Remaining rows updated on Fix for this filter:{' '}
               <strong>{step4to5FixResult.afterPreview.todoCount}</strong> (potential {step4to5FixResult.afterPreview.potentialCount}, blocked{' '}
               {step4to5FixResult.afterPreview.blockedCount}, will do {step4to5FixResult.afterPreview.willDoCount}).
             </div>
@@ -6079,11 +6209,21 @@ function DataChecksPageContent() {
                   </h3>
                   <p className="mt-1 text-sm text-zinc-500 dark:text-zinc-400">
                     {step4to5Preview.customer} / {step4to5Preview.template}
-                    {step4to5Preview.rerun ? ' · Rerun mode' : ''}
+                    {step4to5Preview.orderingFix
+                      ? ' · Order fix'
+                      : step4to5Preview.rerun
+                        ? ' · Rerun mode'
+                        : ''}
                   </p>
                 </div>
                 <div className="space-y-3 px-4 py-4 text-sm text-zinc-700 dark:text-zinc-300">
-                  {step4to5Preview.rerun && (
+                  {step4to5Preview.orderingFix && (
+                    <p className="rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-amber-950 dark:border-amber-700 dark:bg-amber-950/40 dark:text-amber-100">
+                      Order fix: updates <strong>only</strong>{' '}
+                      <code className="rounded bg-amber-100/80 px-1 dark:bg-amber-900/50">step_4_completed_at</code> on done rows where step 4 is not strictly before step 5 completion. Step 5 is not modified.
+                    </p>
+                  )}
+                  {step4to5Preview.rerun && !step4to5Preview.orderingFix && (
                     <p className="rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-amber-950 dark:border-amber-700 dark:bg-amber-950/40 dark:text-amber-100">
                       Rerun: updates <strong>only</strong> <code className="rounded bg-amber-100/80 px-1 dark:bg-amber-900/50">step_4_completed_at</code> on rows that are already done (Arrive Winery / Job Completed / step4to5=1). Step 5 is not modified.
                     </p>
@@ -6097,7 +6237,10 @@ function DataChecksPageContent() {
                     </li>
                   </ul>
                   {(() => {
-                    const est = estimateStep4to5FixRange(step4to5Preview.todoCount, step4to5Preview.rerun);
+                    const est = estimateStep4to5FixRange(
+                      step4to5Preview.todoCount,
+                      step4to5Preview.rerun || step4to5Preview.orderingFix === true,
+                    );
                     return (
                       <p className="rounded-md bg-zinc-100 px-3 py-2 text-sm text-zinc-800 dark:bg-zinc-800 dark:text-zinc-200">
                         <span className="font-medium">Estimated run time:</span> about{' '}
@@ -6105,8 +6248,8 @@ function DataChecksPageContent() {
                           {est.lowSec}–{est.highSec} seconds
                         </strong>
                         .{' '}
-                        {step4to5Preview.rerun
-                          ? 'Rerun only updates one timestamp column per row (lighter than normal).'
+                        {step4to5Preview.rerun || step4to5Preview.orderingFix
+                          ? 'Rerun and order fix only update one timestamp column per row (lighter than normal).'
                           : 'Heuristic for wide multi-column updates on ~500–2000 rows; slow network or a busy database can push this higher.'}
                       </p>
                     );
@@ -6127,7 +6270,7 @@ function DataChecksPageContent() {
                   <button
                     type="button"
                     onClick={() =>
-                      runStep4to5Fix(step4to5Customer.trim(), step4to5Template.trim(), step4to5Preview.rerun)
+                      runStep4to5Fix(step4to5Customer.trim(), step4to5Template.trim(), step4to5Mode)
                     }
                     disabled={step4to5FixLoading}
                     className="rounded bg-amber-600 px-4 py-2 text-sm font-medium text-white hover:bg-amber-700 disabled:opacity-50 dark:bg-amber-700 dark:hover:bg-amber-600"

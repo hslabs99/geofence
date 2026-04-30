@@ -9,8 +9,9 @@ type Row = {
 };
 
 /**
- * GET: returns the geofence as a KML document so Google Maps can show the outline.
- * Use in Google Maps: https://www.google.com/maps?q=ENCODED_URL_TO_THIS_ENDPOINT
+ * GET: returns the geofence as KML (download / My Maps). Do not rely on
+ * https://www.google.com/maps?q=<this-url> — Google often cannot fetch app-hosted KML.
+ * Use lat/lon from the geofences API (ST_PointOnSurface) for “View on map” instead.
  */
 export async function GET(
   _request: Request,

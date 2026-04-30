@@ -13,6 +13,8 @@ export async function POST(request: Request) {
       distanceId?: number;
       persist?: boolean;
       dryRun?: boolean;
+      /** When dryRun: if true, UPDATE tbl_distances (m, min, via, averages) from attempts; does not write samples. */
+      dryRunUpdateDistanceRow?: boolean;
       resetExistingSamples?: boolean;
       startLessMinutes?: number;
       endPlusMinutes?: number;
@@ -36,6 +38,7 @@ export async function POST(request: Request) {
       windowMinutes: body.windowMinutes ?? DEFAULT_HARVEST_WINDOW_MINUTES,
       maxJobs: body.maxJobs,
       maxSuccesses: body.maxSuccesses,
+      dryRunUpdateDistanceRow: body.dryRun === true ? body.dryRunUpdateDistanceRow === true : false,
     });
     return NextResponse.json(result);
   } catch (err) {
@@ -45,7 +48,7 @@ export async function POST(request: Request) {
         {
           error:
             'GPS samples table or columns missing. ' +
-            'Run web/sql/create_tbl_distances_gps_samples.sql, web/sql/alter_tbl_distances_gps_samples_outcomes.sql (if upgrading), and web/sql/add_gps_avg_tbl_distances.sql.',
+            'Run web/sql/create_tbl_distances_gps_samples.sql, web/sql/alter_tbl_distances_gps_samples_outcomes.sql (if upgrading), web/sql/add_gps_avg_tbl_distances.sql, web/sql/add_gps_plus_distances.sql, and web/sql/add_distance_via_tbl_distances.sql.',
           detail: msg,
         },
         { status: 500 }

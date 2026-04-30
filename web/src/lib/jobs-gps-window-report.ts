@@ -1,6 +1,7 @@
 /**
  * Jobs vs tbl_tracking GPS window coverage — uses the same window as Query → Inspect (see inspect-gps-window.ts).
- * Gap rule: any hole of ≥ threshold minutes inside the open NZ window counts as missing coverage.
+ * Gap rule: any hole of ≥ threshold minutes inside the open NZ window counts as missing coverage,
+ * except between two pings at the same lat/lon (stationary / duplicate fixes — not treated as missing GPS).
  * When Inspect has no upper bound (no actual_end), we cap ordered samples for gap math (see INSPECTION_UNBOUNDED_NZ_SAMPLE_CAP).
  */
 
@@ -14,6 +15,17 @@ export const JOBS_GPS_GAP_THRESHOLD_MINUTES = 10;
 
 /** Max ordered points loaded when GPS To is open (Inspect has no end) — keeps report bounded. */
 const INSPECTION_UNBOUNDED_NZ_SAMPLE_CAP = 25_000;
+
+/** Same SELECT as gaps detail — report gap math uses the same rows (incl. lat/lon for stationary rule). */
+const TRACKING_ROWS_FOR_GAP_SELECT = `SELECT t.id,
+       to_char(t.position_time_nz, 'YYYY-MM-DD HH24:MI:SS') AS position_time_nz,
+       to_char(t.position_time, 'YYYY-MM-DD HH24:MI:SS') AS position_time,
+       t.lat,
+       t.lon,
+       COALESCE(g.fence_name, '') AS fence_name,
+       COALESCE(t.geofence_type::text, '') AS geofence_type
+     FROM tbl_tracking t
+     LEFT JOIN tbl_geofences g ON g.fence_id = t.geofence_id`;
 
 /** One tbl_tracking row snapshot for gap popup (verbatim times from DB). */
 export type JobsGpsGapTrackingRow = {
@@ -44,7 +56,7 @@ export type JobsGpsGapSegment = {
   row_before_prev: JobsGpsGapTrackingRow | null;
   /** Minutes with no GPS ping; null only when window has no upper bound and no points (unbounded). */
   gap_minutes: number | null;
-  /** True when gap_minutes ≥ threshold (same rule as report). */
+  /** True when gap_minutes ≥ threshold and not a same-lat/lon stationary pair (same rule as report). */
   is_issue: boolean;
 };
 
@@ -77,6 +89,13 @@ function mapQueryRowToGapTrackingRow(r: Record<string, unknown>): JobsGpsGapTrac
     fence_name: fn || null,
     geofence_type: gt || null,
   };
+}
+
+/** Both pings have coordinates and match within tolerance (vehicle did not move — long gap is not “missing GPS”). */
+function stationarySameLatLon(a: JobsGpsGapTrackingRow, b: JobsGpsGapTrackingRow): boolean {
+  if (a.lat == null || a.lon == null || b.lat == null || b.lon == null) return false;
+  const ε = 1e-5;
+  return Math.abs(a.lat - b.lat) <= ε && Math.abs(a.lon - b.lon) <= ε;
 }
 
 export type JobsGpsGapsDetailResult = {
@@ -139,11 +158,11 @@ function viaLabel(v: unknown): string {
 function computeMaxGapMinutes(
   positionAfter: string,
   positionBefore: string | null,
-  nzTimes: string[],
+  nzRows: JobsGpsGapTrackingRow[],
   threshold: number
 ): { maxGap: number | null; gapMissing: boolean } {
   const after = normalizeTimestampString(positionAfter) ?? positionAfter.slice(0, 19);
-  if (nzTimes.length === 0) {
+  if (nzRows.length === 0) {
     if (positionBefore) {
       const before = normalizeTimestampString(positionBefore) ?? positionBefore.slice(0, 19);
       const full = minutesBetweenNz(after, before);
@@ -153,16 +172,26 @@ function computeMaxGapMinutes(
     return { maxGap: null, gapMissing: true };
   }
   let maxG = 0;
-  const startGap = minutesBetweenNz(after, nzTimes[0]!);
-  if (startGap != null && startGap > maxG) maxG = startGap;
-  for (let i = 1; i < nzTimes.length; i++) {
-    const g = minutesBetweenNz(nzTimes[i - 1]!, nzTimes[i]!);
+  const firstNz = nzRows[0]!.position_time_nz;
+  if (firstNz) {
+    const startGap = minutesBetweenNz(after, firstNz);
+    if (startGap != null && startGap > maxG) maxG = startGap;
+  }
+  for (let i = 1; i < nzRows.length; i++) {
+    const a = nzRows[i - 1]!.position_time_nz;
+    const b = nzRows[i]!.position_time_nz;
+    if (!a || !b) continue;
+    if (stationarySameLatLon(nzRows[i - 1]!, nzRows[i]!)) continue;
+    const g = minutesBetweenNz(a, b);
     if (g != null && g > maxG) maxG = g;
   }
   if (positionBefore) {
     const before = normalizeTimestampString(positionBefore) ?? positionBefore.slice(0, 19);
-    const endGap = minutesBetweenNz(nzTimes[nzTimes.length - 1]!, before);
-    if (endGap != null && endGap > maxG) maxG = endGap;
+    const lastNz = nzRows[nzRows.length - 1]!.position_time_nz;
+    if (lastNz) {
+      const endGap = minutesBetweenNz(lastNz, before);
+      if (endGap != null && endGap > maxG) maxG = endGap;
+    }
   }
   return { maxGap: maxG, gapMissing: maxG >= threshold };
 }
@@ -235,6 +264,7 @@ export function buildGapSegmentsList(
     if (!a || !b) continue;
     const g = minutesBetweenNz(a, b);
     if (g != null) {
+      const stationary = stationarySameLatLon(nzRows[i - 1]!, nzRows[i]!);
       gaps.push({
         kind: 'between',
         gps_last: a,
@@ -243,7 +273,7 @@ export function buildGapSegmentsList(
         next_row: nzRows[i]!,
         row_before_prev: i >= 2 ? nzRows[i - 2]! : null,
         gap_minutes: roundMin(g),
-        is_issue: g >= threshold,
+        is_issue: !stationary && g >= threshold,
       });
     }
   }
@@ -339,23 +369,13 @@ export async function listJobsGpsWindowGaps(
   const positionBefore = win.positionBefore;
   const rawAfter = normalizeTimestampString(positionAfter) ?? String(positionAfter).trim().slice(0, 19);
 
-  const trackingSelect = `SELECT t.id,
-       to_char(t.position_time_nz, 'YYYY-MM-DD HH24:MI:SS') AS position_time_nz,
-       to_char(t.position_time, 'YYYY-MM-DD HH24:MI:SS') AS position_time,
-       t.lat,
-       t.lon,
-       COALESCE(g.fence_name, '') AS fence_name,
-       COALESCE(t.geofence_type::text, '') AS geofence_type
-     FROM tbl_tracking t
-     LEFT JOIN tbl_geofences g ON g.fence_id = t.geofence_id`;
-
   let nzPingRows: JobsGpsGapTrackingRow[];
   let truncatedSample = false;
 
   if (positionBefore) {
     const rawBefore = normalizeTimestampString(positionBefore) ?? String(positionBefore).trim().slice(0, 19);
     const nzRaw = await query<Record<string, unknown>>(
-      `${trackingSelect}
+      `${TRACKING_ROWS_FOR_GAP_SELECT}
        WHERE t.device_name = $1
          AND t.position_time_nz IS NOT NULL
          AND t.position_time_nz > $2::timestamp
@@ -377,7 +397,7 @@ export async function listJobsGpsWindowGaps(
     truncatedSample = total > INSPECTION_UNBOUNDED_NZ_SAMPLE_CAP;
 
     const nzRaw = await query<Record<string, unknown>>(
-      `${trackingSelect}
+      `${TRACKING_ROWS_FOR_GAP_SELECT}
        WHERE t.device_name = $1
          AND t.position_time_nz IS NOT NULL
          AND t.position_time_nz > $2::timestamp
@@ -481,16 +501,15 @@ export async function buildJobsGpsReportRowBuild(
 
   const rawAfter = normalizeTimestampString(positionAfter) ?? String(positionAfter).trim().slice(0, 19);
 
-  let nzTimes: string[];
+  let nzPingRowsForGap: JobsGpsGapTrackingRow[];
   let min_gps_nz: string | null = null;
   let max_gps_nz: string | null = null;
   let points_in_window: number;
 
   if (positionBefore) {
     const rawBefore = normalizeTimestampString(positionBefore) ?? String(positionBefore).trim().slice(0, 19);
-    const nzRows = await query<{ nz: string }>(
-      `SELECT to_char(t.position_time_nz, 'YYYY-MM-DD HH24:MI:SS') AS nz
-       FROM tbl_tracking t
+    const nzRaw = await query<Record<string, unknown>>(
+      `${TRACKING_ROWS_FOR_GAP_SELECT}
        WHERE t.device_name = $1
          AND t.position_time_nz IS NOT NULL
          AND t.position_time_nz > $2::timestamp
@@ -498,11 +517,11 @@ export async function buildJobsGpsReportRowBuild(
        ORDER BY t.position_time_nz ASC, t.id ASC`,
       [device, rawAfter, rawBefore]
     );
-    nzTimes = nzRows.map((r) => r.nz).filter(Boolean);
-    points_in_window = nzTimes.length;
-    if (nzTimes.length > 0) {
-      min_gps_nz = nzTimes[0]!;
-      max_gps_nz = nzTimes[nzTimes.length - 1]!;
+    nzPingRowsForGap = nzRaw.map(mapQueryRowToGapTrackingRow);
+    points_in_window = nzPingRowsForGap.length;
+    if (nzPingRowsForGap.length > 0) {
+      min_gps_nz = nzPingRowsForGap[0]!.position_time_nz ?? null;
+      max_gps_nz = nzPingRowsForGap[nzPingRowsForGap.length - 1]!.position_time_nz ?? null;
     }
   } else {
     const stats = await query<{ min_nz: string | null; max_nz: string | null; c: string }>(
@@ -528,9 +547,8 @@ export async function buildJobsGpsReportRowBuild(
     max_gps_nz = stats[0]?.max_nz ?? null;
     points_in_window = parseInt(stats[0]?.c ?? '0', 10) || 0;
 
-    const nzRows = await query<{ nz: string }>(
-      `SELECT to_char(t.position_time_nz, 'YYYY-MM-DD HH24:MI:SS') AS nz
-       FROM tbl_tracking t
+    const nzRaw = await query<Record<string, unknown>>(
+      `${TRACKING_ROWS_FOR_GAP_SELECT}
        WHERE t.device_name = $1
          AND t.position_time_nz IS NOT NULL
          AND t.position_time_nz > $2::timestamp
@@ -538,7 +556,7 @@ export async function buildJobsGpsReportRowBuild(
        LIMIT ${INSPECTION_UNBOUNDED_NZ_SAMPLE_CAP}`,
       [device, rawAfter]
     );
-    nzTimes = nzRows.map((r) => r.nz).filter(Boolean);
+    nzPingRowsForGap = nzRaw.map(mapQueryRowToGapTrackingRow);
   }
 
   let nullRows: { c: string }[];
@@ -568,7 +586,12 @@ export async function buildJobsGpsReportRowBuild(
   const critical_null_nz_count = parseInt(nullRows[0]?.c ?? '0', 10) || 0;
   const critical_null_nz = critical_null_nz_count > 0;
 
-  const { maxGap, gapMissing } = computeMaxGapMinutes(positionAfter, positionBefore, nzTimes, gapThresholdMinutes);
+  const { maxGap, gapMissing } = computeMaxGapMinutes(
+    positionAfter,
+    positionBefore,
+    nzPingRowsForGap,
+    gapThresholdMinutes
+  );
 
   const rawBeforeDisplay = positionBefore
     ? normalizeTimestampString(positionBefore) ?? String(positionBefore).trim().slice(0, 19)
@@ -586,19 +609,10 @@ export async function buildJobsGpsReportRowBuild(
     minutes_from_last_fix_to_gps_to = m != null ? Math.round(m * 100) / 100 : null;
   }
 
-  const nzPingStubs: JobsGpsGapTrackingRow[] = nzTimes.map((nz) => ({
-    id: null,
-    position_time_nz: nz,
-    position_time: null,
-    lat: null,
-    lon: null,
-    fence_name: null,
-    geofence_type: null,
-  }));
   const fullSegments = buildGapSegmentsList(
     rawAfter,
     positionBefore,
-    nzPingStubs,
+    nzPingRowsForGap,
     gapThresholdMinutes
   );
   const gap_segment_count = fullSegments.length;

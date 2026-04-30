@@ -5,6 +5,7 @@
 CREATE TABLE IF NOT EXISTS tbl_inspect_history (
   id         serial PRIMARY KEY,
   job_id     text NOT NULL,
+  note       text NULL,
   created_at timestamptz NOT NULL DEFAULT now()
 );
 

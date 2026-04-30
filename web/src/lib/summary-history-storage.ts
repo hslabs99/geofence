@@ -5,7 +5,21 @@
 export const SUMMARY_HISTORY_STORAGE_KEY = 'geodata_summary_history_v1';
 const MAX_ENTRIES = 25;
 
-export type SummaryTabMode = 'season' | 'by_day' | 'by_job' | 'data_audit';
+export type SummaryTabMode = 'season' | 'by_day' | 'by_job' | 'data_audit' | 'vineyards';
+
+/** Season / Daily rollup grouping (replaces legacy splitByLimits checkbox). */
+export type SummarySplitMode = 'summary' | 'winery_group_tt_over' | 'winery_group_tt';
+
+export function normalizeSummarySplitMode(
+  splitMode: unknown,
+  legacySplitByLimits?: unknown,
+): SummarySplitMode {
+  if (splitMode === 'summary' || splitMode === 'winery_group_tt_over' || splitMode === 'winery_group_tt') {
+    return splitMode;
+  }
+  if (legacySplitByLimits === true) return 'winery_group_tt_over';
+  return 'summary';
+}
 
 /** Full UI state to restore Summary + sidebar customer (admin/super). */
 export type SummaryHistoryPayload = {
@@ -20,7 +34,9 @@ export type SummaryHistoryPayload = {
   filterVineyardGroup: string;
   /** Selected vineyard_name values (empty = all). */
   filterVineyards: string[];
-  splitByLimits: boolean;
+  splitMode: SummarySplitMode;
+  /** @deprecated Read only for old saved history; prefer splitMode. */
+  splitByLimits?: boolean;
   minsThresholds: Record<string, string>;
   selectedTimeLimitRowId: number | null;
   showLimitsTable: boolean;
@@ -55,7 +71,9 @@ export function buildSummaryHistoryLabel(p: SummaryHistoryPayload): string {
         ? 'By day'
         : p.summaryTab === 'data_audit'
           ? 'Data audit'
-          : 'Season';
+          : p.summaryTab === 'vineyards'
+            ? 'Vineyards'
+            : 'Season';
   const cust = p.clientCustomer.trim() || '—';
   const tpl = p.filterTemplate.trim() || '—';
   const job = p.focusJobId?.trim();

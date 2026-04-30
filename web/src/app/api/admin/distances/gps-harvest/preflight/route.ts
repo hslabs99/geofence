@@ -33,6 +33,10 @@ export async function GET() {
       'debug_json',
       'run_index',
       'updated_at',
+      'gps_plus_meters',
+      'gps_plus_minutes',
+      'gps_plus_outcome',
+      'gps_plus_vineyard_tracking_id',
     ];
     for (const c of sampleColumns) checks.push({ table: 'tbl_distances_gps_samples', column: c, exists: false });
 
@@ -42,6 +46,11 @@ export async function GET() {
       'gps_avg_distance_m',
       'gps_avg_duration_min',
       'gps_averaged_at',
+      'gps_plus_sample_count',
+      'gps_plus_avg_distance_m',
+      'gps_plus_avg_duration_min',
+      'gps_plus_averaged_at',
+      'distance_via',
       'distance_m',
       'duration_min',
       'updated_at',

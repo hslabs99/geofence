@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 const TT_OPTIONS = ['T', 'TT', 'TTT'] as const;
 
@@ -40,6 +40,28 @@ function numOrEmpty(v: number | null | undefined): string {
   return n % 1 === 0 ? String(n) : n.toFixed(2).replace(/\.?0+$/, '');
 }
 
+function normCell(s: string | null | undefined): string {
+  return (s ?? '').trim();
+}
+
+function ctwKey(r: WineryMinutesRow): string {
+  return `${normCell(r.Customer)}\u0000${normCell(r.Template)}\u0000${normCell(r.Winery)}`;
+}
+
+/** Alternating band index (boolean) whenever Customer+Template+Winery changes from the row above. */
+function ctwGroupBands(rows: WineryMinutesRow[]): boolean[] {
+  const out: boolean[] = [];
+  let band = false;
+  let prev: string | null = null;
+  for (const r of rows) {
+    const k = ctwKey(r);
+    if (prev !== null && k !== prev) band = !band;
+    out.push(band);
+    prev = k;
+  }
+  return out;
+}
+
 export default function WineryMinutesPage() {
   const [rows, setRows] = useState<WineryMinutesRow[]>([]);
   const [loading, setLoading] = useState(true);
@@ -51,14 +73,25 @@ export default function WineryMinutesPage() {
   const [templates, setTemplates] = useState<string[]>([]);
   const [vineyardGroups, setVineyardGroups] = useState<string[]>([]);
   const [wineries, setWineries] = useState<string[]>([]);
-  const [templatesAll, setTemplatesAll] = useState<string[]>([]);
-  const [wineriesAll, setWineriesAll] = useState<string[]>([]);
   const [customersLoading, setCustomersLoading] = useState(false);
   const [templatesLoading, setTemplatesLoading] = useState(false);
   const [wineriesLoading, setWineriesLoading] = useState(false);
   const [totalMismatchInfo, setTotalMismatchInfo] = useState<string | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<WineryMinutesRow | null>(null);
+  const [subTab, setSubTab] = useState<'records' | 'exceptions'>('records');
+  const [limitExceptions, setLimitExceptions] = useState<
+    { customer: string; template: string; delivery_winery: string; vineyard_group: string; job_tt: string; job_count: number }[]
+  >([]);
+  const [exceptionsLoading, setExceptionsLoading] = useState(false);
+  const [exceptionsError, setExceptionsError] = useState<string | null>(null);
+  const [exceptionStats, setExceptionStats] = useState<{ comboCount: number; exceptionCount: number } | null>(null);
+  const importFileRef = useRef<HTMLInputElement>(null);
+  const [importBusy, setImportBusy] = useState(false);
+  const [importSummary, setImportSummary] = useState<string | null>(null);
 
   const editing = modal?.mode === 'edit' ? modal.row : null;
+
+  const ctwBands = useMemo(() => ctwGroupBands(rows), [rows]);
 
   const loadCustomers = useCallback(() => {
     setCustomersLoading(true);
@@ -108,19 +141,33 @@ export default function WineryMinutesPage() {
   }, []);
 
   useEffect(() => loadRows(), [loadRows]);
+
+  const loadLimitExceptions = useCallback(() => {
+    setExceptionsLoading(true);
+    setExceptionsError(null);
+    fetch('/api/admin/wineryminutes/limit-exceptions')
+      .then((r) => r.json())
+      .then((data) => {
+        if (data?.error) throw new Error(data.error);
+        setLimitExceptions(data.exceptions ?? []);
+        setExceptionStats(
+          data.comboCount != null && data.exceptionCount != null
+            ? { comboCount: data.comboCount, exceptionCount: data.exceptionCount }
+            : null,
+        );
+      })
+      .catch((e) => {
+        setExceptionsError(e instanceof Error ? e.message : String(e));
+        setLimitExceptions([]);
+        setExceptionStats(null);
+      })
+      .finally(() => setExceptionsLoading(false));
+  }, []);
+
+  useEffect(() => {
+    if (subTab === 'exceptions') loadLimitExceptions();
+  }, [subTab, loadLimitExceptions]);
   useEffect(() => loadCustomers(), [loadCustomers]);
-  useEffect(() => {
-    fetch('/api/vworkjobs/templates')
-      .then((r) => r.json())
-      .then((data) => setTemplatesAll(data?.templates ?? []))
-      .catch(() => setTemplatesAll([]));
-  }, []);
-  useEffect(() => {
-    fetch('/api/admin/data-checks/wine-mapp/delivery-wineries')
-      .then((r) => r.json())
-      .then((data) => setWineriesAll(data?.rows ?? []))
-      .catch(() => setWineriesAll([]));
-  }, []);
   useEffect(() => {
     fetch('/api/admin/wineryminutes/vineyard-groups')
       .then((r) => r.json())
@@ -263,8 +310,10 @@ export default function WineryMinutesPage() {
     }
   };
 
-  const handleDelete = (row: WineryMinutesRow) => {
-    if (!confirm(`Delete winery minutes for ${row.Customer ?? ''} / ${row.Template ?? ''} / ${row.vineyardgroup ?? ''} / ${row.Winery ?? ''}?`)) return;
+  const confirmDelete = () => {
+    const row = pendingDelete;
+    if (!row) return;
+    setPendingDelete(null);
     fetch(`/api/admin/wineryminutes/${row.id}`, { method: 'DELETE' })
       .then(async (r) => {
         const data = await r.json();
@@ -274,16 +323,136 @@ export default function WineryMinutesPage() {
       .catch((e) => setError(e.message));
   };
 
+  const handleExportXlsx = useCallback(async () => {
+    setError(null);
+    try {
+      const r = await fetch('/api/admin/wineryminutes/export');
+      if (!r.ok) {
+        const j = (await r.json().catch(() => ({}))) as { error?: string };
+        throw new Error(j.error ?? r.statusText);
+      }
+      const blob = await r.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `winery-minutes-${new Date().toISOString().slice(0, 10)}.xlsx`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }, []);
+
+  const handleImportFile = useCallback(
+    async (e: React.ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0];
+      e.target.value = '';
+      if (!file) return;
+      setImportBusy(true);
+      setError(null);
+      setImportSummary(null);
+      try {
+        const fd = new FormData();
+        fd.append('file', file);
+        const r = await fetch('/api/admin/wineryminutes/import', { method: 'POST', body: fd });
+        const data = (await r.json()) as {
+          error?: string;
+          ok?: boolean;
+          updated?: number;
+          inserted?: number;
+          skipped?: number;
+          errors?: { row: number; message: string }[];
+        };
+        if (!r.ok) throw new Error(data.error ?? r.statusText);
+        const parts = [
+          `Updated ${data.updated ?? 0}, inserted ${data.inserted ?? 0}, skipped blank ${data.skipped ?? 0}.`,
+        ];
+        if (data.errors?.length) {
+          parts.push(
+            ` Row issues: ${data.errors.map((x) => `${x.row}: ${x.message}`).join(' · ')}`,
+          );
+        }
+        setImportSummary(parts.join(''));
+        loadRows();
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setImportBusy(false);
+      }
+    },
+    [loadRows],
+  );
+
   return (
     <div className="w-full min-w-0 p-6">
-      <div className="mb-4 flex items-center justify-between">
+      <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
         <h1 className="text-2xl font-semibold text-zinc-900 dark:text-zinc-100">Winery Minutes</h1>
+        {subTab === 'records' ? (
+          <div className="flex flex-wrap items-center gap-2">
+            <input
+              ref={importFileRef}
+              type="file"
+              accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+              className="hidden"
+              onChange={handleImportFile}
+            />
+            <button
+              type="button"
+              onClick={handleExportXlsx}
+              className="rounded border border-zinc-300 bg-white px-4 py-2 text-sm font-medium text-zinc-800 hover:bg-zinc-50 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100 dark:hover:bg-zinc-700"
+            >
+              Export XLSX
+            </button>
+            <button
+              type="button"
+              disabled={importBusy}
+              onClick={() => importFileRef.current?.click()}
+              className="rounded border border-zinc-300 bg-white px-4 py-2 text-sm font-medium text-zinc-800 hover:bg-zinc-50 disabled:opacity-60 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100 dark:hover:bg-zinc-700"
+            >
+              {importBusy ? 'Importing…' : 'Import XLSX'}
+            </button>
+            <button
+              type="button"
+              onClick={openAdd}
+              className="rounded bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700"
+            >
+              Add record
+            </button>
+          </div>
+        ) : (
+          <button
+            type="button"
+            onClick={loadLimitExceptions}
+            disabled={exceptionsLoading}
+            className="rounded border border-zinc-300 bg-white px-4 py-2 text-sm font-medium text-zinc-800 hover:bg-zinc-50 disabled:opacity-60 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100 dark:hover:bg-zinc-700"
+          >
+            {exceptionsLoading ? 'Refreshing…' : 'Refresh'}
+          </button>
+        )}
+      </div>
+
+      <div className="mb-4 flex gap-1 border-b border-zinc-200 dark:border-zinc-700">
         <button
           type="button"
-          onClick={openAdd}
-          className="rounded bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700"
+          onClick={() => setSubTab('records')}
+          className={`rounded-t px-4 py-2 text-sm font-medium ${
+            subTab === 'records'
+              ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100'
+              : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
+          }`}
         >
-          Add record
+          Records
+        </button>
+        <button
+          type="button"
+          onClick={() => setSubTab('exceptions')}
+          className={`rounded-t px-4 py-2 text-sm font-medium ${
+            subTab === 'exceptions'
+              ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100'
+              : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
+          }`}
+        >
+          Limit exceptions
         </button>
       </div>
 
@@ -293,7 +462,71 @@ export default function WineryMinutesPage() {
         </div>
       )}
 
-      {loading ? (
+      {subTab === 'records' && importSummary && (
+        <div className="mb-4 rounded border border-zinc-200 bg-zinc-50 p-3 text-sm text-zinc-800 dark:border-zinc-600 dark:bg-zinc-800/50 dark:text-zinc-200">
+          {importSummary}
+        </div>
+      )}
+
+      {subTab === 'records' && (
+        <p className="mb-3 max-w-3xl text-sm text-zinc-600 dark:text-zinc-400">
+          Export downloads all rows. Edit minute columns in Excel, then import: rows are matched on{' '}
+          <strong>Template</strong>, <strong>Winery</strong>, <strong>Vineyard group</strong> (blank matches blank), and{' '}
+          <strong>TT</strong>. If <strong>Customer</strong> is set, it is included in the match; if it is empty, the file
+          must uniquely identify one DB row. Matching rows only update minute fields; otherwise a new row is inserted when
+          Customer is present.
+        </p>
+      )}
+
+      {subTab === 'exceptions' ? (
+        <>
+          <p className="mb-3 max-w-3xl text-sm text-zinc-600 dark:text-zinc-400">
+            Jobs in <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">tbl_vworkjobs</code> grouped by customer, template, delivery winery, vineyard group, and TT. Listed rows have{' '}
+            <strong>no</strong> matching row in <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">tbl_wineryminutes</code> under the same rules as Summary: exact vineyard group (blank only matches blank), plus TT match or TTT fallback for T/TT.
+          </p>
+          {exceptionStats && (
+            <p className="mb-3 text-xs text-zinc-500 dark:text-zinc-400">
+              {exceptionStats.exceptionCount} missing of {exceptionStats.comboCount} distinct job keys (with delivery winery set).
+            </p>
+          )}
+          {exceptionsError && (
+            <div className="mb-4 rounded bg-red-100 p-3 text-red-800 dark:bg-red-900/30 dark:text-red-200">{exceptionsError}</div>
+          )}
+          {exceptionsLoading ? (
+            <p className="text-zinc-600">Loading…</p>
+          ) : (
+            <div className="overflow-x-auto rounded-lg border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900">
+              <table className="min-w-full text-left text-sm">
+                <thead>
+                  <tr className="border-b border-zinc-200 bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-800">
+                    <th className="px-3 py-2 font-medium text-zinc-900 dark:text-zinc-100">Customer</th>
+                    <th className="px-3 py-2 font-medium text-zinc-900 dark:text-zinc-100">Template</th>
+                    <th className="px-3 py-2 font-medium text-zinc-900 dark:text-zinc-100">Winery</th>
+                    <th className="px-3 py-2 font-medium text-zinc-900 dark:text-zinc-100">Vineyard group</th>
+                    <th className="px-3 py-2 font-medium text-zinc-900 dark:text-zinc-100">TT</th>
+                    <th className="px-3 py-2 text-right font-medium text-zinc-900 dark:text-zinc-100">Jobs</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {limitExceptions.map((ex, i) => (
+                    <tr key={`${ex.customer}|${ex.template}|${ex.delivery_winery}|${ex.vineyard_group}|${ex.job_tt}|${i}`} className="border-b border-zinc-100 dark:border-zinc-800">
+                      <td className="whitespace-nowrap px-3 py-2 text-zinc-800 dark:text-zinc-200">{ex.customer || '—'}</td>
+                      <td className="whitespace-nowrap px-3 py-2 text-zinc-800 dark:text-zinc-200">{ex.template || '—'}</td>
+                      <td className="whitespace-nowrap px-3 py-2 text-zinc-800 dark:text-zinc-200">{ex.delivery_winery || '—'}</td>
+                      <td className="whitespace-nowrap px-3 py-2 text-zinc-800 dark:text-zinc-200">{ex.vineyard_group || '—'}</td>
+                      <td className="whitespace-nowrap px-3 py-2 text-zinc-800 dark:text-zinc-200">{ex.job_tt || '—'}</td>
+                      <td className="whitespace-nowrap px-3 py-2 text-right tabular-nums text-zinc-800 dark:text-zinc-200">{ex.job_count}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              {limitExceptions.length === 0 && !exceptionsError && (
+                <p className="p-4 text-zinc-500">No gaps — every vwork job key has a matching winery minutes row.</p>
+              )}
+            </div>
+          )}
+        </>
+      ) : loading ? (
         <p className="text-zinc-600">Loading…</p>
       ) : (
         <div className="overflow-x-auto rounded-lg border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900">
@@ -302,8 +535,8 @@ export default function WineryMinutesPage() {
               <tr className="border-b border-zinc-200 bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-800">
                 <th className="px-3 py-2 font-medium text-zinc-900 dark:text-zinc-100">Customer</th>
                 <th className="px-3 py-2 font-medium text-zinc-900 dark:text-zinc-100">Template</th>
-                <th className="px-3 py-2 font-medium text-zinc-900 dark:text-zinc-100">Vineyard group</th>
                 <th className="px-3 py-2 font-medium text-zinc-900 dark:text-zinc-100">Winery</th>
+                <th className="px-3 py-2 font-medium text-zinc-900 dark:text-zinc-100">Vineyard group</th>
                 <th className="px-3 py-2 font-medium text-zinc-900 dark:text-zinc-100">TT</th>
                 <th className="px-3 py-2 font-medium text-zinc-900 dark:text-zinc-100">To Vine</th>
                 <th className="px-3 py-2 font-medium text-zinc-900 dark:text-zinc-100">In Vine</th>
@@ -314,17 +547,21 @@ export default function WineryMinutesPage() {
               </tr>
             </thead>
             <tbody>
-              {rows.map((r) => {
-                const customerNotInList = r.Customer != null && r.Customer !== '' && !customers.includes(r.Customer);
-                const templateNotInList = r.Template != null && r.Template !== '' && !templatesAll.includes(r.Template);
-                const vgNotInList = r.vineyardgroup != null && r.vineyardgroup !== '' && !vineyardGroups.includes(r.vineyardgroup);
-                const wineryNotInList = r.Winery != null && r.Winery !== '' && !wineriesAll.includes(r.Winery);
+              {rows.map((r, rowIdx) => {
+                const newGroup =
+                  rowIdx > 0 && ctwKey(r) !== ctwKey(rows[rowIdx - 1]!);
+                const shaded = ctwBands[rowIdx];
                 return (
-                <tr key={r.id} className="border-b border-zinc-100 dark:border-zinc-800 hover:bg-zinc-50 dark:hover:bg-zinc-800/50">
-                  <td className={`whitespace-nowrap px-3 py-2 ${customerNotInList ? 'font-bold text-red-600 dark:text-red-400' : 'text-zinc-700 dark:text-zinc-300'}`}>{r.Customer ?? '—'}</td>
-                  <td className={`whitespace-nowrap px-3 py-2 ${templateNotInList ? 'font-bold text-red-600 dark:text-red-400' : 'text-zinc-700 dark:text-zinc-300'}`}>{r.Template ?? '—'}</td>
-                  <td className={`whitespace-nowrap px-3 py-2 ${vgNotInList ? 'font-bold text-red-600 dark:text-red-400' : 'text-zinc-700 dark:text-zinc-300'}`}>{r.vineyardgroup ?? '—'}</td>
-                  <td className={`whitespace-nowrap px-3 py-2 ${wineryNotInList ? 'font-bold text-red-600 dark:text-red-400' : 'text-zinc-700 dark:text-zinc-300'}`}>{r.Winery ?? '—'}</td>
+                <tr
+                  key={r.id}
+                  className={`border-b border-zinc-100 dark:border-zinc-800 hover:bg-zinc-100/80 dark:hover:bg-zinc-800/70 ${
+                    shaded ? 'bg-sky-50/90 dark:bg-sky-950/30' : ''
+                  } ${newGroup ? 'border-t-2 border-t-zinc-300 dark:border-t-zinc-600' : ''}`}
+                >
+                  <td className="whitespace-nowrap px-3 py-2 text-zinc-700 dark:text-zinc-300">{r.Customer ?? '—'}</td>
+                  <td className="whitespace-nowrap px-3 py-2 text-zinc-700 dark:text-zinc-300">{r.Template ?? '—'}</td>
+                  <td className="whitespace-nowrap px-3 py-2 text-zinc-700 dark:text-zinc-300">{r.Winery ?? '—'}</td>
+                  <td className="whitespace-nowrap px-3 py-2 text-zinc-700 dark:text-zinc-300">{r.vineyardgroup ?? '—'}</td>
                   <td className="whitespace-nowrap px-3 py-2 text-zinc-700 dark:text-zinc-300">{r.TT ?? '—'}</td>
                   <td className="whitespace-nowrap px-3 py-2 text-right tabular-nums text-zinc-700 dark:text-zinc-300">{r.ToVineMins != null ? Number(r.ToVineMins).toFixed(2) : '—'}</td>
                   <td className="whitespace-nowrap px-3 py-2 text-right tabular-nums text-zinc-700 dark:text-zinc-300">{r.InVineMins != null ? Number(r.InVineMins).toFixed(2) : '—'}</td>
@@ -349,7 +586,7 @@ export default function WineryMinutesPage() {
                     </button>
                     <button
                       type="button"
-                      onClick={() => handleDelete(r)}
+                      onClick={() => setPendingDelete(r)}
                       className="text-red-600 hover:underline dark:text-red-400"
                     >
                       Delete
@@ -361,6 +598,59 @@ export default function WineryMinutesPage() {
             </tbody>
           </table>
           {rows.length === 0 && <p className="p-4 text-zinc-500">No winery minutes yet. Add a record to get started.</p>}
+        </div>
+      )}
+
+
+      {pendingDelete && (
+        <div
+          className="fixed inset-0 z-[60] flex items-center justify-center bg-black/50 p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="winery-minutes-delete-title"
+          onClick={(e) => { if (e.target === e.currentTarget) setPendingDelete(null); }}
+        >
+          <div
+            className="w-full max-w-md rounded-lg border border-zinc-200 bg-white shadow-xl dark:border-zinc-600 dark:bg-zinc-900"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="border-b border-zinc-200 px-4 py-3 dark:border-zinc-700">
+              <h3 id="winery-minutes-delete-title" className="text-lg font-medium text-zinc-900 dark:text-zinc-100">
+                Delete winery minutes?
+              </h3>
+            </div>
+            <div className="px-4 py-4 text-sm text-zinc-700 dark:text-zinc-300">
+              <p>
+                This will remove limits for{' '}
+                <span className="font-medium text-zinc-900 dark:text-zinc-100">
+                  {pendingDelete.Customer ?? '—'} / {pendingDelete.Template ?? '—'} / {pendingDelete.vineyardgroup ?? '—'} / {pendingDelete.Winery ?? '—'}
+                </span>
+                {pendingDelete.TT ? (
+                  <>
+                    {' '}
+                    (TT: {pendingDelete.TT})
+                  </>
+                ) : null}
+                .
+              </p>
+            </div>
+            <div className="flex justify-end gap-2 border-t border-zinc-200 px-4 py-3 dark:border-zinc-700">
+              <button
+                type="button"
+                onClick={() => setPendingDelete(null)}
+                className="rounded bg-zinc-200 px-4 py-2 text-sm hover:bg-zinc-300 dark:bg-zinc-700 dark:hover:bg-zinc-600"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={confirmDelete}
+                className="rounded bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700"
+              >
+                Delete
+              </button>
+            </div>
+          </div>
         </div>
       )}
 
@@ -436,28 +726,6 @@ export default function WineryMinutesPage() {
                 </select>
               </div>
               <div>
-                <label className="mb-1 block text-xs font-medium text-zinc-500">Vineyard group</label>
-                <input
-                  type="text"
-                  list="vineyardgroup-datalist"
-                  value={form.vineyardgroup}
-                  onChange={(e) => setForm((f) => ({ ...f, vineyardgroup: e.target.value }))}
-                  disabled={!form.Customer}
-                  placeholder="Type or pick from list"
-                  className={`w-full rounded border px-2 py-1.5 text-sm dark:bg-zinc-800 disabled:opacity-70 ${
-                    form.vineyardgroup && !vineyardGroups.includes(form.vineyardgroup)
-                      ? 'border-amber-400 text-zinc-700 dark:border-amber-500 dark:text-zinc-200'
-                      : 'border-zinc-300 dark:border-zinc-600 dark:text-zinc-100'
-                  }`}
-                />
-                <datalist id="vineyardgroup-datalist">
-                  {vineyardGroups.map((g) => (
-                    <option key={g} value={g} />
-                  ))}
-                </datalist>
-                <p className="mt-0.5 text-[11px] text-zinc-500 dark:text-zinc-500">Free text or pick from tbl_vworkjobs.vineyard_group</p>
-              </div>
-              <div>
                 <div className="mb-1 flex items-center justify-between">
                   <label className="text-xs font-medium text-zinc-500">Winery</label>
                   <button
@@ -491,6 +759,28 @@ export default function WineryMinutesPage() {
                     <option key={w} value={w}>{w}</option>
                   ))}
                 </select>
+              </div>
+              <div>
+                <label className="mb-1 block text-xs font-medium text-zinc-500">Vineyard group</label>
+                <input
+                  type="text"
+                  list="vineyardgroup-datalist"
+                  value={form.vineyardgroup}
+                  onChange={(e) => setForm((f) => ({ ...f, vineyardgroup: e.target.value }))}
+                  disabled={!form.Customer}
+                  placeholder="Type or pick from list"
+                  className={`w-full rounded border px-2 py-1.5 text-sm dark:bg-zinc-800 disabled:opacity-70 ${
+                    form.vineyardgroup && !vineyardGroups.includes(form.vineyardgroup)
+                      ? 'border-amber-400 text-zinc-700 dark:border-amber-500 dark:text-zinc-200'
+                      : 'border-zinc-300 dark:border-zinc-600 dark:text-zinc-100'
+                  }`}
+                />
+                <datalist id="vineyardgroup-datalist">
+                  {vineyardGroups.map((g) => (
+                    <option key={g} value={g} />
+                  ))}
+                </datalist>
+                <p className="mt-0.5 text-[11px] text-zinc-500 dark:text-zinc-500">Free text or pick from tbl_vworkjobs.vineyard_group</p>
               </div>
               <div>
                 <label className="mb-1 block text-xs font-medium text-zinc-500">TT</label>

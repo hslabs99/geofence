@@ -17,6 +17,8 @@ import {
   normalizeTimestampString,
   vworkStep1TimeForCleanup,
 } from '@/lib/derived-steps';
+import { getJobEndCeilingBufferMinutes } from '@/lib/job-end-ceiling-buffer-setting';
+import { getStep5ExtendWineryExitMinutes } from '@/lib/step5-winery-exit-extend-setting';
 import { runStepsPlusQuery } from '@/lib/steps-plus-query';
 import { getStepsPlusSettings } from '@/lib/steps-plus-settings';
 import {
@@ -26,8 +28,8 @@ import {
   GPS_HARVEST_DEFAULT_MAX_JOBS,
   GPS_HARVEST_DEFAULT_MAX_SUCCESSES,
   GPS_HARVEST_SQL_JOB_LIMIT,
+  GPS_PLUS_VINEYARD_BUFFER_METERS,
 } from '@/lib/gps-harvest-constants';
-
 export {
   DEFAULT_HARVEST_END_PLUS_MINUTES,
   DEFAULT_HARVEST_START_LESS_MINUTES,
@@ -129,6 +131,24 @@ export async function countTrackingRowsInWindow(
   return parseInt(rows[0]?.c ?? '0', 10) || 0;
 }
 
+/** GPS+: winery anchor = EXIT tag, else first track outside winery union after being inside, else step1; vineyard = first track within buffered vineyard union. */
+export type GpsPlusWineryAnchorSource =
+  | 'fence_EXIT'
+  | 'geom_first_outside_after_inside'
+  | 'vwork_step1_or_actual_start';
+
+export type GpsPlusAttemptSummary = {
+  ok: boolean;
+  meters?: number;
+  minutes?: number;
+  skipReason?: string;
+  winery_anchor_source?: GpsPlusWineryAnchorSource;
+  vineyard_hit_tracking_id?: number | null;
+  segment_point_count?: number;
+  /** Anchors and buffer size for dry-run / inspect UI. */
+  detail?: Record<string, unknown>;
+};
+
 export type SingleHarvestAttempt = {
   job_id: string;
   ok: boolean;
@@ -141,6 +161,8 @@ export type SingleHarvestAttempt = {
   winery_tracking_id?: number | null;
   /** Null when vineyard ENTER came from Steps+ buffered stay (no tbl_tracking ENTER row). */
   vineyard_tracking_id?: number | null;
+  /** Independent path: vineyard target = first point within 100m of fence union (no ENTER tag required). */
+  gps_plus?: GpsPlusAttemptSummary;
   debug: Record<string, unknown>;
 };
 
@@ -209,6 +231,268 @@ async function listTrackingPointsBetween(
     out.push({ id, lat, lon, position_time_nz: ptnz });
   }
   return out;
+}
+
+/** First tracking row outside winery fence union after an earlier row inside (same window as harvest). */
+async function findFirstWineryOutsideAfterInside(
+  device: string,
+  positionAfter: string,
+  positionBefore: string | null,
+  wineryFenceIds: number[]
+): Promise<{ id: number; position_time_nz: string } | null> {
+  if (wineryFenceIds.length === 0) return null;
+  const rawAfter = normalizeTimestampString(positionAfter) ?? String(positionAfter).trim().slice(0, 19);
+  const rawBefore = positionBefore
+    ? (normalizeTimestampString(positionBefore) ?? String(positionBefore).trim().slice(0, 19))
+    : null;
+  const params: unknown[] = [device, rawAfter, wineryFenceIds];
+  let beforeSql = '';
+  if (rawBefore) {
+    params.push(rawBefore);
+    beforeSql = `AND t.position_time_nz < $4::timestamp`;
+  }
+  const rows = await query<{ id: unknown; position_time_nz: unknown }>(
+    `WITH pts AS (
+       SELECT t.id, t.position_time_nz,
+         ST_Transform(ST_SetSRID(ST_MakePoint(t.lon::float8, t.lat::float8), 4326), 3857) AS pt3857,
+         ROW_NUMBER() OVER (ORDER BY t.position_time_nz ASC, t.id ASC) AS rn
+       FROM tbl_tracking t
+       WHERE t.device_name = $1
+         AND t.position_time_nz > $2::timestamp
+         ${beforeSql}
+         AND t.lon IS NOT NULL AND t.lat IS NOT NULL
+     ),
+     wu AS (
+       SELECT ST_UnaryUnion(ST_Collect(ST_Transform(ST_Force2D(g.geom), 3857))) AS u
+       FROM tbl_geofences g
+       WHERE g.geom IS NOT NULL AND g.fence_id = ANY($3::int[])
+     )
+     SELECT p.id, to_char(p.position_time_nz, 'YYYY-MM-DD HH24:MI:SS') AS position_time_nz
+     FROM pts p
+     CROSS JOIN wu
+     WHERE wu.u IS NOT NULL
+       AND NOT ST_Within(p.pt3857, wu.u)
+       AND EXISTS (
+         SELECT 1 FROM pts p2
+         WHERE p2.rn < p.rn AND ST_Within(p2.pt3857, wu.u)
+       )
+     ORDER BY p.position_time_nz ASC, p.id ASC
+     LIMIT 1`,
+    params
+  );
+  const r0 = rows[0];
+  if (!r0) return null;
+  const id = Number(r0.id);
+  if (!Number.isFinite(id)) return null;
+  const ptnz =
+    normalizeTimestampString(String(r0.position_time_nz ?? '')) ?? String(r0.position_time_nz).slice(0, 19);
+  return { id, position_time_nz: ptnz };
+}
+
+/** First tracking row at/after winery anchor inside ST_Buffer(vineyard union, bufferM) in Web Mercator (same pattern as Steps+). */
+async function findFirstVineyardInsideBufferAfter(
+  device: string,
+  wineryAnchorTimeInclusive: string,
+  positionBefore: string | null,
+  vineyardFenceIds: number[],
+  bufferMeters: number
+): Promise<{ id: number; position_time_nz: string } | null> {
+  if (vineyardFenceIds.length === 0) return null;
+  const rawAfter = normalizeTimestampString(wineryAnchorTimeInclusive) ?? wineryAnchorTimeInclusive.slice(0, 19);
+  const rawBefore = positionBefore
+    ? (normalizeTimestampString(positionBefore) ?? String(positionBefore).trim().slice(0, 19))
+    : null;
+  let beforeSql = '';
+  if (rawBefore) {
+    beforeSql = `AND t.position_time_nz <= $5::timestamp`;
+  }
+  const rows = await query<{ id: unknown; position_time_nz: unknown }>(
+    `WITH bu AS (
+       SELECT ST_Buffer(ST_UnaryUnion(ST_Collect(ST_Transform(ST_Force2D(g.geom), 3857))), $4::numeric) AS buffered
+       FROM tbl_geofences g
+       WHERE g.geom IS NOT NULL AND g.fence_id = ANY($3::int[])
+     )
+     SELECT t.id, to_char(t.position_time_nz, 'YYYY-MM-DD HH24:MI:SS') AS position_time_nz
+     FROM tbl_tracking t
+     CROSS JOIN bu
+     WHERE t.device_name = $1
+       AND bu.buffered IS NOT NULL
+       AND t.position_time_nz >= $2::timestamp
+       ${beforeSql}
+       AND t.lon IS NOT NULL AND t.lat IS NOT NULL
+       AND ST_Within(
+         ST_Transform(ST_SetSRID(ST_MakePoint(t.lon::float8, t.lat::float8), 4326), 3857),
+         bu.buffered
+       )
+     ORDER BY t.position_time_nz ASC, t.id ASC
+     LIMIT 1`,
+    rawBefore ? [device, rawAfter, vineyardFenceIds, bufferMeters, rawBefore] : [device, rawAfter, vineyardFenceIds, bufferMeters]
+  );
+  const r0 = rows[0];
+  if (!r0) return null;
+  const id = Number(r0.id);
+  if (!Number.isFinite(id)) return null;
+  const ptnz =
+    normalizeTimestampString(String(r0.position_time_nz ?? '')) ?? String(r0.position_time_nz).slice(0, 19);
+  return { id, position_time_nz: ptnz };
+}
+
+async function computeGpsPlusForJob(
+  job: JobForDerivedSteps,
+  win: { positionAfter: string; positionBefore: string | null; device: string; error: string | null },
+  anchors: Awaited<ReturnType<typeof fetchOutboundLegAnchors>>,
+  opts: { startLessMinutes: number; endPlusMinutes: number; windowMinutes: number },
+  trackingRowsInWindow: number
+): Promise<GpsPlusAttemptSummary> {
+  const dbgBase = {
+    buffer_m_vineyard: GPS_PLUS_VINEYARD_BUFFER_METERS,
+    tracking_rows_in_window: trackingRowsInWindow,
+    windowMinutesParam: opts.windowMinutes,
+  };
+  const dd = anchors.debug as {
+    winery?: { fenceIds?: number[] };
+    vineyard?: { fenceIds?: number[] };
+  };
+  const wineryFenceIds = (dd.winery?.fenceIds ?? []).filter((n) => Number.isFinite(n));
+  const vineyardFenceIds = (dd.vineyard?.fenceIds ?? []).filter((n) => Number.isFinite(n));
+
+  let winerySource: GpsPlusWineryAnchorSource | undefined;
+  let tExit: string | null = null;
+  let wineryExitTrackingId: number | null = null;
+
+  if (anchors.wineryExit?.value) {
+    const n = normalizeTimestampString(anchors.wineryExit.value);
+    if (n) {
+      tExit = n;
+      wineryExitTrackingId = anchors.wineryExit.trackingId ?? null;
+      winerySource = 'fence_EXIT';
+    }
+  }
+  if (!tExit) {
+    const geomHit = await findFirstWineryOutsideAfterInside(
+      win.device,
+      win.positionAfter,
+      win.positionBefore,
+      wineryFenceIds
+    );
+    if (geomHit) {
+      tExit = normalizeTimestampString(geomHit.position_time_nz) ?? geomHit.position_time_nz.slice(0, 19);
+      wineryExitTrackingId = geomHit.id;
+      winerySource = 'geom_first_outside_after_inside';
+    }
+  }
+  if (!tExit) {
+    const fb = vworkStep1TimeForCleanup(job);
+    if (fb) {
+      tExit = normalizeTimestampString(fb) ?? fb.slice(0, 19);
+      winerySource = 'vwork_step1_or_actual_start';
+    }
+  }
+
+  if (!tExit) {
+    return {
+      ok: false,
+      skipReason: 'no winery anchor (EXIT tag, first GPS outside winery fence after inside, or step1/actual start)',
+      detail: { ...dbgBase, winery_fence_ids: wineryFenceIds, vineyard_fence_ids: vineyardFenceIds },
+    };
+  }
+
+  if (vineyardFenceIds.length === 0) {
+    return {
+      ok: false,
+      skipReason: 'no vineyard fences resolved for GPS+',
+      winery_anchor_source: winerySource,
+      detail: { ...dbgBase, t_winery_anchor: tExit, winery_exit_tracking_id: wineryExitTrackingId },
+    };
+  }
+
+  const vHit = await findFirstVineyardInsideBufferAfter(
+    win.device,
+    tExit,
+    win.positionBefore,
+    vineyardFenceIds,
+    GPS_PLUS_VINEYARD_BUFFER_METERS
+  );
+
+  if (!vHit) {
+    return {
+      ok: false,
+      skipReason: `no tracking within ${GPS_PLUS_VINEYARD_BUFFER_METERS}m of vineyard fence after winery anchor`,
+      winery_anchor_source: winerySource,
+      detail: {
+        ...dbgBase,
+        t_winery_anchor: tExit,
+        winery_exit_tracking_id: wineryExitTrackingId,
+        vineyard_fence_ids: vineyardFenceIds,
+      },
+    };
+  }
+
+  const tVineyard =
+    normalizeTimestampString(vHit.position_time_nz) ?? vHit.position_time_nz.slice(0, 19);
+  if (tExit > tVineyard) {
+    return {
+      ok: false,
+      skipReason: 'vineyard buffer hit before winery anchor time',
+      winery_anchor_source: winerySource,
+      detail: {
+        ...dbgBase,
+        t_winery_anchor: tExit,
+        t_vineyard_buffer: tVineyard,
+        winery_exit_tracking_id: wineryExitTrackingId,
+      },
+    };
+  }
+
+  const minutes = minutesBetweenNz(tExit, tVineyard);
+  if (minutes == null || minutes < 0) {
+    return {
+      ok: false,
+      skipReason: 'could not compute GPS+ minutes between anchors',
+      winery_anchor_source: winerySource,
+      detail: { ...dbgBase, t_winery_anchor: tExit, t_vineyard_buffer: tVineyard },
+    };
+  }
+
+  const points = await listTrackingPointsBetween(win.device, tExit, tVineyard);
+  if (points.length < 2) {
+    return {
+      ok: false,
+      skipReason: 'fewer than 2 GPS points on GPS+ path',
+      winery_anchor_source: winerySource,
+      detail: {
+        ...dbgBase,
+        t_winery_anchor: tExit,
+        t_vineyard_buffer: tVineyard,
+        path_point_count: points.length,
+      },
+    };
+  }
+
+  let meters = 0;
+  for (let i = 1; i < points.length; i++) {
+    const a = points[i - 1]!;
+    const b = points[i]!;
+    meters += haversineMeters(a.lat, a.lon, b.lat, b.lon);
+  }
+
+  return {
+    ok: true,
+    meters: Math.round(meters * 100) / 100,
+    minutes,
+    winery_anchor_source: winerySource,
+    vineyard_hit_tracking_id: vHit.id,
+    segment_point_count: points.length,
+    detail: {
+      ...dbgBase,
+      t_winery_anchor: tExit,
+      t_vineyard_buffer: tVineyard,
+      winery_exit_tracking_id: wineryExitTrackingId,
+      vineyard_hit_tracking_id: vHit.id,
+      pathFirstId: points[0]?.id,
+      pathLastId: points[points.length - 1]?.id,
+    },
+  };
 }
 
 /**
@@ -342,6 +626,7 @@ export async function harvestWineryToVineyardForJob(
       ok: false,
       outcome: 'failed',
       skipReason: win.error,
+      gps_plus: { ok: false, skipReason: win.error ?? 'no tracking window' },
       debug: {
         ...enrichDebugBase(rawJobRow, win, opts, trackingRows),
         window_error: win.error,
@@ -349,12 +634,18 @@ export async function harvestWineryToVineyardForJob(
     };
   }
 
+  const jobEndCeilingBufferMinutes = await getJobEndCeilingBufferMinutes();
+  const step5ExtendWineryExitMinutes = await getStep5ExtendWineryExitMinutes();
   const anchors = await fetchOutboundLegAnchors(job, {
     windowMinutes: opts.windowMinutes,
     device: win.device,
     positionAfter: win.positionAfter,
     positionBefore: win.positionBefore,
+    jobEndCeilingBufferMinutes,
+    step5ExtendWineryExitMinutes,
   });
+
+  const gpsPlusSummary = await computeGpsPlusForJob(job, win, anchors, opts, trackingRows);
 
   const dd = anchors.debug as {
     winery?: { step1?: { sqlHint?: string } };
@@ -407,6 +698,7 @@ export async function harvestWineryToVineyardForJob(
       ok: false,
       outcome: 'failed',
       skipReason: 'no winery EXIT (GPS) and no step_1/actual_start for path start',
+      gps_plus: gpsPlusSummary,
       debug: {
         ...enrichDebugBase(rawJobRow, win, opts, trackingRows),
         sql_hints: sqlHints,
@@ -423,6 +715,7 @@ export async function harvestWineryToVineyardForJob(
       ok: false,
       outcome: 'failed',
       skipReason: 'no vineyard ENTER (fence tag or Steps+)',
+      gps_plus: gpsPlusSummary,
       debug: {
         ...enrichDebugBase(rawJobRow, win, opts, trackingRows),
         sql_hints: sqlHints,
@@ -442,6 +735,7 @@ export async function harvestWineryToVineyardForJob(
       ok: false,
       outcome: 'failed',
       skipReason: 'winery exit not strictly before vineyard enter',
+      gps_plus: gpsPlusSummary,
       debug: {
         ...enrichDebugBase(rawJobRow, win, opts, trackingRows),
         sql_hints: sqlHints,
@@ -462,6 +756,7 @@ export async function harvestWineryToVineyardForJob(
       ok: false,
       outcome: 'failed',
       skipReason: 'could not compute minutes between anchors',
+      gps_plus: gpsPlusSummary,
       debug: {
         ...enrichDebugBase(rawJobRow, win, opts, trackingRows),
         sql_hints: sqlHints,
@@ -481,6 +776,7 @@ export async function harvestWineryToVineyardForJob(
       ok: false,
       outcome: 'failed',
       skipReason: 'fewer than 2 GPS points between anchors',
+      gps_plus: gpsPlusSummary,
       debug: {
         ...enrichDebugBase(rawJobRow, win, opts, trackingRows),
         sql_hints: sqlHints,
@@ -509,6 +805,7 @@ export async function harvestWineryToVineyardForJob(
     segment_point_count: points.length,
     winery_tracking_id: wExit.trackingId ?? null,
     vineyard_tracking_id: vEnter.trackingId ?? null,
+    gps_plus: gpsPlusSummary,
     debug: {
       ...enrichDebugBase(rawJobRow, win, opts, trackingRows),
       sql_hints: sqlHints,
@@ -529,46 +826,146 @@ export async function harvestWineryToVineyardForJob(
   };
 }
 
+/** Same aggregates as rollup SQL over samples, computed from in-memory harvest attempts (dry run). */
+export function computeRollupStatsFromAttempts(attempts: SingleHarvestAttempt[]): {
+  cnt: number;
+  avgM: number | null;
+  avgMin: number | null;
+  gpCnt: number;
+  avgGpM: number | null;
+  avgGpMin: number | null;
+} {
+  const primaryOk = attempts.filter(
+    (a) => a.ok && a.outcome === 'success' && a.meters != null && Number.isFinite(Number(a.meters))
+  );
+  const cnt = primaryOk.length;
+  const avgM =
+    cnt === 0 ? null : Math.round(primaryOk.reduce((s, a) => s + Number(a.meters), 0) / cnt);
+  const withMin = primaryOk.filter((a) => typeof a.minutes === 'number' && Number.isFinite(a.minutes));
+  const avgMin =
+    withMin.length === 0 ? null : withMin.reduce((s, a) => s + (a.minutes as number), 0) / withMin.length;
+
+  const gpOk = attempts.filter(
+    (a) =>
+      a.gps_plus?.ok === true &&
+      a.gps_plus.meters != null &&
+      Number.isFinite(Number(a.gps_plus.meters))
+  );
+  const gpCnt = gpOk.length;
+  const avgGpM =
+    gpCnt === 0 ? null : Math.round(gpOk.reduce((s, a) => s + Number(a.gps_plus!.meters), 0) / gpCnt);
+  const withGpMin = gpOk.filter(
+    (a) => typeof a.gps_plus?.minutes === 'number' && Number.isFinite(a.gps_plus!.minutes)
+  );
+  const avgGpMin =
+    withGpMin.length === 0
+      ? null
+      : withGpMin.reduce((s, a) => s + (a.gps_plus!.minutes as number), 0) / withGpMin.length;
+
+  return { cnt, avgM, avgMin, gpCnt, avgGpM, avgGpMin };
+}
+
+async function writeDistanceRollupAggregates(
+  distanceId: number,
+  cnt: number,
+  avgM: number | null,
+  avgMin: number | null,
+  gpCnt: number,
+  avgGpM: number | null,
+  avgGpMin: number | null
+): Promise<void> {
+  await execute(
+    `UPDATE tbl_distances
+     SET gps_sample_count = $2::int,
+         gps_avg_distance_m = CASE WHEN $2::int = 0 THEN NULL ELSE $3::int END,
+         gps_avg_duration_min = CASE WHEN $2::int = 0 THEN NULL ELSE $4::numeric END,
+         gps_averaged_at = now(),
+         gps_plus_sample_count = $5::int,
+         gps_plus_avg_distance_m = CASE WHEN $5::int = 0 THEN NULL ELSE $6::int END,
+         gps_plus_avg_duration_min = CASE WHEN $5::int = 0 THEN NULL ELSE $7::numeric END,
+         gps_plus_averaged_at = now(),
+         distance_via = CASE
+           WHEN $2::int > 0 THEN 'GPSTAGS'
+           WHEN $5::int > 0 THEN 'GPS+'
+           ELSE 'FAIL'
+         END,
+         distance_m = CASE
+           WHEN $2::int > 0 THEN $3::int
+           WHEN $5::int > 0 THEN $6::int
+           ELSE NULL
+         END,
+         duration_min = CASE
+           WHEN $2::int > 0 THEN $4::numeric
+           WHEN $5::int > 0 THEN $7::numeric
+           ELSE NULL
+         END,
+         updated_at = now()
+     WHERE id = $1`,
+    [distanceId, cnt, avgM, avgMin, gpCnt, avgGpM, avgGpMin]
+  );
+}
+
 async function recomputeDistanceRollup(distanceId: number): Promise<void> {
-  const agg = await query<{ cnt: string; avg_m: string | null; avg_min: string | null }>(
-    `SELECT COUNT(*)::text AS cnt,
-            AVG(meters)::text AS avg_m,
-            AVG(minutes)::text AS avg_min
+  const agg = await query<{
+    cnt: string;
+    avg_m: string | null;
+    avg_min: string | null;
+    gp_cnt: string;
+    gp_avg_m: string | null;
+    gp_avg_min: string | null;
+  }>(
+    `SELECT COUNT(*) FILTER (WHERE outcome = 'success' AND meters IS NOT NULL)::text AS cnt,
+            AVG(meters) FILTER (WHERE outcome = 'success' AND meters IS NOT NULL)::text AS avg_m,
+            AVG(minutes) FILTER (WHERE outcome = 'success' AND minutes IS NOT NULL)::text AS avg_min,
+            COUNT(*) FILTER (WHERE gps_plus_outcome = 'success' AND gps_plus_meters IS NOT NULL)::text AS gp_cnt,
+            AVG(gps_plus_meters) FILTER (WHERE gps_plus_outcome = 'success' AND gps_plus_meters IS NOT NULL)::text AS gp_avg_m,
+            AVG(gps_plus_minutes) FILTER (WHERE gps_plus_outcome = 'success' AND gps_plus_minutes IS NOT NULL)::text AS gp_avg_min
      FROM tbl_distances_gps_samples
-     WHERE distance_id = $1
-       AND outcome = 'success'
-       AND meters IS NOT NULL`,
+     WHERE distance_id = $1`,
     [distanceId]
   );
   const row = agg[0];
   const cnt = parseInt(row?.cnt ?? '0', 10) || 0;
   const avgM = row?.avg_m != null ? Math.round(Number(row.avg_m)) : null;
   const avgMin = row?.avg_min != null ? Number(row.avg_min) : null;
-  if (cnt === 0) {
-    await execute(
-      `UPDATE tbl_distances
-       SET gps_sample_count = 0,
-           gps_avg_distance_m = NULL,
-           gps_avg_duration_min = NULL,
-           gps_averaged_at = now(),
-           updated_at = now()
-       WHERE id = $1`,
-      [distanceId]
-    );
-    return;
-  }
-  await execute(
-    `UPDATE tbl_distances
-     SET gps_sample_count = $2,
-         gps_avg_distance_m = $3,
-         gps_avg_duration_min = $4,
-         gps_averaged_at = now(),
-         distance_m = $3,
-         duration_min = $4,
-         updated_at = now()
-     WHERE id = $1`,
-    [distanceId, cnt, avgM, avgMin]
+  const gpCnt = parseInt(row?.gp_cnt ?? '0', 10) || 0;
+  const avgGpM = row?.gp_avg_m != null ? Math.round(Number(row.gp_avg_m)) : null;
+  const avgGpMin = row?.gp_avg_min != null ? Number(row.gp_avg_min) : null;
+
+  await writeDistanceRollupAggregates(distanceId, cnt, avgM, avgMin, gpCnt, avgGpM, avgGpMin);
+}
+
+async function loadRollupSummaryFromDb(distanceId: number): Promise<HarvestRunResult['rollup']> {
+  const rollRows = await query<{
+    distance_via: string | null;
+    gps_sample_count: number | string | null;
+    gps_plus_sample_count: number | string | null;
+    distance_m: number | string | null;
+    gps_avg_distance_m: number | string | null;
+    gps_plus_avg_distance_m: number | string | null;
+  }>(
+    `SELECT distance_via,
+            gps_sample_count,
+            gps_plus_sample_count,
+            distance_m,
+            gps_avg_distance_m,
+            gps_plus_avg_distance_m
+     FROM tbl_distances WHERE id = $1`,
+    [distanceId]
   );
+  const rr = rollRows[0];
+  if (!rr) return undefined;
+  return {
+    distance_via: rr.distance_via != null ? String(rr.distance_via).trim() : null,
+    gps_sample_count:
+      rr.gps_sample_count != null ? parseInt(String(rr.gps_sample_count), 10) || 0 : null,
+    gps_plus_sample_count:
+      rr.gps_plus_sample_count != null ? parseInt(String(rr.gps_plus_sample_count), 10) || 0 : null,
+    distance_m: rr.distance_m != null ? Math.round(Number(rr.distance_m)) : null,
+    gps_avg_distance_m: rr.gps_avg_distance_m != null ? Math.round(Number(rr.gps_avg_distance_m)) : null,
+    gps_plus_avg_distance_m:
+      rr.gps_plus_avg_distance_m != null ? Math.round(Number(rr.gps_plus_avg_distance_m)) : null,
+  };
 }
 
 async function upsertHarvestSample(
@@ -579,11 +976,20 @@ async function upsertHarvestSample(
   const success = attempt.ok && attempt.outcome === 'success';
   const outcome = success ? 'success' : 'failed';
   const failureReason = success ? null : (attempt.skipReason ?? 'failed');
+  const gp = attempt.gps_plus;
+  const gpsPlusOk = gp?.ok === true;
+  const gpsPlusOutcome = gp == null ? null : gpsPlusOk ? 'success' : 'failed';
+  const gpsPlusMeters = gpsPlusOk ? (gp.meters ?? null) : null;
+  const gpsPlusMinutes = gpsPlusOk ? (gp.minutes ?? null) : null;
+  const gpsPlusVineyardTrackingId = gpsPlusOk ? (gp.vineyard_hit_tracking_id ?? null) : null;
+  const debugForDb = { ...attempt.debug, gps_plus: attempt.gps_plus };
   await execute(
     `INSERT INTO tbl_distances_gps_samples
       (distance_id, job_id, outcome, failure_reason, winery_tracking_id, vineyard_tracking_id,
-       meters, minutes, segment_point_count, debug_json, run_index, updated_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, now())
+       meters, minutes, segment_point_count, debug_json, run_index, updated_at,
+       gps_plus_meters, gps_plus_minutes, gps_plus_outcome, gps_plus_vineyard_tracking_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, now(),
+             $12, $13, $14, $15)
      ON CONFLICT (distance_id, job_id) DO UPDATE SET
        outcome = EXCLUDED.outcome,
        failure_reason = EXCLUDED.failure_reason,
@@ -594,6 +1000,10 @@ async function upsertHarvestSample(
        segment_point_count = EXCLUDED.segment_point_count,
        debug_json = EXCLUDED.debug_json,
        run_index = EXCLUDED.run_index,
+       gps_plus_meters = EXCLUDED.gps_plus_meters,
+       gps_plus_minutes = EXCLUDED.gps_plus_minutes,
+       gps_plus_outcome = EXCLUDED.gps_plus_outcome,
+       gps_plus_vineyard_tracking_id = EXCLUDED.gps_plus_vineyard_tracking_id,
        updated_at = now()`,
     [
       distanceId,
@@ -605,8 +1015,12 @@ async function upsertHarvestSample(
       attempt.meters ?? null,
       attempt.minutes ?? null,
       attempt.segment_point_count ?? null,
-      jsonSafeForDb(attempt.debug),
+      jsonSafeForDb(debugForDb),
       runIndex,
+      gpsPlusMeters,
+      gpsPlusMinutes,
+      gpsPlusOutcome,
+      gpsPlusVineyardTrackingId,
     ]
   );
 }
@@ -625,6 +1039,13 @@ export type HarvestRunResult = {
   jobsPolled: number;
   successCount: number;
   failedCount: number;
+  jobMatchDebug?: {
+    countSql: string;
+    listSql: string;
+    params: unknown[];
+    vworkJobsMatchCount: number;
+    candidateJobIds: string[];
+  };
   /** Caps used for this run (UI: successes vs target, jobs tried vs max). */
   maxJobsCap: number;
   maxSuccessesCap: number;
@@ -635,6 +1056,17 @@ export type HarvestRunResult = {
   /** Jobs we would consider (same order as harvest); harvest polls the first maxJobs. */
   candidateJobs: HarvestCandidateJob[];
   message?: string;
+  /** After persist + rollup: how distance_m was chosen (null if dry-run or no rows written). */
+  rollup?: {
+    distance_via: string | null;
+    gps_sample_count: number | null;
+    gps_plus_sample_count: number | null;
+    distance_m: number | null;
+    gps_avg_distance_m: number | null;
+    gps_plus_avg_distance_m: number | null;
+  };
+  /** Dry run with dryRunUpdateDistanceRow: tbl_distances row was updated from attempt aggregates (samples not written). */
+  dryDistanceRowUpdated?: boolean;
 };
 
 export async function runGpsHarvestForDistanceId(
@@ -651,6 +1083,11 @@ export async function runGpsHarvestForDistanceId(
     windowMinutes?: number;
     maxJobs?: number;
     maxSuccesses?: number;
+    /**
+     * When persist is false (dry run): if true, still UPDATE tbl_distances rollups + distance_m / duration_min / distance_via
+     * from this run's attempts only (does not write tbl_distances_gps_samples).
+     */
+    dryRunUpdateDistanceRow?: boolean;
   }
 ): Promise<HarvestRunResult> {
   const startLess = options.startLessMinutes ?? DEFAULT_HARVEST_START_LESS_MINUTES;
@@ -688,25 +1125,24 @@ export async function runGpsHarvestForDistanceId(
     };
   }
 
-  const pairW = String(d0.delivery_winery ?? '').trim();
-  const pairV = String(d0.vineyard_name ?? '').trim();
+  const jobMatchSql = `EXISTS (
+    SELECT 1 FROM tbl_distances d
+    WHERE d.id = $1
+      AND lower(trim(COALESCE(j.delivery_winery, ''))) = lower(trim(COALESCE(d.delivery_winery, '')))
+      AND lower(trim(COALESCE(j.vineyard_name, ''))) = lower(trim(COALESCE(d.vineyard_name, '')))
+  )`;
+
+  const countSql = `SELECT COUNT(*)::text AS c FROM tbl_vworkjobs j WHERE ${jobMatchSql}`;
+  const listSql = `SELECT j.* FROM tbl_vworkjobs j WHERE ${jobMatchSql} ORDER BY j.job_id ASC NULLS LAST LIMIT ${GPS_HARVEST_SQL_JOB_LIMIT}`;
 
   const [countRow, jobs] = await Promise.all([
     query<{ c: string }>(
-      `SELECT COUNT(*)::text AS c
-       FROM tbl_vworkjobs
-       WHERE lower(trim(COALESCE(delivery_winery, ''))) = lower($1::text)
-         AND lower(trim(COALESCE(vineyard_name, ''))) = lower($2::text)`,
-      [pairW, pairV]
+      countSql,
+      [distanceId]
     ),
     query<Record<string, unknown>>(
-      `SELECT *
-       FROM tbl_vworkjobs
-       WHERE lower(trim(COALESCE(delivery_winery, ''))) = lower($1::text)
-         AND lower(trim(COALESCE(vineyard_name, ''))) = lower($2::text)
-       ORDER BY job_id ASC NULLS LAST
-       LIMIT ${GPS_HARVEST_SQL_JOB_LIMIT}`,
-      [pairW, pairV]
+      listSql,
+      [distanceId]
     ),
   ]);
 
@@ -728,6 +1164,8 @@ export async function runGpsHarvestForDistanceId(
   let jobsTried = 0;
   let successCount = 0;
   let failedCount = 0;
+  let dynamicSuccessCap = maxSuccessesCap;
+  let extendedOnce = false;
 
   if (options.persist && options.resetExistingSamples) {
     await execute(`DELETE FROM tbl_distances_gps_samples WHERE distance_id = $1`, [distanceId]);
@@ -735,7 +1173,24 @@ export async function runGpsHarvestForDistanceId(
 
   for (const raw of jobs) {
     if (jobsTried >= maxJobsCap) break;
-    if (successCount >= maxSuccessesCap) break;
+    if (successCount >= dynamicSuccessCap) {
+      if (!extendedOnce) {
+        const okMeters = attempts
+          .filter((a) => a.ok && a.outcome === 'success' && typeof a.meters === 'number' && Number.isFinite(a.meters))
+          .map((a) => a.meters as number);
+        if (okMeters.length >= maxSuccessesCap) {
+          const min = Math.min(...okMeters);
+          const max = Math.max(...okMeters);
+          const avg = okMeters.reduce((s, x) => s + x, 0) / okMeters.length;
+          const spreadRatio = avg > 0 ? (max - min) / avg : 0;
+          if (spreadRatio >= 0.2) {
+            dynamicSuccessCap = Math.min(GPS_HARVEST_SQL_JOB_LIMIT, dynamicSuccessCap + 3);
+            extendedOnce = true;
+          }
+        }
+      }
+      if (successCount >= dynamicSuccessCap) break;
+    }
     jobsTried++;
 
     const jid = raw.job_id != null ? String(raw.job_id).trim() : '';
@@ -745,6 +1200,7 @@ export async function runGpsHarvestForDistanceId(
         ok: false,
         outcome: 'failed',
         skipReason: 'missing job_id on vwork row',
+        gps_plus: { ok: false, skipReason: 'missing job_id on vwork row' },
         debug: { raw_keys: Object.keys(raw) },
       });
       failedCount++;
@@ -766,15 +1222,42 @@ export async function runGpsHarvestForDistanceId(
     }
   }
 
+  let rollup: HarvestRunResult['rollup'] = undefined;
+  let dryDistanceRowUpdated = false;
+
   if (options.persist && insertedOrUpdated > 0) {
     await recomputeDistanceRollup(distanceId);
+    rollup = await loadRollupSummaryFromDb(distanceId);
+    if (rollup) {
+      console.log(
+        `[gps-harvest] distance_id=${distanceId} ${d0.delivery_winery} → ${d0.vineyard_name} ` +
+          `distance_via=${rollup.distance_via ?? 'null'} ` +
+          `tag_samples=${rollup.gps_sample_count ?? 0} gps+_samples=${rollup.gps_plus_sample_count ?? 0} ` +
+          `distance_m=${rollup.distance_m ?? 'null'} ` +
+          `avg_tag_m=${rollup.gps_avg_distance_m ?? 'null'} avg_gps+_m=${rollup.gps_plus_avg_distance_m ?? 'null'}`
+      );
+    }
+  } else if (!options.persist && options.dryRunUpdateDistanceRow === true && attempts.length > 0) {
+    const s = computeRollupStatsFromAttempts(attempts);
+    await writeDistanceRollupAggregates(distanceId, s.cnt, s.avgM, s.avgMin, s.gpCnt, s.avgGpM, s.avgGpMin);
+    rollup = await loadRollupSummaryFromDb(distanceId);
+    dryDistanceRowUpdated = true;
+    if (rollup) {
+      console.log(
+        `[gps-harvest] dry→row distance_id=${distanceId} ${d0.delivery_winery} → ${d0.vineyard_name} ` +
+          `distance_via=${rollup.distance_via ?? 'null'} ` +
+          `tag_samples=${rollup.gps_sample_count ?? 0} gps+_samples=${rollup.gps_plus_sample_count ?? 0} ` +
+          `distance_m=${rollup.distance_m ?? 'null'}`
+      );
+    }
   }
 
   let message: string | undefined;
   if (vworkJobsMatchCount === 0) {
     message =
-      'No tbl_vworkjobs rows match this winery+vineyard pair (case-insensitive trim). ' +
-      'tbl_distances pairs must exist on at least one vWork job — re-run Seed or fix names.';
+      'No tbl_vworkjobs rows match this winery+vineyard pair (case-insensitive trim, same rule as the grid). ' +
+      'tbl_distances pairs must match job delivery_winery and vineyard_name — re-run Seed or fix names. ' +
+      'tbl_gpsmappings expands fence names for GPS paths only, not vWork job matching.';
   } else if (jobsTried === 0 && vworkJobsMatchCount > 0) {
     message = 'Unexpected: jobs matched but none polled; report as bug.';
   }
@@ -787,11 +1270,20 @@ export async function runGpsHarvestForDistanceId(
     jobsPolled: jobsTried,
     successCount,
     failedCount,
+    jobMatchDebug: {
+      countSql,
+      listSql,
+      params: [distanceId],
+      vworkJobsMatchCount,
+      candidateJobIds: candidateJobs.map((c) => c.job_id).filter(Boolean),
+    },
     maxJobsCap,
     maxSuccessesCap,
     distancePair: { delivery_winery: d0.delivery_winery, vineyard_name: d0.vineyard_name },
     vworkJobsMatchCount,
     candidateJobs,
     message,
+    rollup,
+    dryDistanceRowUpdated: dryDistanceRowUpdated || undefined,
   };
 }

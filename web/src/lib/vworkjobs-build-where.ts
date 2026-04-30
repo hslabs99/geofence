@@ -158,20 +158,15 @@ export function buildWhereAndParams(searchParams: URLSearchParams): {
   }
 
   const trailermodeParam = searchParams.get('trailermode')?.trim();
-  if (trailermodeParam) {
-    conditions.push(`(trim(COALESCE(t.trailermode::text, t.trailertype::text)) = $${idx})`);
-    values.push(trailermodeParam);
-    idx++;
-    debug.trailermode = trailermodeParam;
-  }
-
-  /** Inspect: filter on `trailertype` column only (distinct from TT / trailermode COALESCE). */
+  /** Legacy Inspect `trailertype` param — DB column is `trailermode` only. */
   const trailerTypeParam = searchParams.get('trailertype')?.trim();
-  if (trailerTypeParam) {
-    conditions.push(`(t.trailertype IS NOT NULL AND trim(t.trailertype::text) = $${idx})`);
-    values.push(trailerTypeParam);
+  const ttFilter = trailermodeParam ?? trailerTypeParam;
+  if (ttFilter) {
+    conditions.push(`(trim(COALESCE(t.trailermode::text, '')) = $${idx})`);
+    values.push(ttFilter);
     idx++;
-    debug.trailertype = trailerTypeParam;
+    if (trailermodeParam) debug.trailermode = trailermodeParam;
+    if (trailerTypeParam) debug.trailertype = trailerTypeParam;
   }
 
   const loadsizeParam = searchParams.get('loadsize')?.trim();
@@ -245,6 +240,14 @@ export function buildWhereAndParams(searchParams: URLSearchParams): {
       `NOT (trim(COALESCE(t.step_4_name, '')) = 'Arrive Winery' AND trim(COALESCE(t.step_5_name, '')) = 'Job Completed')`
     );
     debug.blockedView = 'rerun';
+  } else if (blockedViewParam === 'ordering') {
+    conditions.push(`COALESCE(t.step4to5, 0) = 1`);
+    conditions.push(`trim(COALESCE(t.step_4_name, '')) = 'Arrive Winery'`);
+    conditions.push(`trim(COALESCE(t.step_5_name, '')) = 'Job Completed'`);
+    conditions.push(
+      `(t.step_4_completed_at IS NOT NULL AND t.step_5_completed_at IS NOT NULL AND t.step_4_completed_at < t.step_5_completed_at)`
+    );
+    debug.blockedView = 'ordering';
   }
 
   return { conditions, values, debug };

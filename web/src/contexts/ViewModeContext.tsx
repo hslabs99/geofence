@@ -11,6 +11,22 @@ export type UserTypeLabel = 'Super Admin' | 'Admin' | 'Client';
 
 const STORAGE_KEY = 'geodata_user';
 
+const VALID_USER_TYPES: UserTypeLabel[] = ['Super Admin', 'Admin', 'Client'];
+
+/** Parse `geodata_user` from localStorage; null if missing or invalid. */
+export function readStoredUserType(): UserTypeLabel | null {
+  if (typeof localStorage === 'undefined') return null;
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as StoredUser;
+    const t = parsed?.userType;
+    return t && VALID_USER_TYPES.includes(t as UserTypeLabel) ? (t as UserTypeLabel) : null;
+  } catch {
+    return null;
+  }
+}
+
 function userTypeToViewMode(t: UserTypeLabel): ViewMode {
   if (t === 'Super Admin') return 'super';
   if (t === 'Admin') return 'admin';
@@ -65,8 +81,8 @@ export function ViewModeProvider({ children }: { children: React.ReactNode }) {
       }
       const parsed = JSON.parse(raw) as StoredUser;
       const t = parsed?.userType;
-      const valid: UserTypeLabel[] = ['Super Admin', 'Admin', 'Client'];
-      const ut: UserTypeLabel | null = t && valid.includes(t as UserTypeLabel) ? (t as UserTypeLabel) : null;
+      const ut: UserTypeLabel | null =
+        t && VALID_USER_TYPES.includes(t as UserTypeLabel) ? (t as UserTypeLabel) : null;
       setUserType(ut);
       // After login or refresh: default view mode to the user's type (Super Admin → super, etc.)
       setViewModeState(ut ? userTypeToViewMode(ut) : 'client');

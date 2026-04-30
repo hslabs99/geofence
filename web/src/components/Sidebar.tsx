@@ -15,7 +15,10 @@ type InspectHistoryEntry = {
   worker: string | null;
   actual_start_time: string | null;
   truck_id: string | null;
+  note: string | null;
 };
+
+const GEODATA_INSPECT_HISTORY_CHANGED = 'geodata-inspect-history-changed';
 
 function buildInspectUrl(entry: InspectHistoryEntry): string {
   const params = new URLSearchParams();
@@ -161,6 +164,14 @@ export default function Sidebar() {
   }, [fetchInspectHistory]);
 
   useEffect(() => {
+    const onHistoryChanged = () => {
+      fetchInspectHistory();
+    };
+    window.addEventListener(GEODATA_INSPECT_HISTORY_CHANGED, onHistoryChanged);
+    return () => window.removeEventListener(GEODATA_INSPECT_HISTORY_CHANGED, onHistoryChanged);
+  }, [fetchInspectHistory]);
+
+  useEffect(() => {
     if (!historyOpen && !recentViewsOpen) return;
     const close = (e: MouseEvent) => {
       const t = e.target as Node;
@@ -222,8 +233,8 @@ export default function Sidebar() {
               </div>
             ))}
           </div>
-          {/* Customer filter: show in both Admin and Client view so both can filter by client. */}
-          {(viewMode === 'admin' || viewMode === 'client') && (
+          {/* Customer filter: Super/Admin can pick client; Client view uses same control (locked for Client users). */}
+          {(viewMode === 'super' || viewMode === 'admin' || viewMode === 'client') && (
             <div className="mt-2 ml-1">
               <label className="mb-0.5 block text-xs font-medium text-zinc-500 dark:text-zinc-400">
                 Customer {clientCustomerLocked && '(locked)'}
@@ -263,15 +274,6 @@ export default function Sidebar() {
             >
               Summary
             </Link>
-            {userType && (
-              <RecentViewsDropdown
-                containerRef={recentViewsRef}
-                flyoutRef={recentViewsFlyoutRef}
-                open={recentViewsOpen}
-                onToggle={() => setRecentViewsOpen((o) => !o)}
-                onClose={() => setRecentViewsOpen(false)}
-              />
-            )}
           </>
         ) : (
           <>
@@ -336,7 +338,19 @@ export default function Sidebar() {
                       }}
                       className="w-full px-3 py-2 text-left text-xs hover:bg-zinc-100 dark:hover:bg-zinc-700"
                     >
-                      <div className="font-medium text-zinc-900 dark:text-zinc-100">{entry.job_id}</div>
+                      <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0">
+                        <span className="font-medium text-zinc-900 dark:text-zinc-100">{entry.job_id}</span>
+                        {entry.note ? (
+                          <span className="rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-900 dark:bg-amber-900/40 dark:text-amber-100">
+                            Pinned
+                          </span>
+                        ) : null}
+                      </div>
+                      {entry.note ? (
+                        <div className="mt-0.5 line-clamp-2 text-[11px] italic text-amber-900 dark:text-amber-100/90" title={entry.note}>
+                          {entry.note}
+                        </div>
+                      ) : null}
                       <div className="mt-0.5 truncate text-zinc-600 dark:text-zinc-400">
                         {[entry.delivery_winery, entry.vineyard_name].filter(Boolean).join(' · ') || '—'}
                       </div>
@@ -456,6 +470,14 @@ export default function Sidebar() {
               }`}
             >
               Settings
+            </Link>
+            <Link
+              href="/admin/column-colors"
+              className={`rounded px-3 py-2 text-sm ${
+                pathname === '/admin/column-colors' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
+              }`}
+            >
+              Column colors
             </Link>
             <Link
               href="/admin/api-test"

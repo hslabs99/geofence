@@ -53,6 +53,7 @@ type ScopedResult = {
   deliveryWineries: string[];
   workers: string[];
   vineyardGroups: string[];
+  templates: string[];
 };
 
 async function distinctAllForCustomer(customer: string): Promise<ScopedResult> {
@@ -61,10 +62,10 @@ async function distinctAllForCustomer(customer: string): Promise<ScopedResult> {
   const truckLower = `SELECT DISTINCT btrim(truck_id::text) AS val FROM tbl_vworkjobs
     WHERE truck_id IS NOT NULL AND btrim(truck_id::text) <> '' AND trim(customer) = $1 ORDER BY 1`;
 
-  const tmQuoted = `SELECT DISTINCT btrim(COALESCE(trailermode::text, trailertype::text, '')) AS val FROM tbl_vworkjobs
-    WHERE btrim(COALESCE(trailermode::text, trailertype::text, '')) <> '' AND trim("Customer") = $1 ORDER BY 1`;
-  const tmLower = `SELECT DISTINCT btrim(COALESCE(trailermode::text, trailertype::text, '')) AS val FROM tbl_vworkjobs
-    WHERE btrim(COALESCE(trailermode::text, trailertype::text, '')) <> '' AND trim(customer) = $1 ORDER BY 1`;
+  const tmQuoted = `SELECT DISTINCT btrim(COALESCE(trailermode::text, '')) AS val FROM tbl_vworkjobs
+    WHERE btrim(COALESCE(trailermode::text, '')) <> '' AND trim("Customer") = $1 ORDER BY 1`;
+  const tmLower = `SELECT DISTINCT btrim(COALESCE(trailermode::text, '')) AS val FROM tbl_vworkjobs
+    WHERE btrim(COALESCE(trailermode::text, '')) <> '' AND trim(customer) = $1 ORDER BY 1`;
 
   const vineQuoted = `SELECT DISTINCT btrim(vineyard_name::text) AS val FROM tbl_vworkjobs
     WHERE vineyard_name IS NOT NULL AND btrim(vineyard_name::text) <> '' AND trim("Customer") = $1 ORDER BY 1`;
@@ -86,17 +87,22 @@ async function distinctAllForCustomer(customer: string): Promise<ScopedResult> {
   const vgLower = `SELECT DISTINCT btrim(vineyard_group::text) AS val FROM tbl_vworkjobs
     WHERE vineyard_group IS NOT NULL AND btrim(vineyard_group::text) <> '' AND trim(customer) = $1 ORDER BY 1`;
 
-  const ttOnlyQuoted = `SELECT DISTINCT btrim(trailertype::text) AS val FROM tbl_vworkjobs
-    WHERE trailertype IS NOT NULL AND btrim(trailertype::text) <> '' AND trim("Customer") = $1 ORDER BY 1`;
-  const ttOnlyLower = `SELECT DISTINCT btrim(trailertype::text) AS val FROM tbl_vworkjobs
-    WHERE trailertype IS NOT NULL AND btrim(trailertype::text) <> '' AND trim(customer) = $1 ORDER BY 1`;
+  const tmplQuoted = `SELECT DISTINCT btrim(template::text) AS val FROM tbl_vworkjobs
+    WHERE template IS NOT NULL AND btrim(template::text) <> '' AND trim("Customer") = $1 ORDER BY 1`;
+  const tmplLower = `SELECT DISTINCT btrim(template::text) AS val FROM tbl_vworkjobs
+    WHERE template IS NOT NULL AND btrim(template::text) <> '' AND trim(customer) = $1 ORDER BY 1`;
+
+  const ttOnlyQuoted = `SELECT DISTINCT btrim(COALESCE(trailermode::text, '')) AS val FROM tbl_vworkjobs
+    WHERE btrim(COALESCE(trailermode::text, '')) <> '' AND trim("Customer") = $1 ORDER BY 1`;
+  const ttOnlyLower = `SELECT DISTINCT btrim(COALESCE(trailermode::text, '')) AS val FROM tbl_vworkjobs
+    WHERE btrim(COALESCE(trailermode::text, '')) <> '' AND trim(customer) = $1 ORDER BY 1`;
 
   const lsQuoted = `SELECT DISTINCT trim(both from loadsize::text) AS val FROM tbl_vworkjobs
     WHERE loadsize IS NOT NULL AND trim("Customer") = $1 ORDER BY 1`;
   const lsLower = `SELECT DISTINCT trim(both from loadsize::text) AS val FROM tbl_vworkjobs
     WHERE loadsize IS NOT NULL AND trim(customer) = $1 ORDER BY 1`;
 
-  const [truckIds, trailermodes, trailerTypes, loadSizes, vineyardNames, deliveryWineries, workers, vineyardGroups] = await Promise.all([
+  const [truckIds, trailermodes, trailerTypes, loadSizes, vineyardNames, deliveryWineries, workers, vineyardGroups, templates] = await Promise.all([
     distinctForCustomer(truckQuoted, truckLower, customer),
     distinctForCustomer(tmQuoted, tmLower, customer),
     distinctForCustomer(ttOnlyQuoted, ttOnlyLower, customer),
@@ -105,9 +111,10 @@ async function distinctAllForCustomer(customer: string): Promise<ScopedResult> {
     distinctForCustomer(winQuoted, winLower, customer),
     distinctForCustomer(workerQuoted, workerLower, customer),
     distinctForCustomer(vgQuoted, vgLower, customer),
+    distinctForCustomer(tmplQuoted, tmplLower, customer),
   ]);
 
-  return { truckIds, trailermodes, trailerTypes, loadSizes, vineyardNames, deliveryWineries, workers, vineyardGroups };
+  return { truckIds, trailermodes, trailerTypes, loadSizes, vineyardNames, deliveryWineries, workers, vineyardGroups, templates };
 }
 
 /**
@@ -130,6 +137,7 @@ export async function GET(request: Request) {
         deliveryWineries: scoped.deliveryWineries,
         workers: scoped.workers,
         vineyardGroups: scoped.vineyardGroups,
+        templates: scoped.templates,
       });
     }
 
@@ -140,13 +148,13 @@ export async function GET(request: Request) {
          ORDER BY 1`,
       ).catch(() => []),
       query<{ v: string }>(
-        `SELECT DISTINCT btrim(COALESCE(trailermode::text, trailertype::text, '')) AS v FROM tbl_vworkjobs
-         WHERE btrim(COALESCE(trailermode::text, trailertype::text, '')) <> ''
+        `SELECT DISTINCT btrim(COALESCE(trailermode::text, '')) AS v FROM tbl_vworkjobs
+         WHERE btrim(COALESCE(trailermode::text, '')) <> ''
          ORDER BY 1`,
       ).catch(() => []),
       query<{ v: string }>(
-        `SELECT DISTINCT btrim(trailertype::text) AS v FROM tbl_vworkjobs
-         WHERE trailertype IS NOT NULL AND btrim(trailertype::text) <> ''
+        `SELECT DISTINCT btrim(COALESCE(trailermode::text, '')) AS v FROM tbl_vworkjobs
+         WHERE btrim(COALESCE(trailermode::text, '')) <> ''
          ORDER BY 1`,
       ).catch(() => []),
       query<{ v: string }>(

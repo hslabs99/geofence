@@ -110,7 +110,7 @@ const RUN_ALL_FIXES_DESCRIPTIONS: string[] = [
   'Driver names: apply tbl_driver_mapp to worker (worker_old).',
   'Trailer type: set trailermode to TT or T from trailer_rego rules.',
   'Trailermode from load size: for rows with loadsize > 0 only, set trailermode to TT where loadsize > Settings “TT Load Size” threshold, else T (uses tbl_settings, default 25.5 if unset). Leaves null/0 loadsize unchanged.',
-  'Step4→5: for every eligible job (step4to5=0, step 4 “Job Completed”, step 5 not completed, no step_5_completed_at, step_4_completed_at set), migrate to Arrive Winery / Job Completed layout, synthetic step 4 time, step4to5=1, clear step GPS and fetched flags.',
+  'Step4→5: for every eligible job (step4to5=0, step 4 “Job Completed”, step 5 not completed, no step_5_completed_at, step_4_completed_at set), migrate to Arrive Winery / Job Completed layout, capped synthetic step 4 time (strictly before step 5 completion), step4to5=1, clear step GPS and fetched flags.',
 ];
 
 export default function AutoRunsPage() {

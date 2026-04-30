@@ -127,6 +127,8 @@ export function mapApiStepViaToDisplay(code: string | undefined | null): string 
       return 'Manual';
     case 'RULE':
       return 'Rule';
+    case 'Step3windback':
+      return 'Step3windback';
     default:
       return s || '—';
   }

@@ -4,11 +4,27 @@ import React, { Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useR
 import { createPortal } from 'react-dom';
 import Link from 'next/link';
 import { useRouter, useSearchParams } from 'next/navigation';
-import { useViewMode } from '@/contexts/ViewModeContext';
+import { useViewMode, type ViewMode } from '@/contexts/ViewModeContext';
 import { useSummaryHistory } from '@/contexts/SummaryHistoryContext';
-import { getSummaryHistoryEntry, type SummaryHistoryPayload } from '@/lib/summary-history-storage';
+import {
+  getSummaryHistoryEntry,
+  normalizeSummarySplitMode,
+  type SummaryHistoryPayload,
+  type SummarySplitMode,
+  type SummaryTabMode,
+} from '@/lib/summary-history-storage';
 import SummaryDataAuditPivot from '@/components/SummaryDataAuditPivot';
-import { formatIntNz } from '@/lib/format-nz';
+import { formatIntNz, formatKmNz2 } from '@/lib/format-nz';
+import { findMatchingWineryMinuteRow } from '@/lib/wineryminutes-limit-match';
+import {
+  SUMMARY_COLUMN_COLOR_DEFAULTS,
+  SUMMARY_COLUMN_COLOR_SETTING_NAMES,
+  SUMMARY_COLUMN_COLOR_SETTINGS_TYPE,
+  type SummaryColumnColorKey,
+} from '@/lib/summary-column-color-setting-names';
+
+/** Center all header cell labels horizontally and vertically within summary thead blocks */
+const SUMMARY_THEAD_TH_ALIGNMENT = '[&_th]:align-middle [&_th]:text-center';
 
 type Row = Record<string, unknown>;
 
@@ -22,11 +38,44 @@ function sortVineyardNames(arr: readonly string[]): string[] {
   return [...new Set(arr.map((x) => String(x).trim()).filter(Boolean))].sort((a, b) => a.localeCompare(b));
 }
 
+function firstDayOfMonthYmd(year: number, month1to12: number): string {
+  return `${year}-${String(month1to12).padStart(2, '0')}-01`;
+}
+
+/** Last calendar day of month (month1–12). */
+function lastDayOfMonthYmd(year: number, month1to12: number): string {
+  const d = new Date(year, month1to12, 0);
+  return `${year}-${String(month1to12).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
 /** Summary rollups and job counts: excluded=1 omits job (still visible on By Job). */
 function includedInRollup(row: Row): boolean {
   const ex = row.excluded;
   if (ex == null || ex === '') return true;
   return Number(ex) !== 1;
+}
+
+/** Map GET /api/admin/wineryminutes single row (or list row) into header threshold keys for red Av vs limits. */
+function thresholdsFromWineryMinutesApiRow(row: Record<string, unknown> | null | undefined): Record<string, string> | null {
+  if (!row || row.error) return null;
+  const toV = (row.ToVineMins ?? row.tovinemins) != null ? String(row.ToVineMins ?? row.tovinemins) : '';
+  const inV = (row.InVineMins ?? row.invinemins) != null ? String(row.InVineMins ?? row.invinemins) : '';
+  const toW = (row.ToWineMins ?? row.towinemins) != null ? String(row.ToWineMins ?? row.towinemins) : '';
+  const inW = (row.InWineMins ?? row.inwinemins) != null ? String(row.InWineMins ?? row.inwinemins) : '';
+  const tv = row.ToVineMins ?? row.tovinemins;
+  const tw = row.ToWineMins ?? row.towinemins;
+  const travelVal = tv != null && tw != null ? String(Number(tv) + Number(tw)) : '';
+  const totalVal = (row.TotalMins ?? row.totalmins) != null ? String(row.TotalMins ?? row.totalmins) : '';
+  return {
+    '2': toV,
+    '3': inV,
+    '4': toW,
+    '5': inW,
+    travel: travelVal,
+    in_vineyard: inV,
+    in_winery: inW,
+    total: totalVal,
+  };
 }
 
 const SORT_SETTING_TYPE = 'System';
@@ -51,6 +100,7 @@ const BY_JOB_LEAD_COLUMNS = [
   { key: 'limits_breached', label: 'Limits' },
   { key: 'delivery_winery', label: 'Winery' },
   { key: 'vineyard_name', label: 'Vineyard' },
+  { key: 'distance', label: 'Distance' },
   { key: 'vineyard_group', label: 'Vineyard group' },
 ] as const;
 
@@ -78,6 +128,61 @@ function formatCell(v: unknown): string {
   if (typeof v === 'string') return v.trim() || '—';
   if (v instanceof Date) return v.toISOString().replace('T', ' ').slice(0, 19);
   return String(v);
+}
+
+/** 18 columns for aligned Time Limits — col1 Winery, cols 2–6 Vineyard group, 12 metric subcols (Jobs/Actual/Limit). */
+function SeasonClientSplitColgroupLimits() {
+  const widths = [
+    '18%',
+    '6%',
+    '6%',
+    '6%',
+    '6%',
+    '6%',
+    '4.333%',
+    '4.333%',
+    '4.333%',
+    '4.333%',
+    '4.333%',
+    '4.333%',
+    '4.333%',
+    '4.333%',
+    '4.333%',
+    '4.333%',
+    '4.333%',
+    '4.333%',
+  ] as const;
+  return (
+    <colgroup>
+      {widths.map((w, i) => (
+        <col key={i} style={{ width: w }} />
+      ))}
+    </colgroup>
+  );
+}
+
+/** 16 columns for Season Summary (client + split): Winery, Vineyard Group, TT, Over/Under, Jobs, Vyards, then Travel–Total metrics (two subcols each). */
+function SeasonClientSplitColgroupSeasonData() {
+  const widths = ['10%', '8%', '8%', '8%', '6%', '6%', '6%', '6%', '6%', '6%', '6%', '6%', '6%', '6%', '6%', '6%'] as const;
+  return (
+    <colgroup>
+      {widths.map((w, i) => (
+        <col key={i} style={{ width: w }} />
+      ))}
+    </colgroup>
+  );
+}
+
+/** 15 columns: same as above without Over/Under (Winery / Group / TT only). */
+function SeasonClientSplitColgroupSeasonDataNoOU() {
+  const widths = ['10%', '9%', '9%', '6%', '6%', '6%', '6%', '6%', '6%', '6%', '6%', '6%', '6%', '6%', '6%'] as const;
+  return (
+    <colgroup>
+      {widths.map((w, i) => (
+        <col key={i} style={{ width: w }} />
+      ))}
+    </colgroup>
+  );
 }
 
 /** Parse timestamp (ISO or YYYY-MM-DD HH:mm:ss) to ms. Returns null if invalid. */
@@ -147,8 +252,14 @@ function rollupQuadFromValues(values: number[]): { total: number; max: number; m
 }
 
 /** T / TT for season average charts; TTT and unknown → other (excluded from T / TT / T+TT average charts). */
+/** tbl_vworkjobs.vineyard_group — trim; empty key groups blanks together. */
+function vineyardGroupKey(row: Row): string {
+  const v = (row as Record<string, unknown>).vineyard_group;
+  return v == null || v === '' ? '' : String(v).trim();
+}
+
 function jobTrailerChartBucket(row: Row): 'T' | 'TT' | 'other' {
-  const raw = (row.trailermode ?? row.trailertype ?? '').toString().trim().toUpperCase().replace(/\s+/g, '');
+  const raw = (row.trailermode ?? '').toString().trim().toUpperCase().replace(/\s+/g, '');
   if (raw === 'TT' || raw === 'T_T' || raw === 'T+T' || raw === 'T&T') return 'TT';
   if (raw === 'T') return 'T';
   return 'other';
@@ -158,6 +269,11 @@ function jobIsTOrTT(row: Row): boolean {
   const b = jobTrailerChartBucket(row);
   return b === 'T' || b === 'TT';
 }
+
+/** Season Summary split-by-limits: TT column labels (match bar chart wording). */
+const SEASON_TT_LABEL_T = 'Truck Only';
+const SEASON_TT_LABEL_TT = 'Truck & Trailer';
+const SEASON_TT_LABEL_OTHER = 'Other';
 
 /** Per-job average AVs for Travel / In Vineyard / In Winery / Total (for bar charts). */
 function seasonChartAverageAvs(jobs: Row[]) {
@@ -202,11 +318,11 @@ function jobRowMinuteValues(row: Row): number[] {
   return out;
 }
 
-/** Any &lt; 0 → red; else any &lt; 5 → yellow. */
-function timeOutlierSeverity(values: number[]): 'red' | 'yellow' | null {
+/** Any &lt; 0 → red; else any &lt; lowMinutesThreshold → yellow. */
+function timeOutlierSeverity(values: number[], lowMinutesThreshold: number): 'red' | 'yellow' | null {
   if (values.length === 0) return null;
   if (values.some((v) => v < 0)) return 'red';
-  if (values.some((v) => v < 5)) return 'yellow';
+  if (values.some((v) => v < lowMinutesThreshold)) return 'yellow';
   return null;
 }
 
@@ -222,28 +338,61 @@ type RollupQuads = {
   total: { total: number; max: number; min: number; av: number };
 };
 
-function dayRollupOutlierSeverity(r: RollupQuads): 'red' | 'yellow' | null {
-  const rollN = r.rollupJobCount ?? r.jobs.filter(includedInRollup).length;
-  if (rollN === 0) return null;
-  const keys = ['mins_2', 'mins_3', 'mins_4', 'mins_5', 'travel', 'total'] as const;
-  const vals: number[] = [];
-  for (const k of keys) {
-    const q = r[k];
-    vals.push(q.total, q.max, q.min, q.av);
-  }
-  return timeOutlierSeverity(vals);
+function dayRollupOutlierSeverity(
+  r: RollupQuads,
+  lowMinutesThreshold: number,
+  exclusionSet?: Set<string>,
+): 'red' | 'yellow' | null {
+  const jobs = r.jobs
+    .filter(includedInRollup)
+    .filter((j) => {
+      if (!exclusionSet || exclusionSet.size === 0) return true;
+      const v = String(j.vineyard_name ?? '').trim().toLowerCase();
+      if (!v) return true;
+      return !exclusionSet.has(v);
+    });
+  if (jobs.length === 0) return null;
+  const vals = jobs.flatMap(jobRowMinuteValues);
+  return timeOutlierSeverity(vals, lowMinutesThreshold);
 }
 
 function footerStatsOutlierSeverity(
   stats: Record<string, { total: number; max: number; min: number; av: number }>,
   jobCount: number,
+  lowMinutesThreshold: number,
 ): 'red' | 'yellow' | null {
   if (jobCount === 0) return null;
   const vals: number[] = [];
   for (const q of Object.values(stats)) {
     vals.push(q.total, q.max, q.min, q.av);
   }
-  return timeOutlierSeverity(vals);
+  return timeOutlierSeverity(vals, lowMinutesThreshold);
+}
+
+function uniqueVineyardCount(jobs: Row[]): number {
+  const s = new Set<string>();
+  for (const j of jobs) {
+    const v = String(j.vineyard_name ?? '').trim();
+    if (v) s.add(v);
+  }
+  return s.size;
+}
+
+/** `tbl_vworkjobs.distance`: round-trip km (Populate vWork: pair m÷1000×2); null if missing/invalid. */
+function distanceRoundTripKmFromRow(row: Row): number | null {
+  const raw = (row as Record<string, unknown>).distance;
+  const n = typeof raw === 'number' ? raw : typeof raw === 'string' ? parseFloat(raw) : NaN;
+  return Number.isFinite(n) ? n : null;
+}
+
+/** Sum of per-job round-trip km (integer display). */
+function roundTripKms(jobs: Row[]): number {
+  let km = 0;
+  for (const j of jobs) {
+    const k = distanceRoundTripKmFromRow(j);
+    if (k != null) km += k;
+  }
+  return Math.round(km);
 }
 
 /** Season charts: bar order Travel → Vineyard → Winery → Total. */
@@ -606,6 +755,7 @@ function sortValueFor(row: Row, key: string): unknown {
   if (key === 'in_vineyard') return minsBetween(row, 2, 3);
   if (key === 'in_winery') return minsBetween(row, 4, 5);
   if (key === 'total') return totalMins(row);
+  if (key === 'distance') return distanceRoundTripKmFromRow(row);
   if (key === 'Customer') return row['Customer'] ?? row['customer'];
   if (key === 'limits_breached') return row.limits_breached ?? '-';
   return row[key];
@@ -638,7 +788,7 @@ function timeLimitRowTravelVal(r: {
   return (toV ?? 0) + (toW ?? 0);
 }
 
-/** Same limits + grouping as another row (compare without TT) — for hiding duplicate T when TT exists. */
+/** Same limits + grouping as another row (TT not in key) — client table: hide TT when a T row has identical limit columns. */
 function timeLimitRowComparableKey(r: {
   Customer?: string | null;
   Template?: string | null;
@@ -665,10 +815,100 @@ function timeLimitRowComparableKey(r: {
   ].join('\u0001');
 }
 
+/** Safe fragment for download filenames (customer / template / date). */
+function sanitizeSummaryExportFilenamePart(s: string): string {
+  const t = String(s ?? '')
+    .trim()
+    .replace(/[^\w\-_.]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+  return t.slice(0, 60) || 'x';
+}
+
+function summaryExportQuadCells(q: { total: number; max: number; min: number; av: number }): number[] {
+  return [q.total, q.max, q.min, q.av];
+}
+
+/** Rollup layout control — used in the Season Summary tab header (wide select). */
+function SeasonRollupLayoutSelect({
+  splitMode,
+  setSplitMode,
+  viewMode,
+  className = '',
+}: {
+  splitMode: SummarySplitMode;
+  setSplitMode: (v: SummarySplitMode) => void;
+  viewMode: ViewMode;
+  className?: string;
+}) {
+  const uiValue =
+    viewMode === 'client' && splitMode === 'winery_group_tt_over' ? 'winery_group_tt' : splitMode;
+  return (
+    <select
+      value={uiValue}
+      onChange={(e) => setSplitMode(e.target.value as SummarySplitMode)}
+      aria-label="Rollup layout"
+      title="Rollup layout"
+      className={`w-full min-w-[12rem] max-w-[20rem] rounded border border-zinc-300 bg-white py-1 pl-2 pr-7 text-xs font-normal text-zinc-800 shadow-sm dark:border-zinc-600 dark:bg-zinc-900 dark:text-zinc-100 ${className}`}
+    >
+      <option value="summary">Summary (single total row)</option>
+      {viewMode !== 'client' && (
+        <option value="winery_group_tt_over">Winery / Group / TT / Over–Under</option>
+      )}
+      <option value="winery_group_tt">Winery / Group / TT</option>
+    </select>
+  );
+}
+
+async function downloadSummaryXlsx(
+  rows: (string | number | null | undefined)[][],
+  sheetName: string,
+  filename: string,
+): Promise<void> {
+  const XLSX = await import('xlsx');
+  const ws = XLSX.utils.aoa_to_sheet(rows);
+  const wb = XLSX.utils.book_new();
+  const safeSheet = sheetName.replace(/[\[\]*\/\\?:]/g, '').slice(0, 31) || 'Sheet1';
+  XLSX.utils.book_append_sheet(wb, ws, safeSheet);
+  const out = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
+  const blob = new Blob([out], {
+    type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  });
+  const a = document.createElement('a');
+  const url = URL.createObjectURL(blob);
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+/** Stable pastel band per winery name for Time Limits table rows (light + dark). */
+function wineryLimitRowBgClass(winery: string | null | undefined): string {
+  const s = String(winery ?? '').trim();
+  if (!s) return 'bg-zinc-50/90 dark:bg-zinc-800/40';
+  const palette = [
+    'bg-amber-50/90 dark:bg-amber-950/35',
+    'bg-emerald-50/90 dark:bg-emerald-950/35',
+    'bg-violet-50/90 dark:bg-violet-950/35',
+    'bg-cyan-50/90 dark:bg-cyan-950/35',
+    'bg-orange-50/90 dark:bg-orange-950/35',
+    'bg-teal-50/90 dark:bg-teal-950/35',
+    'bg-rose-50/90 dark:bg-rose-950/35',
+    'bg-lime-50/90 dark:bg-lime-950/35',
+    'bg-indigo-50/90 dark:bg-indigo-950/35',
+    'bg-fuchsia-50/90 dark:bg-fuchsia-950/35',
+  ];
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 16777619);
+  return palette[Math.abs(h) % palette.length];
+}
+
 function SummaryPageInner() {
   const [rows, setRows] = useState<Row[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [jobsReloadNonce, setJobsReloadNonce] = useState(0);
   const [filterActualFrom, setFilterActualFrom] = useState('');
   const [filterActualTo, setFilterActualTo] = useState('');
   // Customer is always taken from sidebar (clientCustomer); no local dropdown to avoid disconnect in admin/super view
@@ -678,9 +918,20 @@ function SummaryPageInner() {
   const [filterTrailermode, setFilterTrailermode] = useState('');
   const [sortKey, setSortKey] = useState<string | null>(null);
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc');
-  const [sortColumns, setSortColumns] = useState<[string, string, string]>(['', '', '']);
+  // Default dropdown sorting: Vineyard, then None/None (matches Summary tab expectation).
+  const [sortColumns, setSortColumns] = useState<[string, string, string]>(['vineyard_name', '', '']);
   const sortColumnsInitialized = useRef(false);
   const [sortSaveStatus, setSortSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
+  const [headerOpen, setHeaderOpen] = useState(true);
+  const [lowMinutesHighlight, setLowMinutesHighlight] = useState<string>('5');
+  const [lowMinutesExclusions, setLowMinutesExclusions] = useState<string[]>([]);
+  const [lowMinutesExclusionsOpen, setLowMinutesExclusionsOpen] = useState(false);
+  const [lowMinutesExclusionsDraft, setLowMinutesExclusionsDraft] = useState<string[]>([]);
+  const lowMinutesExclusionsDraftRef = useRef<string[]>([]);
+  lowMinutesExclusionsDraftRef.current = lowMinutesExclusionsDraft;
+  const [summaryColumnColors, setSummaryColumnColors] = useState<Record<SummaryColumnColorKey, string>>(
+    () => ({ ...SUMMARY_COLUMN_COLOR_DEFAULTS }),
+  );
   const { viewMode, clientCustomer, setClientCustomer, clientCustomerLocked } = useViewMode();
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -690,8 +941,10 @@ function SummaryPageInner() {
   clientCustomerLockedRef.current = clientCustomerLocked;
   /** Customer always mirrors sidebar selection (single source of truth; avoids disconnect in admin/super). */
   const effectiveCustomer = clientCustomer;
-  const [summaryTab, setSummaryTab] = useState<'season' | 'by_day' | 'by_job' | 'data_audit'>('season');
+  const [summaryTab, setSummaryTab] = useState<SummaryTabMode>('season');
   const [filterWinery, setFilterWinery] = useState('');
+  const filterWineryRef = useRef(filterWinery);
+  filterWineryRef.current = filterWinery;
   const [filterVineyardGroup, setFilterVineyardGroup] = useState('');
   const [filterVineyards, setFilterVineyards] = useState<string[]>([]);
   const [vineyardPickerOpen, setVineyardPickerOpen] = useState(false);
@@ -701,8 +954,12 @@ function SummaryPageInner() {
   vineyardPickerDraftRef.current = vineyardPickerDraft;
   const vineyardPickerAnchorRef = useRef<HTMLDivElement | null>(null);
   const vineyardPickerPanelRef = useRef<HTMLDivElement | null>(null);
+  const [summaryExportMenuOpen, setSummaryExportMenuOpen] = useState(false);
+  const summaryExportMenuRef = useRef<HTMLDivElement | null>(null);
   /** All vineyard_name values for the customer (from filter-options), independent of vineyard filter — avoids “stuck” list after reload. */
   const [vineyardOptionsAll, setVineyardOptionsAll] = useState<string[]>([]);
+  /** Distinct templates for the customer (filter-options) so the Template dropdown works before jobs are loaded. */
+  const [templateOptionsForCustomer, setTemplateOptionsForCustomer] = useState<string[]>([]);
   const vineyardFilterSet = useMemo(() => new Set(filterVineyards), [filterVineyards]);
   const vineyardDraftSet = useMemo(() => new Set(vineyardPickerDraft), [vineyardPickerDraft]);
 
@@ -710,7 +967,10 @@ function SummaryPageInner() {
     setFilterVineyards(sortVineyardNames(vineyardPickerDraftRef.current));
     setVineyardPickerOpen(false);
   }, []);
-  const [splitByLimits, setSplitByLimits] = useState(false);
+  const [splitMode, setSplitMode] = useState<SummarySplitMode>('summary');
+  const splitSeasonGrouped = splitMode !== 'summary';
+  /** Over–Under layout is admin-only; client still uses grouped rows if `splitMode` is `winery_group_tt_over` but without Within/Over splits. */
+  const splitByOverUnder = splitMode === 'winery_group_tt_over' && viewMode !== 'client';
   const [minsThresholds, setMinsThresholds] = useState<Record<string, string>>({
     '2': '', '3': '', '4': '', '5': '', travel: '', in_vineyard: '', in_winery: '', total: '',
   });
@@ -732,27 +992,43 @@ function SummaryPageInner() {
     TotalMins?: number | null;
   };
   const [timeLimitRows, setTimeLimitRows] = useState<TimeLimitRow[]>([]);
-  /** Hide T row when a TT row has identical limit columns (visual only). */
+  /** Client view: hide TT when a T row exists with the same template/winery/VG and identical limit minutes (show T only). */
   const timeLimitRowsForTable = useMemo(() => {
-    const rows = timeLimitRows;
-    const ttKeys = new Set<string>();
-    for (const r of rows) {
-      if (String(r.TT ?? '').trim() !== 'TT') continue;
-      ttKeys.add(timeLimitRowComparableKey(r));
-    }
-    return rows.filter((r) => {
-      if (String(r.TT ?? '').trim() !== 'T') return true;
-      return !ttKeys.has(timeLimitRowComparableKey(r));
+    const raw = timeLimitRows;
+    const afterDedup =
+      viewMode === 'client'
+        ? (() => {
+            const tKeys = new Set<string>();
+            for (const r of raw) {
+              if (String(r.TT ?? '').trim() !== 'T') continue;
+              tKeys.add(timeLimitRowComparableKey(r));
+            }
+            return raw.filter((r) => {
+              if (String(r.TT ?? '').trim() !== 'TT') return true;
+              return !tKeys.has(timeLimitRowComparableKey(r));
+            });
+          })()
+        : raw;
+    return [...afterDedup].sort((a, b) => {
+      const t = String(a.Template ?? '').localeCompare(String(b.Template ?? ''), undefined, { sensitivity: 'base' });
+      if (t !== 0) return t;
+      const w = String(a.Winery ?? '').localeCompare(String(b.Winery ?? ''), undefined, { sensitivity: 'base' });
+      if (w !== 0) return w;
+      const vg = String(a.vineyardgroup ?? '').localeCompare(String(b.vineyardgroup ?? ''), undefined, {
+        sensitivity: 'base',
+      });
+      if (vg !== 0) return vg;
+      return String(a.TT ?? '').localeCompare(String(b.TT ?? ''), undefined, { sensitivity: 'base' });
     });
-  }, [timeLimitRows]);
+  }, [timeLimitRows, viewMode]);
   /** When user clicks a Time Limits row, we show that row's limits in the header white boxes (for info only). */
   const [selectedTimeLimitRowId, setSelectedTimeLimitRowId] = useState<number | null>(null);
   /** Show/hide the Time Limits table (can get in the way). */
   const [showLimitsTable, setShowLimitsTable] = useState(true);
   const [jobsPage, setJobsPage] = useState(0);
-  const [jobsPageSize] = useState(500);
+  const [jobsPageSize, setJobsPageSize] = useState(500);
   const [totalJobsFromApi, setTotalJobsFromApi] = useState(0);
-  /** Same WHERE as /api/vworkjobs for the current filters (for season/daily footer). */
+  /** SQL debug from /api/vworkjobs (customer + template only; subsidiary filters are client-side). */
   const [jobsQueryDebug, setJobsQueryDebug] = useState<{
     debugSql: string;
     debugSqlParams: unknown[];
@@ -762,7 +1038,6 @@ function SummaryPageInner() {
   /** After sidebar history restore (?sh=): suppress jobs reset + cascade wipes (same as Client hydrate). */
   const jobsPageResetSuppressCountRef = useRef(0);
   const skipCustomerCascadeRef = useRef(false);
-  const skipTemplateCascadeRef = useRef(false);
   const appliedHistoryIdRef = useRef<string | null>(null);
   /** After ?sh= restore: scroll/highlight this job row once it appears in By Job. */
   const pendingScrollToJobIdRef = useRef<string | null>(null);
@@ -771,8 +1046,6 @@ function SummaryPageInner() {
   const byJobTableScrollRef = useRef<HTMLDivElement | null>(null);
   /** Avoid treating context filling `'' → customer` (Client refreshUser) as a user customer change. */
   const prevEffectiveCustomerForCascadeRef = useRef<string | null>(null);
-  /** Avoid first template effect run wiping winery after programmatic restore. */
-  const prevFilterTemplateForCascadeRef = useRef<string | null>(null);
 
   const shParam = searchParams.get('sh');
 
@@ -792,7 +1065,6 @@ function SummaryPageInner() {
     appliedHistoryIdRef.current = id;
     jobsPageResetSuppressCountRef.current = clientCustomerLockedRef.current ? 2 : 1;
     skipCustomerCascadeRef.current = true;
-    skipTemplateCascadeRef.current = true;
     const s = entry.payload;
     if (!clientCustomerLockedRef.current && s.clientCustomer !== undefined) {
       setClientCustomer(s.clientCustomer);
@@ -803,7 +1075,12 @@ function SummaryPageInner() {
     setFilterTruckId(s.filterTruckId ?? '');
     setFilterWorker(s.filterWorker ?? '');
     setFilterTrailermode(s.filterTrailermode ?? '');
-    setSummaryTab(s.summaryTab ?? 'season');
+    {
+      const t = s.summaryTab;
+      setSummaryTab(
+        t === 'season' || t === 'by_day' || t === 'by_job' || t === 'data_audit' || t === 'vineyards' ? t : 'season',
+      );
+    }
     setFilterWinery(s.filterWinery ?? '');
     setFilterVineyardGroup(s.filterVineyardGroup ?? '');
     {
@@ -816,7 +1093,7 @@ function SummaryPageInner() {
       }
       setFilterVineyards(fv);
     }
-    setSplitByLimits(Boolean(s.splitByLimits));
+    setSplitMode(normalizeSummarySplitMode(s.splitMode, s.splitByLimits));
     if (s.minsThresholds && typeof s.minsThresholds === 'object') {
       setMinsThresholds((prev) => ({ ...prev, ...s.minsThresholds }));
     }
@@ -847,20 +1124,20 @@ function SummaryPageInner() {
   }, [effectiveCustomer, filterTemplate, filterActualFrom, filterActualTo, filterWinery, filterVineyardGroup, filterVineyards, filterTruckId, filterWorker, filterTrailermode]);
 
   useEffect(() => {
-    const params = new URLSearchParams();
-    if (effectiveCustomer.trim()) params.set('customer', effectiveCustomer.trim());
-    if (filterTemplate.trim()) params.set('template', filterTemplate.trim());
-    if (filterActualFrom?.trim()) params.set('dateFrom', filterActualFrom.trim().slice(0, 10));
-    if (filterActualTo?.trim()) params.set('dateTo', filterActualTo.trim().slice(0, 10));
-    if (filterWinery.trim()) params.set('winery', filterWinery.trim());
-    if (filterVineyardGroup.trim()) params.set('vineyard_group', filterVineyardGroup.trim());
-    for (const v of filterVineyards) {
-      const t = v.trim();
-      if (t) params.append('vineyard', t);
+    const customerOk = effectiveCustomer.trim();
+    const templateOk = filterTemplate.trim();
+    if (!customerOk || !templateOk) {
+      setRows([]);
+      setTotalJobsFromApi(0);
+      setJobsQueryDebug(null);
+      setError(null);
+      setLoading(false);
+      return;
     }
-    if (filterTruckId.trim()) params.set('truck_id', filterTruckId.trim());
-    if (filterWorker.trim()) params.set('worker', filterWorker.trim());
-    if (filterTrailermode.trim()) params.set('trailermode', filterTrailermode.trim());
+    /** Load full job set for customer + template only; dates / winery / truck / worker / TT filter on the client so dropdowns and month presets stay stable. */
+    const params = new URLSearchParams();
+    params.set('customer', customerOk);
+    params.set('template', templateOk);
     /** Full result set for rollups; By Job tab paginates client-side (was capped at 500 rows server-side). */
     setLoading(true);
     fetch(`/api/vworkjobs?${params}`, { cache: 'no-store' })
@@ -885,7 +1162,7 @@ function SummaryPageInner() {
       })
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false));
-  }, [effectiveCustomer, filterTemplate, filterActualFrom, filterActualTo, filterWinery, filterVineyardGroup, filterVineyards, filterTruckId, filterWorker, filterTrailermode]);
+  }, [effectiveCustomer, filterTemplate, jobsReloadNonce]);
 
   useEffect(() => {
     if (!vineyardPickerOpen) return;
@@ -901,9 +1178,22 @@ function SummaryPageInner() {
   }, [vineyardPickerOpen, commitVineyardPicker]);
 
   useEffect(() => {
+    if (!summaryExportMenuOpen) return;
+    const onDoc = (e: MouseEvent) => {
+      const t = e.target as Node | null;
+      if (!t) return;
+      if (summaryExportMenuRef.current?.contains(t)) return;
+      setSummaryExportMenuOpen(false);
+    };
+    document.addEventListener('mousedown', onDoc);
+    return () => document.removeEventListener('mousedown', onDoc);
+  }, [summaryExportMenuOpen]);
+
+  useEffect(() => {
     const c = effectiveCustomer.trim();
     if (!c) {
       setVineyardOptionsAll([]);
+      setTemplateOptionsForCustomer([]);
       return;
     }
     let cancelled = false;
@@ -919,9 +1209,20 @@ function SummaryPageInner() {
         } else {
           setVineyardOptionsAll([]);
         }
+        const tmpl = data?.templates;
+        if (Array.isArray(tmpl)) {
+          setTemplateOptionsForCustomer(
+            tmpl.map((x: unknown) => String(x).trim()).filter((s: string) => s !== ''),
+          );
+        } else {
+          setTemplateOptionsForCustomer([]);
+        }
       })
       .catch(() => {
-        if (!cancelled) setVineyardOptionsAll([]);
+        if (!cancelled) {
+          setVineyardOptionsAll([]);
+          setTemplateOptionsForCustomer([]);
+        }
       });
     return () => {
       cancelled = true;
@@ -963,7 +1264,7 @@ function SummaryPageInner() {
       filterWinery,
       filterVineyardGroup,
       filterVineyards,
-      splitByLimits,
+      splitMode,
       minsThresholds: { ...minsThresholds },
       selectedTimeLimitRowId,
       showLimitsTable,
@@ -988,7 +1289,7 @@ function SummaryPageInner() {
     filterWinery,
     filterVineyardGroup,
     filterVineyards,
-    splitByLimits,
+    splitMode,
     minsThresholds,
     selectedTimeLimitRowId,
     showLimitsTable,
@@ -1007,101 +1308,32 @@ function SummaryPageInner() {
     return Array.from(set).sort();
   }, [rows]);
 
-  /** Distinct workers in the current summary result set: rows matching customer (and template if set), winery, vineyard, truck, date range — so dropdown only shows workers that exist in the filtered data. */
+  /** Distinct workers in the loaded job set (customer + template); subsidiary filters do not shrink this list. */
   const distinctWorkers = useMemo(() => {
     const set = new Set<string>();
     for (const row of rows) {
-      if (effectiveCustomer) {
-        const v = row.Customer ?? row.customer;
-        if (v == null || String(v).trim() !== effectiveCustomer) continue;
-      }
-      if (filterTemplate) {
-        const v = row.template;
-        if (v == null || String(v).trim() !== filterTemplate) continue;
-      }
-      if (filterWinery) {
-        const v = row.delivery_winery;
-        if (v == null || String(v).trim() !== filterWinery) continue;
-      }
-      if (filterVineyardGroup) {
-        const v = (row as Record<string, unknown>).vineyard_group;
-        if (v == null || String(v).trim() !== filterVineyardGroup) continue;
-      }
-      if (filterVineyards.length > 0) {
-        const v = row.vineyard_name;
-        const s = v == null ? '' : String(v).trim();
-        if (!vineyardFilterSet.has(s)) continue;
-      }
-      if (filterTruckId) {
-        const v = row.truck_id;
-        if (v == null || String(v).trim() !== filterTruckId) continue;
-      }
-      if (filterActualFrom || filterActualTo) {
-        const v = row.actual_start_time;
-        if (v == null || v === '') continue;
-        const str = String(v).trim();
-        const datePart = str.match(/^(\d{4})-(\d{2})-(\d{2})/)?.[0] ?? '';
-        if (!datePart) continue;
-        const from = filterActualFrom ? filterActualFrom.slice(0, 10) : '';
-        const to = filterActualTo ? filterActualTo.slice(0, 10) : '';
-        if (from && datePart < from) continue;
-        if (to && datePart > to) continue;
-      }
       const w = row.worker;
       if (w != null && String(w).trim() !== '') set.add(String(w).trim());
     }
     return Array.from(set).sort();
-  }, [rows, effectiveCustomer, filterTemplate, filterWinery, filterVineyardGroup, filterVineyards, vineyardFilterSet, filterTruckId, filterActualFrom, filterActualTo]);
+  }, [rows]);
 
-  /** Distinct trailermode values in the current summary result set (same filters as distinctWorkers). */
+  /** Distinct trailermode in the loaded job set (same scope as distinctWorkers). */
   const distinctTrailermodes = useMemo(() => {
     const set = new Set<string>();
     for (const row of rows) {
-      if (effectiveCustomer) {
-        const v = row.Customer ?? row.customer;
-        if (v == null || String(v).trim() !== effectiveCustomer) continue;
-      }
-      if (filterTemplate) {
-        const v = row.template;
-        if (v == null || String(v).trim() !== filterTemplate) continue;
-      }
-      if (filterWinery) {
-        const v = row.delivery_winery;
-        if (v == null || String(v).trim() !== filterWinery) continue;
-      }
-      if (filterVineyardGroup) {
-        const v = (row as Record<string, unknown>).vineyard_group;
-        if (v == null || String(v).trim() !== filterVineyardGroup) continue;
-      }
-      if (filterVineyards.length > 0) {
-        const v = row.vineyard_name;
-        const s = v == null ? '' : String(v).trim();
-        if (!vineyardFilterSet.has(s)) continue;
-      }
-      if (filterTruckId) {
-        const v = row.truck_id;
-        if (v == null || String(v).trim() !== filterTruckId) continue;
-      }
-      if (filterActualFrom || filterActualTo) {
-        const v = row.actual_start_time;
-        if (v == null || v === '') continue;
-        const str = String(v).trim();
-        const datePart = str.match(/^(\d{4})-(\d{2})-(\d{2})/)?.[0] ?? '';
-        if (!datePart) continue;
-        const from = filterActualFrom ? filterActualFrom.slice(0, 10) : '';
-        const to = filterActualTo ? filterActualTo.slice(0, 10) : '';
-        if (from && datePart < from) continue;
-        if (to && datePart > to) continue;
-      }
       const t = row.trailermode;
       if (t != null && String(t).trim() !== '') set.add(String(t).trim());
     }
     return Array.from(set).sort();
-  }, [rows, effectiveCustomer, filterTemplate, filterWinery, filterVineyardGroup, filterVineyards, vineyardFilterSet, filterTruckId, filterActualFrom, filterActualTo]);
+  }, [rows]);
 
-  /** Templates only for the effective customer (template dropdown is dependent on customer). */
+  /** Templates for the customer: `/api/vworkjobs/filter-options` list only when present so the dropdown never shrinks to the single loaded template. */
   const distinctTemplates = useMemo(() => {
     if (!effectiveCustomer.trim()) return [];
+    if (templateOptionsForCustomer.length > 0) {
+      return [...templateOptionsForCustomer].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+    }
     const set = new Set<string>();
     for (const row of rows) {
       const cust = row.Customer ?? row.customer;
@@ -1109,8 +1341,8 @@ function SummaryPageInner() {
       const v = row.template;
       if (v != null && String(v).trim() !== '') set.add(String(v).trim());
     }
-    return Array.from(set).sort();
-  }, [rows, effectiveCustomer]);
+    return Array.from(set).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+  }, [rows, effectiveCustomer, templateOptionsForCustomer]);
 
   /** Wineries (delivery_winery) only for the effective customer. */
   const distinctWineries = useMemo(() => {
@@ -1170,26 +1402,6 @@ function SummaryPageInner() {
     setFilterTrailermode('');
   }, [effectiveCustomer]);
 
-  /** Clear winery, … when template changes (skip once after session restore; skip first mount). */
-  useEffect(() => {
-    if (skipTemplateCascadeRef.current) {
-      skipTemplateCascadeRef.current = false;
-      prevFilterTemplateForCascadeRef.current = filterTemplate;
-      return;
-    }
-    const prev = prevFilterTemplateForCascadeRef.current;
-    if (prev === null) {
-      prevFilterTemplateForCascadeRef.current = filterTemplate;
-      return;
-    }
-    if (prev === filterTemplate) return;
-    prevFilterTemplateForCascadeRef.current = filterTemplate;
-    setFilterWinery('');
-    setFilterVineyardGroup('');
-    setFilterWorker('');
-    setFilterTrailermode('');
-  }, [filterTemplate]);
-
   /** When Customer + Template + Winery (and optionally Vineyard group) are selected, load minute limits from tbl_wineryminutes (2=ToVine, 3=InVine, 4=ToWine, 5=InWine, travel=ToVine+ToWine, in_vineyard=InVine, in_winery=InWine, total=TotalMins). */
   useEffect(() => {
     if (!effectiveCustomer.trim() || !filterTemplate.trim() || !filterWinery.trim()) return;
@@ -1198,28 +1410,30 @@ function SummaryPageInner() {
     fetch(`/api/admin/wineryminutes?${params}`)
       .then((r) => r.json())
       .then((row) => {
-        if (!row || row.error) return;
-        const toV = (row.ToVineMins ?? row.tovinemins) != null ? String(row.ToVineMins ?? row.tovinemins) : '';
-        const inV = (row.InVineMins ?? row.invinemins) != null ? String(row.InVineMins ?? row.invinemins) : '';
-        const toW = (row.ToWineMins ?? row.towinemins) != null ? String(row.ToWineMins ?? row.towinemins) : '';
-        const inW = (row.InWineMins ?? row.inwinemins) != null ? String(row.InWineMins ?? row.inwinemins) : '';
-        const tv = row.ToVineMins ?? row.tovinemins;
-        const tw = row.ToWineMins ?? row.towinemins;
-        const travelVal = (tv != null && tw != null) ? String(Number(tv) + Number(tw)) : '';
-        const totalVal = (row.TotalMins ?? row.totalmins) != null ? String(row.TotalMins ?? row.totalmins) : '';
-        setMinsThresholds({
-          '2': toV,
-          '3': inV,
-          '4': toW,
-          '5': inW,
-          travel: travelVal,
-          in_vineyard: inV,
-          in_winery: inW,
-          total: totalVal,
-        });
+        const t = thresholdsFromWineryMinutesApiRow(row as Record<string, unknown>);
+        if (t) setMinsThresholds(t);
       })
       .catch(() => {});
   }, [effectiveCustomer, filterTemplate, filterWinery, filterVineyardGroup]);
+
+  /** When Winery is not filtered, still load limits from the first template row so Av columns can go red vs limits (same API as Time Limits list). */
+  useEffect(() => {
+    if (!effectiveCustomer.trim() || !filterTemplate.trim() || filterWinery.trim()) return;
+    let cancelled = false;
+    fetch(`/api/admin/wineryminutes?${new URLSearchParams({ customer: effectiveCustomer, template: filterTemplate })}`)
+      .then((r) => r.json())
+      .then((data) => {
+        if (cancelled || filterWineryRef.current.trim()) return;
+        const rows = data?.rows;
+        if (!Array.isArray(rows) || rows.length === 0) return;
+        const t = thresholdsFromWineryMinutesApiRow(rows[0] as Record<string, unknown>);
+        if (t) setMinsThresholds(t);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [effectiveCustomer, filterTemplate, filterWinery]);
 
   /** When a customer is selected, load time limit rows for the Time Limits section (tbl_wineryminutes by customer; if template selected, filter on template too). */
   useEffect(() => {
@@ -1289,28 +1503,62 @@ function SummaryPageInner() {
     });
   }, [rows, effectiveCustomer, filterTemplate, filterWinery, filterVineyardGroup, filterVineyards, vineyardFilterSet, filterTruckId, filterWorker, filterTrailermode, filterActualFrom, filterActualTo]);
 
-  /** Find the time limit row that matches this job's delivery_winery, vineyard_group, and trailer type (tbl_vworkjobs = tbl_wineryminutes; customer/template already applied to timeLimitRows). Limit row with null/empty vineyardgroup matches any job vineyard_group. If no T or TT row exists for the job's trailermode, fall back to a TTT row (some wineries only have TTT). */
+  /** Distinct year-months from the loaded job rows (customer + template); not narrowed by date or subsidiary filters so users can switch months without clearing. */
+  const actualStartMonthOptions = useMemo(() => {
+    const seen = new Set<string>();
+    const out: { key: string; label: string; y: number; m: number }[] = [];
+    for (const row of rows) {
+      const v = row.actual_start_time;
+      if (v == null || v === '') continue;
+      const str = String(v).trim();
+      const m = str.match(/^(\d{4})-(\d{2})-(\d{2})/);
+      if (!m) continue;
+      const y = Number(m[1]);
+      const mo = Number(m[2]);
+      const key = `${y}-${String(mo).padStart(2, '0')}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const label = new Date(y, mo - 1, 1).toLocaleDateString('en-NZ', { month: 'short', year: 'numeric' });
+      out.push({ key, label, y, m: mo });
+    }
+    out.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+    return out;
+  }, [rows]);
+
+  const actualStartMonthQuickPickValue = useMemo(() => {
+    if (!filterActualFrom?.trim() || !filterActualTo?.trim()) return '';
+    const f = filterActualFrom.trim().slice(0, 10);
+    const t = filterActualTo.trim().slice(0, 10);
+    const fm = f.match(/^(\d{4})-(\d{2})/);
+    const tm = t.match(/^(\d{4})-(\d{2})/);
+    if (!fm || !tm || fm[0] !== tm[0]) return '';
+    const y = Number(fm[1]);
+    const mo = Number(fm[2]);
+    if (f !== firstDayOfMonthYmd(y, mo) || t !== lastDayOfMonthYmd(y, mo)) return '';
+    return `${y}-${String(mo).padStart(2, '0')}`;
+  }, [filterActualFrom, filterActualTo]);
+
+  /** Find the time limit row that matches this job (tbl_vworkjobs ↔ tbl_wineryminutes). Vineyard group exact after trim; blank limit row only for jobs with no vineyard_group. TT match or TTT fallback for T/TT. */
   const getMatchingLimitsRow = (job: Row): TimeLimitRow | null => {
+    const customer = effectiveCustomer.trim();
+    if (!customer) return null;
+    const tmpl =
+      filterTemplate.trim() ||
+      (job.template != null ? String(job.template).trim() : '');
     const winery = (job.delivery_winery ?? '').toString().trim();
     if (!winery) return null;
-    const jobTT = (job.trailermode ?? job.trailertype ?? '').toString().trim();
+    const jobTT = (job.trailermode ?? '').toString().trim();
     const jobVg = ((job as Record<string, unknown>).vineyard_group ?? '').toString().trim();
-    const match = (r: TimeLimitRow) => {
-      if ((r.Winery ?? '').toString().trim() !== winery) return false;
-      const limitVg = (r.vineyardgroup ?? '').toString().trim();
-      if (limitVg !== '' && limitVg !== jobVg) return false;
-      return true;
-    };
-    const exact = timeLimitRows.find((r) => match(r) && (r.TT ?? '').toString().trim() === jobTT);
-    if (exact) return exact;
-    if (jobTT === 'T' || jobTT === 'TT') {
-      const tttRow = timeLimitRows.find((r) => match(r) && (r.TT ?? '').toString().trim() === 'TTT');
-      if (tttRow) return tttRow;
-    }
-    return null;
+    return findMatchingWineryMinuteRow(timeLimitRows, {
+      customer,
+      template: tmpl,
+      winery,
+      vineyardGroup: jobVg,
+      jobTT,
+    }) as TimeLimitRow | null;
   };
 
-  /** Get limit value from a limits row for a given key. Travel_ = ToVine + ToWine. */
+  /** Get limit value from a limits row for a given key. Travel = ToVine + ToWine. */
   const getLimitFromRow = (lim: TimeLimitRow | null, key: string): number | null => {
     if (!lim) return null;
     if (key === '2') return lim.ToVineMins ?? null;
@@ -1353,7 +1601,7 @@ function SummaryPageInner() {
 
   /** Rows with computed limits_breached for sorting and display. */
   const rowsWithLimits = useMemo((): (Row & { limits_breached: '-' | 'X' })[] =>
-    filteredRows.map((r) => ({ ...r, limits_breached: limitsBreachedForRow(r) })), [filteredRows, timeLimitRows]);
+    filteredRows.map((r) => ({ ...r, limits_breached: limitsBreachedForRow(r) })), [filteredRows, timeLimitRows, effectiveCustomer, filterTemplate]);
 
   /** Get YYYY-MM-DD from row actual_start_time for By Day rollup. */
   const getRowDate = (row: Row): string | null => {
@@ -1380,7 +1628,7 @@ function SummaryPageInner() {
 
   type MinsQuad = { total: number; max: number; min: number; av: number };
 
-  /** By Day: one row per day, or when splitByLimits three rows per day (Over Allowance, Within Allowance, Daily Total). */
+  /** By Day: one row per day, or when Over/Under split three rows per day (Over Allowance, Within Allowance, Daily Total). */
   const rowsByDay = useMemo(() => {
     const { min, max } = dayRange;
     if (min == null || max == null || min > max) return [];
@@ -1401,21 +1649,43 @@ function SummaryPageInner() {
       mins_2: MinsQuad; mins_3: MinsQuad; mins_4: MinsQuad; mins_5: MinsQuad; travel: MinsQuad; total: MinsQuad;
     };
     const out: DayRow[] = [];
-    const [minY, minMo, minDay] = min.split('-').map(Number);
-    const [maxY, maxMo, maxDay] = max.split('-').map(Number);
-    const minT = new Date(minY, minMo - 1, minDay).getTime();
-    const maxT = new Date(maxY, maxMo - 1, maxDay).getTime();
-    const sourceRows = splitByLimits ? rowsWithLimits : filteredRows;
-    for (let t = minT; t <= maxT; t += 86400000) {
-      const d = new Date(t);
-      const y = d.getFullYear();
-      const mo = String(d.getMonth() + 1).padStart(2, '0');
-      const day = String(d.getDate()).padStart(2, '0');
-      const dateStr = `${y}-${mo}-${day}`;
-      const dateLabel = `${day}/${mo}/${String(y).slice(2)}`;
-      const dayJobs = sourceRows.filter((row) => getRowDate(row) === dateStr);
+    const sourceRows = splitByOverUnder ? rowsWithLimits : filteredRows;
+    /** One pass: bucket by calendar day; dedupe by job_id per day so duplicate API rows don't inflate Jobs / mins. No min→max calendar walk (avoids hang on bad span). */
+    const jobIdForDedupe = (row: Row): string | null => {
+      const id = row.job_id;
+      if (id == null || id === '') return null;
+      const s = String(id).trim();
+      return s === '' ? null : s;
+    };
+    const jobsByDate = new Map<string, Row[]>();
+    const seenJobIdByDate = new Map<string, Set<string>>();
+    for (const row of sourceRows) {
+      const rd = getRowDate(row);
+      if (rd == null || rd < min || rd > max) continue;
+      const jid = jobIdForDedupe(row);
+      let seen = seenJobIdByDate.get(rd);
+      if (!seen) {
+        seen = new Set<string>();
+        seenJobIdByDate.set(rd, seen);
+      }
+      if (jid != null) {
+        if (seen.has(jid)) continue;
+        seen.add(jid);
+      }
+      let list = jobsByDate.get(rd);
+      if (!list) {
+        list = [];
+        jobsByDate.set(rd, list);
+      }
+      list.push(row);
+    }
+    const sortedDates = [...jobsByDate.keys()].sort();
+    for (const dateStr of sortedDates) {
+      const dayJobs = jobsByDate.get(dateStr)!;
       if (dayJobs.length === 0) continue;
-      if (splitByLimits) {
+      const [y, mo, day] = dateStr.split('-');
+      const dateLabel = `${day}/${mo}/${y.slice(2)}`;
+      if (splitByOverUnder) {
         const overJobs = dayJobs.filter((row) => (row as Row & { limits_breached?: string }).limits_breached === 'X');
         const withinJobs = dayJobs.filter((row) => (row as Row & { limits_breached?: string }).limits_breached === '-');
         for (const { label, jobs } of [
@@ -1434,7 +1704,7 @@ function SummaryPageInner() {
             date: dateStr,
             dateLabel,
             rowType: label,
-            jobs,
+            jobs: roll,
             rollupJobCount: roll.length,
             mins_2: fromValues(m2vals),
             mins_3: fromValues(m3vals),
@@ -1445,8 +1715,7 @@ function SummaryPageInner() {
           });
         }
       } else {
-        const jobs = dayJobs;
-        const roll = jobs.filter(includedInRollup);
+        const roll = dayJobs.filter(includedInRollup);
         const m2vals = roll.map((row) => minsBetween(row, 1, 2)).filter((v): v is number => v != null);
         const m3vals = roll.map((row) => minsBetween(row, 2, 3)).filter((v): v is number => v != null);
         const m4vals = roll.map((row) => minsBetween(row, 3, 4)).filter((v): v is number => v != null);
@@ -1456,7 +1725,7 @@ function SummaryPageInner() {
         out.push({
           date: dateStr,
           dateLabel,
-          jobs,
+          jobs: roll,
           rollupJobCount: roll.length,
           mins_2: fromValues(m2vals),
           mins_3: fromValues(m3vals),
@@ -1468,7 +1737,7 @@ function SummaryPageInner() {
       }
     }
     return out;
-  }, [filteredRows, rowsWithLimits, splitByLimits, dayRange]);
+  }, [filteredRows, rowsWithLimits, splitByOverUnder, dayRange]);
 
   const fromValuesToQuad = (values: number[]): MinsQuad => rollupQuadFromValues(values);
 
@@ -1496,11 +1765,32 @@ function SummaryPageInner() {
     };
   }, [filteredRows]);
 
-  /** When splitByLimits: 3 rows (Over Allowance, Within Allowance, Season Total). Otherwise same as seasonRollup in single row. */
-  type SeasonRollupRow = { rowType: 'Over Allowance' | 'Within Allowance' | 'Season Total'; jobs: Row[]; mins_2: MinsQuad; mins_3: MinsQuad; mins_4: MinsQuad; mins_5: MinsQuad; travel: MinsQuad; total: MinsQuad };
-  const seasonRollupRows = useMemo((): SeasonRollupRow[] | null => {
-    if (filteredRows.length === 0) return null;
-    const withLimits = filteredRows.map((r) => ({ ...r, limits_breached: limitsBreachedForRow(r) }));
+  /** Season table: non-split = one row; split = Season → Winery → Vineyard Group → TT → Within/Over/Total, plus vineyard-group, winery, and season totals. */
+  type SeasonRollupRow = {
+    rowKey: string;
+    tier: 'over_within' | 'tt_total' | 'vg_total' | 'winery_total' | 'season_total';
+    limitLabel: string;
+    wineryCol: string;
+    vineyardGroupCol: string;
+    ttCol: string;
+    jobs: Row[];
+    mins_2: MinsQuad;
+    mins_3: MinsQuad;
+    mins_4: MinsQuad;
+    mins_5: MinsQuad;
+    travel: MinsQuad;
+    total: MinsQuad;
+  };
+
+  type RowWithLimitsBreached = Row & { limits_breached: '-' | 'X' };
+
+  /** When Over/Under split: full-season Over | Within | Season charts (not per winery). */
+  const seasonSplitChartTriplet = useMemo((): Pick<SeasonRollupRow, 'rowKey' | 'limitLabel' | 'jobs' | 'mins_2' | 'mins_3' | 'mins_4' | 'mins_5' | 'travel' | 'total'>[] | null => {
+    if (!splitByOverUnder || filteredRows.length === 0) return null;
+    const withLimits: RowWithLimitsBreached[] = filteredRows.map((r) => ({
+      ...r,
+      limits_breached: limitsBreachedForRow(r),
+    }));
     const overJobs = withLimits.filter(
       (r) => includedInRollup(r) && (r as Row & { limits_breached?: string }).limits_breached === 'X',
     );
@@ -1516,22 +1806,176 @@ function SummaryPageInner() {
       travel: fromValuesToQuad(jobs.map((row) => travelMins(row)).filter((v): v is number => v != null)),
       total: fromValuesToQuad(jobs.map((row) => totalMins(row)).filter((v): v is number => v != null)),
     });
-    if (splitByLimits) {
-      return [
-        { rowType: 'Over Allowance', ...build(overJobs) },
-        { rowType: 'Within Allowance', ...build(withinJobs) },
-        { rowType: 'Season Total', ...build(filteredRows.filter(includedInRollup)) },
-      ];
+    return [
+      { rowKey: 'chart-over', limitLabel: 'Over Allowance', ...build(overJobs) },
+      { rowKey: 'chart-within', limitLabel: 'Within Allowance', ...build(withinJobs) },
+      { rowKey: 'chart-season', limitLabel: 'Season Total', ...build(filteredRows.filter(includedInRollup)) },
+    ];
+  }, [filteredRows, splitByOverUnder, timeLimitRows, effectiveCustomer, filterTemplate]);
+
+  const seasonRollupRows = useMemo((): SeasonRollupRow[] | null => {
+    if (filteredRows.length === 0) return null;
+    const withLimits: RowWithLimitsBreached[] = filteredRows.map((r) => ({
+      ...r,
+      limits_breached: limitsBreachedForRow(r),
+    }));
+    const build = (jobs: Row[]) => ({
+      jobs,
+      mins_2: fromValuesToQuad(jobs.map((row) => minsBetween(row, 1, 2)).filter((v): v is number => v != null)),
+      mins_3: fromValuesToQuad(jobs.map((row) => minsBetween(row, 2, 3)).filter((v): v is number => v != null)),
+      mins_4: fromValuesToQuad(jobs.map((row) => minsBetween(row, 3, 4)).filter((v): v is number => v != null)),
+      mins_5: fromValuesToQuad(jobs.map((row) => minsBetween(row, 4, 5)).filter((v): v is number => v != null)),
+      travel: fromValuesToQuad(jobs.map((row) => travelMins(row)).filter((v): v is number => v != null)),
+      total: fromValuesToQuad(jobs.map((row) => totalMins(row)).filter((v): v is number => v != null)),
+    });
+    if (!splitSeasonGrouped) {
+      return seasonRollup
+        ? [
+            {
+              rowKey: 'season-only',
+              tier: 'season_total',
+              limitLabel: 'Season Total',
+              wineryCol: '',
+              vineyardGroupCol: '',
+              ttCol: '',
+              ...seasonRollup,
+            },
+          ]
+        : null;
     }
-    return seasonRollup ? [{ rowType: 'Season Total', ...seasonRollup }] : null;
-  }, [filteredRows, seasonRollup, splitByLimits, timeLimitRows]);
+    const byWinery = new Map<string, RowWithLimitsBreached[]>();
+    for (const r of withLimits) {
+      if (!includedInRollup(r)) continue;
+      const w = (r.delivery_winery ?? '').toString().trim();
+      if (!byWinery.has(w)) byWinery.set(w, []);
+      byWinery.get(w)!.push(r);
+    }
+    const wineries = [...byWinery.keys()].sort((a, b) => {
+      if (a === '' && b !== '') return 1;
+      if (b === '' && a !== '') return -1;
+      return a.localeCompare(b, undefined, { sensitivity: 'base' });
+    });
+    const ttOrder: { bucket: ReturnType<typeof jobTrailerChartBucket>; label: string }[] = [
+      { bucket: 'T', label: SEASON_TT_LABEL_T },
+      { bucket: 'TT', label: SEASON_TT_LABEL_TT },
+      { bucket: 'other', label: SEASON_TT_LABEL_OTHER },
+    ];
+    const out: SeasonRollupRow[] = [];
+    for (const w of wineries) {
+      const wineryJobs = byWinery.get(w)!;
+      const displayWinery = w === '' ? '—' : w;
+      const byVg = new Map<string, RowWithLimitsBreached[]>();
+      for (const r of wineryJobs) {
+        const k = vineyardGroupKey(r);
+        if (!byVg.has(k)) byVg.set(k, []);
+        byVg.get(k)!.push(r);
+      }
+      const vgKeys = [...byVg.keys()].sort((a, b) => {
+        if (a === '' && b !== '') return 1;
+        if (b === '' && a !== '') return -1;
+        return a.localeCompare(b, undefined, { sensitivity: 'base' });
+      });
+      let isFirstRowOfWinery = true;
+      for (const vgk of vgKeys) {
+        const vgJobs = byVg.get(vgk)!;
+        const displayVg = vgk === '' ? '—' : vgk;
+        let isFirstRowOfVg = true;
+        for (const { bucket, label } of ttOrder) {
+          const bucketJobs = vgJobs.filter((r) => jobTrailerChartBucket(r) === bucket);
+          if (bucketJobs.length === 0) continue;
+          if (splitByOverUnder) {
+            const withinJobs = bucketJobs.filter((r) => (r as Row & { limits_breached?: string }).limits_breached === '-');
+            const overJobs = bucketJobs.filter((r) => (r as Row & { limits_breached?: string }).limits_breached === 'X');
+            const segments: { tier: SeasonRollupRow['tier']; limitLabel: string; jobs: Row[] }[] = [
+              { tier: 'over_within', limitLabel: 'Within Allowance', jobs: withinJobs },
+              { tier: 'over_within', limitLabel: 'Over Allowance', jobs: overJobs },
+              { tier: 'tt_total', limitLabel: 'Total', jobs: bucketJobs },
+            ];
+            segments.forEach((seg, segIdx) => {
+              const firstOfTt = segIdx === 0;
+              out.push({
+                rowKey: `${w}|${vgk}|${bucket}|${seg.limitLabel}`,
+                tier: seg.tier,
+                limitLabel: seg.limitLabel,
+                wineryCol: isFirstRowOfWinery && firstOfTt ? displayWinery : '',
+                vineyardGroupCol: isFirstRowOfVg && firstOfTt ? displayVg : '',
+                ttCol: firstOfTt ? label : '',
+                ...build(seg.jobs),
+              });
+              if (firstOfTt) {
+                isFirstRowOfWinery = false;
+                isFirstRowOfVg = false;
+              }
+            });
+          } else {
+            out.push({
+              rowKey: `${w}|${vgk}|${bucket}|roll`,
+              tier: 'tt_total',
+              limitLabel: '',
+              wineryCol: isFirstRowOfWinery ? displayWinery : '',
+              vineyardGroupCol: isFirstRowOfVg ? displayVg : '',
+              ttCol: label,
+              ...build(bucketJobs),
+            });
+            isFirstRowOfWinery = false;
+            isFirstRowOfVg = false;
+          }
+        }
+        out.push({
+          rowKey: `${w}|${vgk}|vg-total`,
+          tier: 'vg_total',
+          limitLabel: 'Total',
+          wineryCol: '',
+          vineyardGroupCol: 'Vineyard Group Total',
+          ttCol: '',
+          ...build(vgJobs),
+        });
+      }
+      out.push({
+        rowKey: `${w}|winery-total`,
+        tier: 'winery_total',
+        limitLabel: 'Total',
+        wineryCol: '',
+        vineyardGroupCol: '',
+        ttCol: 'Winery Total',
+        ...build(wineryJobs),
+      });
+    }
+    const allRoll = filteredRows.filter(includedInRollup);
+    out.push({
+      rowKey: 'season-grand-total',
+      tier: 'season_total',
+      limitLabel: splitByOverUnder ? 'Season Total' : '',
+      wineryCol: '',
+      vineyardGroupCol: '',
+      ttCol: splitByOverUnder ? '' : 'Season Total',
+      ...build(allRoll),
+    });
+    return out;
+  }, [filteredRows, seasonRollup, splitSeasonGrouped, splitByOverUnder, timeLimitRows, effectiveCustomer, filterTemplate]);
 
   /** By Day footer: Total, Max, Min, Av. Max/Min across harvest days (rows with ≥1 job). Av = grand total ÷ total jobs (same as each day row: column Total ÷ Jobs), not sum of daily Av cells and not ÷ day count. */
-  type ByDayFooterSet = { rowType?: 'Over Allowance' | 'Within Allowance' | 'Daily Total'; jobCount: number; stats: Record<string, MinsQuad> };
+  type ByDayFooterSet = {
+    rowType?: 'Over Allowance' | 'Within Allowance' | 'Daily Total';
+    jobCount: number;
+    /** Sum of per-row unique vineyard counts (matches summing the Vyards column). */
+    vyardsTotal: number;
+    /** Sum of per-row round-trip KMs (admin daily body column). */
+    kmsTotal: number;
+    stats: Record<string, MinsQuad>;
+  };
   const byDayFooterSets = useMemo((): ByDayFooterSet[] => {
     const keys = ['mins_2', 'mins_3', 'mins_4', 'mins_5', 'travel', 'total'] as const;
     const build = (rowsForFooter: typeof rowsByDay): ByDayFooterSet => {
       const jobCount = rowsForFooter.reduce((a, r) => a + r.rollupJobCount, 0);
+      const vyardsTotal = rowsForFooter.reduce(
+        (a, r) => a + uniqueVineyardCount((r as RollupQuads).jobs ?? []),
+        0,
+      );
+      const kmsTotal = rowsForFooter.reduce(
+        (a, r) => a + roundTripKms((r as RollupQuads).jobs ?? []),
+        0,
+      );
       const harvestRows = rowsForFooter.filter((r) => r.rollupJobCount > 0);
       const stats: Record<string, MinsQuad> = {};
       for (const k of keys) {
@@ -1545,9 +1989,9 @@ function SummaryPageInner() {
           av: jobCount > 0 ? Math.round(sumTotal / jobCount) : 0,
         };
       }
-      return { jobCount, stats };
+      return { jobCount, vyardsTotal, kmsTotal, stats };
     };
-    if (splitByLimits) {
+    if (splitByOverUnder) {
       const over = rowsByDay.filter((r) => (r as { rowType?: string }).rowType === 'Over Allowance');
       const within = rowsByDay.filter((r) => (r as { rowType?: string }).rowType === 'Within Allowance');
       const dailyTotal = rowsByDay.filter((r) => (r as { rowType?: string }).rowType === 'Daily Total');
@@ -1558,7 +2002,7 @@ function SummaryPageInner() {
       ];
     }
     return [{ ...build(rowsByDay) }];
-  }, [rowsByDay, splitByLimits]);
+  }, [rowsByDay, splitByOverUnder]);
 
   /** Distinct dates with ≥1 non-excluded job in Daily Summary (split-by-limits: 3 rows per date). */
   const summaryHarvestDayCount = useMemo(() => {
@@ -1643,9 +2087,9 @@ function SummaryPageInner() {
             /* ignore */
           }
         }
-        setSortColumns(['', '', '']);
+        setSortColumns(['vineyard_name', '', '']);
       })
-      .catch(() => setSortColumns(['', '', '']));
+      .catch(() => setSortColumns(['vineyard_name', '', '']));
   }, [sortableKeys]);
 
   const getThresholdNum = (key: string): number | null => {
@@ -1673,11 +2117,12 @@ function SummaryPageInner() {
     const n = getThresholdNum(key);
     return n != null ? String(n) : '—';
   };
+  /** `!` so limit red wins over inherited table/td text color (Tailwind v4). */
   const redIfOver = (val: number | null, key: string) =>
-    isMinsOverThreshold(val, key) ? 'bg-red-200 text-red-900 dark:bg-red-900/40 dark:text-red-200' : '';
+    isMinsOverThreshold(val, key) ? 'text-red-700! dark:text-red-300!' : '';
   /** Red if over any threshold for this step column (used for step 3 and 5 to match 2 and 4). */
   const redIfOverStepCol = (val: number | null, stepNum: number) =>
-    isMinsOverThresholdForStepCol(val, stepNum) ? 'bg-red-200 text-red-900 dark:bg-red-900/40 dark:text-red-200' : '';
+    isMinsOverThresholdForStepCol(val, stepNum) ? 'text-red-700! dark:text-red-300!' : '';
 
   const sortedRows = useMemo(() => {
     const out = [...rowsWithLimits];
@@ -1705,6 +2150,15 @@ function SummaryPageInner() {
     const start = jobsPage * jobsPageSize;
     return sortedRows.slice(start, start + jobsPageSize);
   }, [sortedRows, summaryTab, jobsPage, jobsPageSize]);
+
+  const jobsTotalPages = useMemo(() => {
+    if (jobsPageSize <= 0) return 1;
+    return Math.max(1, Math.ceil(sortedRows.length / jobsPageSize));
+  }, [sortedRows.length, jobsPageSize]);
+
+  useEffect(() => {
+    setJobsPage((p) => Math.max(0, Math.min(p, jobsTotalPages - 1)));
+  }, [jobsTotalPages]);
 
   useEffect(() => {
     const jid = pendingScrollToJobIdRef.current;
@@ -1782,109 +2236,744 @@ function SummaryPageInner() {
 
   const rollupJobsCount = useMemo(() => filteredRows.filter(includedInRollup).length, [filteredRows]);
 
+  /**
+   * Distinct vineyards in the current filter set (rollup jobs only), sorted; total minutes = sum of step 2–5 minutes per job where computable.
+   * KMs: sum of each job's `tbl_vworkjobs.distance` (via API row.distance), not a roll-up keyed off `tbl_distances` alone.
+   */
+  const vineyardSummaryList = useMemo(() => {
+    type Agg = { jobCount: number; totalMinsSum: number; distanceRoundTripKmSum: number };
+    const byName = new Map<string, Agg>();
+    for (const row of filteredRows) {
+      if (!includedInRollup(row)) continue;
+      const raw = String(row.vineyard_name ?? '').trim();
+      const key = raw === '' ? '\0' : raw;
+      let a = byName.get(key);
+      if (!a) {
+        a = { jobCount: 0, totalMinsSum: 0, distanceRoundTripKmSum: 0 };
+        byName.set(key, a);
+      }
+      a.jobCount += 1;
+      const tm = totalMins(row);
+      if (tm != null && !Number.isNaN(tm)) a.totalMinsSum += tm;
+      const k = distanceRoundTripKmFromRow(row);
+      if (k != null) a.distanceRoundTripKmSum += k;
+    }
+    const out = [...byName.entries()].map(([key, a]) => ({
+      vineyardLabel: key === '\0' ? '—' : key,
+      jobCount: a.jobCount,
+      totalMinsSum: a.totalMinsSum,
+      kmsRoundTrip: a.distanceRoundTripKmSum,
+    }));
+    out.sort((x, y) => {
+      const bx = x.vineyardLabel === '—';
+      const by = y.vineyardLabel === '—';
+      if (bx !== by) return bx ? 1 : -1;
+      return x.vineyardLabel.localeCompare(y.vineyardLabel, undefined, { sensitivity: 'base' });
+    });
+    return out;
+  }, [filteredRows]);
+
   const dayClientView = summaryTab === 'by_day' && viewMode === 'client';
   const jobClientView = summaryTab === 'by_job' && viewMode === 'client';
   const seasonClientView = summaryTab === 'season' && viewMode === 'client';
+  /** Client + split season: Time Limits uses `SeasonClientSplitColgroupLimits`; Season table uses `SeasonClientSplitColgroupSeasonData` (same cols 1–6 cumulative %, wider TT/Over). */
+  const alignClientTimeLimitsToSeasonAv =
+    viewMode === 'client' && splitSeasonGrouped && summaryTab === 'season';
+  /**
+   * Per limit row: Av columns match Season table math (rollupQuadFromValues on jobs in the silo that
+   * map to this limit row). Only jobs with includedInRollup (excluded ≠ 1), same as season rollups.
+   */
+  const timeLimitRowActualById = useMemo(() => {
+    const map = new Map<
+      number,
+      {
+        metrics: {
+          toVine: { jobs: number; actual: number | null };
+          inVine: { jobs: number; actual: number | null };
+          toWine: { jobs: number; actual: number | null };
+          inWine: { jobs: number; actual: number | null };
+          travel: { jobs: number; actual: number | null };
+          inVineyard: { jobs: number; actual: number | null };
+          inWinery: { jobs: number; actual: number | null };
+          total: { jobs: number; actual: number | null };
+        };
+      }
+    >();
+    if (timeLimitRowsForTable.length === 0) return map;
+    const customer = effectiveCustomer.trim();
+    if (!customer) return map;
+    for (const r of timeLimitRowsForTable) {
+      /** Client: one visible row can represent T + hidden TT with identical limits — merge job stats for all those limit row ids. */
+      const mergedLimitIds =
+        viewMode === 'client'
+          ? new Set(
+              timeLimitRows
+                .filter((row) => timeLimitRowComparableKey(row) === timeLimitRowComparableKey(r))
+                .map((row) => row.id),
+            )
+          : new Set<number>([r.id]);
+      const matching = filteredRows.filter((job) => {
+        if (!includedInRollup(job)) return false;
+        const winery = String(job.delivery_winery ?? '').trim();
+        if (!winery) return false;
+        const tmpl =
+          filterTemplate.trim() ||
+          (job.template != null ? String(job.template).trim() : '');
+        const lim = findMatchingWineryMinuteRow(timeLimitRows, {
+          customer,
+          template: tmpl,
+          winery,
+          vineyardGroup: String((job as Record<string, unknown>).vineyard_group ?? '').trim(),
+          jobTT: String(job.trailermode ?? '').trim(),
+        }) as TimeLimitRow | null;
+        return lim != null && mergedLimitIds.has(lim.id);
+      });
+      const toVineVals = matching.map((row) => minsBetween(row, 1, 2)).filter((v): v is number => v != null);
+      const inVineVals = matching.map((row) => minsBetween(row, 2, 3)).filter((v): v is number => v != null);
+      const toWineVals = matching.map((row) => minsBetween(row, 3, 4)).filter((v): v is number => v != null);
+      const inWineVals = matching.map((row) => minsBetween(row, 4, 5)).filter((v): v is number => v != null);
+      const travelVals = matching.map((row) => travelMins(row)).filter((v): v is number => v != null);
+      const totalVals = matching.map((row) => totalMins(row)).filter((v): v is number => v != null);
+      const toStat = (vals: number[]) => ({ jobs: vals.length, actual: vals.length > 0 ? rollupQuadFromValues(vals).av : null });
+      map.set(r.id, {
+        metrics: {
+          toVine: toStat(toVineVals),
+          inVine: toStat(inVineVals),
+          toWine: toStat(toWineVals),
+          inWine: toStat(inWineVals),
+          travel: toStat(travelVals),
+          inVineyard: toStat(inVineVals),
+          inWinery: toStat(inWineVals),
+          total: toStat(totalVals),
+        },
+      });
+    }
+    return map;
+  }, [timeLimitRowsForTable, filteredRows, effectiveCustomer, filterTemplate, timeLimitRows, viewMode]);
+
+  const runExportLimitsTableXlsx = useCallback(async () => {
+    const day = new Date().toISOString().slice(0, 10);
+    const cust = sanitizeSummaryExportFilenamePart(effectiveCustomer);
+    const tmpl = sanitizeSummaryExportFilenamePart(filterTemplate);
+    const header = [
+      'id',
+      'Customer',
+      'Template',
+      'Winery',
+      'Vineyard group',
+      'TT',
+      'To Vine Jobs',
+      'To Vine Actual (Av)',
+      'To Vine Limit',
+      'In Vine Jobs',
+      'In Vine Actual (Av)',
+      'In Vine Limit',
+      'To Wine Jobs',
+      'To Wine Actual (Av)',
+      'To Wine Limit',
+      'In Wine Jobs',
+      'In Wine Actual (Av)',
+      'In Wine Limit',
+      'Travel Jobs',
+      'Travel Actual (Av)',
+      'Travel Limit',
+      'In Vineyard Jobs',
+      'In Vineyard Actual (Av)',
+      'In Vineyard Limit',
+      'In Winery Jobs',
+      'In Winery Actual (Av)',
+      'In Winery Limit',
+      'Total Jobs',
+      'Total Actual (Av)',
+      'Total Limit',
+    ];
+    const aoa: (string | number | null | undefined)[][] = [header];
+    for (const r of timeLimitRowsForTable) {
+      const stats = timeLimitRowActualById.get(r.id)?.metrics;
+      const travelLim = timeLimitRowTravelVal(r);
+      aoa.push([
+        r.id,
+        r.Customer ?? '',
+        r.Template ?? '',
+        r.Winery ?? '',
+        r.vineyardgroup ?? '',
+        r.TT ?? '',
+        stats?.toVine.jobs ?? '',
+        stats?.toVine.actual ?? '',
+        r.ToVineMins ?? '',
+        stats?.inVine.jobs ?? '',
+        stats?.inVine.actual ?? '',
+        r.InVineMins ?? '',
+        stats?.toWine.jobs ?? '',
+        stats?.toWine.actual ?? '',
+        r.ToWineMins ?? '',
+        stats?.inWine.jobs ?? '',
+        stats?.inWine.actual ?? '',
+        r.InWineMins ?? '',
+        stats?.travel.jobs ?? '',
+        stats?.travel.actual ?? '',
+        travelLim ?? '',
+        stats?.inVineyard.jobs ?? '',
+        stats?.inVineyard.actual ?? '',
+        r.InVineMins ?? '',
+        stats?.inWinery.jobs ?? '',
+        stats?.inWinery.actual ?? '',
+        r.InWineMins ?? '',
+        stats?.total.jobs ?? '',
+        stats?.total.actual ?? '',
+        r.TotalMins ?? '',
+      ]);
+    }
+    await downloadSummaryXlsx(aoa, 'Time Limits', `summary-limits_${cust}_${tmpl}_${day}.xlsx`);
+  }, [timeLimitRowsForTable, timeLimitRowActualById, effectiveCustomer, filterTemplate]);
+
+  const runExportSeasonDataXlsx = useCallback(async () => {
+    const day = new Date().toISOString().slice(0, 10);
+    const cust = sanitizeSummaryExportFilenamePart(effectiveCustomer);
+    const tmpl = sanitizeSummaryExportFilenamePart(filterTemplate);
+    const quadHeaders = (prefix: string) => [`${prefix}_total`, `${prefix}_max`, `${prefix}_min`, `${prefix}_av`];
+    const header = [
+      'tier',
+      'rowKey',
+      'limitLabel',
+      'customer',
+      'template',
+      'winery',
+      'vineyardGroup',
+      'tt',
+      'jobs',
+      'vyards',
+      'kmsRoundTrip',
+      ...quadHeaders('step2_toVine'),
+      ...quadHeaders('step3_inVine'),
+      ...quadHeaders('step4_toWine'),
+      ...quadHeaders('step5_inWinery'),
+      ...quadHeaders('travel'),
+      ...quadHeaders('inVineyard'),
+      ...quadHeaders('inWinery'),
+      ...quadHeaders('grandTotal'),
+    ];
+    const aoa: (string | number | null | undefined)[][] = [header];
+    const list = seasonRollupRows ?? [];
+    for (const rollup of list) {
+      aoa.push([
+        rollup.tier,
+        rollup.rowKey,
+        rollup.limitLabel,
+        effectiveCustomer,
+        filterTemplate,
+        rollup.wineryCol,
+        rollup.vineyardGroupCol,
+        rollup.ttCol,
+        rollup.jobs.length,
+        uniqueVineyardCount(rollup.jobs),
+        roundTripKms(rollup.jobs),
+        ...summaryExportQuadCells(rollup.mins_2),
+        ...summaryExportQuadCells(rollup.mins_3),
+        ...summaryExportQuadCells(rollup.mins_4),
+        ...summaryExportQuadCells(rollup.mins_5),
+        ...summaryExportQuadCells(rollup.travel),
+        ...summaryExportQuadCells(rollup.mins_3),
+        ...summaryExportQuadCells(rollup.mins_5),
+        ...summaryExportQuadCells(rollup.total),
+      ]);
+    }
+    await downloadSummaryXlsx(aoa, 'Season Data', `summary-season_${cust}_${tmpl}_${day}.xlsx`);
+  }, [seasonRollupRows, effectiveCustomer, filterTemplate]);
+
+  /** Jobs API runs only with both set so payloads stay scoped to one customer + template. */
+  const canLoadJobs = effectiveCustomer.trim() !== '' && filterTemplate.trim() !== '';
+
+  useEffect(() => {
+    if (viewMode === 'client' && summaryTab === 'data_audit') {
+      setSummaryTab('season');
+    }
+  }, [summaryTab, viewMode]);
+
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem('SummaryHeaderOpen');
+      if (raw === '0') setHeaderOpen(false);
+      if (raw === '1') setHeaderOpen(true);
+    } catch {
+      /* ignore */
+    }
+  }, []);
+  const setHeaderOpenAndPersist = useCallback((open: boolean) => {
+    setHeaderOpen(open);
+    try {
+      localStorage.setItem('SummaryHeaderOpen', open ? '1' : '0');
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const LOW_MINUTES_HIGHLIGHT_SETTING_TYPE = 'System';
+  const LOW_MINUTES_HIGHLIGHT_SETTING_NAME = 'SummaryLowMinutesHighlight';
+  const JOBS_PAGE_SIZE_SETTING_TYPE = 'System';
+  const JOBS_PAGE_SIZE_SETTING_NAME = 'SummaryJobsRowsPerPage';
+
+  useEffect(() => {
+    fetch(
+      `/api/settings?${new URLSearchParams({
+        type: LOW_MINUTES_HIGHLIGHT_SETTING_TYPE,
+        name: LOW_MINUTES_HIGHLIGHT_SETTING_NAME,
+      })}`,
+      { cache: 'no-store' },
+    )
+      .then((r) => r.json())
+      .then((data) => {
+        const raw = String(data?.settingvalue ?? '').trim();
+        const n = raw === '' ? NaN : parseFloat(raw);
+        if (Number.isFinite(n) && n >= 0) setLowMinutesHighlight(String(n));
+        else setLowMinutesHighlight('5');
+      })
+      .catch(() => setLowMinutesHighlight('5'));
+  }, []);
+
+  useEffect(() => {
+    fetch(
+      `/api/settings?${new URLSearchParams({
+        type: JOBS_PAGE_SIZE_SETTING_TYPE,
+        name: JOBS_PAGE_SIZE_SETTING_NAME,
+      })}`,
+      { cache: 'no-store' },
+    )
+      .then((r) => r.json())
+      .then((data) => {
+        const raw = String(data?.settingvalue ?? '').trim();
+        const n = raw === '' ? NaN : parseInt(raw, 10);
+        if (Number.isFinite(n) && n > 0) setJobsPageSize(Math.max(50, Math.min(2000, n)));
+      })
+      .catch(() => {});
+  }, []);
+
+  const saveJobsPageSize = useCallback((n: number) => {
+    fetch('/api/settings', {
+      method: 'PUT',
+      cache: 'no-store',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        type: JOBS_PAGE_SIZE_SETTING_TYPE,
+        settingname: JOBS_PAGE_SIZE_SETTING_NAME,
+        settingvalue: String(n),
+      }),
+    }).catch(() => {});
+  }, []);
+
+  const lowMinutesHighlightNum = useMemo(() => {
+    const n = parseFloat(String(lowMinutesHighlight).trim());
+    if (!Number.isFinite(n) || n < 0) return 5;
+    return n;
+  }, [lowMinutesHighlight]);
+  /** Flag when any mins value is strictly less than this threshold. */
+  const lowMinutesHighlightThreshold = lowMinutesHighlightNum;
+
+  const saveLowMinutesHighlight = useCallback(() => {
+    const raw = String(lowMinutesHighlight).trim();
+    if (raw === '') return;
+    const n = parseFloat(raw);
+    if (!Number.isFinite(n) || n < 0) return;
+    fetch('/api/settings', {
+      method: 'PUT',
+      cache: 'no-store',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        type: LOW_MINUTES_HIGHLIGHT_SETTING_TYPE,
+        settingname: LOW_MINUTES_HIGHLIGHT_SETTING_NAME,
+        settingvalue: String(n),
+      }),
+    }).catch(() => {});
+  }, [lowMinutesHighlight]);
+
+  useEffect(() => {
+    fetch('/api/summary/low-minutes-exclusions', { cache: 'no-store' })
+      .then((r) => r.json())
+      .then((data) => {
+        const arr = Array.isArray(data?.vineyards) ? (data.vineyards as unknown[]) : [];
+        const cleaned = arr.filter((x): x is string => typeof x === 'string').map((s) => s.trim()).filter(Boolean);
+        setLowMinutesExclusions(cleaned);
+      })
+      .catch(() => setLowMinutesExclusions([]));
+  }, []);
+
+  const lowMinutesExclusionSet = useMemo(
+    () => new Set(lowMinutesExclusions.map((s) => s.trim().toLowerCase()).filter(Boolean)),
+    [lowMinutesExclusions],
+  );
+  const lowMinutesDraftSet = useMemo(() => new Set(lowMinutesExclusionsDraft), [lowMinutesExclusionsDraft]);
+
+  const commitLowMinutesExclusions = useCallback(() => {
+    const next = sortVineyardNames(lowMinutesExclusionsDraftRef.current);
+    setLowMinutesExclusions(next);
+    setLowMinutesExclusionsOpen(false);
+    fetch('/api/summary/low-minutes-exclusions', {
+      method: 'PUT',
+      cache: 'no-store',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ vineyards: next }),
+    }).catch(() => {});
+  }, []);
+
+  const lowMinutesValuesForRow = useCallback(
+    (row: Row): number[] => {
+      if (lowMinutesExclusionSet.size === 0) return jobRowMinuteValues(row);
+      const v = String(row.vineyard_name ?? '').trim().toLowerCase();
+      if (v && lowMinutesExclusionSet.has(v)) return [];
+      return jobRowMinuteValues(row);
+    },
+    [lowMinutesExclusionSet],
+  );
+
+  useEffect(() => {
+    const type = SUMMARY_COLUMN_COLOR_SETTINGS_TYPE;
+    const keys = Object.keys(SUMMARY_COLUMN_COLOR_SETTING_NAMES) as SummaryColumnColorKey[];
+    Promise.all(
+      keys.map((k) =>
+        fetch(
+          `/api/settings?${new URLSearchParams({ type, name: SUMMARY_COLUMN_COLOR_SETTING_NAMES[k] })}`,
+          { cache: 'no-store' },
+        )
+          .then((r) => r.json())
+          .then((data) => ({ k, v: String(data?.settingvalue ?? '').trim() }))
+          .catch(() => ({ k, v: '' })),
+      ),
+    ).then((pairs) => {
+      setSummaryColumnColors((prev) => {
+        const next = { ...prev };
+        for (const p of pairs) next[p.k] = p.v;
+        return next;
+      });
+    });
+  }, []);
+
+  const bgFor = useCallback(
+    (k: SummaryColumnColorKey): React.CSSProperties | undefined => {
+      const v = (summaryColumnColors[k] ?? '').trim();
+      if (!v) return undefined;
+      return { backgroundColor: v };
+    },
+    [summaryColumnColors],
+  );
 
   return (
     <div className="w-full min-w-0 p-6">
       <div className="mb-4">
         <h1 className="text-2xl font-semibold text-zinc-900 dark:text-zinc-100">Summary</h1>
       </div>
-      {loading && <p className="text-zinc-600 dark:text-zinc-400">Loading…</p>}
       {error && (
         <div className="rounded bg-red-100 p-3 text-red-800 dark:bg-red-900/30 dark:text-red-200">
           <p className="font-medium">{error}</p>
         </div>
       )}
-      {!loading && !error && (
+      {!error && (
         <>
-          <div className="mb-4 flex flex-wrap items-end gap-4 rounded-lg border border-zinc-200 bg-white p-3 dark:border-zinc-700 dark:bg-zinc-900">
-            <div>
-              <label className="mb-1 block text-xs font-medium text-zinc-500">Customer</label>
-              <div
-                title="Set in sidebar (Client view)"
-                className="rounded border border-zinc-200 bg-zinc-50 px-2 py-1.5 text-sm text-zinc-700 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-300"
-              >
-                {clientCustomer || '— All —'}
+          <div className="mb-3 rounded-lg border border-zinc-200 bg-white p-2 dark:border-zinc-700 dark:bg-zinc-900">
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+              <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">Filters & sorting</h2>
+
+              <div className="flex flex-1 flex-wrap items-center justify-start gap-x-3 gap-y-2">
+                <div className="grid grid-cols-[5rem_1fr] items-center gap-1.5">
+                  <label className="text-[11px] font-medium text-zinc-500">Customer</label>
+                  <div
+                    title="Set in sidebar (Client view)"
+                    className="rounded border border-zinc-200 bg-zinc-50 px-2 py-0.5 text-[11px] text-zinc-700 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-300"
+                  >
+                    {clientCustomer || '— All —'}
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-[5rem_1fr] items-center gap-1.5">
+                  <label className="text-[11px] font-medium text-zinc-500">Template</label>
+                  <select
+                    value={filterTemplate}
+                    onChange={(e) => setFilterTemplate(e.target.value)}
+                    disabled={!effectiveCustomer.trim()}
+                    className="w-full rounded border border-zinc-300 bg-white px-2 py-0.5 text-[11px] disabled:cursor-not-allowed disabled:opacity-70 dark:border-zinc-600 dark:bg-zinc-800"
+                  >
+                    <option value="">— Select template —</option>
+                    {distinctTemplates.map((t) => (
+                      <option key={t} value={t}>{t}</option>
+                    ))}
+                  </select>
+                </div>
+
+                <label className="flex cursor-pointer items-center gap-2 text-xs text-zinc-600 dark:text-zinc-400">
+                  <input
+                    type="checkbox"
+                    checked={headerOpen}
+                    onChange={(e) => setHeaderOpenAndPersist(e.target.checked)}
+                    className="rounded border-zinc-300"
+                  />
+                  Show all filters
+                </label>
               </div>
             </div>
-            <div>
-              <label className="mb-1 block text-xs font-medium text-zinc-500">Template</label>
-              <select
-                value={filterTemplate}
-                onChange={(e) => setFilterTemplate(e.target.value)}
-                disabled={!effectiveCustomer.trim()}
-                className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm disabled:cursor-not-allowed disabled:opacity-70 dark:border-zinc-600 dark:bg-zinc-800"
-              >
-                <option value="">— All —</option>
-                {distinctTemplates.map((t) => (
-                  <option key={t} value={t}>{t}</option>
-                ))}
-              </select>
+
+            {headerOpen && (
+            <div className="grid gap-3 xl:grid-cols-4">
+              {/* Filters: 3 columns, 4 rows each (label + value). */}
+              <div className="grid gap-3 md:grid-cols-3 xl:col-span-3">
+                <div className="flex min-w-0 flex-col gap-2">
+                  <div>
+                    <div className="grid grid-cols-[5rem_1fr] items-center gap-1.5">
+                      <label className="text-[11px] font-medium text-zinc-500">Winery</label>
+                      <select
+                        value={filterWinery}
+                        onChange={(e) => setFilterWinery(e.target.value)}
+                        disabled={!canLoadJobs}
+                        className="w-full rounded border border-zinc-300 bg-white px-2 py-0.5 text-[11px] disabled:cursor-not-allowed disabled:opacity-70 dark:border-zinc-600 dark:bg-zinc-800"
+                      >
+                        <option value="">— All —</option>
+                        {distinctWineries.map((w) => (
+                          <option key={w} value={w}>{w}</option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+                  <div>
+                    <div className="grid grid-cols-[5rem_1fr] items-center gap-1.5">
+                      <label className="text-[11px] font-medium text-zinc-500">V group</label>
+                      <select
+                        value={filterVineyardGroup}
+                        onChange={(e) => setFilterVineyardGroup(e.target.value)}
+                        disabled={!canLoadJobs}
+                        className="w-full rounded border border-zinc-300 bg-white px-2 py-0.5 text-[11px] disabled:cursor-not-allowed disabled:opacity-70 dark:border-zinc-600 dark:bg-zinc-800"
+                      >
+                        <option value="">— All —</option>
+                        {distinctVineyardGroups.map((g) => (
+                          <option key={g} value={g}>{g}</option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="flex min-w-0 flex-col gap-2">
+                  <div className="relative min-w-0" ref={vineyardPickerAnchorRef}>
+                    <div className="grid grid-cols-[5rem_1fr] items-center gap-1.5">
+                      <label className="text-[11px] font-medium text-zinc-500">Vineyard</label>
+                      <button
+                        type="button"
+                        disabled={!canLoadJobs}
+                        onClick={() => {
+                          if (vineyardPickerOpen) {
+                            commitVineyardPicker();
+                          } else {
+                            setVineyardPickerDraft(sortVineyardNames(filterVineyards));
+                            setVineyardPickerOpen(true);
+                          }
+                        }}
+                        className="flex w-full min-w-0 items-center justify-between gap-2 rounded border border-zinc-300 bg-white px-2 py-0.5 text-left text-[11px] disabled:cursor-not-allowed disabled:opacity-70 dark:border-zinc-600 dark:bg-zinc-800"
+                        title={
+                          filterVineyards.length === 0
+                            ? 'All vineyards'
+                            : filterVineyards.length <= 3
+                              ? filterVineyards.join(', ')
+                              : `${filterVineyards.length} selected`
+                        }
+                      >
+                        <span className="min-w-0 truncate">
+                          {filterVineyards.length === 0
+                            ? '— All —'
+                            : filterVineyards.length <= 2
+                              ? filterVineyards.join(', ')
+                              : `${filterVineyards.length} selected`}
+                        </span>
+                        <span className="shrink-0 text-zinc-400" aria-hidden>
+                          ▾
+                        </span>
+                      </button>
+                    </div>
+                  </div>
+
+                  <div>
+                    <div className="grid grid-cols-[5rem_1fr] items-center gap-1.5">
+                      <label className="text-[11px] font-medium text-zinc-500">Start From</label>
+                      <input
+                        type="date"
+                        value={filterActualFrom}
+                        onChange={(e) => setFilterActualFrom(e.target.value)}
+                        disabled={!canLoadJobs}
+                        className="w-full rounded border border-zinc-300 bg-white px-2 py-0.5 text-[11px] disabled:cursor-not-allowed disabled:opacity-70 dark:border-zinc-600 dark:bg-zinc-800"
+                      />
+                    </div>
+                  </div>
+                  <div>
+                    <div className="grid grid-cols-[5rem_1fr] items-center gap-1.5">
+                      <label className="text-[11px] font-medium text-zinc-500">Start To</label>
+                      <input
+                        type="date"
+                        value={filterActualTo}
+                        onChange={(e) => setFilterActualTo(e.target.value)}
+                        disabled={!canLoadJobs}
+                        className="w-full rounded border border-zinc-300 bg-white px-2 py-0.5 text-[11px] disabled:cursor-not-allowed disabled:opacity-70 dark:border-zinc-600 dark:bg-zinc-800"
+                      />
+                    </div>
+                  </div>
+                  <div>
+                    <div className="grid grid-cols-[5rem_1fr] items-center gap-1.5">
+                      <label className="text-[11px] font-medium text-zinc-500">Month</label>
+                      <select
+                        value={actualStartMonthQuickPickValue}
+                        onChange={(e) => {
+                          const v = e.target.value;
+                          if (!v) {
+                            setFilterActualFrom('');
+                            setFilterActualTo('');
+                            return;
+                          }
+                          const [ys, ms] = v.split('-');
+                          const y = Number(ys);
+                          const mo = Number(ms);
+                          setFilterActualFrom(firstDayOfMonthYmd(y, mo));
+                          setFilterActualTo(lastDayOfMonthYmd(y, mo));
+                        }}
+                        disabled={!canLoadJobs || actualStartMonthOptions.length === 0}
+                        className="w-full rounded border border-zinc-300 bg-white px-2 py-0.5 text-[11px] disabled:cursor-not-allowed disabled:opacity-70 dark:border-zinc-600 dark:bg-zinc-800"
+                        title="Months from all loaded jobs for this customer and template (not narrowed by other filters). Sets from/to to first and last day of the month."
+                      >
+                        <option value="">— Dates: manual —</option>
+                        {actualStartMonthOptions.map((opt) => (
+                          <option key={opt.key} value={opt.key}>
+                            {opt.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="flex min-w-0 flex-col gap-2">
+                  <div>
+                    <div className="grid grid-cols-[5rem_1fr] items-center gap-1.5">
+                      <label className="text-[11px] font-medium text-zinc-500">Truck</label>
+                      <select
+                        value={filterTruckId}
+                        onChange={(e) => setFilterTruckId(e.target.value)}
+                        disabled={!canLoadJobs}
+                        className="w-full rounded border border-zinc-300 bg-white px-2 py-0.5 text-[11px] disabled:cursor-not-allowed disabled:opacity-70 dark:border-zinc-600 dark:bg-zinc-800"
+                      >
+                        <option value="">— All —</option>
+                        {distinctTruckIds.map((id) => (
+                          <option key={id} value={id}>{id}</option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+                  <div>
+                    <div className="grid grid-cols-[5rem_1fr] items-center gap-1.5">
+                      <label className="text-[11px] font-medium text-zinc-500">Worker</label>
+                      <select
+                        value={filterWorker}
+                        onChange={(e) => setFilterWorker(e.target.value)}
+                        disabled={!canLoadJobs}
+                        className="w-full rounded border border-zinc-300 bg-white px-2 py-0.5 text-[11px] disabled:cursor-not-allowed disabled:opacity-70 dark:border-zinc-600 dark:bg-zinc-800"
+                        title="Workers appearing in jobs for this customer and template (list does not shrink when you filter by date, winery, etc.)"
+                      >
+                        <option value="">— All —</option>
+                        {distinctWorkers.map((w) => (
+                          <option key={w} value={w}>{w}</option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+                  <div>
+                    <div className="grid grid-cols-[5rem_1fr] items-center gap-1.5">
+                      <label className="text-[11px] font-medium text-zinc-500">TT</label>
+                      <select
+                        value={filterTrailermode}
+                        onChange={(e) => setFilterTrailermode(e.target.value)}
+                        disabled={!canLoadJobs}
+                        className="w-full rounded border border-zinc-300 bg-white px-2 py-0.5 text-[11px] disabled:cursor-not-allowed disabled:opacity-70 dark:border-zinc-600 dark:bg-zinc-800"
+                        title="Filter by trailermode (T = truck only, T_T = truck + trailer)"
+                      >
+                        <option value="">— All —</option>
+                        {distinctTrailermodes.map((t) => (
+                          <option key={t} value={t}>{t}</option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Sorting: 4th column, 3 rows + separate save frame. */}
+              <div className="rounded-md border border-zinc-200 bg-zinc-50 p-2 shadow-sm dark:border-zinc-700 dark:bg-zinc-900/70">
+                <div className="mb-1 flex items-center justify-between gap-2 border-b border-zinc-200 pb-0.5 dark:border-zinc-700">
+                  <div className="text-xs font-semibold uppercase tracking-wide text-zinc-600 dark:text-zinc-400">
+                    Sorting
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => saveSortColumns(sortColumns)}
+                    disabled={sortSaveStatus === 'saving'}
+                    className="rounded border border-zinc-300 bg-white px-2 py-0.5 text-[11px] font-medium text-zinc-700 hover:bg-zinc-50 disabled:opacity-70 dark:border-zinc-600 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800"
+                    title="Save sort config"
+                  >
+                    {sortSaveStatus === 'saving'
+                      ? 'Saving…'
+                      : sortSaveStatus === 'saved'
+                        ? 'Saved ✓'
+                        : sortSaveStatus === 'error'
+                          ? 'Save failed'
+                          : 'Save'}
+                  </button>
+                </div>
+                <div className="grid gap-2">
+                  <div>
+                    <div className="grid grid-cols-[3.75rem_1fr] items-center gap-1.5">
+                      <label className="text-[11px] font-medium text-zinc-500">Sort 1</label>
+                      <select
+                        value={sortColumns[0]}
+                        onChange={(e) => setSortColumn(0, e.target.value)}
+                        disabled={!canLoadJobs}
+                        className="w-full rounded border border-zinc-300 bg-white px-2 py-0.5 text-[11px] disabled:cursor-not-allowed disabled:opacity-70 dark:border-zinc-600 dark:bg-zinc-800"
+                      >
+                        <option value="">— None —</option>
+                        {sortableKeys.map((k) => (
+                          <option key={k} value={k}>{allColumns.find((c) => c.key === k)?.label ?? k}</option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+                  <div>
+                    <div className="grid grid-cols-[3.75rem_1fr] items-center gap-1.5">
+                      <label className="text-[11px] font-medium text-zinc-500">Sort 2</label>
+                      <select
+                        value={sortColumns[1]}
+                        onChange={(e) => setSortColumn(1, e.target.value)}
+                        disabled={!canLoadJobs}
+                        className="w-full rounded border border-zinc-300 bg-white px-2 py-0.5 text-[11px] disabled:cursor-not-allowed disabled:opacity-70 dark:border-zinc-600 dark:bg-zinc-800"
+                      >
+                        <option value="">— None —</option>
+                        {sortableKeys.map((k) => (
+                          <option key={k} value={k}>{allColumns.find((c) => c.key === k)?.label ?? k}</option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+                  <div>
+                    <div className="grid grid-cols-[3.75rem_1fr] items-center gap-1.5">
+                      <label className="text-[11px] font-medium text-zinc-500">Sort 3</label>
+                      <select
+                        value={sortColumns[2]}
+                        onChange={(e) => setSortColumn(2, e.target.value)}
+                        disabled={!canLoadJobs}
+                        className="w-full rounded border border-zinc-300 bg-white px-2 py-0.5 text-[11px] disabled:cursor-not-allowed disabled:opacity-70 dark:border-zinc-600 dark:bg-zinc-800"
+                      >
+                        <option value="">— None —</option>
+                        {sortableKeys.map((k) => (
+                          <option key={k} value={k}>{allColumns.find((c) => c.key === k)?.label ?? k}</option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+                </div>
+              </div>
             </div>
-            <div>
-              <label className="mb-1 block text-xs font-medium text-zinc-500">Winery</label>
-              <select
-                value={filterWinery}
-                onChange={(e) => setFilterWinery(e.target.value)}
-                disabled={!effectiveCustomer.trim()}
-                className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm disabled:cursor-not-allowed disabled:opacity-70 dark:border-zinc-600 dark:bg-zinc-800"
-              >
-                <option value="">— All —</option>
-                {distinctWineries.map((w) => (
-                  <option key={w} value={w}>{w}</option>
-                ))}
-              </select>
-            </div>
-            <div>
-              <label className="mb-1 block text-xs font-medium text-zinc-500">Vineyard group</label>
-              <select
-                value={filterVineyardGroup}
-                onChange={(e) => setFilterVineyardGroup(e.target.value)}
-                disabled={!effectiveCustomer.trim()}
-                className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm disabled:cursor-not-allowed disabled:opacity-70 dark:border-zinc-600 dark:bg-zinc-800"
-              >
-                <option value="">— All —</option>
-                {distinctVineyardGroups.map((g) => (
-                  <option key={g} value={g}>{g}</option>
-                ))}
-              </select>
-            </div>
-            <div className="relative min-w-[11rem]" ref={vineyardPickerAnchorRef}>
-              <label className="mb-1 block text-xs font-medium text-zinc-500">Vineyard</label>
-              <button
-                type="button"
-                disabled={!effectiveCustomer.trim()}
-                onClick={() => {
-                  if (vineyardPickerOpen) {
-                    commitVineyardPicker();
-                  } else {
-                    setVineyardPickerDraft(sortVineyardNames(filterVineyards));
-                    setVineyardPickerOpen(true);
-                  }
-                }}
-                className="flex w-full min-w-0 items-center justify-between gap-2 rounded border border-zinc-300 bg-white px-2 py-1.5 text-left text-sm disabled:cursor-not-allowed disabled:opacity-70 dark:border-zinc-600 dark:bg-zinc-800"
-                title={
-                  filterVineyards.length === 0
-                    ? 'All vineyards'
-                    : filterVineyards.length <= 3
-                      ? filterVineyards.join(', ')
-                      : `${filterVineyards.length} selected`
-                }
-              >
-                <span className="min-w-0 truncate">
-                  {filterVineyards.length === 0
-                    ? '— All —'
-                    : filterVineyards.length <= 2
-                      ? filterVineyards.join(', ')
-                      : `${filterVineyards.length} selected`}
-                </span>
-                <span className="shrink-0 text-zinc-400" aria-hidden>
-                  ▾
-                </span>
-              </button>
-            </div>
+            )}
+          </div>
             {vineyardPickerOpen &&
               effectiveCustomer.trim() &&
               typeof document !== 'undefined' &&
@@ -1934,173 +3023,223 @@ function SummaryPageInner() {
                 </div>,
                 document.body,
               )}
-            <div>
-              <label className="mb-1 block text-xs font-medium text-zinc-500">Actual start from</label>
-              <input
-                type="date"
-                value={filterActualFrom}
-                onChange={(e) => setFilterActualFrom(e.target.value)}
-                className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800"
-              />
-            </div>
-            <div>
-              <label className="mb-1 block text-xs font-medium text-zinc-500">Actual start to</label>
-              <input
-                type="date"
-                value={filterActualTo}
-                onChange={(e) => setFilterActualTo(e.target.value)}
-                className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800"
-              />
-            </div>
-            <div>
-              <label className="mb-1 block text-xs font-medium text-zinc-500">Truck</label>
-              <select
-                value={filterTruckId}
-                onChange={(e) => setFilterTruckId(e.target.value)}
-                className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800"
-              >
-                <option value="">— All —</option>
-                {distinctTruckIds.map((id) => (
-                  <option key={id} value={id}>{id}</option>
-                ))}
-              </select>
-            </div>
-            <div>
-              <label className="mb-1 block text-xs font-medium text-zinc-500">Worker</label>
-              <select
-                value={filterWorker}
-                onChange={(e) => setFilterWorker(e.target.value)}
-                className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800"
-                title="Distinct workers in current result set (Customer, Template, Winery, Vineyard, Truck, Date)"
-              >
-                <option value="">— All —</option>
-                {distinctWorkers.map((w) => (
-                  <option key={w} value={w}>{w}</option>
-                ))}
-              </select>
-            </div>
-            <div>
-              <label className="mb-1 block text-xs font-medium text-zinc-500">TT</label>
-              <select
-                value={filterTrailermode}
-                onChange={(e) => setFilterTrailermode(e.target.value)}
-                className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800"
-                title="Filter by trailermode (T = truck only, T_T = truck + trailer)"
-              >
-                <option value="">— All —</option>
-                {distinctTrailermodes.map((t) => (
-                  <option key={t} value={t}>{t}</option>
-                ))}
-              </select>
-            </div>
-            <div>
-              <label className="mb-1 block text-xs font-medium text-zinc-500">Sort 1</label>
-              <select
-                value={sortColumns[0]}
-                onChange={(e) => setSortColumn(0, e.target.value)}
-                className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800"
-              >
-                <option value="">— None —</option>
-                {sortableKeys.map((k) => (
-                  <option key={k} value={k}>{allColumns.find((c) => c.key === k)?.label ?? k}</option>
-                ))}
-              </select>
-            </div>
-            <div>
-              <label className="mb-1 block text-xs font-medium text-zinc-500">Sort 2</label>
-              <select
-                value={sortColumns[1]}
-                onChange={(e) => setSortColumn(1, e.target.value)}
-                className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800"
-              >
-                <option value="">— None —</option>
-                {sortableKeys.map((k) => (
-                  <option key={k} value={k}>{allColumns.find((c) => c.key === k)?.label ?? k}</option>
-                ))}
-              </select>
-            </div>
-            <div>
-              <label className="mb-1 block text-xs font-medium text-zinc-500">Sort 3</label>
-              <select
-                value={sortColumns[2]}
-                onChange={(e) => setSortColumn(2, e.target.value)}
-                className="rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800"
-              >
-                <option value="">— None —</option>
-                {sortableKeys.map((k) => (
-                  <option key={k} value={k}>{allColumns.find((c) => c.key === k)?.label ?? k}</option>
-                ))}
-              </select>
-            </div>
-            <div>
-              <label className="mb-1 block text-xs font-medium text-zinc-500 invisible">Save</label>
-              <button
-                type="button"
-                onClick={() => saveSortColumns(sortColumns)}
-                disabled={sortSaveStatus === 'saving'}
-                className="rounded bg-green-600 px-3 py-1.5 text-sm text-white hover:bg-green-700 disabled:opacity-70 dark:bg-green-700 dark:hover:bg-green-600"
-              >
-                {sortSaveStatus === 'saving' ? 'Saving…' : sortSaveStatus === 'saved' ? 'Saved ✓' : sortSaveStatus === 'error' ? 'Save failed' : 'Save sort config'}
-              </button>
-            </div>
-          </div>
-          {/* Time Limits: rows for selected customer (tbl_wineryminutes). Click a row to show its limits in the header white boxes (for info only). By Job table colours each job using limits from the row where Winery = job.delivery_winery and TT = job.trailermode (T = truck only, TT = truck + trailer). */}
+          {/* Time Limits: tbl_wineryminutes for selected customer (shown before jobs load so limits are visible while choosing template). */}
           {effectiveCustomer.trim() && (
             <div className="mb-4 rounded-lg border border-zinc-200 bg-white p-3 dark:border-zinc-700 dark:bg-zinc-900">
-              <div className="mb-2 flex items-center justify-between gap-2">
+              <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
                 <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">Time Limits</h2>
-                <label className="flex cursor-pointer items-center gap-2 text-xs text-zinc-600 dark:text-zinc-400">
-                  <input
-                    type="checkbox"
-                    checked={showLimitsTable}
-                    onChange={(e) => setShowLimitsTable(e.target.checked)}
-                    className="rounded border-zinc-300"
-                  />
-                  Show limits table
-                </label>
+                <div className="flex flex-wrap items-center justify-start gap-x-4 gap-y-1">
+                  <label className="flex items-center gap-2 text-xs text-zinc-600 dark:text-zinc-400">
+                    Low minutes highlight
+                    <input
+                      type="number"
+                      min={0}
+                      step="1"
+                      value={lowMinutesHighlight}
+                      onChange={(e) => setLowMinutesHighlight(e.target.value)}
+                      onBlur={saveLowMinutesHighlight}
+                      className="w-16 rounded border border-zinc-300 bg-white px-2 py-1 text-xs dark:border-zinc-600 dark:bg-zinc-800"
+                      title="Highlight day/job row when any mins value is below this threshold."
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => setJobsReloadNonce((n) => n + 1)}
+                    disabled={loading || !canLoadJobs}
+                    className="rounded border border-zinc-300 bg-white px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-50 disabled:opacity-60 dark:border-zinc-600 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800"
+                    title="Reload jobs from API (customer + template)"
+                  >
+                    Refresh
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setLowMinutesExclusionsDraft(sortVineyardNames(lowMinutesExclusions));
+                      setLowMinutesExclusionsOpen(true);
+                    }}
+                    className="rounded border border-zinc-300 bg-white px-2 py-1 text-xs text-zinc-700 hover:bg-zinc-50 dark:border-zinc-600 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800"
+                    title="Exclude vineyards from low-minutes highlighting"
+                  >
+                    Exclusions… ({lowMinutesExclusions.length})
+                  </button>
+                  <label className="flex cursor-pointer items-center gap-2 text-xs text-zinc-600 dark:text-zinc-400">
+                    <input
+                      type="checkbox"
+                      checked={showLimitsTable}
+                      onChange={(e) => setShowLimitsTable(e.target.checked)}
+                      className="rounded border-zinc-300"
+                    />
+                    Show limits table
+                  </label>
+                </div>
               </div>
+              {lowMinutesExclusionsOpen &&
+                typeof document !== 'undefined' &&
+                createPortal(
+                  <div
+                    className="fixed left-1/2 top-1/2 z-[110] flex h-[60vh] w-[60vw] max-h-[60vh] max-w-[60vw] min-w-0 -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-lg border border-zinc-200 bg-white shadow-2xl dark:border-zinc-600 dark:bg-zinc-900"
+                    role="dialog"
+                    aria-label="Low minutes highlight exclusions"
+                  >
+                    <div className="flex shrink-0 items-center justify-between gap-3 border-b border-zinc-200 px-4 py-3 dark:border-zinc-700">
+                      <div>
+                        <div className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Low minutes highlight exclusions</div>
+                        <div className="text-xs text-zinc-500 dark:text-zinc-400">
+                          Selected vineyards will be excluded from low-minutes highlighting (use for very close vineyards).
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          className="rounded border border-zinc-300 px-3 py-1 text-sm hover:bg-zinc-100 dark:border-zinc-600 dark:hover:bg-zinc-800"
+                          onClick={() => setLowMinutesExclusionsDraft([])}
+                        >
+                          Clear all
+                        </button>
+                        <button
+                          type="button"
+                          className="rounded bg-blue-600 px-3 py-1 text-sm font-medium text-white hover:bg-blue-700 dark:bg-blue-700 dark:hover:bg-blue-600"
+                          onClick={commitLowMinutesExclusions}
+                        >
+                          Save
+                        </button>
+                        <button
+                          type="button"
+                          className="rounded border border-zinc-300 px-3 py-1 text-sm hover:bg-zinc-100 dark:border-zinc-600 dark:hover:bg-zinc-800"
+                          onClick={() => setLowMinutesExclusionsOpen(false)}
+                        >
+                          Close
+                        </button>
+                      </div>
+                    </div>
+                    <div className="min-h-0 flex-1 overflow-y-auto p-4">
+                      <div className="mb-2 text-xs text-zinc-500 dark:text-zinc-400">
+                        {lowMinutesExclusionsDraft.length} selected
+                      </div>
+                      <div className="grid grid-cols-3 gap-x-8 gap-y-2 text-sm">
+                        {vineyardOptionsAll.map((v) => (
+                          <label
+                            key={v}
+                            className="flex cursor-pointer items-center gap-2 rounded px-1 py-1 hover:bg-zinc-50 dark:hover:bg-zinc-800"
+                          >
+                            <input
+                              type="checkbox"
+                              className="shrink-0"
+                              checked={lowMinutesDraftSet.has(v)}
+                              onChange={() => {
+                                setLowMinutesExclusionsDraft((prev) => {
+                                  const next = new Set(prev);
+                                  if (next.has(v)) next.delete(v);
+                                  else next.add(v);
+                                  return sortVineyardNames(Array.from(next));
+                                });
+                              }}
+                            />
+                            <span className="min-w-0 whitespace-nowrap" title={v}>
+                              {v}
+                            </span>
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+                  </div>,
+                  document.body,
+                )}
               {showLimitsTable && timeLimitRows.length === 0 ? (
                 <p className="text-sm text-zinc-500 dark:text-zinc-400">No time limit rows for this customer.</p>
               ) : showLimitsTable && timeLimitRows.length > 0 ? (
                 <>
-                  <p className="mb-2 text-xs text-zinc-500 dark:text-zinc-400">Click a row to show its limits in the header boxes (for reference). Each job uses the row where Winery = delivery_winery, Vineyard group = vineyard_group, and TT = trailermode (T / TT). Columns align with By Job table.</p>
-                  <div className="overflow-x-auto">
-                    <table className="w-full min-w-[64rem] text-left text-sm">
-                      <thead>
-                        <tr className="border-b border-zinc-200 dark:border-zinc-700">
-                          <th className="border-r border-zinc-200 px-2 py-1.5 font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-400">Template</th>
-                          <th className="border-r border-zinc-200 px-2 py-1.5 dark:border-zinc-700" />
-                          <th className="border-r border-zinc-200 px-2 py-1.5 dark:border-zinc-700" />
-                          <th className="border-r border-zinc-200 px-2 py-1.5 font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-400">TT</th>
-                          <th className="border-r border-zinc-200 px-2 py-1.5 font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-400">Winery</th>
-                          <th className="border-r border-zinc-200 px-2 py-1.5 font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-400">Vineyard group</th>
-                          <th className="border-r border-zinc-200 px-2 py-1.5 dark:border-zinc-700" />
-                          <th colSpan={2} className="border-r border-zinc-200 px-2 py-1.5 dark:border-zinc-700" />
-                          <th className={`border-r border-zinc-200 px-2 py-1.5 font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[2]}`}>To Vine</th>
-                          <th colSpan={2} className={`border-r border-zinc-200 dark:border-zinc-700 ${STEP_GROUP_BG[2]}`} />
-                          <th className={`border-r border-zinc-200 px-2 py-1.5 font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[3]}`}>In Vine</th>
-                          <th colSpan={2} className={`border-r border-zinc-200 dark:border-zinc-700 ${STEP_GROUP_BG[3]}`} />
-                          <th className={`border-r border-zinc-200 px-2 py-1.5 font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[4]}`}>To Wine</th>
-                          <th colSpan={2} className={`border-r border-zinc-200 dark:border-zinc-700 ${STEP_GROUP_BG[4]}`} />
-                          <th className={`border-r border-zinc-200 px-2 py-1.5 font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[5]}`}>In Wine</th>
-                          <th colSpan={2} className={`border-r border-zinc-200 dark:border-zinc-700 ${STEP_GROUP_BG[5]}`} />
-                          <th className="border-r border-zinc-200 px-2 py-1.5 font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-400">Travel_</th>
-                          <th className={`border-r border-zinc-200 px-2 py-1.5 font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[3]}`}>In Vineyard</th>
-                          <th className={`border-r border-zinc-200 px-2 py-1.5 font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[5]}`}>In Winery</th>
-                          <th className="px-2 py-1.5 font-medium text-zinc-600 dark:text-zinc-400">Total</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {timeLimitRowsForTable.map((r) => {
-                          const travelVal = timeLimitRowTravelVal(r);
-                          const isSelected = selectedTimeLimitRowId === r.id;
-                          const emptyCell = (k: string) => <td key={k} className="border-r border-zinc-200 px-2 py-1.5 dark:border-zinc-700">&nbsp;</td>;
-                          return (
-                            <tr
-                              key={r.id}
-                              role="button"
-                              tabIndex={0}
-                              onClick={() => {
+                  <p className="mb-2 text-xs text-zinc-500 dark:text-zinc-400">
+                    {viewMode === 'client'
+                      ? 'Click a row to show its limits in the header boxes. Travel limits = to vineyard + to winery. Jobs | Actual | Limit: stats combine all jobs mapped to this row or any hidden duplicate limit row (same customer/template/winery/group and same limit minutes; e.g. T + TT). Actual uses Season Summary Av math; excluded=1 omitted. Duplicate rows are shown once in the table.'
+                      : 'Click a row to show its limits in the header boxes. Jobs | Actual | Limit for every metric: Actual matches Season Summary Av math for jobs mapped to this limit row (Customer, Template, Winery, vineyard group, TT; excluded=1 omitted from rollups).'}
+                  </p>
+                  <div
+                    className={
+                      alignClientTimeLimitsToSeasonAv
+                        ? 'overflow-x-auto -mx-3'
+                        : 'overflow-x-auto'
+                    }
+                  >
+                    {viewMode === 'client' ? (
+                      alignClientTimeLimitsToSeasonAv ? (
+                        <table className="w-full min-w-0 table-fixed text-left text-xs">
+                          <SeasonClientSplitColgroupLimits />
+                          <thead className={SUMMARY_THEAD_TH_ALIGNMENT}>
+                            <tr className="border-b border-zinc-200 dark:border-zinc-700">
+                              <th
+                                rowSpan={2}
+                                className="min-w-[9rem] border-r border-zinc-200 px-2 py-1.5 font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-400"
+                              >
+                                Winery
+                              </th>
+                              <th
+                                rowSpan={2}
+                                colSpan={5}
+                                className="border-r border-zinc-200 px-2 py-1.5 font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-400"
+                              >
+                                Vineyard group
+                              </th>
+                              <th
+                                style={bgFor('travel')}
+                                colSpan={3}
+                                className="border-r border-zinc-200 px-2 py-1.5 text-center text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100"
+                              >
+                                Travel
+                              </th>
+                              <th
+                                style={bgFor('inVineyard')}
+                                colSpan={3}
+                                className={`border-r border-zinc-200 px-2 py-1.5 text-center text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[3]}`}
+                              >
+                                In Vineyard
+                              </th>
+                              <th
+                                style={bgFor('inWinery')}
+                                colSpan={3}
+                                className={`border-r border-zinc-200 px-2 py-1.5 text-center text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[5]}`}
+                              >
+                                In Winery
+                              </th>
+                              <th
+                                style={bgFor('total')}
+                                colSpan={3}
+                                className="border-zinc-200 px-2 py-1.5 text-center text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100"
+                              >
+                                Total
+                              </th>
+                            </tr>
+                            <tr className="border-b border-zinc-200 dark:border-zinc-700">
+                              {(['travel', 'in_vineyard', 'in_winery', 'total'] as const).map((step) => {
+                                const groupBg =
+                                  step === 'in_vineyard' ? STEP_GROUP_BG[3] : step === 'in_winery' ? STEP_GROUP_BG[5] : '';
+                                const colorKey =
+                                  step === 'travel'
+                                    ? 'travel'
+                                    : step === 'in_vineyard'
+                                      ? 'inVineyard'
+                                      : step === 'in_winery'
+                                        ? 'inWinery'
+                                        : 'total';
+                                return (['Jobs', 'Actual', 'Limit'] as const).map((sub) => (
+                                  <th
+                                    key={`${step}-${sub}`}
+                                    style={bgFor(colorKey)}
+                                    className={`whitespace-nowrap border-r border-zinc-200 bg-white px-2 py-1 text-center text-xs font-medium text-zinc-500 dark:border-zinc-700 dark:bg-zinc-900 ${groupBg} ${step === 'total' && sub === 'Limit' ? 'border-r-0' : ''}`}
+                                  >
+                                    {sub}
+                                  </th>
+                                ));
+                              })}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {timeLimitRowsForTable.map((r) => {
+                              const travelVal = timeLimitRowTravelVal(r);
+                              const isSelected = selectedTimeLimitRowId === r.id;
+                              const wineryBg = wineryLimitRowBgClass(r.Winery);
+                              const stats = timeLimitRowActualById.get(r.id)?.metrics;
+                              const onPick = () => {
                                 setSelectedTimeLimitRowId(r.id);
                                 const toV = r.ToVineMins != null ? String(r.ToVineMins) : '';
                                 const inV = r.InVineMins != null ? String(r.InVineMins) : '';
@@ -2109,52 +3248,516 @@ function SummaryPageInner() {
                                 const travelStr = travelVal != null ? String(travelVal) : '';
                                 const totalStr = r.TotalMins != null ? String(r.TotalMins) : '';
                                 setMinsThresholds({
-                                  '2': toV, '3': inV, '4': toW, '5': inW,
-                                  travel: travelStr, in_vineyard: inV, in_winery: inW, total: totalStr,
+                                  '2': toV,
+                                  '3': inV,
+                                  '4': toW,
+                                  '5': inW,
+                                  travel: travelStr,
+                                  in_vineyard: inV,
+                                  in_winery: inW,
+                                  total: totalStr,
                                 });
-                              }}
-                              onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); (e.target as HTMLTableRowElement).click(); } }}
-                              className={`border-b border-zinc-100 dark:border-zinc-800 cursor-pointer ${isSelected ? 'bg-sky-100 dark:bg-sky-900/40' : 'hover:bg-zinc-100 dark:hover:bg-zinc-800/50'}`}
-                            >
-                              <td className="border-r border-zinc-200 px-2 py-1.5 text-zinc-700 dark:border-zinc-700 dark:text-zinc-300">{formatCell(r.Template)}</td>
-                              {emptyCell(`${r.id}-e1`)}
-                              {emptyCell(`${r.id}-e2`)}
-                              <td className="border-r border-zinc-200 px-2 py-1.5 text-zinc-700 dark:border-zinc-700 dark:text-zinc-300">{formatCell(r.TT)}</td>
-                              <td className="border-r border-zinc-200 px-2 py-1.5 text-zinc-700 dark:border-zinc-700 dark:text-zinc-300">{formatCell(r.Winery)}</td>
-                              <td className="border-r border-zinc-200 px-2 py-1.5 text-zinc-700 dark:border-zinc-700 dark:text-zinc-300">{formatCell(r.vineyardgroup)}</td>
-                              {emptyCell(`${r.id}-e5`)}
-                              <td colSpan={2} className="border-r border-zinc-200 px-2 py-1.5 dark:border-zinc-700">&nbsp;</td>
-                              <td className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[2]}`}>{r.ToVineMins != null ? formatIntNz(Number(r.ToVineMins)) : '—'}</td>
-                              <td colSpan={2} className={`border-r border-zinc-200 px-2 py-1.5 dark:border-zinc-700 ${STEP_GROUP_BG[2]}`}>&nbsp;</td>
-                              <td className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[3]}`}>{r.InVineMins != null ? formatIntNz(Number(r.InVineMins)) : '—'}</td>
-                              <td colSpan={2} className={`border-r border-zinc-200 px-2 py-1.5 dark:border-zinc-700 ${STEP_GROUP_BG[3]}`}>&nbsp;</td>
-                              <td className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[4]}`}>{r.ToWineMins != null ? formatIntNz(Number(r.ToWineMins)) : '—'}</td>
-                              <td colSpan={2} className={`border-r border-zinc-200 px-2 py-1.5 dark:border-zinc-700 ${STEP_GROUP_BG[4]}`}>&nbsp;</td>
-                              <td className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[5]}`}>{r.InWineMins != null ? formatIntNz(Number(r.InWineMins)) : '—'}</td>
-                              <td colSpan={2} className={`border-r border-zinc-200 px-2 py-1.5 dark:border-zinc-700 ${STEP_GROUP_BG[5]}`}>&nbsp;</td>
-                              <td className="border-r border-zinc-200 px-2 py-1.5 tabular-nums text-zinc-600 dark:border-zinc-700 dark:text-zinc-400">{travelVal != null ? formatIntNz(Number(travelVal)) : '—'}</td>
-                              <td className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[3]}`}>{r.InVineMins != null ? formatIntNz(Number(r.InVineMins)) : '—'}</td>
-                              <td className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[5]}`}>{r.InWineMins != null ? formatIntNz(Number(r.InWineMins)) : '—'}</td>
-                              <td className="px-2 py-1.5 tabular-nums font-medium text-zinc-700 dark:text-zinc-300">{r.TotalMins != null ? formatIntNz(Number(r.TotalMins)) : '—'}</td>
+                              };
+                              return (
+                                <tr
+                                  key={r.id}
+                                  role="button"
+                                  tabIndex={0}
+                                  onClick={onPick}
+                                  onKeyDown={(e) => {
+                                    if (e.key === 'Enter' || e.key === ' ') {
+                                      e.preventDefault();
+                                      onPick();
+                                    }
+                                  }}
+                                  className={`border-b border-zinc-100 dark:border-zinc-800 cursor-pointer ${wineryBg} ${isSelected ? 'ring-2 ring-inset ring-sky-500 dark:ring-sky-400' : 'hover:brightness-[0.97] dark:hover:brightness-110'}`}
+                                >
+                                  <td className="min-w-[9rem] border-r border-zinc-200 px-2 py-1.5 text-zinc-700 dark:border-zinc-700 dark:text-zinc-300">
+                                    {formatCell(r.Winery)}
+                                  </td>
+                                  <td
+                                    colSpan={5}
+                                    className="border-r border-zinc-200 px-2 py-1.5 text-zinc-700 dark:border-zinc-700 dark:text-zinc-300"
+                                  >
+                                    {formatCell(r.vineyardgroup)}
+                                  </td>
+                                  <td style={bgFor('travel')} className="border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums text-zinc-500 dark:border-zinc-700 dark:text-zinc-400">
+                                    {stats != null ? formatIntNz(stats.travel.jobs) : '0'}
+                                  </td>
+                                  <td
+                                    style={bgFor('travel')}
+                                    className={`border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums dark:border-zinc-700 ${
+                                      stats?.travel.actual != null && isOverLimitWithRow(stats.travel.actual, r, 'travel')
+                                        ? 'text-red-700 dark:text-red-300'
+                                        : 'text-zinc-600 dark:text-zinc-400'
+                                    }`}
+                                  >
+                                    {stats?.travel.actual != null ? formatIntNz(stats.travel.actual) : '—'}
+                                  </td>
+                                  <td style={bgFor('travel')} className="border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums text-zinc-600 dark:border-zinc-700 dark:text-zinc-400">
+                                    {travelVal != null ? formatIntNz(Number(travelVal)) : '—'}
+                                  </td>
+                                  <td style={bgFor('inVineyard')} className={`border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums text-zinc-500 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[3]}`}>
+                                    {stats != null ? formatIntNz(stats.inVineyard.jobs) : '0'}
+                                  </td>
+                                  <td
+                                    style={bgFor('inVineyard')}
+                                    className={`border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums dark:border-zinc-700 ${STEP_GROUP_BG[3]} ${
+                                      stats?.inVineyard.actual != null && isOverLimitWithRow(stats.inVineyard.actual, r, 'in_vineyard')
+                                        ? 'text-red-700 dark:text-red-300'
+                                        : 'text-zinc-600 dark:text-zinc-400'
+                                    }`}
+                                  >
+                                    {stats?.inVineyard.actual != null ? formatIntNz(stats.inVineyard.actual) : '—'}
+                                  </td>
+                                  <td style={bgFor('inVineyard')} className={`border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[3]}`}>
+                                    {r.InVineMins != null ? formatIntNz(Number(r.InVineMins)) : '—'}
+                                  </td>
+                                  <td style={bgFor('inWinery')} className={`border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums text-zinc-500 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[5]}`}>
+                                    {stats != null ? formatIntNz(stats.inWinery.jobs) : '0'}
+                                  </td>
+                                  <td
+                                    style={bgFor('inWinery')}
+                                    className={`border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums dark:border-zinc-700 ${STEP_GROUP_BG[5]} ${
+                                      stats?.inWinery.actual != null && isOverLimitWithRow(stats.inWinery.actual, r, 'in_winery')
+                                        ? 'text-red-700 dark:text-red-300'
+                                        : 'text-zinc-600 dark:text-zinc-400'
+                                    }`}
+                                  >
+                                    {stats?.inWinery.actual != null ? formatIntNz(stats.inWinery.actual) : '—'}
+                                  </td>
+                                  <td style={bgFor('inWinery')} className={`border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[5]}`}>
+                                    {r.InWineMins != null ? formatIntNz(Number(r.InWineMins)) : '—'}
+                                  </td>
+                                  <td style={bgFor('total')} className="border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums text-zinc-500 dark:border-zinc-700 dark:text-zinc-400">
+                                    {stats != null ? formatIntNz(stats.total.jobs) : '0'}
+                                  </td>
+                                  <td
+                                    style={bgFor('total')}
+                                    className={`border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums font-medium ${
+                                      stats?.total.actual != null && isOverLimitWithRow(stats.total.actual, r, 'total')
+                                        ? 'text-red-700 dark:text-red-300'
+                                        : 'text-zinc-700 dark:text-zinc-300'
+                                    }`}
+                                  >
+                                    {stats?.total.actual != null ? formatIntNz(stats.total.actual) : '—'}
+                                  </td>
+                                  <td style={bgFor('total')} className="px-2 py-1.5 text-right tabular-nums font-medium text-zinc-700 dark:text-zinc-300">
+                                    {r.TotalMins != null ? formatIntNz(Number(r.TotalMins)) : '—'}
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      ) : (
+                        <table className="w-full min-w-[24rem] text-left text-xs">
+                          <thead className={SUMMARY_THEAD_TH_ALIGNMENT}>
+                            <tr className="border-b border-zinc-200 dark:border-zinc-700">
+                              <th
+                                rowSpan={2}
+                                className="border-r border-zinc-200 px-2 py-1.5 font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-400"
+                              >
+                                Winery
+                              </th>
+                              <th
+                                rowSpan={2}
+                                className="border-r border-zinc-200 px-2 py-1.5 font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-400"
+                              >
+                                Vineyard group
+                              </th>
+                              <th
+                                style={bgFor('travel')}
+                                colSpan={3}
+                                className="border-r border-zinc-200 px-2 py-1.5 text-center font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-400"
+                              >
+                                Travel
+                              </th>
+                              <th
+                                style={bgFor('inVineyard')}
+                                colSpan={3}
+                                className={`border-r border-zinc-200 px-2 py-1.5 text-center font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[3]}`}
+                              >
+                                In Vineyard
+                              </th>
+                              <th
+                                style={bgFor('inWinery')}
+                                colSpan={3}
+                                className={`border-r border-zinc-200 px-2 py-1.5 text-center font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[5]}`}
+                              >
+                                In Winery
+                              </th>
+                              <th style={bgFor('total')} colSpan={3} className="px-2 py-1.5 text-center font-medium text-zinc-600 dark:text-zinc-400">
+                                Total
+                              </th>
                             </tr>
-                          );
-                        })}
-                      </tbody>
-                    </table>
+                            <tr className="border-b border-zinc-200 dark:border-zinc-700">
+                              {(['travel', 'in_vineyard', 'in_winery', 'total'] as const).map((step) => {
+                                const groupBg =
+                                  step === 'in_vineyard' ? STEP_GROUP_BG[3] : step === 'in_winery' ? STEP_GROUP_BG[5] : '';
+                                const colorKey =
+                                  step === 'travel'
+                                    ? 'travel'
+                                    : step === 'in_vineyard'
+                                      ? 'inVineyard'
+                                      : step === 'in_winery'
+                                        ? 'inWinery'
+                                        : 'total';
+                                return (['Jobs', 'Actual', 'Limit'] as const).map((sub) => (
+                                  <th
+                                    key={`${step}-${sub}`}
+                                    style={bgFor(colorKey)}
+                                    className={`whitespace-nowrap border-r border-zinc-200 bg-white px-2 py-1 text-center text-xs font-medium text-zinc-500 dark:border-zinc-700 dark:bg-zinc-900 ${groupBg} ${step === 'total' && sub === 'Limit' ? 'border-r-0' : ''}`}
+                                  >
+                                    {sub}
+                                  </th>
+                                ));
+                              })}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {timeLimitRowsForTable.map((r) => {
+                              const travelVal = timeLimitRowTravelVal(r);
+                              const isSelected = selectedTimeLimitRowId === r.id;
+                              const wineryBg = wineryLimitRowBgClass(r.Winery);
+                              const stats = timeLimitRowActualById.get(r.id)?.metrics;
+                              return (
+                                <tr
+                                  key={r.id}
+                                  role="button"
+                                  tabIndex={0}
+                                  onClick={() => {
+                                    setSelectedTimeLimitRowId(r.id);
+                                    const toV = r.ToVineMins != null ? String(r.ToVineMins) : '';
+                                    const inV = r.InVineMins != null ? String(r.InVineMins) : '';
+                                    const toW = r.ToWineMins != null ? String(r.ToWineMins) : '';
+                                    const inW = r.InWineMins != null ? String(r.InWineMins) : '';
+                                    const travelStr = travelVal != null ? String(travelVal) : '';
+                                    const totalStr = r.TotalMins != null ? String(r.TotalMins) : '';
+                                    setMinsThresholds({
+                                      '2': toV, '3': inV, '4': toW, '5': inW,
+                                      travel: travelStr, in_vineyard: inV, in_winery: inW, total: totalStr,
+                                    });
+                                  }}
+                                  onKeyDown={(e) => {
+                                    if (e.key === 'Enter' || e.key === ' ') {
+                                      e.preventDefault();
+                                      (e.target as HTMLTableRowElement).click();
+                                    }
+                                  }}
+                                  className={`border-b border-zinc-100 dark:border-zinc-800 cursor-pointer ${wineryBg} ${isSelected ? 'ring-2 ring-inset ring-sky-500 dark:ring-sky-400' : 'hover:brightness-[0.97] dark:hover:brightness-110'}`}
+                                >
+                                  <td className="border-r border-zinc-200 px-2 py-1.5 text-zinc-700 dark:border-zinc-700 dark:text-zinc-300">{formatCell(r.Winery)}</td>
+                                  <td className="border-r border-zinc-200 px-2 py-1.5 text-zinc-700 dark:border-zinc-700 dark:text-zinc-300">{formatCell(r.vineyardgroup)}</td>
+                                  <td style={bgFor('travel')} className="border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums text-zinc-500 dark:border-zinc-700 dark:text-zinc-400">
+                                    {stats != null ? formatIntNz(stats.travel.jobs) : '0'}
+                                  </td>
+                                  <td
+                                    style={bgFor('travel')}
+                                    className={`border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums dark:border-zinc-700 ${
+                                      stats?.travel.actual != null && isOverLimitWithRow(stats.travel.actual, r, 'travel')
+                                        ? 'text-red-700 dark:text-red-300'
+                                        : 'text-zinc-600 dark:text-zinc-400'
+                                    }`}
+                                  >
+                                    {stats?.travel.actual != null ? formatIntNz(stats.travel.actual) : '—'}
+                                  </td>
+                                  <td style={bgFor('travel')} className="border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums text-zinc-600 dark:border-zinc-700 dark:text-zinc-400">
+                                    {travelVal != null ? formatIntNz(Number(travelVal)) : '—'}
+                                  </td>
+                                  <td style={bgFor('inVineyard')} className={`border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums text-zinc-500 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[3]}`}>
+                                    {stats != null ? formatIntNz(stats.inVineyard.jobs) : '0'}
+                                  </td>
+                                  <td
+                                    style={bgFor('inVineyard')}
+                                    className={`border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums dark:border-zinc-700 ${STEP_GROUP_BG[3]} ${
+                                      stats?.inVineyard.actual != null && isOverLimitWithRow(stats.inVineyard.actual, r, 'in_vineyard')
+                                        ? 'text-red-700 dark:text-red-300'
+                                        : 'text-zinc-600 dark:text-zinc-400'
+                                    }`}
+                                  >
+                                    {stats?.inVineyard.actual != null ? formatIntNz(stats.inVineyard.actual) : '—'}
+                                  </td>
+                                  <td style={bgFor('inVineyard')} className={`border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[3]}`}>
+                                    {r.InVineMins != null ? formatIntNz(Number(r.InVineMins)) : '—'}
+                                  </td>
+                                  <td style={bgFor('inWinery')} className={`border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums text-zinc-500 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[5]}`}>
+                                    {stats != null ? formatIntNz(stats.inWinery.jobs) : '0'}
+                                  </td>
+                                  <td
+                                    style={bgFor('inWinery')}
+                                    className={`border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums dark:border-zinc-700 ${STEP_GROUP_BG[5]} ${
+                                      stats?.inWinery.actual != null && isOverLimitWithRow(stats.inWinery.actual, r, 'in_winery')
+                                        ? 'text-red-700 dark:text-red-300'
+                                        : 'text-zinc-600 dark:text-zinc-400'
+                                    }`}
+                                  >
+                                    {stats?.inWinery.actual != null ? formatIntNz(stats.inWinery.actual) : '—'}
+                                  </td>
+                                  <td style={bgFor('inWinery')} className={`border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[5]}`}>
+                                    {r.InWineMins != null ? formatIntNz(Number(r.InWineMins)) : '—'}
+                                  </td>
+                                  <td style={bgFor('total')} className="border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums text-zinc-500 dark:border-zinc-700 dark:text-zinc-400">
+                                    {stats != null ? formatIntNz(stats.total.jobs) : '0'}
+                                  </td>
+                                  <td
+                                    style={bgFor('total')}
+                                    className={`border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums font-medium ${
+                                      stats?.total.actual != null && isOverLimitWithRow(stats.total.actual, r, 'total')
+                                        ? 'text-red-700 dark:text-red-300'
+                                        : 'text-zinc-700 dark:text-zinc-300'
+                                    }`}
+                                  >
+                                    {stats?.total.actual != null ? formatIntNz(stats.total.actual) : '—'}
+                                  </td>
+                                  <td style={bgFor('total')} className="px-2 py-1.5 text-right tabular-nums font-medium text-zinc-700 dark:text-zinc-300">
+                                    {r.TotalMins != null ? formatIntNz(Number(r.TotalMins)) : '—'}
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      )
+                    ) : (
+                      <table className="w-full min-w-[64rem] text-left text-xs">
+                        <thead className={SUMMARY_THEAD_TH_ALIGNMENT}>
+                          <tr className="border-b border-zinc-200 dark:border-zinc-700">
+                            <th
+                              rowSpan={2}
+                              className="border-r border-zinc-200 px-2 py-1.5 font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-400"
+                            >
+                              Template
+                            </th>
+                            <th
+                              rowSpan={2}
+                              className="border-r border-zinc-200 px-2 py-1.5 font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-400"
+                            >
+                              Winery
+                            </th>
+                            <th
+                              rowSpan={2}
+                              className="border-r border-zinc-200 px-2 py-1.5 font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-400"
+                            >
+                              Vineyard group
+                            </th>
+                            <th
+                              rowSpan={2}
+                              className="border-r border-zinc-200 px-2 py-1.5 font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-400"
+                            >
+                              TT
+                            </th>
+                            <th
+                              colSpan={3}
+                              style={bgFor('step2')}
+                              className={`border-r border-zinc-200 px-2 py-1.5 font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[2]}`}
+                            >
+                              To Vine
+                            </th>
+                            <th
+                              colSpan={3}
+                              style={bgFor('step3')}
+                              className={`border-r border-zinc-200 px-2 py-1.5 font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[3]}`}
+                            >
+                              In Vine
+                            </th>
+                            <th
+                              colSpan={3}
+                              style={bgFor('step4')}
+                              className={`border-r border-zinc-200 px-2 py-1.5 font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[4]}`}
+                            >
+                              To Wine
+                            </th>
+                            <th
+                              colSpan={3}
+                              style={bgFor('step5')}
+                              className={`border-r border-zinc-200 px-2 py-1.5 font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[5]}`}
+                            >
+                              In Wine
+                            </th>
+                            <th
+                              style={bgFor('travel')}
+                              colSpan={3}
+                              className="border-r border-zinc-200 px-2 py-1.5 text-center font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-400"
+                            >
+                              Travel
+                            </th>
+                            <th
+                              style={bgFor('inVineyard')}
+                              colSpan={3}
+                              className={`border-r border-zinc-200 px-2 py-1.5 text-center font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[3]}`}
+                            >
+                              In Vineyard
+                            </th>
+                            <th
+                              style={bgFor('inWinery')}
+                              colSpan={3}
+                              className={`border-r border-zinc-200 px-2 py-1.5 text-center font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[5]}`}
+                            >
+                              In Winery
+                            </th>
+                            <th style={bgFor('total')} colSpan={3} className="px-2 py-1.5 text-center font-medium text-zinc-600 dark:text-zinc-400">
+                              Total
+                            </th>
+                          </tr>
+                          <tr className="border-b border-zinc-200 dark:border-zinc-700">
+                            {(['step2', 'step3', 'step4', 'step5', 'travel', 'in_vineyard', 'in_winery', 'total'] as const).map((step) => {
+                              const groupBg =
+                                step === 'step2'
+                                  ? STEP_GROUP_BG[2]
+                                  : step === 'step3' || step === 'in_vineyard'
+                                    ? STEP_GROUP_BG[3]
+                                    : step === 'step4'
+                                      ? STEP_GROUP_BG[4]
+                                      : step === 'step5' || step === 'in_winery'
+                                        ? STEP_GROUP_BG[5]
+                                        : '';
+                              const colorKey =
+                                step === 'step2'
+                                  ? 'step2'
+                                  : step === 'step3'
+                                    ? 'step3'
+                                    : step === 'step4'
+                                      ? 'step4'
+                                      : step === 'step5'
+                                        ? 'step5'
+                                        : step === 'travel'
+                                  ? 'travel'
+                                  : step === 'in_vineyard'
+                                    ? 'inVineyard'
+                                    : step === 'in_winery'
+                                      ? 'inWinery'
+                                      : 'total';
+                                return (['Jobs', 'Actual', 'Limit'] as const).map((sub) => (
+                                <th
+                                  key={`admin-${step}-${sub}`}
+                                  style={bgFor(colorKey)}
+                                    className={`whitespace-nowrap border-r border-zinc-200 bg-white px-2 py-1 text-center text-xs font-medium text-zinc-500 dark:border-zinc-700 dark:bg-zinc-900 ${groupBg} ${step === 'total' && sub === 'Limit' ? 'border-r-0' : ''}`}
+                                >
+                                  {sub}
+                                </th>
+                              ));
+                            })}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {timeLimitRowsForTable.map((r) => {
+                            const travelVal = timeLimitRowTravelVal(r);
+                            const isSelected = selectedTimeLimitRowId === r.id;
+                            const wineryBg = wineryLimitRowBgClass(r.Winery);
+                              const stats = timeLimitRowActualById.get(r.id)?.metrics;
+                            return (
+                              <tr
+                                key={r.id}
+                                role="button"
+                                tabIndex={0}
+                                onClick={() => {
+                                  setSelectedTimeLimitRowId(r.id);
+                                  const toV = r.ToVineMins != null ? String(r.ToVineMins) : '';
+                                  const inV = r.InVineMins != null ? String(r.InVineMins) : '';
+                                  const toW = r.ToWineMins != null ? String(r.ToWineMins) : '';
+                                  const inW = r.InWineMins != null ? String(r.InWineMins) : '';
+                                  const travelStr = travelVal != null ? String(travelVal) : '';
+                                  const totalStr = r.TotalMins != null ? String(r.TotalMins) : '';
+                                  setMinsThresholds({
+                                    '2': toV, '3': inV, '4': toW, '5': inW,
+                                    travel: travelStr, in_vineyard: inV, in_winery: inW, total: totalStr,
+                                  });
+                                }}
+                                onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); (e.target as HTMLTableRowElement).click(); } }}
+                                className={`border-b border-zinc-100 dark:border-zinc-800 cursor-pointer ${wineryBg} ${isSelected ? 'ring-2 ring-inset ring-sky-500 dark:ring-sky-400' : 'hover:brightness-[0.97] dark:hover:brightness-110'}`}
+                              >
+                                <td className="border-r border-zinc-200 px-2 py-1.5 text-zinc-700 dark:border-zinc-700 dark:text-zinc-300">{formatCell(r.Template)}</td>
+                                <td className="border-r border-zinc-200 px-2 py-1.5 text-zinc-700 dark:border-zinc-700 dark:text-zinc-300">{formatCell(r.Winery)}</td>
+                                <td className="border-r border-zinc-200 px-2 py-1.5 text-zinc-700 dark:border-zinc-700 dark:text-zinc-300">{formatCell(r.vineyardgroup)}</td>
+                                <td className="border-r border-zinc-200 px-2 py-1.5 text-zinc-700 dark:border-zinc-700 dark:text-zinc-300">{formatCell(r.TT)}</td>
+                                <td style={bgFor('step2')} className={`border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums text-zinc-500 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[2]}`}>{stats != null ? formatIntNz(stats.toVine.jobs) : '0'}</td>
+                                <td style={bgFor('step2')} className={`border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums dark:border-zinc-700 ${STEP_GROUP_BG[2]} ${stats?.toVine.actual != null && isOverLimitWithRow(stats.toVine.actual, r, '2') ? 'text-red-700 dark:text-red-300' : 'text-zinc-600 dark:text-zinc-400'}`}>{stats?.toVine.actual != null ? formatIntNz(stats.toVine.actual) : '—'}</td>
+                                <td style={bgFor('step2')} className={`border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[2]}`}>{r.ToVineMins != null ? formatIntNz(Number(r.ToVineMins)) : '—'}</td>
+                                <td style={bgFor('step3')} className={`border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums text-zinc-500 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[3]}`}>{stats != null ? formatIntNz(stats.inVine.jobs) : '0'}</td>
+                                <td style={bgFor('step3')} className={`border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums dark:border-zinc-700 ${STEP_GROUP_BG[3]} ${stats?.inVine.actual != null && isOverLimitWithRow(stats.inVine.actual, r, '3') ? 'text-red-700 dark:text-red-300' : 'text-zinc-600 dark:text-zinc-400'}`}>{stats?.inVine.actual != null ? formatIntNz(stats.inVine.actual) : '—'}</td>
+                                <td style={bgFor('step3')} className={`border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[3]}`}>{r.InVineMins != null ? formatIntNz(Number(r.InVineMins)) : '—'}</td>
+                                <td style={bgFor('step4')} className={`border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums text-zinc-500 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[4]}`}>{stats != null ? formatIntNz(stats.toWine.jobs) : '0'}</td>
+                                <td style={bgFor('step4')} className={`border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums dark:border-zinc-700 ${STEP_GROUP_BG[4]} ${stats?.toWine.actual != null && isOverLimitWithRow(stats.toWine.actual, r, '4') ? 'text-red-700 dark:text-red-300' : 'text-zinc-600 dark:text-zinc-400'}`}>{stats?.toWine.actual != null ? formatIntNz(stats.toWine.actual) : '—'}</td>
+                                <td style={bgFor('step4')} className={`border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[4]}`}>{r.ToWineMins != null ? formatIntNz(Number(r.ToWineMins)) : '—'}</td>
+                                <td style={bgFor('step5')} className={`border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums text-zinc-500 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[5]}`}>{stats != null ? formatIntNz(stats.inWine.jobs) : '0'}</td>
+                                <td style={bgFor('step5')} className={`border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums dark:border-zinc-700 ${STEP_GROUP_BG[5]} ${stats?.inWine.actual != null && isOverLimitWithRow(stats.inWine.actual, r, '5') ? 'text-red-700 dark:text-red-300' : 'text-zinc-600 dark:text-zinc-400'}`}>{stats?.inWine.actual != null ? formatIntNz(stats.inWine.actual) : '—'}</td>
+                                <td style={bgFor('step5')} className={`border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[5]}`}>{r.InWineMins != null ? formatIntNz(Number(r.InWineMins)) : '—'}</td>
+                                <td style={bgFor('travel')} className="border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums text-zinc-500 dark:border-zinc-700 dark:text-zinc-400">{stats != null ? formatIntNz(stats.travel.jobs) : '0'}</td>
+                                <td style={bgFor('travel')} className={`border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums dark:border-zinc-700 ${stats?.travel.actual != null && isOverLimitWithRow(stats.travel.actual, r, 'travel') ? 'text-red-700 dark:text-red-300' : 'text-zinc-600 dark:text-zinc-400'}`}>{stats?.travel.actual != null ? formatIntNz(stats.travel.actual) : '—'}</td>
+                                <td style={bgFor('travel')} className="border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums text-zinc-600 dark:border-zinc-700 dark:text-zinc-400">{travelVal != null ? formatIntNz(Number(travelVal)) : '—'}</td>
+                                <td style={bgFor('inVineyard')} className={`border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums text-zinc-500 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[3]}`}>{stats != null ? formatIntNz(stats.inVineyard.jobs) : '0'}</td>
+                                <td style={bgFor('inVineyard')} className={`border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums dark:border-zinc-700 ${STEP_GROUP_BG[3]} ${stats?.inVineyard.actual != null && isOverLimitWithRow(stats.inVineyard.actual, r, 'in_vineyard') ? 'text-red-700 dark:text-red-300' : 'text-zinc-600 dark:text-zinc-400'}`}>{stats?.inVineyard.actual != null ? formatIntNz(stats.inVineyard.actual) : '—'}</td>
+                                <td style={bgFor('inVineyard')} className={`border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[3]}`}>{r.InVineMins != null ? formatIntNz(Number(r.InVineMins)) : '—'}</td>
+                                <td style={bgFor('inWinery')} className={`border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums text-zinc-500 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[5]}`}>{stats != null ? formatIntNz(stats.inWinery.jobs) : '0'}</td>
+                                <td style={bgFor('inWinery')} className={`border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums dark:border-zinc-700 ${STEP_GROUP_BG[5]} ${stats?.inWinery.actual != null && isOverLimitWithRow(stats.inWinery.actual, r, 'in_winery') ? 'text-red-700 dark:text-red-300' : 'text-zinc-600 dark:text-zinc-400'}`}>{stats?.inWinery.actual != null ? formatIntNz(stats.inWinery.actual) : '—'}</td>
+                                <td style={bgFor('inWinery')} className={`border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${STEP_GROUP_BG[5]}`}>{r.InWineMins != null ? formatIntNz(Number(r.InWineMins)) : '—'}</td>
+                                <td style={bgFor('total')} className="border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums text-zinc-500 dark:border-zinc-700 dark:text-zinc-400">{stats != null ? formatIntNz(stats.total.jobs) : '0'}</td>
+                                <td style={bgFor('total')} className={`border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums font-medium ${stats?.total.actual != null && isOverLimitWithRow(stats.total.actual, r, 'total') ? 'text-red-700 dark:text-red-300' : 'text-zinc-700 dark:text-zinc-300'}`}>{stats?.total.actual != null ? formatIntNz(stats.total.actual) : '—'}</td>
+                                <td style={bgFor('total')} className="px-2 py-1.5 text-right tabular-nums font-medium text-zinc-700 dark:text-zinc-300">{r.TotalMins != null ? formatIntNz(Number(r.TotalMins)) : '—'}</td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    )}
                   </div>
                 </>
               ) : null}
             </div>
           )}
-          <div className="mb-4 flex flex-wrap items-center gap-4 border-b border-zinc-200 dark:border-zinc-700">
-            <div className="flex gap-2">
-              <button
-                type="button"
-                onClick={() => setSummaryTab('season')}
-                className={`rounded-t px-4 py-2 text-sm font-medium ${summaryTab === 'season' ? 'bg-zinc-200 dark:bg-zinc-700 text-zinc-900 dark:text-zinc-100' : 'bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 hover:bg-zinc-150 dark:hover:bg-zinc-750'}`}
-              >
-                Season Summary
-              </button>
+          {canLoadJobs && loading && (
+            <p className="mb-3 text-zinc-600 dark:text-zinc-400">Loading jobs…</p>
+          )}
+          {!canLoadJobs && (
+            <p className="mb-4 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-zinc-800 dark:border-amber-900/40 dark:bg-amber-950/25 dark:text-zinc-200">
+              Select a <strong className="font-semibold">customer</strong> in the sidebar and a <strong className="font-semibold">template</strong> to load jobs and rollups. Winery, vineyard, date and other filters apply after data has loaded.
+            </p>
+          )}
+          {canLoadJobs && !loading && (
+          <>
+          <div className="mb-4 flex flex-wrap items-end gap-4 border-b border-zinc-200 dark:border-zinc-700">
+            <div className="flex items-end gap-2">
+              {summaryTab === 'season' ? (
+                <div
+                  className={`flex min-w-[20rem] max-w-[28rem] items-stretch rounded-t border border-zinc-300 border-b-0 bg-zinc-200 dark:border-zinc-600 dark:bg-zinc-700`}
+                >
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setFilterActualFrom('');
+                      setFilterActualTo('');
+                      setSummaryTab('season');
+                    }}
+                    className="shrink-0 px-3 py-2 text-sm font-medium text-zinc-900 dark:text-zinc-100"
+                  >
+                    Season Summary
+                  </button>
+                  <div
+                    className="flex min-w-0 flex-1 items-center border-l border-zinc-300 px-2 py-1 dark:border-zinc-600"
+                    onMouseDown={(e) => e.stopPropagation()}
+                    onClick={(e) => e.stopPropagation()}
+                  >
+                    <SeasonRollupLayoutSelect
+                      splitMode={splitMode}
+                      setSplitMode={setSplitMode}
+                      viewMode={viewMode}
+                    />
+                  </div>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setFilterActualFrom('');
+                    setFilterActualTo('');
+                    setSummaryTab('season');
+                  }}
+                  className="rounded-t px-4 py-2 text-sm font-medium bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 hover:bg-zinc-150 dark:hover:bg-zinc-750"
+                >
+                  Season Summary
+                </button>
+              )}
               <button
                 type="button"
                 onClick={() => {
@@ -2178,64 +3781,154 @@ function SummaryPageInner() {
               >
                 By Job
               </button>
+              {viewMode !== 'client' && (
+                <button
+                  type="button"
+                  onClick={() => setSummaryTab('data_audit')}
+                  className={`rounded-t px-4 py-2 text-sm font-medium ${summaryTab === 'data_audit' ? 'bg-zinc-200 dark:bg-zinc-700 text-zinc-900 dark:text-zinc-100' : 'bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 hover:bg-zinc-150 dark:hover:bg-zinc-750'}`}
+                >
+                  Data Audits
+                </button>
+              )}
               <button
                 type="button"
-                onClick={() => setSummaryTab('data_audit')}
-                className={`rounded-t px-4 py-2 text-sm font-medium ${summaryTab === 'data_audit' ? 'bg-zinc-200 dark:bg-zinc-700 text-zinc-900 dark:text-zinc-100' : 'bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 hover:bg-zinc-150 dark:hover:bg-zinc-750'}`}
+                onClick={() => setSummaryTab('vineyards')}
+                className={`rounded-t px-4 py-2 text-sm font-medium ${summaryTab === 'vineyards' ? 'bg-zinc-200 dark:bg-zinc-700 text-zinc-900 dark:text-zinc-100' : 'bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 hover:bg-zinc-150 dark:hover:bg-zinc-750'}`}
               >
-                Data Audits
+                Vineyards
               </button>
+              {viewMode !== 'client' && (
+                <div className="relative" ref={summaryExportMenuRef}>
+                  <button
+                    type="button"
+                    aria-label="Export summary data"
+                    aria-expanded={summaryExportMenuOpen}
+                    aria-haspopup="menu"
+                    onClick={() => setSummaryExportMenuOpen((o) => !o)}
+                    className={`rounded-t px-3 py-2 text-sm font-medium tabular-nums ${summaryExportMenuOpen ? 'bg-zinc-200 dark:bg-zinc-700 text-zinc-900 dark:text-zinc-100' : 'bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 hover:bg-zinc-150 dark:hover:bg-zinc-750'}`}
+                  >
+                    ⋯
+                  </button>
+                  {summaryExportMenuOpen && (
+                    <div
+                      role="menu"
+                      className="absolute left-0 top-full z-50 mt-0.5 min-w-[13rem] rounded-md border border-zinc-200 bg-white py-1 shadow-lg dark:border-zinc-600 dark:bg-zinc-900"
+                    >
+                      <button
+                        type="button"
+                        role="menuitem"
+                        className="block w-full px-3 py-2 text-left text-sm text-zinc-800 hover:bg-zinc-100 dark:text-zinc-200 dark:hover:bg-zinc-800"
+                        onClick={() => {
+                          setSummaryExportMenuOpen(false);
+                          void runExportLimitsTableXlsx();
+                        }}
+                      >
+                        Export Limits Table
+                      </button>
+                      <button
+                        type="button"
+                        role="menuitem"
+                        className="block w-full px-3 py-2 text-left text-sm text-zinc-800 hover:bg-zinc-100 dark:text-zinc-200 dark:hover:bg-zinc-800"
+                        onClick={() => {
+                          setSummaryExportMenuOpen(false);
+                          void runExportSeasonDataXlsx();
+                        }}
+                      >
+                        Export Season Data
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
-            {(summaryTab === 'season' || summaryTab === 'by_day') && (
-              <label className="flex cursor-pointer items-center gap-2 rounded border border-zinc-200 bg-white px-3 py-2 text-sm dark:border-zinc-700 dark:bg-zinc-900">
-                <input
-                  type="checkbox"
-                  checked={splitByLimits}
-                  onChange={(e) => setSplitByLimits(e.target.checked)}
-                  className="rounded border-zinc-300"
-                />
-                <span className="text-zinc-700 dark:text-zinc-300">Split by Limits</span>
-              </label>
-            )}
           </div>
           {summaryTab === 'season' && (
             <div className="max-h-[70vh] overflow-auto rounded-lg border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900">
               <p className="mb-2 text-sm text-zinc-500">
                 {seasonClientView
                   ? 'Season rollup for your account. Travel + In Vineyard + In Winery = Total mins.'
-                  : 'Rollup of all jobs for the selected Customer and Template (same column sections as Daily Summary for audit). Use the Customer and Template dropdowns above.'}
+                  : 'Rollup of all jobs for the selected Customer and Template (same column sections as Daily Summary for audit). Rollup layout is in the Season Summary tab header.'}
               </p>
-              <table className={`w-full text-left text-sm ${seasonClientView ? 'min-w-[24rem]' : 'min-w-[64rem]'}`}>
-                <thead className="sticky top-0 z-10 bg-zinc-100 shadow-[0_1px_0_0_rgba(0,0,0,0.1)] dark:bg-zinc-800 dark:shadow-[0_1px_0_0_rgba(255,255,255,0.08)]">
+              <table
+                className={`w-full text-left text-xs ${seasonClientView ? 'min-w-[24rem]' : 'min-w-[64rem]'} ${seasonClientView && splitSeasonGrouped ? 'table-fixed' : ''}`}
+              >
+                {seasonClientView && splitSeasonGrouped
+                  ? splitByOverUnder
+                    ? <SeasonClientSplitColgroupSeasonData />
+                    : <SeasonClientSplitColgroupSeasonDataNoOU />
+                  : null}
+                <thead
+                  className={`${SUMMARY_THEAD_TH_ALIGNMENT} sticky top-0 z-10 bg-zinc-100 shadow-[0_1px_0_0_rgba(0,0,0,0.1)] dark:bg-zinc-800 dark:shadow-[0_1px_0_0_rgba(255,255,255,0.08)]`}
+                >
                   <tr className="border-b border-zinc-200 dark:border-zinc-700">
-                    <th className="border-r border-zinc-200 px-2 py-1 text-xs font-medium text-zinc-500 dark:border-zinc-700">Limit (red if &gt;)</th>
-                    <th className="border-r border-zinc-200 px-2 py-1 dark:border-zinc-700" />
-                    {(!seasonClientView ? (['2', '3', '4', '5', 'travel', 'in_vineyard', 'in_winery', 'total'] as const) : (['travel', 'in_vineyard', 'in_winery', 'total'] as const)).map((key) =>
-                      (seasonClientView ? (['Total', 'Av'] as const) : (['Total', 'Max', 'Min', 'Av'] as const)).map((sub) => (
-                        <th key={`limit-${key}-${sub}`} className="whitespace-nowrap border-r border-zinc-200 px-2 py-1 text-xs font-medium text-zinc-500 dark:border-zinc-700">
-                          {sub === 'Av' ? limitDisplay(key) : '\u00A0'}
-                        </th>
-                      ))
-                    )}
-                  </tr>
-                  <tr className="border-b border-zinc-200 dark:border-zinc-700">
-                    <th rowSpan={2} className="border-r border-zinc-200 px-3 py-2 font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100">Season</th>
-                    {splitByLimits && (
-                      <th rowSpan={2} className="border-r border-zinc-200 px-3 py-2 text-xs font-medium text-zinc-500 dark:border-zinc-700">Type</th>
-                    )}
-                    <th rowSpan={2} className="border-r border-zinc-200 px-3 py-2 text-xs font-medium text-zinc-500 dark:border-zinc-700">Jobs</th>
                     {!seasonClientView && (
+                      <th
+                        rowSpan={2}
+                        className="border-r border-zinc-200 px-3 py-2 text-xs font-medium text-zinc-500 dark:border-zinc-700 dark:text-zinc-400"
+                      >
+                        Season
+                      </th>
+                    )}
+                    {splitSeasonGrouped && (
                       <>
-                        <th colSpan={4} className={`border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[2]}`}>2. Travel To Vineyard</th>
-                        <th colSpan={4} className={`border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[3]}`}>3. Time In Vineyard</th>
-                        <th colSpan={4} className={`border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[4]}`}>4. Travel To Winery</th>
-                        <th colSpan={4} className={`border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[5]}`}>5. Unloading Winery</th>
+                        <th
+                          rowSpan={2}
+                          className="min-w-[9rem] border-r border-zinc-200 px-2 py-2 text-xs font-medium text-zinc-500 dark:border-zinc-700"
+                        >
+                          Winery
+                        </th>
+                        <th
+                          rowSpan={2}
+                          className="min-w-[7rem] border-r border-zinc-200 px-2 py-2 text-xs font-medium text-zinc-500 dark:border-zinc-700"
+                        >
+                          Vineyard Group
+                        </th>
+                        <th
+                          rowSpan={2}
+                          className="border-r border-zinc-200 px-2 py-2 text-xs font-medium text-zinc-500 dark:border-zinc-700"
+                        >
+                          TT
+                        </th>
+                        {splitByOverUnder && (
+                          <th
+                            rowSpan={2}
+                            className="border-r border-zinc-200 px-2 py-2 text-xs font-medium text-zinc-500 dark:border-zinc-700"
+                          >
+                            Over/Under
+                          </th>
+                        )}
                       </>
                     )}
-                    <th colSpan={seasonClientView ? 2 : 4} className="border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100">Travel</th>
-                    <th colSpan={seasonClientView ? 2 : 4} className={`border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[3]}`}>In Vineyard</th>
-                    <th colSpan={seasonClientView ? 2 : 4} className={`border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[5]}`}>In Winery</th>
-                    <th colSpan={seasonClientView ? 2 : 4} className="border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100">Total</th>
+                    <th
+                      rowSpan={2}
+                      className="border-r border-zinc-200 px-2 py-2 text-xs font-medium text-zinc-500 dark:border-zinc-700"
+                    >
+                      Jobs
+                    </th>
+                    <th
+                      rowSpan={2}
+                      className="border-r border-zinc-200 px-2 py-2 text-xs font-medium text-zinc-500 dark:border-zinc-700"
+                    >
+                      Vyards
+                    </th>
+                    <th
+                      rowSpan={2}
+                      className="border-r border-zinc-200 px-2 py-2 text-xs font-medium text-zinc-500 dark:border-zinc-700"
+                    >
+                      KMs
+                    </th>
+                    {!seasonClientView && (
+                      <>
+                        <th style={bgFor('step2')} colSpan={4} className={`border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[2]}`}>2. Travel To Vineyard</th>
+                        <th style={bgFor('step3')} colSpan={4} className={`border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[3]}`}>3. Time In Vineyard</th>
+                        <th style={bgFor('step4')} colSpan={4} className={`border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[4]}`}>4. Travel To Winery</th>
+                        <th style={bgFor('step5')} colSpan={4} className={`border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[5]}`}>5. Unloading Winery</th>
+                      </>
+                    )}
+                    <th style={bgFor('travel')} colSpan={seasonClientView ? 2 : 4} className="border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100">Travel</th>
+                    <th style={bgFor('inVineyard')} colSpan={seasonClientView ? 2 : 4} className={`border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[3]}`}>In Vineyard</th>
+                    <th style={bgFor('inWinery')} colSpan={seasonClientView ? 2 : 4} className={`border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[5]}`}>In Winery</th>
+                    <th style={bgFor('total')} colSpan={seasonClientView ? 2 : 4} className="border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100">Total</th>
                   </tr>
                   <tr className="border-b border-zinc-200 dark:border-zinc-700">
                     {(!seasonClientView ? ([2, 3, 4, 5, 'travel', 'in_vineyard', 'in_winery', 'total'] as const) : (['travel', 'in_vineyard', 'in_winery', 'total'] as const)).map((step, stepIdx) => {
@@ -2243,7 +3936,7 @@ function SummaryPageInner() {
                       return (seasonClientView ? (['Total', 'Av'] as const) : (['Total', 'Max', 'Min', 'Av'] as const)).map((sub) => (
                         <th
                           key={`${step}-${sub}`}
-                          className={`whitespace-nowrap border-r border-zinc-200 px-2 py-1 text-xs font-medium text-zinc-500 dark:border-zinc-700 ${groupBg} ${step === 'total' && sub === 'Av' ? 'border-r-0' : ''}`}
+                          className={`whitespace-nowrap border-r border-zinc-200 bg-white px-2 py-1 text-center text-xs font-medium text-zinc-500 dark:border-zinc-700 dark:bg-zinc-900 ${groupBg} ${step === 'total' && sub === 'Av' ? 'border-r-0' : ''}`}
                         >
                           {sub}
                         </th>
@@ -2254,7 +3947,24 @@ function SummaryPageInner() {
                 <tbody>
                   {!seasonRollupRows || seasonRollupRows.length === 0 ? (
                     <tr>
-                      <td colSpan={(seasonClientView ? 10 : 34) + (splitByLimits ? 1 : 0)} className="px-3 py-6 text-center text-zinc-500">
+                      <td
+                        colSpan={
+                          (seasonClientView
+                            ? splitSeasonGrouped
+                              ? splitByOverUnder
+                                ? 13
+                                : 12
+                              : 9
+                            : splitSeasonGrouped
+                              ? splitByOverUnder
+                                ? 35
+                                : 34
+                              : 34) +
+                          (!seasonClientView && splitSeasonGrouped ? (splitByOverUnder ? 4 : 3) : 0) +
+                          2
+                        }
+                        className="px-3 py-6 text-center text-zinc-500"
+                      >
                         {effectiveCustomer || filterTemplate
                           ? 'No jobs for the selected Customer and Template.'
                           : 'Select Customer (and optionally Template) above to see season rollup.'}
@@ -2262,29 +3972,63 @@ function SummaryPageInner() {
                     </tr>
                   ) : (
                     seasonRollupRows.map((rollup) => {
-                      const isSubTotal = splitByLimits && (rollup.rowType === 'Over Allowance' || rollup.rowType === 'Within Allowance');
-                      const isSeasonTotal = splitByLimits && rollup.rowType === 'Season Total';
+                      const isSubTotal = splitSeasonGrouped && splitByOverUnder && rollup.tier === 'over_within';
+                      const isTtBlockTotal = splitSeasonGrouped && rollup.tier === 'tt_total';
+                      const isVgTotal = splitSeasonGrouped && rollup.tier === 'vg_total';
+                      const isWineryTotal = splitSeasonGrouped && rollup.tier === 'winery_total';
+                      const isSeasonTotal = rollup.tier === 'season_total';
                       const seasonRowClass = [
                         'border-b border-zinc-100 dark:border-zinc-800',
-                        isSubTotal ? 'bg-zinc-100 dark:bg-zinc-800/50' : isSeasonTotal ? 'border-t-2 border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 font-medium' : 'bg-zinc-50/50 dark:bg-zinc-800/30',
+                        isSubTotal
+                          ? 'bg-zinc-100 dark:bg-zinc-800/50'
+                          : isWineryTotal
+                            ? 'border-t border-zinc-300 bg-zinc-100 font-semibold dark:border-zinc-600 dark:bg-zinc-800/50'
+                            : isSeasonTotal
+                              ? 'border-t-2 border-zinc-300 dark:border-zinc-600 bg-white dark:bg-zinc-900 font-semibold'
+                              : isVgTotal
+                                ? 'border-t border-zinc-200 bg-zinc-50 font-medium dark:border-zinc-700 dark:bg-zinc-800/40'
+                                : isTtBlockTotal
+                                  ? 'bg-zinc-50/50 dark:bg-zinc-800/30'
+                                  : 'bg-zinc-50/50 dark:bg-zinc-800/30',
                       ].filter(Boolean).join(' ');
+                      const totalRowCell = isSeasonTotal ? 'bg-white dark:bg-zinc-900' : '';
                       return (
-                    <tr key={rollup.rowType} className={seasonRowClass}>
-                      <td className="whitespace-nowrap border-r border-zinc-200 px-3 py-2 font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100">
-                        {effectiveCustomer && filterTemplate ? `${effectiveCustomer} / ${filterTemplate}` : effectiveCustomer || 'All'}
-                      </td>
-                      {splitByLimits && (
-                        <td className="whitespace-nowrap border-r border-zinc-200 px-3 py-2 text-xs font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-400">{rollup.rowType}</td>
+                    <tr key={rollup.rowKey} className={seasonRowClass}>
+                      {!seasonClientView && (
+                        <td className={`whitespace-nowrap border-r border-zinc-200 px-3 py-2 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${totalRowCell}`}>
+                          {effectiveCustomer && filterTemplate ? `${effectiveCustomer} / ${filterTemplate}` : effectiveCustomer || 'All'}
+                        </td>
                       )}
-                      <td className="whitespace-nowrap border-r border-zinc-200 px-3 py-2 tabular-nums text-zinc-500 dark:border-zinc-700 dark:text-zinc-400">
+                      {splitSeasonGrouped && (
+                        <>
+                          <td className={`min-w-[9rem] whitespace-nowrap border-r border-zinc-200 px-2 py-2 text-xs font-medium text-zinc-800 dark:border-zinc-700 dark:text-zinc-200 ${totalRowCell}`}>{rollup.wineryCol || '\u00A0'}</td>
+                          <td className={`min-w-[7rem] whitespace-nowrap border-r border-zinc-200 px-2 py-2 text-xs font-medium text-zinc-700 dark:border-zinc-700 dark:text-zinc-300 ${totalRowCell}`}>{rollup.vineyardGroupCol || '\u00A0'}</td>
+                          <td className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 text-xs font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${totalRowCell}`}>{rollup.ttCol || '\u00A0'}</td>
+                          {splitByOverUnder && (
+                            <td className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 text-xs font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 ${totalRowCell}`}>{rollup.limitLabel}</td>
+                          )}
+                        </>
+                      )}
+                      <td className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 text-right tabular-nums text-zinc-500 dark:border-zinc-700 dark:text-zinc-400 ${totalRowCell}`}>
                         {formatIntNz(rollup.jobs.length)}
+                      </td>
+                      <td className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 text-right tabular-nums text-zinc-500 dark:border-zinc-700 dark:text-zinc-400 ${totalRowCell}`}>
+                        {formatIntNz(uniqueVineyardCount(rollup.jobs))}
+                      </td>
+                      <td className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 text-right tabular-nums text-zinc-500 dark:border-zinc-700 dark:text-zinc-400 ${totalRowCell}`}>
+                        {formatIntNz(roundTripKms(rollup.jobs))}
                       </td>
                       {!seasonClientView && [rollup.mins_2, rollup.mins_3, rollup.mins_4, rollup.mins_5].map((q, i) =>
                         (['total', 'max', 'min', 'av'] as const).map((key) => {
                           const stepNum = i + 2;
+                          const styleKey = stepNum === 2 ? 'step2' : stepNum === 3 ? 'step3' : stepNum === 4 ? 'step4' : 'step5';
                           const redClass = key === 'av' ? redIfOverStepCol(q[key], stepNum) : '';
                           return (
-                            <td key={`${i}-${key}`} className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 tabular-nums ${redClass ? redClass : `${STEP_GROUP_BG[(i + 2) as 2 | 3 | 4 | 5]} text-zinc-600 dark:text-zinc-400 dark:border-zinc-700`}`}>
+                            <td
+                              key={`${i}-${key}`}
+                              style={isSeasonTotal ? undefined : bgFor(styleKey)}
+                              className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 text-right tabular-nums ${isSeasonTotal ? totalRowCell : redClass ? redClass : `${STEP_GROUP_BG[(i + 2) as 2 | 3 | 4 | 5]} text-zinc-600 dark:text-zinc-400 dark:border-zinc-700`}`}
+                            >
                               {fmtNz(q[key])}
                             </td>
                           );
@@ -2293,7 +4037,11 @@ function SummaryPageInner() {
                       {(seasonClientView ? (['total', 'av'] as const) : (['total', 'max', 'min', 'av'] as const)).map((key) => {
                         const redClass = key === 'av' ? redIfOver(rollup.travel[key], 'travel') : '';
                         return (
-                          <td key={`travel-${key}`} className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 tabular-nums ${redClass || 'text-zinc-600 dark:border-zinc-700 dark:text-zinc-400'}`}>
+                          <td
+                            key={`travel-${key}`}
+                            style={isSeasonTotal ? undefined : bgFor('travel')}
+                            className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 text-right tabular-nums ${isSeasonTotal ? totalRowCell : redClass || 'text-zinc-600 dark:border-zinc-700 dark:text-zinc-400'}`}
+                          >
                             {fmtNz(rollup.travel[key])}
                           </td>
                         );
@@ -2301,7 +4049,11 @@ function SummaryPageInner() {
                       {(seasonClientView ? (['total', 'av'] as const) : (['total', 'max', 'min', 'av'] as const)).map((key) => {
                         const redClass = key === 'av' ? redIfOver(rollup.mins_3[key], 'in_vineyard') : '';
                         return (
-                          <td key={`in_vineyard-${key}`} className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 tabular-nums ${redClass ? redClass : `${STEP_GROUP_BG[3]} text-zinc-600 dark:text-zinc-400 dark:border-zinc-700`}`}>
+                          <td
+                            key={`in_vineyard-${key}`}
+                            style={isSeasonTotal ? undefined : bgFor('inVineyard')}
+                            className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 text-right tabular-nums ${isSeasonTotal ? totalRowCell : redClass ? redClass : `${STEP_GROUP_BG[3]} text-zinc-600 dark:text-zinc-400 dark:border-zinc-700`}`}
+                          >
                             {fmtNz(rollup.mins_3[key])}
                           </td>
                         );
@@ -2309,7 +4061,11 @@ function SummaryPageInner() {
                       {(seasonClientView ? (['total', 'av'] as const) : (['total', 'max', 'min', 'av'] as const)).map((key) => {
                         const redClass = key === 'av' ? redIfOver(rollup.mins_5[key], 'in_winery') : '';
                         return (
-                          <td key={`in_winery-${key}`} className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 tabular-nums ${redClass ? redClass : `${STEP_GROUP_BG[5]} text-zinc-600 dark:text-zinc-400 dark:border-zinc-700`}`}>
+                          <td
+                            key={`in_winery-${key}`}
+                            style={isSeasonTotal ? undefined : bgFor('inWinery')}
+                            className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 text-right tabular-nums ${isSeasonTotal ? totalRowCell : redClass ? redClass : `${STEP_GROUP_BG[5]} text-zinc-600 dark:text-zinc-400 dark:border-zinc-700`}`}
+                          >
                             {fmtNz(rollup.mins_5[key])}
                           </td>
                         );
@@ -2317,7 +4073,11 @@ function SummaryPageInner() {
                       {(seasonClientView ? (['total', 'av'] as const) : (['total', 'max', 'min', 'av'] as const)).map((key) => {
                         const redClass = key === 'av' ? redIfOver(rollup.total[key], 'total') : '';
                         return (
-                          <td key={`total-${key}`} className={`whitespace-nowrap border-zinc-200 px-2 py-2 tabular-nums font-medium ${redClass || 'text-zinc-700 dark:border-zinc-700 dark:text-zinc-300'}`}>
+                          <td
+                            key={`total-${key}`}
+                            style={isSeasonTotal ? undefined : bgFor('total')}
+                            className={`whitespace-nowrap border-zinc-200 px-2 py-2 text-right tabular-nums font-medium ${isSeasonTotal ? totalRowCell : redClass || 'text-zinc-700 dark:border-zinc-700 dark:text-zinc-300'}`}
+                          >
                             {fmtNz(rollup.total[key])}
                           </td>
                         );
@@ -2328,12 +4088,21 @@ function SummaryPageInner() {
                 </tbody>
               </table>
               {(() => {
-                /** Split: 3 columns (Over Allowance | Within Allowance | Season), each: avg bars → total pie → total bars. Non-split: one column. */
-                const chartSources = splitByLimits && seasonRollupRows && seasonRollupRows.length === 3
-                  ? seasonRollupRows
-                  : seasonRollup
-                    ? [{ rowType: 'Season Total' as const, ...seasonRollup }]
-                    : [];
+                /** Split: 3 columns (Over Allowance | Within Allowance | Season), full season — not per winery. Non-split: one column. */
+                const chartSources =
+                  splitByOverUnder && seasonSplitChartTriplet && seasonSplitChartTriplet.length === 3
+                    ? seasonSplitChartTriplet.map((s) => ({
+                        rowKey: s.rowKey,
+                        rowType: s.limitLabel as 'Over Allowance' | 'Within Allowance' | 'Season Total',
+                        jobs: s.jobs,
+                        travel: s.travel,
+                        mins_3: s.mins_3,
+                        mins_5: s.mins_5,
+                        total: s.total,
+                      }))
+                    : seasonRollup
+                      ? [{ rowKey: 'season-chart-unsplit', rowType: 'Season Total' as const, ...seasonRollup }]
+                      : [];
                 if (chartSources.length === 0) return null;
                 const multiCol = chartSources.length === 3;
                 let sharedAvgBarMax = 1;
@@ -2371,7 +4140,7 @@ function SummaryPageInner() {
                     >
                       {chartSources.map((source, colIdx) => (
                         <SeasonSummaryChartColumn
-                          key={source.rowType}
+                          key={source.rowKey}
                           rowType={source.rowType}
                           jobs={source.jobs}
                           travel={source.travel}
@@ -2390,38 +4159,56 @@ function SummaryPageInner() {
           )}
           {summaryTab === 'by_day' && (
             <div className="max-h-[70vh] overflow-auto rounded-lg border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900">
-              <table className="w-full min-w-[64rem] text-left text-sm">
-                <thead className="sticky top-0 z-10 bg-zinc-100 shadow-[0_1px_0_0_rgba(0,0,0,0.1)] dark:bg-zinc-800 dark:shadow-[0_1px_0_0_rgba(255,255,255,0.08)]">
+              <table className="w-full min-w-[64rem] text-left text-xs">
+                <thead
+                  className={`${SUMMARY_THEAD_TH_ALIGNMENT} sticky top-0 z-10 bg-zinc-100 shadow-[0_1px_0_0_rgba(0,0,0,0.1)] dark:bg-zinc-800 dark:shadow-[0_1px_0_0_rgba(255,255,255,0.08)]`}
+                >
                   <tr className="border-b border-zinc-200 dark:border-zinc-700">
                     <th className="border-r border-zinc-200 px-2 py-1 text-xs font-medium text-zinc-500 dark:border-zinc-700">Limit (red if &gt;)</th>
-                    {splitByLimits && <th className="border-r border-zinc-200 px-2 py-1 dark:border-zinc-700" />}
-                    <th className="border-r border-zinc-200 px-2 py-1 dark:border-zinc-700" />
+                    {splitByOverUnder && <th className="border-r border-zinc-200 px-2 py-1 dark:border-zinc-700" />}
+                    {(dayClientView ? [0, 1, 2] : [0, 1, 2, 3]).map((i) => (
+                      <th key={`day-limit-pad-${i}`} className="border-r border-zinc-200 px-2 py-1 dark:border-zinc-700" />
+                    ))}
                     {(dayClientView ? (['travel', 'in_vineyard', 'in_winery', 'total'] as const) : (['2', '3', '4', '5', 'travel', 'in_vineyard', 'in_winery', 'total'] as const)).map((key) =>
                       (dayClientView ? (['Total', 'Av'] as const) : (['Total', 'Max', 'Min', 'Av'] as const)).map((sub) => (
                         <th key={`limit-${key}-${sub}`} className="whitespace-nowrap border-r border-zinc-200 px-2 py-1 text-xs font-medium text-zinc-500 dark:border-zinc-700">
-                          {sub === 'Av' ? limitDisplay(key) : '\u00A0'}
+                          {sub === 'Total' ? limitDisplay(key) : '\u00A0'}
                         </th>
                       ))
                     )}
                   </tr>
                   <tr className="border-b border-zinc-200 dark:border-zinc-700">
                     <th rowSpan={2} className="border-r border-zinc-200 px-3 py-2 font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100">Date</th>
-                    {splitByLimits && (
+                    {splitByOverUnder && (
                       <th rowSpan={2} className="border-r border-zinc-200 px-3 py-2 text-xs font-medium text-zinc-500 dark:border-zinc-700">Type</th>
                     )}
-                    <th rowSpan={2} className="border-r border-zinc-200 px-3 py-2 text-xs font-medium text-zinc-500 dark:border-zinc-700">Jobs</th>
+                    <th
+                      rowSpan={2}
+                      className="w-0 max-w-[4rem] min-w-0 border-r border-zinc-200 px-1.5 py-2 text-xs font-medium text-zinc-500 dark:border-zinc-700"
+                    >
+                      Jobs
+                    </th>
+                    <th
+                      rowSpan={2}
+                      className="w-0 max-w-[4rem] min-w-0 border-r border-zinc-200 px-1.5 py-2 text-xs font-medium text-zinc-500 dark:border-zinc-700"
+                    >
+                      Vyards
+                    </th>
+                    {!dayClientView && (
+                      <th rowSpan={2} className="border-r border-zinc-200 px-3 py-2 text-xs font-medium text-zinc-500 dark:border-zinc-700">KMs</th>
+                    )}
                     {!dayClientView && (
                       <>
-                        <th colSpan={4} className={`border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[2]}`}>2. Travel To Vineyard</th>
-                        <th colSpan={4} className={`border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[3]}`}>3. Time In Vineyard</th>
-                        <th colSpan={4} className={`border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[4]}`}>4. Travel To Winery</th>
-                        <th colSpan={4} className={`border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[5]}`}>5. Unloading Winery</th>
+                        <th style={bgFor('step2')} colSpan={4} className={`border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[2]}`}>2. Travel To Vineyard</th>
+                        <th style={bgFor('step3')} colSpan={4} className={`border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[3]}`}>3. Time In Vineyard</th>
+                        <th style={bgFor('step4')} colSpan={4} className={`border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[4]}`}>4. Travel To Winery</th>
+                        <th style={bgFor('step5')} colSpan={4} className={`border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[5]}`}>5. Unloading Winery</th>
                       </>
                     )}
-                    <th colSpan={dayClientView ? 2 : 4} className="border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100">Travel</th>
-                    <th colSpan={dayClientView ? 2 : 4} className={`border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[3]}`}>In Vineyard</th>
-                    <th colSpan={dayClientView ? 2 : 4} className={`border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[5]}`}>In Winery</th>
-                    <th colSpan={dayClientView ? 2 : 4} className="border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100">Total</th>
+                    <th style={bgFor('travel')} colSpan={dayClientView ? 2 : 4} className="border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100">Travel</th>
+                    <th style={bgFor('inVineyard')} colSpan={dayClientView ? 2 : 4} className={`border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[3]}`}>In Vineyard</th>
+                    <th style={bgFor('inWinery')} colSpan={dayClientView ? 2 : 4} className={`border-r border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100 ${STEP_GROUP_BG[5]}`}>In Winery</th>
+                    <th style={bgFor('total')} colSpan={dayClientView ? 2 : 4} className="border-zinc-200 px-2 py-1.5 text-xs font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100">Total</th>
                   </tr>
                   <tr className="border-b border-zinc-200 dark:border-zinc-700">
                     {(!dayClientView ? [2, 3, 4, 5, 'travel', 'in_vineyard', 'in_winery', 'total'] : ['travel', 'in_vineyard', 'in_winery', 'total']).map((step, stepIdx) => {
@@ -2432,7 +4219,7 @@ function SummaryPageInner() {
                       return subCols.map((sub) => (
                         <th
                           key={`${step}-${sub}`}
-                          className={`whitespace-nowrap border-r border-zinc-200 px-2 py-1 text-xs font-medium text-zinc-500 dark:border-zinc-700 ${groupBg} ${step === 'total' && sub === 'Av' ? 'border-r-0' : ''}`}
+                          className={`whitespace-nowrap border-r border-zinc-200 bg-white px-2 py-1 text-center text-xs font-medium text-zinc-500 dark:border-zinc-700 dark:bg-zinc-900 ${groupBg} ${step === 'total' && sub === 'Av' ? 'border-r-0' : ''}`}
                         >
                           {sub}
                         </th>
@@ -2443,22 +4230,32 @@ function SummaryPageInner() {
                 <tbody>
                   {rowsByDay.length === 0 ? (
                     <tr>
-                      <td colSpan={(dayClientView ? 10 : 34) + (splitByLimits ? 1 : 0)} className="px-3 py-6 text-center text-zinc-500">
+                      <td colSpan={(dayClientView ? 9 : 34) + (splitByOverUnder ? 1 : 0) + 2} className="px-3 py-6 text-center text-zinc-500">
                         No days {filteredRows.length === 0 ? '(no jobs match filters)' : '(no job dates in range)'}.
                       </td>
                     </tr>
                   ) : (
                     rowsByDay.map((r, idx) => {
                       const rowType = (r as { rowType?: string }).rowType;
-                      const isFirstRowOfDay = !splitByLimits || idx === 0 || (rowsByDay[idx - 1] as { date?: string }).date !== r.date;
+                      const isDailyTotal = splitByOverUnder && rowType === 'Daily Total';
+                      const isFirstRowOfDay =
+                        !splitByOverUnder || idx === 0 || (rowsByDay[idx - 1] as { date?: string }).date !== r.date;
                       const dailyRowClass = [
                         'border-b border-zinc-100 dark:border-zinc-800',
-                        splitByLimits && isFirstRowOfDay ? 'border-t-2 border-zinc-300 dark:border-zinc-600' : '',
-                        splitByLimits && (rowType === 'Over Allowance' || rowType === 'Within Allowance') ? 'bg-zinc-100 dark:bg-zinc-800/50' : '',
-                        splitByLimits && rowType === 'Daily Total' ? 'bg-white dark:bg-zinc-900 font-medium' : '',
-                        !splitByLimits ? 'hover:bg-zinc-50 dark:hover:bg-zinc-800/50' : (rowType === 'Daily Total' ? '' : 'hover:bg-zinc-200/50 dark:hover:bg-zinc-700/50'),
+                        splitByOverUnder && isFirstRowOfDay ? 'border-t-2 border-zinc-300 dark:border-zinc-600' : '',
+                        splitByOverUnder && (rowType === 'Over Allowance' || rowType === 'Within Allowance')
+                          ? 'bg-zinc-100 dark:bg-zinc-800/50'
+                          : '',
+                        isDailyTotal ? 'bg-white dark:bg-zinc-900 font-semibold' : '',
+                        !splitByOverUnder
+                          ? 'hover:bg-zinc-50 dark:hover:bg-zinc-800/50'
+                          : rowType === 'Daily Total'
+                            ? ''
+                            : 'hover:bg-zinc-200/50 dark:hover:bg-zinc-700/50',
                       ].filter(Boolean).join(' ');
-                      const dayTimeOutlier = isFirstRowOfDay ? dayRollupOutlierSeverity(r as RollupQuads) : null;
+                      const dayTimeOutlier = isFirstRowOfDay
+                        ? dayRollupOutlierSeverity(r as RollupQuads, lowMinutesHighlightThreshold, lowMinutesExclusionSet)
+                        : null;
                       const dateCellFlag =
                         dayTimeOutlier === 'red'
                           ? SUMMARY_OUTLIER_RED
@@ -2490,16 +4287,29 @@ function SummaryPageInner() {
                             '\u00A0'
                           )}
                         </td>
-                        {splitByLimits && (
+                        {splitByOverUnder && (
                           <td className="whitespace-nowrap border-r border-zinc-200 px-3 py-2 text-xs font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-400">{rowType}</td>
                         )}
-                        <td className="whitespace-nowrap border-r border-zinc-200 px-3 py-2 tabular-nums text-zinc-500 dark:border-zinc-700 dark:text-zinc-400">{formatIntNz(r.rollupJobCount)}</td>
+                        <td className="w-0 max-w-[4rem] min-w-0 whitespace-nowrap border-r border-zinc-200 px-1.5 py-2 text-right tabular-nums text-zinc-500 dark:border-zinc-700 dark:text-zinc-400">
+                          {formatIntNz(r.rollupJobCount)}
+                        </td>
+                        <td className="w-0 max-w-[4rem] min-w-0 whitespace-nowrap border-r border-zinc-200 px-1.5 py-2 text-right tabular-nums text-zinc-500 dark:border-zinc-700 dark:text-zinc-400">
+                          {formatIntNz(uniqueVineyardCount((r as RollupQuads).jobs ?? []))}
+                        </td>
+                        {!dayClientView && (
+                          <td className="whitespace-nowrap border-r border-zinc-200 px-3 py-2 text-right tabular-nums text-zinc-500 dark:border-zinc-700 dark:text-zinc-400">{formatIntNz(roundTripKms((r as RollupQuads).jobs ?? []))}</td>
+                        )}
                         {!dayClientView && [r.mins_2, r.mins_3, r.mins_4, r.mins_5].map((q, i) =>
                           (['total', 'max', 'min', 'av'] as const).map((key) => {
                             const stepNum = i + 2;
+                            const styleKey = stepNum === 2 ? 'step2' : stepNum === 3 ? 'step3' : stepNum === 4 ? 'step4' : 'step5';
                             const redClass = key === 'av' ? redIfOverStepCol(q[key], stepNum) : '';
                             return (
-                              <td key={`${i}-${key}`} className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 tabular-nums ${redClass ? redClass : `${STEP_GROUP_BG[(i + 2) as 2 | 3 | 4 | 5]} text-zinc-600 dark:text-zinc-400 dark:border-zinc-700`}`}>
+                              <td
+                                key={`${i}-${key}`}
+                                style={isDailyTotal ? undefined : bgFor(styleKey)}
+                                className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 text-right tabular-nums ${redClass ? redClass : `${STEP_GROUP_BG[(i + 2) as 2 | 3 | 4 | 5]} text-zinc-600 dark:text-zinc-400 dark:border-zinc-700`}`}
+                              >
                                 {fmtNz(q[key])}
                               </td>
                             );
@@ -2508,7 +4318,11 @@ function SummaryPageInner() {
                         {(dayClientView ? (['total', 'av'] as const) : (['total', 'max', 'min', 'av'] as const)).map((key) => {
                           const redClass = key === 'av' ? redIfOver(r.travel[key], 'travel') : '';
                           return (
-                            <td key={`travel-${key}`} className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 tabular-nums ${redClass || 'text-zinc-600 dark:border-zinc-700 dark:text-zinc-400'}`}>
+                            <td
+                              key={`travel-${key}`}
+                              style={isDailyTotal ? undefined : bgFor('travel')}
+                              className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 text-right tabular-nums ${redClass || 'text-zinc-600 dark:border-zinc-700 dark:text-zinc-400'}`}
+                            >
                               {fmtNz(r.travel[key])}
                             </td>
                           );
@@ -2516,7 +4330,11 @@ function SummaryPageInner() {
                         {(dayClientView ? (['total', 'av'] as const) : (['total', 'max', 'min', 'av'] as const)).map((key) => {
                           const redClass = key === 'av' ? redIfOver(r.mins_3[key], 'in_vineyard') : '';
                           return (
-                            <td key={`in_vineyard-${key}`} className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 tabular-nums ${redClass ? redClass : `${STEP_GROUP_BG[3]} text-zinc-600 dark:text-zinc-400 dark:border-zinc-700`}`}>
+                            <td
+                              key={`in_vineyard-${key}`}
+                              style={isDailyTotal ? undefined : bgFor('inVineyard')}
+                              className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 text-right tabular-nums ${redClass ? redClass : `${STEP_GROUP_BG[3]} text-zinc-600 dark:text-zinc-400 dark:border-zinc-700`}`}
+                            >
                               {fmtNz(r.mins_3[key])}
                             </td>
                           );
@@ -2524,7 +4342,11 @@ function SummaryPageInner() {
                         {(dayClientView ? (['total', 'av'] as const) : (['total', 'max', 'min', 'av'] as const)).map((key) => {
                           const redClass = key === 'av' ? redIfOver(r.mins_5[key], 'in_winery') : '';
                           return (
-                            <td key={`in_winery-${key}`} className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 tabular-nums ${redClass ? redClass : `${STEP_GROUP_BG[5]} text-zinc-600 dark:text-zinc-400 dark:border-zinc-700`}`}>
+                            <td
+                              key={`in_winery-${key}`}
+                              style={isDailyTotal ? undefined : bgFor('inWinery')}
+                              className={`whitespace-nowrap border-r border-zinc-200 px-2 py-2 text-right tabular-nums ${redClass ? redClass : `${STEP_GROUP_BG[5]} text-zinc-600 dark:text-zinc-400 dark:border-zinc-700`}`}
+                            >
                               {fmtNz(r.mins_5[key])}
                             </td>
                           );
@@ -2532,7 +4354,11 @@ function SummaryPageInner() {
                         {(dayClientView ? (['total', 'av'] as const) : (['total', 'max', 'min', 'av'] as const)).map((key) => {
                           const redClass = key === 'av' ? redIfOver(r.total[key], 'total') : '';
                           return (
-                            <td key={`total-${key}`} className={`whitespace-nowrap border-zinc-200 px-2 py-2 tabular-nums font-medium ${redClass || 'text-zinc-700 dark:border-zinc-700 dark:text-zinc-300'}`}>
+                            <td
+                              key={`total-${key}`}
+                              style={isDailyTotal ? undefined : bgFor('total')}
+                              className={`whitespace-nowrap border-zinc-200 px-2 py-2 text-right tabular-nums font-medium ${redClass || 'text-zinc-700 dark:border-zinc-700 dark:text-zinc-300'}`}
+                            >
                               {fmtNz(r.total[key])}
                             </td>
                           );
@@ -2546,7 +4372,7 @@ function SummaryPageInner() {
                     {byDayFooterSets.map((set) => {
                       const s = set.stats;
                       const subKeys = dayClientView ? (['total', 'av'] as const) : (['total', 'max', 'min', 'av'] as const);
-                      const footOutlier = footerStatsOutlierSeverity(s, set.jobCount);
+                      const footOutlier = footerStatsOutlierSeverity(s, set.jobCount, lowMinutesHighlightThreshold);
                       const footFlag =
                         footOutlier === 'red'
                           ? SUMMARY_OUTLIER_RED
@@ -2560,20 +4386,28 @@ function SummaryPageInner() {
                           >
                             Total / Av
                           </td>
-                          {splitByLimits && (
+                          {splitByOverUnder && (
                             <td className="border-r border-zinc-200 px-3 py-1.5 text-xs font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-400">
                               {set.rowType}
                             </td>
                           )}
-                          <td className="border-r border-zinc-200 px-3 py-1.5 tabular-nums text-xs text-zinc-500 dark:border-zinc-700 dark:text-zinc-400">
+                          <td className="w-0 max-w-[4rem] min-w-0 border-r border-zinc-200 px-1.5 py-1.5 text-right tabular-nums text-xs text-zinc-500 dark:border-zinc-700 dark:text-zinc-400">
                             {formatIntNz(set.jobCount)}
                           </td>
+                          <td className="w-0 max-w-[4rem] min-w-0 border-r border-zinc-200 px-1.5 py-1.5 text-right tabular-nums text-xs text-zinc-500 dark:border-zinc-700 dark:text-zinc-400">
+                            {formatIntNz(set.vyardsTotal)}
+                          </td>
+                          {!dayClientView && (
+                            <td className="border-r border-zinc-200 px-3 py-1.5 text-right tabular-nums text-xs text-zinc-500 dark:border-zinc-700 dark:text-zinc-400">
+                              {formatIntNz(set.kmsTotal)}
+                            </td>
+                          )}
                           {!dayClientView && [s.mins_2, s.mins_3, s.mins_4, s.mins_5].map((quad, i) =>
                             subKeys.map((key) => {
                               const val = key === 'total' ? quad.total : key === 'max' ? quad.max : key === 'min' ? quad.min : quad.av;
                               const redClass = key === 'av' && val != null ? redIfOverStepCol(val, i + 2) : '';
                               return (
-                                <td key={`${i}-${key}`} className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-xs ${redClass ? redClass : `${STEP_GROUP_BG[(i + 2) as 2 | 3 | 4 | 5]} text-zinc-600 dark:text-zinc-400 dark:border-zinc-700`}`}>
+                                <td key={`${i}-${key}`} className={`border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums text-xs ${redClass ? redClass : `${STEP_GROUP_BG[(i + 2) as 2 | 3 | 4 | 5]} text-zinc-600 dark:text-zinc-400 dark:border-zinc-700`}`}>
                                   {val != null ? formatIntNz(val) : '—'}
                                 </td>
                               );
@@ -2583,7 +4417,7 @@ function SummaryPageInner() {
                             const val = key === 'total' ? s.travel.total : key === 'max' ? s.travel.max : key === 'min' ? s.travel.min : s.travel.av;
                             const redClass = key === 'av' && val != null ? redIfOver(val, 'travel') : '';
                             return (
-                              <td key={`travel-${key}`} className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-xs ${redClass || (val != null ? 'text-zinc-600 dark:border-zinc-700 dark:text-zinc-400' : 'text-zinc-600 dark:border-zinc-700 dark:text-zinc-400')}`}>
+                              <td key={`travel-${key}`} className={`border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums text-xs ${redClass || (val != null ? 'text-zinc-600 dark:border-zinc-700 dark:text-zinc-400' : 'text-zinc-600 dark:border-zinc-700 dark:text-zinc-400')}`}>
                                 {val != null ? formatIntNz(val) : '—'}
                               </td>
                             );
@@ -2592,7 +4426,7 @@ function SummaryPageInner() {
                             const val = key === 'total' ? s.mins_3.total : key === 'max' ? s.mins_3.max : key === 'min' ? s.mins_3.min : s.mins_3.av;
                             const redClass = key === 'av' && val != null ? redIfOver(val, 'in_vineyard') : '';
                             return (
-                              <td key={`in_vineyard-${key}`} className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-xs ${redClass ? redClass : `${STEP_GROUP_BG[3]} text-zinc-600 dark:text-zinc-400 dark:border-zinc-700`}`}>
+                              <td key={`in_vineyard-${key}`} className={`border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums text-xs ${redClass ? redClass : `${STEP_GROUP_BG[3]} text-zinc-600 dark:text-zinc-400 dark:border-zinc-700`}`}>
                                 {val != null ? formatIntNz(val) : '—'}
                               </td>
                             );
@@ -2601,7 +4435,7 @@ function SummaryPageInner() {
                             const val = key === 'total' ? s.mins_5.total : key === 'max' ? s.mins_5.max : key === 'min' ? s.mins_5.min : s.mins_5.av;
                             const redClass = key === 'av' && val != null ? redIfOver(val, 'in_winery') : '';
                             return (
-                              <td key={`in_winery-${key}`} className={`border-r border-zinc-200 px-2 py-1.5 tabular-nums text-xs ${redClass ? redClass : `${STEP_GROUP_BG[5]} text-zinc-600 dark:text-zinc-400 dark:border-zinc-700`}`}>
+                              <td key={`in_winery-${key}`} className={`border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums text-xs ${redClass ? redClass : `${STEP_GROUP_BG[5]} text-zinc-600 dark:text-zinc-400 dark:border-zinc-700`}`}>
                                 {val != null ? formatIntNz(val) : '—'}
                               </td>
                             );
@@ -2610,7 +4444,7 @@ function SummaryPageInner() {
                             const val = key === 'total' ? s.total.total : key === 'max' ? s.total.max : key === 'min' ? s.total.min : s.total.av;
                             const redClass = key === 'av' && val != null ? redIfOver(val, 'total') : '';
                             return (
-                              <td key={`total-${key}`} className={`border-zinc-200 px-2 py-1.5 tabular-nums text-xs font-medium ${redClass || (val != null ? 'text-zinc-700 dark:border-zinc-700 dark:text-zinc-300' : 'text-zinc-700 dark:border-zinc-700 dark:text-zinc-300')}`}>
+                              <td key={`total-${key}`} className={`border-zinc-200 px-2 py-1.5 text-right tabular-nums text-xs font-medium ${redClass || (val != null ? 'text-zinc-700 dark:border-zinc-700 dark:text-zinc-300' : 'text-zinc-700 dark:border-zinc-700 dark:text-zinc-300')}`}>
                                 {val != null ? formatIntNz(val) : '—'}
                               </td>
                             );
@@ -2624,14 +4458,77 @@ function SummaryPageInner() {
             </div>
           )}
           {summaryTab === 'by_job' && (
-          <div
-            ref={byJobTableScrollRef}
-            className="max-h-[70vh] overflow-auto rounded-lg border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900"
-          >
-            <table className="w-full min-w-[64rem] text-left text-sm">
-              <thead className="sticky top-0 z-10 bg-zinc-100 shadow-[0_1px_0_0_rgba(0,0,0,0.1)] dark:bg-zinc-800 dark:shadow-[0_1px_0_0_rgba(255,255,255,0.08)]">
+          <div ref={byJobTableScrollRef} className="w-full min-w-0">
+            {(() => {
+              const n = sortedRows.length;
+              if (n <= jobsPageSize) return null;
+              const start = n === 0 ? 0 : jobsPage * jobsPageSize + 1;
+              const end = Math.min((jobsPage + 1) * jobsPageSize, n);
+              return (
+                <div className="mb-2 flex flex-wrap items-center justify-start gap-2 text-xs text-zinc-500">
+                  <span className="whitespace-nowrap">
+                    {formatIntNz(start)}–{formatIntNz(end)} of {formatIntNz(n)} jobs
+                  </span>
+                  <span className="flex items-center gap-2">
+                    <label className="flex items-center gap-1">
+                      <span className="text-[11px] text-zinc-500">Rows</span>
+                      <select
+                        value={jobsPageSize}
+                        onChange={(e) => {
+                          const v = parseInt(e.target.value, 10);
+                          if (!Number.isFinite(v) || v <= 0) return;
+                          setJobsPage(0);
+                          setJobsPageSize(v);
+                          saveJobsPageSize(v);
+                        }}
+                        className="h-7 rounded border border-zinc-300 bg-white px-2 text-xs dark:border-zinc-600 dark:bg-zinc-800"
+                      >
+                        {[100, 250, 500, 1000, 2000].map((v) => (
+                          <option key={v} value={v}>
+                            {v}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <button
+                      type="button"
+                      disabled={jobsPage === 0 || loading}
+                      onClick={() => setJobsPage((p) => Math.max(0, p - 1))}
+                      className="rounded border border-zinc-300 bg-white px-2 py-1 text-xs disabled:opacity-50 dark:border-zinc-600 dark:bg-zinc-800"
+                    >
+                      Prev
+                    </button>
+                    <span className="text-[11px] tabular-nums">
+                      Page {formatIntNz(jobsPage + 1)} of {formatIntNz(jobsTotalPages)}
+                    </span>
+                    <button
+                      type="button"
+                      disabled={jobsPage >= jobsTotalPages - 1 || loading}
+                      onClick={() => setJobsPage((p) => p + 1)}
+                      className="rounded border border-zinc-300 bg-white px-2 py-1 text-xs disabled:opacity-50 dark:border-zinc-600 dark:bg-zinc-800"
+                    >
+                      Next
+                    </button>
+                  </span>
+                </div>
+              );
+            })()}
+            <table className="w-max min-w-[64rem] text-left text-xs">
+              <thead
+                className={`${SUMMARY_THEAD_TH_ALIGNMENT} sticky top-0 z-10 bg-zinc-100 shadow-[0_1px_0_0_rgba(0,0,0,0.1)] dark:bg-zinc-800 dark:shadow-[0_1px_0_0_rgba(255,255,255,0.08)]`}
+              >
                 <tr className="border-b border-zinc-200 dark:border-zinc-700">
-                  <th colSpan={10} className="border-r border-zinc-200 px-2 py-1 text-xs font-medium text-zinc-500 dark:border-zinc-700" title={timeLimitRows.length > 0 ? "Per job: red if value > limit from row where Winery = delivery_winery, Vineyard group = vineyard_group, and TT = trailermode (T / TT). Boxes below show selected Time Limits row for reference only." : undefined}>
+                  <th
+                    // Top limit header row must account for Step 1 (Time/Via) columns in admin mode,
+                    // otherwise the per-column limit inputs/stats shift left.
+                    colSpan={BY_JOB_LEAD_COLUMNS.length + (jobClientView ? 1 : 2)}
+                    className="border-r border-zinc-200 px-2 py-0.5 text-[11px] font-medium text-zinc-500 dark:border-zinc-700"
+                    title={
+                      timeLimitRows.length > 0
+                        ? "Per job: red if value > limit from row matching Customer, Template, Winery, vineyard group (exact, blank only matches blank), and TT (or TTT fallback for T/TT). Boxes below are reference only."
+                        : undefined
+                    }
+                  >
                     Limit (red if &gt;){timeLimitRows.length > 0 ? ' (per winery)' : ''}
                   </th>
                   {!jobClientView && (
@@ -2640,108 +4537,62 @@ function SummaryPageInner() {
                         const key = `mins_${n}`;
                         const st = columnStats[key];
                         const groupBg = STEP_GROUP_BG[n];
+                        const styleKey = n === 2 ? 'step2' : n === 3 ? 'step3' : n === 4 ? 'step4' : 'step5';
                         return (
                           <React.Fragment key={n}>
-                            <th className={`border-r border-zinc-200 px-1 py-1 dark:border-zinc-700 ${groupBg}`}>
-                              <div className="flex flex-col gap-0.5">
-                                <input
-                                  type="number"
-                                  min={0}
-                                  placeholder="—"
-                                  value={minsThresholds[String(n)] ?? ''}
-                                  onChange={(e) => setMinsThreshold(String(n), e.target.value)}
-                                  onClick={(e) => e.stopPropagation()}
-                                  className="w-12 rounded border border-zinc-300 bg-white px-1 py-0.5 text-xs dark:border-zinc-600 dark:bg-zinc-800"
-                                  title={`Step ${n} Mins: red if value > this`}
-                                />
-                                {st && st.count > 0 && (
-                                  <span className="text-[10px] text-zinc-500 dark:text-zinc-400 tabular-nums">
-                                    Σ {formatIntNz(st.sum)} · avg {st.avg != null ? formatIntNz(st.avg) : '—'}
-                                  </span>
-                                )}
-                              </div>
+                            <th
+                              style={bgFor(styleKey)}
+                              colSpan={3}
+                              className={`border-r border-zinc-200 px-2 py-0.5 dark:border-zinc-700 ${groupBg}`}
+                            >
+                              {st && st.count > 0 ? (
+                                <span className="text-[10px] text-zinc-500 dark:text-zinc-400 tabular-nums">
+                                  Σ {formatIntNz(st.sum)} · avg {st.avg != null ? formatIntNz(st.avg) : '—'}
+                                </span>
+                              ) : (
+                                '\u00A0'
+                              )}
                             </th>
-                            <th colSpan={2} className={`border-r border-zinc-200 dark:border-zinc-700 ${groupBg}`} />
                           </React.Fragment>
                         );
                       })}
                     </>
                   )}
-                  <th className="border-r border-zinc-200 px-1 py-1 dark:border-zinc-700">
-                    <div className="flex flex-col gap-0.5">
-                      <input
-                        type="number"
-                        min={0}
-                        placeholder="—"
-                        value={minsThresholds.travel ?? ''}
-                        onChange={(e) => setMinsThreshold('travel', e.target.value)}
-                        onClick={(e) => e.stopPropagation()}
-                        className="w-12 rounded border border-zinc-300 bg-white px-1 py-0.5 text-xs dark:border-zinc-600 dark:bg-zinc-800"
-                        title="Travel: red if value > this"
-                      />
-                      {columnStats.travel?.count > 0 && (
-                        <span className="text-[10px] text-zinc-500 dark:text-zinc-400 tabular-nums">
-                          Σ {formatIntNz(columnStats.travel.sum)} · avg {columnStats.travel.avg != null ? formatIntNz(columnStats.travel.avg) : '—'}
-                        </span>
-                      )}
-                    </div>
+                  <th style={bgFor('travel')} className="border-r border-zinc-200 px-1 py-0.5 dark:border-zinc-700">
+                    {columnStats.travel?.count > 0 ? (
+                      <span className="text-[10px] text-zinc-500 dark:text-zinc-400 tabular-nums">
+                        Σ {formatIntNz(columnStats.travel.sum)} · avg {columnStats.travel.avg != null ? formatIntNz(columnStats.travel.avg) : '—'}
+                      </span>
+                    ) : (
+                      '\u00A0'
+                    )}
                   </th>
-                  <th className="border-r border-zinc-200 px-1 py-1 dark:border-zinc-700">
-                    <div className="flex flex-col gap-0.5">
-                      <input
-                        type="number"
-                        min={0}
-                        placeholder="—"
-                        value={minsThresholds.in_vineyard ?? ''}
-                        onChange={(e) => setMinsThreshold('in_vineyard', e.target.value)}
-                        onClick={(e) => e.stopPropagation()}
-                        className="w-12 rounded border border-zinc-300 bg-white px-1 py-0.5 text-xs dark:border-zinc-600 dark:bg-zinc-800"
-                        title="In Vineyard (step 3 mins): red if value > this"
-                      />
-                      {columnStats.in_vineyard?.count > 0 && (
-                        <span className="text-[10px] text-zinc-500 dark:text-zinc-400 tabular-nums">
-                          Σ {formatIntNz(columnStats.in_vineyard.sum)} · avg {columnStats.in_vineyard.avg != null ? formatIntNz(columnStats.in_vineyard.avg) : '—'}
-                        </span>
-                      )}
-                    </div>
+                  <th style={bgFor('inVineyard')} className="border-r border-zinc-200 px-1 py-0.5 dark:border-zinc-700">
+                    {columnStats.in_vineyard?.count > 0 ? (
+                      <span className="text-[10px] text-zinc-500 dark:text-zinc-400 tabular-nums">
+                        Σ {formatIntNz(columnStats.in_vineyard.sum)} · avg {columnStats.in_vineyard.avg != null ? formatIntNz(columnStats.in_vineyard.avg) : '—'}
+                      </span>
+                    ) : (
+                      '\u00A0'
+                    )}
                   </th>
-                  <th className="border-r border-zinc-200 px-1 py-1 dark:border-zinc-700">
-                    <div className="flex flex-col gap-0.5">
-                      <input
-                        type="number"
-                        min={0}
-                        placeholder="—"
-                        value={minsThresholds.in_winery ?? ''}
-                        onChange={(e) => setMinsThreshold('in_winery', e.target.value)}
-                        onClick={(e) => e.stopPropagation()}
-                        className="w-12 rounded border border-zinc-300 bg-white px-1 py-0.5 text-xs dark:border-zinc-600 dark:bg-zinc-800"
-                        title="In Winery (step 5 mins): red if value > this"
-                      />
-                      {columnStats.in_winery?.count > 0 && (
-                        <span className="text-[10px] text-zinc-500 dark:text-zinc-400 tabular-nums">
-                          Σ {formatIntNz(columnStats.in_winery.sum)} · avg {columnStats.in_winery.avg != null ? formatIntNz(columnStats.in_winery.avg) : '—'}
-                        </span>
-                      )}
-                    </div>
+                  <th style={bgFor('inWinery')} className="border-r border-zinc-200 px-1 py-0.5 dark:border-zinc-700">
+                    {columnStats.in_winery?.count > 0 ? (
+                      <span className="text-[10px] text-zinc-500 dark:text-zinc-400 tabular-nums">
+                        Σ {formatIntNz(columnStats.in_winery.sum)} · avg {columnStats.in_winery.avg != null ? formatIntNz(columnStats.in_winery.avg) : '—'}
+                      </span>
+                    ) : (
+                      '\u00A0'
+                    )}
                   </th>
-                  <th className="border-zinc-200 px-1 py-1 dark:border-zinc-700">
-                    <div className="flex flex-col gap-0.5">
-                      <input
-                        type="number"
-                        min={0}
-                        placeholder="—"
-                        value={minsThresholds.total ?? ''}
-                        onChange={(e) => setMinsThreshold('total', e.target.value)}
-                        onClick={(e) => e.stopPropagation()}
-                        className="w-12 rounded border border-zinc-300 bg-white px-1 py-0.5 text-xs dark:border-zinc-600 dark:bg-zinc-800"
-                        title="Total: red if value > this"
-                      />
-                      {columnStats.total?.count > 0 && (
-                        <span className="text-[10px] text-zinc-500 dark:text-zinc-400 tabular-nums">
-                          Σ {formatIntNz(columnStats.total.sum)} · avg {columnStats.total.avg != null ? formatIntNz(columnStats.total.avg) : '—'}
-                        </span>
-                      )}
-                    </div>
+                  <th style={bgFor('total')} className="border-zinc-200 px-1 py-0.5 dark:border-zinc-700">
+                    {columnStats.total?.count > 0 ? (
+                      <span className="text-[10px] text-zinc-500 dark:text-zinc-400 tabular-nums">
+                        Σ {formatIntNz(columnStats.total.sum)} · avg {columnStats.total.avg != null ? formatIntNz(columnStats.total.avg) : '—'}
+                      </span>
+                    ) : (
+                      '\u00A0'
+                    )}
                   </th>
                 </tr>
                 <tr className="border-b border-zinc-200 dark:border-zinc-700">
@@ -2780,7 +4631,12 @@ function SummaryPageInner() {
                         {STEP_LABELS[1]}
                       </th>
                       {[2, 3, 4, 5].map((n) => (
-                        <th key={n} colSpan={3} className={`border-b border-r border-zinc-200 px-3 py-2 font-medium text-zinc-900 dark:border-zinc-700 ${STEP_GROUP_BG[n]}`}>
+                        <th
+                          key={n}
+                          colSpan={3}
+                          style={bgFor(n === 2 ? 'step2' : n === 3 ? 'step3' : n === 4 ? 'step4' : 'step5')}
+                          className={`border-b border-r border-zinc-200 px-3 py-2 font-medium text-zinc-900 dark:border-zinc-700 ${STEP_GROUP_BG[n]}`}
+                        >
                           {STEP_LABELS[n]}
                         </th>
                       ))}
@@ -2789,6 +4645,7 @@ function SummaryPageInner() {
                   <th
                     rowSpan={2}
                     onClick={() => handleSort('travel')}
+                    style={bgFor('travel')}
                     className={`cursor-pointer select-none whitespace-nowrap border-b border-r border-zinc-200 px-3 py-2 font-medium text-zinc-900 hover:bg-zinc-200 dark:border-zinc-700 dark:text-zinc-100 dark:hover:bg-zinc-700 ${sortKey === 'travel' ? 'bg-zinc-200 dark:bg-zinc-700' : ''}`}
                   >
                     Travel {sortKey === 'travel' ? (sortDir === 'asc' ? '↑' : '↓') : ''}
@@ -2796,6 +4653,7 @@ function SummaryPageInner() {
                   <th
                     rowSpan={2}
                     onClick={() => handleSort('in_vineyard')}
+                    style={bgFor('inVineyard')}
                     className={`cursor-pointer select-none whitespace-nowrap border-b border-r border-zinc-200 px-3 py-2 font-medium text-zinc-900 hover:bg-zinc-200 dark:border-zinc-700 dark:text-zinc-100 dark:hover:bg-zinc-700 ${sortKey === 'in_vineyard' ? 'bg-zinc-200 dark:bg-zinc-700' : ''}`}
                   >
                     In Vineyard {sortKey === 'in_vineyard' ? (sortDir === 'asc' ? '↑' : '↓') : ''}
@@ -2803,6 +4661,7 @@ function SummaryPageInner() {
                   <th
                     rowSpan={2}
                     onClick={() => handleSort('in_winery')}
+                    style={bgFor('inWinery')}
                     className={`cursor-pointer select-none whitespace-nowrap border-b border-r border-zinc-200 px-3 py-2 font-medium text-zinc-900 hover:bg-zinc-200 dark:border-zinc-700 dark:text-zinc-100 dark:hover:bg-zinc-700 ${sortKey === 'in_winery' ? 'bg-zinc-200 dark:bg-zinc-700' : ''}`}
                   >
                     In Winery {sortKey === 'in_winery' ? (sortDir === 'asc' ? '↑' : '↓') : ''}
@@ -2810,6 +4669,7 @@ function SummaryPageInner() {
                   <th
                     rowSpan={2}
                     onClick={() => handleSort('total')}
+                    style={bgFor('total')}
                     className={`cursor-pointer select-none whitespace-nowrap border-b border-zinc-200 px-3 py-2 font-medium text-zinc-900 hover:bg-zinc-200 dark:border-zinc-700 dark:text-zinc-100 dark:hover:bg-zinc-700 ${sortKey === 'total' ? 'bg-zinc-200 dark:bg-zinc-700' : ''}`}
                   >
                     Total {sortKey === 'total' ? (sortDir === 'asc' ? '↑' : '↓') : ''}
@@ -2831,22 +4691,26 @@ function SummaryPageInner() {
                   </th>
                   {[2, 3, 4, 5].map((n) => {
                     const groupBg = STEP_GROUP_BG[n];
+                    const styleKey = n === 2 ? 'step2' : n === 3 ? 'step3' : n === 4 ? 'step4' : 'step5';
                     return (
                       <React.Fragment key={n}>
                         <th
                           onClick={() => handleSort(`mins_${n}`)}
+                          style={bgFor(styleKey)}
                           className={`cursor-pointer select-none whitespace-nowrap border-r border-zinc-200 px-3 py-1.5 text-xs font-medium text-zinc-600 hover:bg-zinc-200 dark:border-zinc-700 dark:text-zinc-400 dark:hover:bg-zinc-700 ${groupBg} ${sortKey === `mins_${n}` ? 'bg-zinc-200 dark:bg-zinc-700' : ''}`}
                         >
                         Mins {sortKey === `mins_${n}` ? (sortDir === 'asc' ? '↑' : '↓') : ''}
                         </th>
                         <th
                           onClick={() => handleSort(`step_${n}_actual_time`)}
+                          style={bgFor(styleKey)}
                           className={`cursor-pointer select-none whitespace-nowrap border-r border-zinc-200 px-3 py-1.5 text-xs font-medium text-zinc-600 hover:bg-zinc-200 dark:border-zinc-700 dark:text-zinc-400 dark:hover:bg-zinc-700 ${groupBg} ${sortKey === `step_${n}_actual_time` ? 'bg-zinc-200 dark:bg-zinc-700' : ''}`}
                         >
                           Time {sortKey === `step_${n}_actual_time` ? (sortDir === 'asc' ? '↑' : '↓') : ''}
                         </th>
                         <th
                           onClick={() => handleSort(`step_${n}_via`)}
+                          style={bgFor(styleKey)}
                           className={`cursor-pointer select-none whitespace-nowrap border-r border-zinc-200 px-3 py-1.5 text-xs font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-400 dark:hover:bg-zinc-700 ${groupBg} ${sortKey === `step_${n}_via` ? 'bg-zinc-200 dark:bg-zinc-700' : ''}`}
                         >
                           Via {sortKey === `step_${n}_via` ? (sortDir === 'asc' ? '↑' : '↓') : ''}
@@ -2875,7 +4739,7 @@ function SummaryPageInner() {
                       (k === 'Customer' || k === 'job_id' || k === 'worker')
                         ? ' bg-sky-100 dark:bg-sky-900/45'
                         : '';
-                    const jobTimeOutlier = timeOutlierSeverity(jobRowMinuteValues(row));
+                    const jobTimeOutlier = timeOutlierSeverity(lowMinutesValuesForRow(row), lowMinutesHighlightThreshold);
                     const ghostExcluded = !includedInRollup(row);
                     return (
                     <tr
@@ -2902,14 +4766,28 @@ function SummaryPageInner() {
                             ? ' max-w-[7.5rem] w-[7.5rem] whitespace-normal break-words'
                             : key === 'vineyard_group'
                               ? ' max-w-[4rem] w-[4rem] whitespace-normal break-words'
+                              : key === 'distance'
+                                ? ' max-w-[4.75rem] w-[4.75rem]'
                               : '';
+                        const isDistance = key === 'distance';
                         return (
                         <td
                           key={key}
-                          className={`${vineyardW || 'whitespace-nowrap'} px-3 py-2 text-zinc-700 dark:text-zinc-300${jobIdOutlierBg}${key === 'limits_breached' ? ' text-center font-medium tabular-nums ' + (row.limits_breached === 'X' ? 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-200' : 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-200') : ''}`}
+                          className={`${vineyardW || 'whitespace-nowrap'} px-2 py-1.5 dark:text-zinc-300${jobIdOutlierBg}${
+                            key === 'limits_breached'
+                              ? ' text-center font-medium tabular-nums ' + (row.limits_breached === 'X' ? 'text-red-700 dark:text-red-300' : 'text-emerald-700 dark:text-emerald-300')
+                              : isDistance
+                                ? ' text-right tabular-nums text-zinc-600'
+                                : ' text-zinc-700'
+                          }`}
                         >
                           {key === 'limits_breached' ? (
                             row.limits_breached ?? '-'
+                          ) : isDistance ? (
+                            (() => {
+                              const km = distanceRoundTripKmFromRow(row);
+                              return km == null ? '—' : formatKmNz2(km);
+                            })()
                           ) : key === 'job_id' && viewMode !== 'client' ? (
                             <Link
                               href={inspectUrlForRow(row)}
@@ -2937,7 +4815,7 @@ function SummaryPageInner() {
                       );
                       })}
                       {jobClientView && (
-                        <td className="whitespace-nowrap px-3 py-2 text-zinc-600 dark:text-zinc-400">
+                        <td className="whitespace-nowrap px-2 py-1.5 text-zinc-600 dark:text-zinc-400">
                           {formatDateDDMM(row.actual_start_time ?? row.step_1_actual_time ?? row.step_1_gps_completed_at ?? row.step_1_completed_at)}
                         </td>
                       )}
@@ -2958,7 +4836,9 @@ function SummaryPageInner() {
                           const isOride = viaStr.toUpperCase() === 'ORIDE';
                           const mins = n >= 2 ? minsBetween(row, n - 1, n) : null;
                           const minsOver = n >= 2 && isOverLimitStepWithRow(mins, limitsRow, n);
-                          const groupBg = STEP_GROUP_BG[n];
+                          // Step 1 cells should not have a filled background; Via should read as font-only (GPS/VW/etc).
+                          const groupBg = n === 1 ? '' : STEP_GROUP_BG[n];
+                          const styleKey = n === 2 ? 'step2' : n === 3 ? 'step3' : n === 4 ? 'step4' : n === 5 ? 'step5' : null;
                           const viaDisplay = isVineFencePlus ? 'GPS+' : isVineFenceVPlus ? 'GPS+V' : viaStr;
                           const viaGreen =
                             isGps || isVineFencePlus || isVineFenceVPlus || isGpsStar || isVineSr1;
@@ -2966,16 +4846,21 @@ function SummaryPageInner() {
                             <React.Fragment key={n}>
                               {n >= 2 && (
                                 <td
-                                  className={`whitespace-nowrap px-3 py-2 tabular-nums ${minsOver ? 'bg-red-200 text-red-900 dark:bg-red-900/40 dark:text-red-200' : `${groupBg} text-zinc-500 dark:text-zinc-400`}`}
+                                  style={styleKey ? bgFor(styleKey) : undefined}
+                                  className={`w-10 whitespace-nowrap px-1 py-1.5 text-right tabular-nums ${minsOver ? 'text-red-700 dark:text-red-300' : `${groupBg} text-zinc-500 dark:text-zinc-400`}`}
                                 >
                                   {mins != null ? formatIntNz(mins) : '—'}
                                 </td>
                               )}
-                            <td className={`whitespace-nowrap px-3 py-2 text-zinc-600 dark:text-zinc-400 ${groupBg}`}>
+                            <td
+                              style={styleKey ? bgFor(styleKey) : undefined}
+                              className={`whitespace-nowrap px-2 py-1.5 text-zinc-600 dark:text-zinc-400 ${groupBg}`}
+                            >
                               {formatDateDDMM(actualVal)}
                             </td>
                             <td
-                              className={`whitespace-nowrap px-3 py-2 font-medium ${isOride ? 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-200' : viaGreen ? 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-200' : `${groupBg} text-zinc-700 dark:text-zinc-300`}`}
+                              style={styleKey ? bgFor(styleKey) : undefined}
+                              className={`whitespace-nowrap px-2 py-1.5 font-medium ${isOride ? 'text-red-700 dark:text-red-300' : viaGreen ? 'text-emerald-700 dark:text-emerald-300' : `${groupBg} text-zinc-700 dark:text-zinc-300`}`}
                             >
                               {viaDisplay}
                             </td>
@@ -2992,22 +4877,26 @@ function SummaryPageInner() {
                         return (
                           <React.Fragment>
                             <td
-                              className={`whitespace-nowrap px-3 py-2 tabular-nums ${isOverLimitWithRow(travel, limitsRow, 'travel') ? 'bg-red-200 text-red-900 dark:bg-red-900/40 dark:text-red-200' : 'text-zinc-500 dark:text-zinc-400'}`}
+                              style={bgFor('travel')}
+                              className={`whitespace-nowrap px-3 py-2 tabular-nums ${isOverLimitWithRow(travel, limitsRow, 'travel') ? 'text-red-700 dark:text-red-300' : 'text-zinc-500 dark:text-zinc-400'}`}
                             >
                               {travel != null ? formatIntNz(travel) : '—'}
                             </td>
                             <td
-                              className={`whitespace-nowrap px-3 py-2 tabular-nums ${isOverLimitWithRow(inVineyard, limitsRow, 'in_vineyard') ? 'bg-red-200 text-red-900 dark:bg-red-900/40 dark:text-red-200' : 'text-zinc-500 dark:text-zinc-400'}`}
+                              style={bgFor('inVineyard')}
+                              className={`whitespace-nowrap px-3 py-2 tabular-nums ${isOverLimitWithRow(inVineyard, limitsRow, 'in_vineyard') ? 'text-red-700 dark:text-red-300' : 'text-zinc-500 dark:text-zinc-400'}`}
                             >
                               {inVineyard != null ? formatIntNz(inVineyard) : '—'}
                             </td>
                             <td
-                              className={`whitespace-nowrap px-3 py-2 tabular-nums ${isOverLimitWithRow(inWinery, limitsRow, 'in_winery') ? 'bg-red-200 text-red-900 dark:bg-red-900/40 dark:text-red-200' : 'text-zinc-500 dark:text-zinc-400'}`}
+                              style={bgFor('inWinery')}
+                              className={`whitespace-nowrap px-3 py-2 tabular-nums ${isOverLimitWithRow(inWinery, limitsRow, 'in_winery') ? 'text-red-700 dark:text-red-300' : 'text-zinc-500 dark:text-zinc-400'}`}
                             >
                               {inWinery != null ? formatIntNz(inWinery) : '—'}
                             </td>
                             <td
-                              className={`whitespace-nowrap px-3 py-2 tabular-nums ${isOverLimitWithRow(total, limitsRow, 'total') ? 'bg-red-200 text-red-900 dark:bg-red-900/40 dark:text-red-200' : 'text-zinc-500 dark:text-zinc-400'}`}
+                              style={bgFor('total')}
+                              className={`whitespace-nowrap px-3 py-2 tabular-nums ${isOverLimitWithRow(total, limitsRow, 'total') ? 'text-red-700 dark:text-red-300' : 'text-zinc-500 dark:text-zinc-400'}`}
                             >
                               {total != null ? formatIntNz(total) : '—'}
                             </td>
@@ -3030,6 +4919,81 @@ function SummaryPageInner() {
               <SummaryDataAuditPivot jobs={filteredRows} loading={loading} />
             </div>
           )}
+          {summaryTab === 'vineyards' && (
+            <div className="max-h-[70vh] overflow-auto rounded-lg border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900">
+              <table className="w-full max-w-3xl text-left text-xs">
+                <thead
+                  className={`${SUMMARY_THEAD_TH_ALIGNMENT} sticky top-0 z-10 bg-zinc-100 shadow-[0_1px_0_0_rgba(0,0,0,0.1)] dark:bg-zinc-800 dark:shadow-[0_1px_0_0_rgba(255,255,255,0.08)]`}
+                >
+                  <tr className="border-b border-zinc-200 dark:border-zinc-700">
+                    <th className="border-r border-zinc-200 px-2 py-2 text-xs font-medium text-zinc-500 dark:border-zinc-700 dark:text-zinc-400">
+                      Vineyard
+                    </th>
+                    <th className="border-r border-zinc-200 px-2 py-2 text-xs font-medium text-zinc-500 dark:border-zinc-700">Jobs</th>
+                    {viewMode !== 'client' && (
+                      <th className="border-r border-zinc-200 px-2 py-2 text-xs font-medium text-zinc-500 dark:border-zinc-700">
+                        Total mins
+                      </th>
+                    )}
+                    <th className="border-r border-zinc-200 px-2 py-2 text-xs font-medium text-zinc-500 dark:border-zinc-700">KMs</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {vineyardSummaryList.length === 0 ? (
+                    <tr>
+                      <td
+                        colSpan={viewMode === 'client' ? 3 : 4}
+                        className="px-3 py-6 text-center text-zinc-500 dark:text-zinc-400"
+                      >
+                        {filteredRows.length === 0
+                          ? 'No jobs match the current filters.'
+                          : 'No rollup jobs (all may be marked excluded).'}
+                      </td>
+                    </tr>
+                  ) : (
+                    vineyardSummaryList.map((v) => (
+                      <tr key={v.vineyardLabel} className="border-b border-zinc-100 dark:border-zinc-800">
+                        <td className="min-w-[9rem] whitespace-nowrap border-r border-zinc-200 px-2 py-2 text-xs font-medium text-zinc-800 dark:border-zinc-700 dark:text-zinc-200">
+                          {v.vineyardLabel}
+                        </td>
+                        <td className="whitespace-nowrap border-r border-zinc-200 px-2 py-2 text-right tabular-nums text-zinc-500 dark:border-zinc-700 dark:text-zinc-400">
+                          {formatIntNz(v.jobCount)}
+                        </td>
+                        {viewMode !== 'client' && (
+                          <td className="whitespace-nowrap border-r border-zinc-200 px-2 py-2 text-right tabular-nums text-zinc-600 dark:border-zinc-700 dark:text-zinc-400">
+                            {formatIntNz(v.totalMinsSum)}
+                          </td>
+                        )}
+                        <td className="whitespace-nowrap border-r border-zinc-200 px-2 py-2 text-right tabular-nums text-zinc-600 dark:border-zinc-700 dark:text-zinc-400">
+                          {formatKmNz2(v.kmsRoundTrip)}
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+                {vineyardSummaryList.length > 0 && (
+                  <tfoot className="border-t-2 border-zinc-300 bg-zinc-50 dark:border-zinc-600 dark:bg-zinc-800/80">
+                    <tr>
+                      <td className="border-r border-zinc-200 px-2 py-2 text-xs font-medium text-zinc-600 dark:border-zinc-700 dark:text-zinc-400">
+                        Total
+                      </td>
+                      <td className="whitespace-nowrap border-r border-zinc-200 px-2 py-2 text-right text-xs font-medium tabular-nums text-zinc-700 dark:border-zinc-700 dark:text-zinc-300">
+                        {formatIntNz(vineyardSummaryList.reduce((s, v) => s + v.jobCount, 0))}
+                      </td>
+                      {viewMode !== 'client' && (
+                        <td className="whitespace-nowrap border-r border-zinc-200 px-2 py-2 text-right text-xs font-medium tabular-nums text-zinc-700 dark:border-zinc-700 dark:text-zinc-300">
+                          {formatIntNz(vineyardSummaryList.reduce((s, v) => s + v.totalMinsSum, 0))}
+                        </td>
+                      )}
+                      <td className="whitespace-nowrap border-r border-zinc-200 px-2 py-2 text-right text-xs font-medium tabular-nums text-zinc-700 dark:border-zinc-700 dark:text-zinc-300">
+                        {formatKmNz2(vineyardSummaryList.reduce((s, v) => s + v.kmsRoundTrip, 0))}
+                      </td>
+                    </tr>
+                  </tfoot>
+                )}
+              </table>
+            </div>
+          )}
           <div className="mt-3 flex flex-wrap items-center gap-3 text-zinc-500">
             <span>
               {summaryTab === 'by_job'
@@ -3043,7 +5007,9 @@ function SummaryPageInner() {
                   })()
                 : summaryTab === 'data_audit'
                   ? `Jobs (rollups): ${formatIntNz(rollupJobsCount)}${rollupJobsCount !== filteredRows.length ? ` · ${formatIntNz(filteredRows.length)} loaded` : ''}${filteredRows.length !== totalJobsFromApi ? ` (client filter ${formatIntNz(filteredRows.length)} vs API ${formatIntNz(totalJobsFromApi)})` : ''}`
-                  : `Total harvest days: ${formatIntNz(summaryHarvestDayCount)} · Jobs (rollups): ${formatIntNz(rollupJobsCount)}${rollupJobsCount !== filteredRows.length ? ` · ${formatIntNz(filteredRows.length)} loaded` : ''}${filteredRows.length !== totalJobsFromApi ? ` (client filter ${formatIntNz(filteredRows.length)} vs API ${formatIntNz(totalJobsFromApi)})` : ''}`}
+                  : summaryTab === 'vineyards'
+                    ? `${formatIntNz(vineyardSummaryList.length)} vineyard${vineyardSummaryList.length !== 1 ? 's' : ''} · Jobs (rollups): ${formatIntNz(rollupJobsCount)}${rollupJobsCount !== filteredRows.length ? ` · ${formatIntNz(filteredRows.length)} loaded` : ''}${filteredRows.length !== totalJobsFromApi ? ` (client filter ${formatIntNz(filteredRows.length)} vs API ${formatIntNz(totalJobsFromApi)})` : ''}`
+                    : `Total harvest days: ${formatIntNz(summaryHarvestDayCount)} · Jobs (rollups): ${formatIntNz(rollupJobsCount)}${rollupJobsCount !== filteredRows.length ? ` · ${formatIntNz(filteredRows.length)} loaded` : ''}${filteredRows.length !== totalJobsFromApi ? ` (client filter ${formatIntNz(filteredRows.length)} vs API ${formatIntNz(totalJobsFromApi)})` : ''}`}
             </span>
             {summaryTab === 'by_job' && sortedRows.length > jobsPageSize && (
               <span className="flex items-center gap-2">
@@ -3056,11 +5022,11 @@ function SummaryPageInner() {
                   Prev
                 </button>
                 <span className="text-xs">
-                  Page {formatIntNz(jobsPage + 1)} of {formatIntNz(Math.ceil(sortedRows.length / jobsPageSize))}
+                  Page {formatIntNz(jobsPage + 1)} of {formatIntNz(jobsTotalPages)}
                 </span>
                 <button
                   type="button"
-                  disabled={jobsPage >= Math.ceil(sortedRows.length / jobsPageSize) - 1 || loading}
+                  disabled={jobsPage >= jobsTotalPages - 1 || loading}
                   onClick={() => setJobsPage((p) => p + 1)}
                   className="rounded border border-zinc-300 bg-white px-2 py-1 text-sm disabled:opacity-50 dark:border-zinc-600 dark:bg-zinc-800"
                 >
@@ -3069,7 +5035,9 @@ function SummaryPageInner() {
               </span>
             )}
           </div>
-          {jobsQueryDebug && (summaryTab === 'season' || summaryTab === 'by_day' || summaryTab === 'data_audit') && (
+          {jobsQueryDebug &&
+            viewMode !== 'client' &&
+            (summaryTab === 'season' || summaryTab === 'by_day' || summaryTab === 'data_audit' || summaryTab === 'vineyards') && (
             <details className="mt-4 rounded border border-zinc-200 bg-zinc-50 p-3 text-xs dark:border-zinc-600 dark:bg-zinc-900/50">
               <summary className="cursor-pointer font-medium text-zinc-700 dark:text-zinc-300">
                 Debug: job count SQL (criteria for this summary)
@@ -3081,6 +5049,8 @@ function SummaryPageInner() {
                 Params JSON: {JSON.stringify(jobsQueryDebug.debugSqlParams)}
               </p>
             </details>
+          )}
+          </>
           )}
         </>
       )}

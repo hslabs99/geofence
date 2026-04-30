@@ -23,8 +23,8 @@ export async function GET(
 
     const rows = await query<Row>(
       `SELECT fence_id, fence_name, ST_AsGeoJSON(geom)::text AS geojson,
-              ST_Y(ST_Centroid(geom))::text AS center_lat,
-              ST_X(ST_Centroid(geom))::text AS center_lon
+              ST_Y(ST_PointOnSurface(geom))::text AS center_lat,
+              ST_X(ST_PointOnSurface(geom))::text AS center_lon
        FROM tbl_geofences WHERE fence_id = $1`,
       [idNum]
     );
@@ -37,12 +37,14 @@ export async function GET(
     } catch {
       // leave null if invalid json
     }
+    const lat = parseFloat(r.center_lat);
+    const lon = parseFloat(r.center_lon);
     return NextResponse.json({
       fence_id: r.fence_id,
       fence_name: r.fence_name ?? '',
       geometry,
-      center_lat: parseFloat(r.center_lat) || null,
-      center_lon: parseFloat(r.center_lon) || null,
+      center_lat: Number.isFinite(lat) ? lat : null,
+      center_lon: Number.isFinite(lon) ? lon : null,
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

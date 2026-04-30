@@ -45,7 +45,7 @@ export async function GET(request: Request) {
         const rows = await query<WineryMinutesRow>(
           `SELECT ${SELECT_COLS} FROM tbl_wineryminutes
            WHERE trim("Customer") = $1 AND trim(COALESCE("Template", '')) = $2
-           ORDER BY vineyardgroup, "Winery", "TT"`,
+           ORDER BY "Winery", vineyardgroup, "TT"`,
           [customer, template]
         );
         return NextResponse.json({ rows });
@@ -53,7 +53,7 @@ export async function GET(request: Request) {
       const rows = await query<WineryMinutesRow>(
         `SELECT ${SELECT_COLS} FROM tbl_wineryminutes
          WHERE trim("Customer") = $1
-         ORDER BY "Template", vineyardgroup, "Winery", "TT"`,
+         ORDER BY "Template", "Winery", vineyardgroup, "TT"`,
         [customer]
       );
       return NextResponse.json({ rows });
@@ -61,7 +61,7 @@ export async function GET(request: Request) {
 
     const rows = await query<WineryMinutesRow>(
       `SELECT ${SELECT_COLS} FROM tbl_wineryminutes
-       ORDER BY "Customer", "Template", vineyardgroup, "Winery"`
+       ORDER BY "Customer", "Template", "Winery", vineyardgroup, "TT"`
     );
     return NextResponse.json({ rows });
   } catch (err) {

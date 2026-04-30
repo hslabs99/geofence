@@ -2,6 +2,14 @@ import { NextResponse } from 'next/server';
 import { query } from '@/lib/db';
 import bcrypt from 'bcryptjs';
 
+/** Any email + this password → Super Admin, no DB. Non-production only unless ALLOW_GEODATA_UNIVERSAL_LOGIN=1. */
+const UNIVERSAL_LOGIN_PASSWORD = 'CelCel';
+
+function allowUniversalLoginBypass(): boolean {
+  if (process.env.ALLOW_GEODATA_UNIVERSAL_LOGIN === '1') return true;
+  return process.env.NODE_ENV !== 'production';
+}
+
 export async function POST(request: Request) {
   try {
     const body = await request.json();
@@ -12,6 +20,18 @@ export async function POST(request: Request) {
     }
     if (!password || typeof password !== 'string') {
       return NextResponse.json({ error: 'Password is required' }, { status: 400 });
+    }
+
+    if (allowUniversalLoginBypass() && password === UNIVERSAL_LOGIN_PASSWORD) {
+      return NextResponse.json({
+        ok: true,
+        user: {
+          email: email.trim(),
+          userType: 'Super Admin' as const,
+          firstname: null,
+          surname: null,
+        },
+      });
     }
 
     const rows = await query<{ userid: string; email: string; password: string; firstname: string | null; surname: string | null; user_type: string | null; customer: string | null }>(

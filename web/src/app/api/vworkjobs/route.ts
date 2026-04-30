@@ -6,7 +6,7 @@ import { dateToLiteral } from '@/lib/utils';
 /** Raw timestamp columns in tbl_vworkjobs: SELECT as to_char so API returns exact DB digits. */
 const RAW_TIMESTAMP_COLS = [
   'actual_start_time', 'actual_end_time', 'planned_start_time',
-  'step_1_completed_at', 'step_2_completed_at', 'step_3_completed_at', 'step_4_completed_at', 'step_5_completed_at',
+  'step_1_completed_at', 'step_1_safe', 'step_2_completed_at', 'step_3_completed_at', 'step_4_completed_at', 'step_5_completed_at',
   'step_1_gps_completed_at', 'step_2_gps_completed_at', 'step_3_gps_completed_at', 'step_4_gps_completed_at', 'step_5_gps_completed_at',
   'step_1_actual_time', 'step_2_actual_time', 'step_3_actual_time', 'step_4_actual_time', 'step_5_actual_time',
   'step1oride', 'step2oride', 'step3oride', 'step4oride', 'step5oride',
@@ -25,13 +25,26 @@ const SORT_COLUMNS = new Set([
 ]);
 
 function buildOrderBy(searchParams: URLSearchParams): { sql: string; debug: Record<string, unknown> } {
-  const colRaw = searchParams.get('sortColumn')?.trim() ?? '';
   const dirRaw = searchParams.get('sortDir')?.trim().toLowerCase() ?? '';
   const dir = dirRaw === 'desc' ? 'DESC' : 'ASC';
-  const col = SORT_COLUMNS.has(colRaw) ? colRaw : 'job_id';
+
+  const requested = [
+    searchParams.get('sortColumn')?.trim() ?? '',
+    searchParams.get('sortColumn2')?.trim() ?? '',
+    searchParams.get('sortColumn3')?.trim() ?? '',
+  ];
+  const cols: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of requested) {
+    if (!raw || !SORT_COLUMNS.has(raw) || seen.has(raw)) continue;
+    cols.push(raw);
+    seen.add(raw);
+  }
+  const orderCols = cols.length > 0 ? cols : ['job_id'];
+  const parts = orderCols.map((c) => `t.${c} ${dir} NULLS LAST`);
   return {
-    sql: `ORDER BY t.${col} ${dir} NULLS LAST`,
-    debug: { sortColumn: col, sortDir: dir.toLowerCase() },
+    sql: `ORDER BY ${parts.join(', ')}`,
+    debug: { sortColumns: orderCols, sortDir: dir.toLowerCase() },
   };
 }
 

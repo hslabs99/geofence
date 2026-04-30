@@ -5,6 +5,9 @@ import { formatIntNz } from '@/lib/format-nz';
 
 type Row = Record<string, unknown>;
 
+/** Match Summary query tables: center header labels horizontally and vertically */
+const SUMMARY_THEAD_TH_ALIGNMENT = '[&_th]:align-middle [&_th]:text-center';
+
 /** Same notion as Summary: excluded=1 omits job from rollup counts. */
 function includedInRollup(row: Row): boolean {
   const ex = row.excluded;
@@ -193,7 +196,7 @@ function fieldValue(row: Row, id: DataAuditPivotFieldId): string {
     case 'vineyard':
       return cellLabel(row.vineyard_name);
     case 'trailermode':
-      return cellLabel(row.trailermode ?? row.trailertype);
+      return cellLabel(row.trailermode);
     case 'loadsize':
       return cellLabel(row.loadsize);
     case 'vineyard_gps':
@@ -646,14 +649,14 @@ export default function SummaryDataAuditPivot({ jobs, loading }: Props) {
               <p className="p-6 text-center text-sm text-zinc-500">Loading…</p>
             ) : fl === 0 ? (
               <table className="w-full text-left text-sm">
-                <thead className="bg-zinc-100 dark:bg-zinc-800">
+                <thead className={`${SUMMARY_THEAD_TH_ALIGNMENT} bg-zinc-100 dark:bg-zinc-800`}>
                   <tr className="border-b border-zinc-200 dark:border-zinc-700">
                     <th className="px-3 py-2 text-xs font-semibold text-zinc-700 dark:text-zinc-200">Grand total</th>
-                    <th className="px-3 py-2 text-right text-xs font-semibold text-zinc-700 dark:text-zinc-200">Jobs</th>
-                    <th className="px-3 py-2 text-right text-xs font-semibold text-zinc-700 dark:text-zinc-200">Travel</th>
-                    <th className="px-3 py-2 text-right text-xs font-semibold text-zinc-700 dark:text-zinc-200">Vineyard</th>
-                    <th className="px-3 py-2 text-right text-xs font-semibold text-zinc-700 dark:text-zinc-200">Winery</th>
-                    <th className="px-3 py-2 text-right text-xs font-semibold text-zinc-700 dark:text-zinc-200">Total</th>
+                    <th className="px-3 py-2 text-xs font-semibold text-zinc-700 dark:text-zinc-200">Jobs</th>
+                    <th className="px-3 py-2 text-xs font-semibold text-zinc-700 dark:text-zinc-200">Travel</th>
+                    <th className="px-3 py-2 text-xs font-semibold text-zinc-700 dark:text-zinc-200">Vineyard</th>
+                    <th className="px-3 py-2 text-xs font-semibold text-zinc-700 dark:text-zinc-200">Winery</th>
+                    <th className="px-3 py-2 text-xs font-semibold text-zinc-700 dark:text-zinc-200">Total</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -677,7 +680,9 @@ export default function SummaryDataAuditPivot({ jobs, loading }: Props) {
               </table>
             ) : (
               <table className="w-full min-w-[48rem] border-collapse text-left text-sm">
-                <thead className="sticky top-0 z-[1] bg-zinc-100 shadow-[0_1px_0_0_rgba(0,0,0,0.08)] dark:bg-zinc-800">
+                <thead
+                  className={`${SUMMARY_THEAD_TH_ALIGNMENT} sticky top-0 z-[1] bg-zinc-100 shadow-[0_1px_0_0_rgba(0,0,0,0.08)] dark:bg-zinc-800`}
+                >
                   <tr className="border-b border-zinc-300 dark:border-zinc-600">
                     {rowFields.map((id) => (
                       <th
@@ -687,19 +692,19 @@ export default function SummaryDataAuditPivot({ jobs, loading }: Props) {
                         {FIELD_META[id].label}
                       </th>
                     ))}
-                    <th className="whitespace-nowrap border-r border-zinc-200 px-3 py-2 text-right text-xs font-semibold text-zinc-700 dark:border-zinc-600 dark:text-zinc-200">
+                    <th className="whitespace-nowrap border-r border-zinc-200 px-3 py-2 text-xs font-semibold text-zinc-700 dark:border-zinc-600 dark:text-zinc-200">
                       Jobs
                     </th>
-                    <th className="whitespace-nowrap border-r border-zinc-200 px-3 py-2 text-right text-xs font-semibold text-zinc-700 dark:border-zinc-600 dark:text-zinc-200">
+                    <th className="whitespace-nowrap border-r border-zinc-200 px-3 py-2 text-xs font-semibold text-zinc-700 dark:border-zinc-600 dark:text-zinc-200">
                       Travel
                     </th>
-                    <th className="whitespace-nowrap border-r border-zinc-200 px-3 py-2 text-right text-xs font-semibold text-zinc-700 dark:border-zinc-600 dark:text-zinc-200">
+                    <th className="whitespace-nowrap border-r border-zinc-200 px-3 py-2 text-xs font-semibold text-zinc-700 dark:border-zinc-600 dark:text-zinc-200">
                       Vineyard
                     </th>
-                    <th className="whitespace-nowrap border-r border-zinc-200 px-3 py-2 text-right text-xs font-semibold text-zinc-700 dark:border-zinc-600 dark:text-zinc-200">
+                    <th className="whitespace-nowrap border-r border-zinc-200 px-3 py-2 text-xs font-semibold text-zinc-700 dark:border-zinc-600 dark:text-zinc-200">
                       Winery
                     </th>
-                    <th className="whitespace-nowrap px-3 py-2 text-right text-xs font-semibold text-zinc-700 dark:text-zinc-200">
+                    <th className="whitespace-nowrap px-3 py-2 text-xs font-semibold text-zinc-700 dark:text-zinc-200">
                       Total
                     </th>
                   </tr>

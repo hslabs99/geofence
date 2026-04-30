@@ -115,7 +115,7 @@ export async function POST(request: Request) {
       return NextResponse.json(
         {
           error:
-            'GPS samples table or columns missing. Run web/sql/create_tbl_distances_gps_samples.sql, web/sql/alter_tbl_distances_gps_samples_outcomes.sql (if upgrading), and web/sql/add_gps_avg_tbl_distances.sql.',
+            'GPS samples table or columns missing. Run web/sql/create_tbl_distances_gps_samples.sql, web/sql/alter_tbl_distances_gps_samples_outcomes.sql (if upgrading), web/sql/add_gps_avg_tbl_distances.sql, web/sql/add_gps_plus_distances.sql, and web/sql/add_distance_via_tbl_distances.sql.',
         },
         { status: 500 }
       );

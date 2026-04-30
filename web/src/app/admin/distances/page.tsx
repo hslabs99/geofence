@@ -19,6 +19,18 @@ type DistanceRow = {
   gps_attempt_count?: number | null;
   gps_avg_distance_m?: number | null;
   gps_avg_duration_min?: string | null;
+  gps_plus_sample_count?: number | null;
+  gps_plus_avg_distance_m?: number | null;
+  gps_plus_avg_duration_min?: string | null;
+  distance_via?: string | null;
+  pair_clients?: string | null;
+  manual_distance_m?: number | null;
+  manual_duration_min?: string | null;
+  manual_notes?: string | null;
+  effective_distance_m?: number | null;
+  effective_duration_min?: string | null;
+  display_distance_via?: string | null;
+  maps_drive_url?: string | null;
 };
 
 type GpsMappingRow = { vwname: string | null; gpsname: string | null };
@@ -26,29 +38,65 @@ type GpsMappingRow = { vwname: string | null; gpsname: string | null };
 type ListResponse = {
   wineryOptions: string[];
   vineyardOptions: string[];
+  customerOptions?: string[];
   rows: DistanceRow[];
   gpsWineryMappings?: Record<string, GpsMappingRow[]>;
   gpsVineyardMappings?: Record<string, GpsMappingRow[]>;
 };
 
-type DistancesSortKey = 'winery' | 'vineyard' | 'vwork_jobs' | 'meters' | 'minutes' | 'gps_ok';
+type DistancesSortKey =
+  | 'winery'
+  | 'vineyard'
+  | 'vwork_jobs'
+  | 'meters'
+  | 'minutes'
+  | 'tag_avg_m'
+  | 'gps_plus_avg_m'
+  | 'gps_ok'
+  | 'gps_success'
+  | 'distance_via';
 
-/** m and min still unset or zero (seed defaults / nothing useful stored yet). */
+/** Metres: API effective_distance_m already merges manual over tbl_distances. */
+function effectiveDistanceM(row: DistanceRow): number | null {
+  const m = row.effective_distance_m ?? row.distance_m;
+  if (m == null) return null;
+  const n = Number(m);
+  return Number.isFinite(n) ? n : null;
+}
+
+function effectiveDurationMinStr(row: DistanceRow): string | null {
+  const t = row.effective_duration_min ?? row.duration_min;
+  if (t == null || String(t).trim() === '') return null;
+  return String(t);
+}
+
+/** m and min still unset or zero after merging manual distances. */
 function rowHasNoDistanceData(row: DistanceRow): boolean {
-  const m = row.distance_m;
+  const m = effectiveDistanceM(row);
   const noM = m == null || m === 0;
-  const t = row.duration_min;
-  if (t == null || String(t).trim() === '') return noM;
+  const t = effectiveDurationMinStr(row);
+  if (t == null) return noM;
   const n = Number(t);
   if (Number.isNaN(n)) return noM;
   return noM && n === 0;
 }
 
 function durationMinSortValue(row: DistanceRow): number | null {
-  const t = row.duration_min;
-  if (t == null || String(t).trim() === '') return null;
+  const t = effectiveDurationMinStr(row);
+  if (t == null) return null;
   const n = Number(t);
   return Number.isNaN(n) ? null : n;
+}
+
+function totalDistanceTimesJobs(row: DistanceRow): number | null {
+  const m = effectiveDistanceM(row);
+  const j = row.vwork_job_count ?? 0;
+  if (m == null || j <= 0) return null;
+  return m * j;
+}
+
+function viaLabelForRow(row: DistanceRow): string {
+  return String(row.display_distance_via ?? row.distance_via ?? '').trim();
 }
 
 function gpsOkCountForSort(
@@ -70,7 +118,7 @@ function DistancesSortHeader({
   title,
   center = false,
 }: {
-  label: string;
+  label: ReactNode;
   columnKey: DistancesSortKey;
   sortKey: DistancesSortKey;
   sortDir: 'asc' | 'desc';
@@ -81,17 +129,21 @@ function DistancesSortHeader({
 }) {
   const active = sortKey === columnKey;
   return (
-    <th className={`px-2 py-2 ${center ? 'text-center' : ''} ${className}`} title={title}>
+    <th
+      scope="col"
+      className={`border-b border-zinc-200 bg-zinc-100 px-2 py-2.5 dark:border-zinc-700 dark:bg-zinc-900 ${center ? 'text-center' : 'text-left'} ${className}`}
+      title={title}
+    >
       <button
         type="button"
         onClick={() => onSort(columnKey)}
-        className={`flex w-full items-center gap-0.5 font-semibold hover:text-zinc-950 dark:hover:text-zinc-100 ${
-          center ? 'justify-center' : 'justify-start'
+        className={`flex w-full gap-1 text-xs font-semibold uppercase tracking-wide text-zinc-700 hover:text-zinc-950 dark:text-zinc-300 dark:hover:text-zinc-100 ${
+          center ? 'items-center justify-center' : 'items-start justify-start'
         }`}
       >
         <span>{label}</span>
         {active && (
-          <span className="font-mono text-zinc-500" aria-hidden>
+          <span className="font-mono text-[10px] font-normal normal-case text-zinc-500" aria-hidden>
             {sortDir === 'asc' ? '↑' : '↓'}
           </span>
         )}
@@ -146,6 +198,20 @@ type GpsSampleRow = {
   run_index: number | null;
   created_at: string;
   updated_at: string;
+  gps_plus_meters?: number | null;
+  gps_plus_minutes?: number | null;
+  gps_plus_outcome?: string | null;
+};
+
+type GpsPlusSummary = {
+  ok: boolean;
+  meters?: number;
+  minutes?: number;
+  skipReason?: string;
+  winery_anchor_source?: string;
+  vineyard_hit_tracking_id?: number | null;
+  segment_point_count?: number;
+  detail?: Record<string, unknown>;
 };
 
 type HarvestAttempt = {
@@ -156,6 +222,7 @@ type HarvestAttempt = {
   meters?: number;
   minutes?: number;
   segment_point_count?: number;
+  gps_plus?: GpsPlusSummary;
   debug?: Record<string, unknown>;
 };
 
@@ -170,6 +237,13 @@ type DryRunDebugSnapshot = {
   distanceId: number;
   distancePair: { delivery_winery: string; vineyard_name: string };
   vworkJobsMatchCount: number;
+  jobMatchDebug?: {
+    countSql: string;
+    listSql: string;
+    params: unknown[];
+    vworkJobsMatchCount: number;
+    candidateJobIds: string[];
+  };
   candidateJobs: HarvestCandidateJob[];
   jobsPolled: number;
   successCount: number;
@@ -178,7 +252,241 @@ type DryRunDebugSnapshot = {
   maxSuccessesCap: number;
   message?: string;
   attempts: HarvestAttempt[];
+  /** Present when dry run updated tbl_distances from attempts (no samples written). */
+  rollup?: {
+    distance_via: string | null;
+    gps_sample_count: number | null;
+    gps_plus_sample_count: number | null;
+    distance_m: number | null;
+    gps_avg_distance_m: number | null;
+    gps_plus_avg_distance_m: number | null;
+  };
+  dryDistanceRowUpdated?: boolean;
 };
+
+type DryHarvestSortCol = 'job_id' | 'tag_m' | 'tag_min' | 'gp_m' | 'gp_min' | 'status' | 'fail_msg';
+
+function DryRunHarvestJobsTable({
+  attempts,
+  workerByJobId,
+}: {
+  attempts: HarvestAttempt[];
+  workerByJobId: Map<string, string | null>;
+}) {
+  const fmt2 = (n: unknown) => (typeof n === 'number' && Number.isFinite(n) ? n.toFixed(2) : '');
+  const matchedFenceNameFromAttempt = (a: HarvestAttempt, kind: 'winery' | 'vineyard'): string => {
+    const dbg = (a.debug ?? {}) as Record<string, unknown>;
+    const derived = dbg.derived_debug as any;
+    const node = kind === 'winery' ? derived?.winery : derived?.vineyard;
+    const step = kind === 'winery' ? node?.step1 : node?.step2;
+    const nm = step?.matchedFenceName;
+    return nm != null && String(nm).trim() !== '' ? String(nm) : '—';
+  };
+  const [q, setQ] = useState('');
+  const [status, setStatus] = useState<'all' | 'ok' | 'fail'>('all');
+  const [sortCol, setSortCol] = useState<DryHarvestSortCol>('job_id');
+  const [sortAsc, setSortAsc] = useState(true);
+
+  const toggleSort = (col: DryHarvestSortCol) => {
+    if (sortCol === col) setSortAsc((v) => !v);
+    else {
+      setSortCol(col);
+      setSortAsc(true);
+    }
+  };
+
+  const rows = useMemo(() => {
+    const qt = q.trim().toLowerCase();
+    let a = attempts.filter((x) => {
+      if (status === 'ok') return x.ok === true || x.outcome === 'success';
+      if (status === 'fail') return !(x.ok === true || x.outcome === 'success');
+      return true;
+    });
+    if (qt) {
+      a = a.filter(
+        (x) =>
+          String(x.job_id).toLowerCase().includes(qt) ||
+          String(x.skipReason ?? '').toLowerCase().includes(qt) ||
+          String(x.gps_plus?.skipReason ?? '').toLowerCase().includes(qt)
+      );
+    }
+    const mul = sortAsc ? 1 : -1;
+    const numTagM = (x: HarvestAttempt) =>
+      x.ok && typeof x.meters === 'number' ? x.meters : Number.NaN;
+    const numTagMin = (x: HarvestAttempt) =>
+      x.ok && typeof x.minutes === 'number' ? x.minutes : Number.NaN;
+    const numGpM = (x: HarvestAttempt) =>
+      x.gps_plus?.ok && typeof x.gps_plus.meters === 'number' ? x.gps_plus.meters : Number.NaN;
+    const numGpMin = (x: HarvestAttempt) =>
+      x.gps_plus?.ok && typeof x.gps_plus.minutes === 'number' ? x.gps_plus.minutes : Number.NaN;
+    const cmpNum = (vx: number, vy: number) => {
+      const nx = Number.isFinite(vx);
+      const ny = Number.isFinite(vy);
+      if (!nx && !ny) return 0;
+      if (!nx) return 1;
+      if (!ny) return -1;
+      return vx - vy;
+    };
+    return [...a].sort((x, y) => {
+      let c = 0;
+      switch (sortCol) {
+        case 'job_id':
+          c = String(x.job_id).localeCompare(String(y.job_id));
+          break;
+        case 'tag_m':
+          c = cmpNum(numTagM(x), numTagM(y));
+          break;
+        case 'tag_min':
+          c = cmpNum(numTagMin(x), numTagMin(y));
+          break;
+        case 'gp_m':
+          c = cmpNum(numGpM(x), numGpM(y));
+          break;
+        case 'gp_min':
+          c = cmpNum(numGpMin(x), numGpMin(y));
+          break;
+        case 'status': {
+          const sx = x.ok === true || x.outcome === 'success' ? 1 : 0;
+          const sy = y.ok === true || y.outcome === 'success' ? 1 : 0;
+          c = sx - sy;
+          break;
+        }
+        case 'fail_msg':
+          c = String(x.skipReason ?? '').localeCompare(String(y.skipReason ?? ''));
+          break;
+        default:
+          c = 0;
+      }
+      if (c !== 0) return mul * c;
+      return String(x.job_id).localeCompare(String(y.job_id));
+    });
+  }, [attempts, q, status, sortCol, sortAsc]);
+
+  const th = (col: DryHarvestSortCol, label: string, className = '') => (
+    <th className={`px-2 py-1.5 ${className}`}>
+      <button
+        type="button"
+        onClick={() => toggleSort(col)}
+        className="font-semibold text-zinc-800 hover:text-zinc-950 dark:text-zinc-200 dark:hover:text-white"
+      >
+        {label}
+        {sortCol === col && (
+          <span className="ml-0.5 font-mono text-zinc-500" aria-hidden>
+            {sortAsc ? '↑' : '↓'}
+          </span>
+        )}
+      </button>
+    </th>
+  );
+
+  return (
+    <div>
+      <div className="mb-2 flex flex-wrap items-end gap-3">
+        <label className="flex flex-col gap-0.5 text-[10px] font-medium uppercase tracking-wide text-zinc-500">
+          Filter text
+          <input
+            value={q}
+            onChange={(e) => setQ(e.target.value)}
+            placeholder="job_id, fail text…"
+            className="w-44 rounded border border-zinc-200 bg-white px-2 py-1 text-xs text-zinc-900 dark:border-zinc-600 dark:bg-zinc-950 dark:text-zinc-100"
+          />
+        </label>
+        <label className="flex flex-col gap-0.5 text-[10px] font-medium uppercase tracking-wide text-zinc-500">
+          Primary path
+          <select
+            value={status}
+            onChange={(e) => setStatus(e.target.value as 'all' | 'ok' | 'fail')}
+            className="rounded border border-zinc-200 bg-white px-2 py-1 text-xs dark:border-zinc-600 dark:bg-zinc-950"
+          >
+            <option value="all">All jobs</option>
+            <option value="ok">OK only</option>
+            <option value="fail">Failed only</option>
+          </select>
+        </label>
+        <span className="pb-1 text-[10px] text-zinc-500">
+          Showing <strong>{rows.length}</strong> of {attempts.length}
+        </span>
+      </div>
+      <div className="max-h-[min(52vh,520px)] overflow-auto rounded border border-zinc-200 dark:border-zinc-700">
+        <table className="w-full min-w-[40rem] border-collapse text-left text-[11px]">
+          <thead className="sticky top-0 z-20 border-b border-zinc-200 bg-zinc-100 shadow-sm dark:border-zinc-600 dark:bg-zinc-800">
+            <tr>
+              {th('job_id', 'job_id')}
+              {th('status', 'Tag', 'text-center')}
+              <th className="px-2 py-1.5 font-semibold text-zinc-700 dark:text-zinc-200">worker</th>
+              <th className="px-2 py-1.5 font-semibold text-zinc-700 dark:text-zinc-200">Winery fence used</th>
+              <th className="px-2 py-1.5 font-semibold text-zinc-700 dark:text-zinc-200">Vineyard fence used</th>
+              {th('tag_m', 'Tag m', 'text-right')}
+              {th('tag_min', 'Tag min', 'text-right')}
+              {th('gp_m', 'GPS+ m', 'text-right')}
+              {th('gp_min', 'GPS+ min', 'text-right')}
+              {th('fail_msg', 'Primary fail / GPS+ fail')}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((a, idx) => (
+              <tr
+                key={`${a.job_id}-${idx}`}
+                className={`border-t border-zinc-100 dark:border-zinc-700 ${
+                  a.ok ? 'bg-emerald-50/50 dark:bg-emerald-950/20' : 'bg-amber-50/40 dark:bg-amber-950/15'
+                }`}
+              >
+                <td className="px-2 py-1 font-mono">{a.job_id}</td>
+                <td className="px-2 py-1 text-center font-medium">
+                  {a.ok ? <span className="text-emerald-800 dark:text-emerald-200">OK</span> : '—'}
+                </td>
+                <td className="px-2 py-1 font-mono text-zinc-700 dark:text-zinc-300">
+                  {workerByJobId.get(String(a.job_id)) ?? '—'}
+                </td>
+                {(() => {
+                  const wUsed = matchedFenceNameFromAttempt(a, 'winery');
+                  const vUsed = matchedFenceNameFromAttempt(a, 'vineyard');
+                  return (
+                    <>
+                      <td
+                        className="max-w-[14rem] truncate px-2 py-1 font-mono text-[10px] text-zinc-700 dark:text-zinc-300"
+                        title={wUsed}
+                      >
+                        {wUsed}
+                      </td>
+                      <td
+                        className="max-w-[14rem] truncate px-2 py-1 font-mono text-[10px] text-zinc-700 dark:text-zinc-300"
+                        title={vUsed}
+                      >
+                        {vUsed}
+                      </td>
+                    </>
+                  );
+                })()}
+                <td className="px-2 py-1 text-right font-mono">
+                  {a.ok && typeof a.meters === 'number' ? fmt2(a.meters) : a.ok ? '—' : ''}
+                </td>
+                <td className="px-2 py-1 text-right font-mono">
+                  {a.ok && typeof a.minutes === 'number' ? a.minutes.toFixed(2) : a.ok ? '—' : '—'}
+                </td>
+                <td className="px-2 py-1 text-right font-mono">
+                  {a.gps_plus?.ok && typeof a.gps_plus.meters === 'number' ? fmt2(a.gps_plus.meters) : ''}
+                </td>
+                <td className="px-2 py-1 text-right font-mono">
+                  {a.gps_plus?.ok && typeof a.gps_plus.minutes === 'number' ? (
+                    a.gps_plus.minutes.toFixed(2)
+                  ) : a.gps_plus?.ok ? (
+                    '—'
+                  ) : (
+                    <span className="text-[10px] text-zinc-500">{a.gps_plus?.skipReason ?? '—'}</span>
+                  )}
+                </td>
+                <td className="max-w-[14rem] truncate px-2 py-1 text-[10px] text-amber-950 dark:text-amber-100" title={a.skipReason}>
+                  {!a.ok ? a.skipReason ?? '—' : '—'}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
 
 function StructuredDebugValue({
   value,
@@ -260,6 +568,14 @@ function formatDryRunSummaryText(s: DryRunDebugSnapshot): string {
           .join(', ')
     );
   }
+  const nGp = s.attempts.filter((a) => a.gps_plus?.ok === true).length;
+  if (nGp > 0 && av.avgGpsPlusMeters != null) {
+    lines.push('');
+    lines.push(
+      `GPS+ mean (${nGp} OK): ${Math.round(av.avgGpsPlusMeters)} m` +
+        (av.avgGpsPlusMinutes != null ? `, ${av.avgGpsPlusMinutes.toFixed(2)} min` : '')
+    );
+  }
   return lines.join('\n');
 }
 
@@ -284,6 +600,51 @@ function DryRunDebugModalBody({ snapshot }: { snapshot: DryRunDebugSnapshot }) {
             ? ` (first ${GPS_HARVEST_SQL_JOB_LIMIT} by job_id ascending loaded for harvest)`
             : ''}
         </p>
+        {snapshot.jobMatchDebug && (
+          <details className="mt-2 rounded border border-zinc-200 bg-white/60 p-2 text-xs dark:border-zinc-700 dark:bg-zinc-950/30">
+            <summary className="cursor-pointer select-none font-medium text-zinc-700 dark:text-zinc-300">
+              vWork match SQL (first step) — count + first job_ids
+            </summary>
+            <div className="mt-2 space-y-2">
+              <div className="font-mono text-[11px] text-zinc-700 dark:text-zinc-300">
+                matched={snapshot.jobMatchDebug.vworkJobsMatchCount} · candidateJobIds={snapshot.jobMatchDebug.candidateJobIds.length}
+              </div>
+              <div className="space-y-1">
+                <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">COUNT SQL</div>
+                <pre className="max-h-40 overflow-auto rounded bg-zinc-100 p-2 font-mono text-[10px] text-zinc-800 dark:bg-zinc-900 dark:text-zinc-100">
+{snapshot.jobMatchDebug.countSql}
+                </pre>
+              </div>
+              <div className="space-y-1">
+                <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">LIST SQL</div>
+                <pre className="max-h-40 overflow-auto rounded bg-zinc-100 p-2 font-mono text-[10px] text-zinc-800 dark:bg-zinc-900 dark:text-zinc-100">
+{snapshot.jobMatchDebug.listSql}
+                </pre>
+              </div>
+              <div className="space-y-1">
+                <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">PARAMS</div>
+                <pre className="max-h-24 overflow-auto rounded bg-zinc-100 p-2 font-mono text-[10px] text-zinc-800 dark:bg-zinc-900 dark:text-zinc-100">
+{JSON.stringify(snapshot.jobMatchDebug.params)}
+                </pre>
+              </div>
+              {snapshot.jobMatchDebug.candidateJobIds.length > 0 && (
+                <div className="space-y-1">
+                  <div className="text-[10px] font-semibold uppercase tracking-wide text-zinc-500">FIRST JOB_IDS</div>
+                  <div className="flex flex-wrap gap-1">
+                    {snapshot.jobMatchDebug.candidateJobIds.slice(0, 24).map((id) => (
+                      <span
+                        key={id}
+                        className="rounded bg-zinc-200 px-1.5 py-0.5 font-mono text-[10px] text-zinc-800 dark:bg-zinc-800 dark:text-zinc-100"
+                      >
+                        {id}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          </details>
+        )}
         <p className="mt-1 text-xs text-zinc-600 dark:text-zinc-400">
           Caps: up to <strong>{snapshot.maxJobsCap}</strong> job(s) tried, stop after{' '}
           <strong>{snapshot.maxSuccessesCap}</strong> success(es). This run:{' '}
@@ -297,59 +658,53 @@ function DryRunDebugModalBody({ snapshot }: { snapshot: DryRunDebugSnapshot }) {
         {(() => {
           const okA = snapshot.attempts.filter((a) => a.ok === true || a.outcome === 'success');
           const nOk = okA.length;
-          if (nOk === 0) return null;
           const av = dryRunAveragesFromAttempts(snapshot.attempts);
-          if (av.avgMeters == null && av.avgMinutes == null) return null;
+          const nGp = snapshot.attempts.filter((a) => a.gps_plus?.ok === true).length;
+          if (nOk === 0 && nGp === 0) return null;
           return (
-            <p className="mt-2 border-t border-zinc-200/80 pt-2 text-xs text-zinc-700 dark:text-zinc-300">
-              <span className="font-medium">Mean (of {nOk} successful job{nOk === 1 ? '' : 's'} only):</span>{' '}
-              {av.avgMeters != null && <span>{Math.round(av.avgMeters)} m</span>}
-              {av.avgMeters != null && av.avgMinutes != null && ' · '}
-              {av.avgMinutes != null && <span>{av.avgMinutes.toFixed(2)} min</span>}
-            </p>
+            <div className="mt-2 space-y-1 border-t border-zinc-200/80 pt-2 text-xs text-zinc-700 dark:text-zinc-300">
+              {nOk > 0 && (av.avgMeters != null || av.avgMinutes != null) && (
+                <p>
+                  <span className="font-medium">Mean (of {nOk} successful job{nOk === 1 ? '' : 's'} only):</span>{' '}
+                  {av.avgMeters != null && <span>{Math.round(av.avgMeters)} m</span>}
+                  {av.avgMeters != null && av.avgMinutes != null && ' · '}
+                  {av.avgMinutes != null && <span>{av.avgMinutes.toFixed(2)} min</span>}
+                </p>
+              )}
+              {nGp > 0 && av.avgGpsPlusMeters != null && (
+                <p>
+                  <span className="font-medium">GPS+ mean ({nGp} OK):</span>{' '}
+                  <span>{Math.round(av.avgGpsPlusMeters)} m</span>
+                  {av.avgGpsPlusMinutes != null && (
+                    <>
+                      {' · '}
+                      <span>{av.avgGpsPlusMinutes.toFixed(2)} min</span>
+                    </>
+                  )}
+                </p>
+              )}
+            </div>
           );
         })()}
+        {snapshot.dryDistanceRowUpdated && snapshot.rollup && (
+          <div className="mt-3 rounded border border-violet-200 bg-violet-50/90 p-2 text-xs text-violet-950 dark:border-violet-900 dark:bg-violet-950/40 dark:text-violet-100">
+            <p className="font-semibold">tbl_distances updated from this dry run (samples not saved)</p>
+            <p className="mt-1 font-mono">
+              distance_via={snapshot.rollup.distance_via ?? 'null'} · distance_m={snapshot.rollup.distance_m ?? 'null'}{' '}
+              · tag_OK={snapshot.rollup.gps_sample_count ?? 0} · GPS+_OK={snapshot.rollup.gps_plus_sample_count ?? 0} ·
+              avg_tag_m={snapshot.rollup.gps_avg_distance_m ?? 'null'} · avg_GPS+_m=
+              {snapshot.rollup.gps_plus_avg_distance_m ?? 'null'}
+            </p>
+          </div>
+        )}
       </div>
 
       {snapshot.attempts.length > 0 && (
         <div>
-          <h4 className="mb-1 text-xs font-semibold uppercase tracking-wide text-zinc-500">Results (polled jobs)</h4>
-          <div className="overflow-x-auto rounded border border-zinc-200 dark:border-zinc-700">
-            <table className="w-full min-w-[22rem] text-left text-[11px]">
-              <thead className="bg-zinc-100 dark:bg-zinc-800">
-                <tr>
-                  <th className="px-2 py-1">job_id</th>
-                  <th className="px-2 py-1">worker</th>
-                  <th className="px-2 py-1">metres</th>
-                  <th className="px-2 py-1">minutes / fail</th>
-                </tr>
-              </thead>
-              <tbody>
-                {snapshot.attempts.map((a, idx) => (
-                  <tr key={`${a.job_id}-${idx}`} className="border-t border-zinc-100 dark:border-zinc-700">
-                    <td className="px-2 py-0.5 font-mono">{a.job_id}</td>
-                    <td className="px-2 py-0.5 font-mono">
-                      {workerByJobId.get(String(a.job_id)) ?? '—'}
-                    </td>
-                    <td className="px-2 py-0.5 font-mono">
-                      {a.ok && typeof a.meters === 'number' ? a.meters : a.ok ? '—' : ''}
-                    </td>
-                    <td className="px-2 py-0.5">
-                      {a.ok && typeof a.minutes === 'number' ? (
-                        <span className="font-mono">{a.minutes.toFixed(2)}</span>
-                      ) : a.ok ? (
-                        '—'
-                      ) : (
-                        <span className="font-medium text-amber-900 dark:text-amber-100">
-                          Fail: {a.skipReason ?? 'Unknown reason'}
-                        </span>
-                      )}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+          <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-zinc-500">
+            Results (polled jobs) — filter and sort
+          </h4>
+          <DryRunHarvestJobsTable attempts={snapshot.attempts} workerByJobId={workerByJobId} />
         </div>
       )}
 
@@ -416,6 +771,50 @@ function DryRunDebugModalBody({ snapshot }: { snapshot: DryRunDebugSnapshot }) {
                   </dl>
                 )}
 
+                {a.gps_plus && (
+                  <div className="mt-2 border-t border-zinc-200/80 pt-2 dark:border-zinc-700">
+                    <p className="text-[11px] font-semibold uppercase tracking-wide text-violet-700 dark:text-violet-300">
+                      GPS+ (vineyard +100m buffer, any hit)
+                    </p>
+                    {a.gps_plus.ok ? (
+                      <dl className="mt-1 space-y-0.5 text-sm text-zinc-800 dark:text-zinc-200">
+                        <div className="flex flex-wrap gap-x-3 gap-y-0.5">
+                          <dt className="text-zinc-500">Metres</dt>
+                          <dd className="font-mono font-medium">
+                            {typeof a.gps_plus.meters === 'number' ? a.gps_plus.meters : '—'}
+                          </dd>
+                        </div>
+                        <div className="flex flex-wrap gap-x-3 gap-y-0.5">
+                          <dt className="text-zinc-500">Minutes</dt>
+                          <dd className="font-mono font-medium">
+                            {typeof a.gps_plus.minutes === 'number' ? a.gps_plus.minutes.toFixed(2) : '—'}
+                          </dd>
+                        </div>
+                        {a.gps_plus.winery_anchor_source != null && (
+                          <div className="text-xs text-zinc-500">
+                            Winery anchor: <span className="font-mono">{a.gps_plus.winery_anchor_source}</span>
+                          </div>
+                        )}
+                        {a.gps_plus.segment_point_count != null && (
+                          <div className="text-xs text-zinc-500">Path: {a.gps_plus.segment_point_count} pts</div>
+                        )}
+                      </dl>
+                    ) : (
+                      <p className="mt-1 text-xs font-medium text-amber-900 dark:text-amber-100">
+                        {a.gps_plus.skipReason ?? 'GPS+ failed'}
+                      </p>
+                    )}
+                    {a.gps_plus.detail != null && Object.keys(a.gps_plus.detail).length > 0 && (
+                      <details className="mt-1">
+                        <summary className="cursor-pointer text-[10px] text-zinc-500">GPS+ anchors</summary>
+                        <div className="mt-1 max-h-40 overflow-auto rounded bg-zinc-100/80 p-2 dark:bg-zinc-950/80">
+                          <StructuredDebugValue value={a.gps_plus.detail} maxDepth={5} />
+                        </div>
+                      </details>
+                    )}
+                  </div>
+                )}
+
                 {Object.keys(dbgRest).length > 0 && (
                   <div className="mt-3 border-t border-zinc-200/80 pt-2 dark:border-zinc-700">
                     <p className="mb-1 text-[10px] font-semibold uppercase text-zinc-500">Context</p>
@@ -442,7 +841,7 @@ function DryRunDebugModalBody({ snapshot }: { snapshot: DryRunDebugSnapshot }) {
 }
 
 function parseDistanceInput(s: string): number | null | 'invalid' {
-  const t = s.trim();
+  const t = s.trim().replace(/,/g, '');
   if (t === '') return null;
   const n = Number(t);
   if (!Number.isFinite(n) || !Number.isInteger(n)) return 'invalid';
@@ -450,22 +849,61 @@ function parseDistanceInput(s: string): number | null | 'invalid' {
 }
 
 function parseDurationInput(s: string): number | null | 'invalid' {
-  const t = s.trim();
+  const t = s.trim().replace(/,/g, '');
   if (t === '') return null;
   const n = Number(t);
   if (!Number.isFinite(n)) return 'invalid';
   return n;
 }
 
-function listParams(winery: string, vineyard: string): string {
+function listParams(winery: string, vineyard: string, client: string): string {
   const p = new URLSearchParams();
   if (winery.trim()) p.set('winery', winery.trim());
   if (vineyard.trim()) p.set('vineyard', vineyard.trim());
+  if (client.trim()) p.set('client', client.trim());
   const q = p.toString();
   return q ? `?${q}` : '';
 }
 
 /** Build the structured debug modal payload from rows already in tbl_distances_gps_samples (e.g. after refresh). */
+function gpsPlusFromSampleRow(s: GpsSampleRow, debug: Record<string, unknown> | undefined): GpsPlusSummary | undefined {
+  const fromDebug = debug?.gps_plus;
+  if (fromDebug != null && typeof fromDebug === 'object' && !Array.isArray(fromDebug)) {
+    const o = fromDebug as Record<string, unknown>;
+    if (o.ok === true) {
+      return {
+        ok: true,
+        meters: typeof o.meters === 'number' ? o.meters : undefined,
+        minutes: typeof o.minutes === 'number' ? o.minutes : undefined,
+        winery_anchor_source: typeof o.winery_anchor_source === 'string' ? o.winery_anchor_source : undefined,
+        vineyard_hit_tracking_id:
+          typeof o.vineyard_hit_tracking_id === 'number' ? o.vineyard_hit_tracking_id : null,
+        segment_point_count: typeof o.segment_point_count === 'number' ? o.segment_point_count : undefined,
+        detail: o.detail != null && typeof o.detail === 'object' && !Array.isArray(o.detail)
+          ? (o.detail as Record<string, unknown>)
+          : undefined,
+      };
+    }
+    if (o.ok === false || o.ok === undefined) {
+      return {
+        ok: false,
+        skipReason: typeof o.skipReason === 'string' ? o.skipReason : 'GPS+ not OK',
+      };
+    }
+  }
+  if (s.gps_plus_outcome === 'success' && typeof s.gps_plus_meters === 'number') {
+    return {
+      ok: true,
+      meters: s.gps_plus_meters,
+      minutes: typeof s.gps_plus_minutes === 'number' ? s.gps_plus_minutes : undefined,
+    };
+  }
+  if (s.gps_plus_outcome === 'failed') {
+    return { ok: false, skipReason: 'GPS+ failed (saved row)' };
+  }
+  return undefined;
+}
+
 function dryRunSnapshotFromSavedSamples(row: DistanceRow, samples: GpsSampleRow[]): DryRunDebugSnapshot {
   const attempts: HarvestAttempt[] = samples.map((s) => {
     const ok = s.outcome === 'success';
@@ -474,6 +912,7 @@ function dryRunSnapshotFromSavedSamples(row: DistanceRow, samples: GpsSampleRow[
       dbg != null && typeof dbg === 'object' && !Array.isArray(dbg)
         ? (dbg as Record<string, unknown>)
         : undefined;
+    const gps_plus = gpsPlusFromSampleRow(s, debug);
     return {
       job_id: String(s.job_id),
       ok,
@@ -482,6 +921,7 @@ function dryRunSnapshotFromSavedSamples(row: DistanceRow, samples: GpsSampleRow[
       meters: typeof s.meters === 'number' ? s.meters : undefined,
       minutes: typeof s.minutes === 'number' ? s.minutes : undefined,
       segment_point_count: s.segment_point_count ?? undefined,
+      gps_plus,
       debug,
     };
   });
@@ -515,17 +955,28 @@ function dryRunSnapshotFromSavedSamples(row: DistanceRow, samples: GpsSampleRow[
 function dryRunAveragesFromAttempts(attempts: HarvestAttempt[]): {
   avgMeters: number | null;
   avgMinutes: number | null;
+  avgGpsPlusMeters: number | null;
+  avgGpsPlusMinutes: number | null;
 } {
   const ok = attempts.filter((a) => a.ok === true || a.outcome === 'success');
   const n = ok.length;
-  if (n === 0) return { avgMeters: null, avgMinutes: null };
   const withM = ok.filter((a): a is HarvestAttempt & { meters: number } => typeof a.meters === 'number');
   const withMin = ok.filter((a): a is HarvestAttempt & { minutes: number } => typeof a.minutes === 'number');
+  const gpOk = attempts.filter((a) => a.gps_plus?.ok === true);
+  const ng = gpOk.length;
+  const withGpM = gpOk.filter((a): a is HarvestAttempt & { gps_plus: { meters: number } } =>
+    typeof a.gps_plus?.meters === 'number'
+  );
+  const withGpMin = gpOk.filter((a): a is HarvestAttempt & { gps_plus: { minutes: number } } =>
+    typeof a.gps_plus?.minutes === 'number'
+  );
   return {
-    avgMeters:
-      withM.length === n ? withM.reduce((s, a) => s + a.meters, 0) / n : null,
-    avgMinutes:
-      withMin.length === n ? withMin.reduce((s, a) => s + a.minutes, 0) / n : null,
+    avgMeters: n === 0 ? null : withM.length === n ? withM.reduce((s, a) => s + a.meters, 0) / n : null,
+    avgMinutes: n === 0 ? null : withMin.length === n ? withMin.reduce((s, a) => s + a.minutes, 0) / n : null,
+    avgGpsPlusMeters:
+      ng === 0 ? null : withGpM.length === ng ? withGpM.reduce((s, a) => s + a.gps_plus!.meters!, 0) / ng : null,
+    avgGpsPlusMinutes:
+      ng === 0 ? null : withGpMin.length === ng ? withGpMin.reduce((s, a) => s + a.gps_plus!.minutes!, 0) / ng : null,
   };
 }
 
@@ -534,9 +985,12 @@ export default function AdminDistancesPage() {
   const [vineyardFilter, setVineyardFilter] = useState('');
   const [appliedWinery, setAppliedWinery] = useState('');
   const [appliedVineyard, setAppliedVineyard] = useState('');
+  const [clientFilter, setClientFilter] = useState('');
+  const [appliedClient, setAppliedClient] = useState('');
 
   const [wineryOptions, setWineryOptions] = useState<string[]>([]);
   const [vineyardOptions, setVineyardOptions] = useState<string[]>([]);
+  const [customerOptions, setCustomerOptions] = useState<string[]>([]);
   const [gpsWineryMappings, setGpsWineryMappings] = useState<Record<string, GpsMappingRow[]>>({});
   const [gpsVineyardMappings, setGpsVineyardMappings] = useState<Record<string, GpsMappingRow[]>>({});
   const [rows, setRows] = useState<DistanceRow[]>([]);
@@ -549,8 +1003,14 @@ export default function AdminDistancesPage() {
   const [populateVworkMsg, setPopulateVworkMsg] = useState<string | null>(null);
   const [populateVworkBusy, setPopulateVworkBusy] = useState(false);
   const [filterNoDataOnly, setFilterNoDataOnly] = useState(false);
+  /** GPS rollup FAIL and no manual override (pairs that still need a drive distance). */
+  const [filterFailNoManualOnly, setFilterFailNoManualOnly] = useState(false);
   const [sortKey, setSortKey] = useState<DistancesSortKey>('winery');
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc');
+  /** Client-side Via filter on loaded rows (after API apply). */
+  const [tableGridFilterVia, setTableGridFilterVia] = useState<'' | 'GPSTAGS' | 'GPS+' | 'FAIL' | 'MANUAL'>('');
+  /** When true, dry run also UPDATEs tbl_distances for that pair (no sample rows written). */
+  const [dryRunUpdatePairRow, setDryRunUpdatePairRow] = useState(true);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [runAllBusy, setRunAllBusy] = useState(false);
   const [runAllMsg, setRunAllMsg] = useState<string | null>(null);
@@ -584,6 +1044,14 @@ export default function AdminDistancesPage() {
     vworkJobsMatchCount: number;
     candidateJobs: HarvestCandidateJob[];
     message?: string;
+    rollup?: {
+      distance_via: string | null;
+      gps_sample_count: number | null;
+      gps_plus_sample_count: number | null;
+      distance_m: number | null;
+      gps_avg_distance_m: number | null;
+      gps_plus_avg_distance_m: number | null;
+    };
   } | null>(null);
   /** Per distance_id: last dry-run snapshot for structured debug popup. */
   const [dryRunDebugSnapshotById, setDryRunDebugSnapshotById] = useState<
@@ -596,6 +1064,12 @@ export default function AdminDistancesPage() {
   /** Opening saved-samples report (no in-memory dry-run snapshot). */
   const [gpsDebugOpeningId, setGpsDebugOpeningId] = useState<number | null>(null);
   /** Per distance_id: last dry-run success count + averages until Save (then DB is source of truth). */
+  const [manualDm, setManualDm] = useState('');
+  const [manualDur, setManualDur] = useState('');
+  const [manualNotes, setManualNotes] = useState('');
+  const [manualBusy, setManualBusy] = useState(false);
+  const [manualMsg, setManualMsg] = useState<string | null>(null);
+
   const [gpsDryRunPreviewById, setGpsDryRunPreviewById] = useState<
     Record<
       number,
@@ -606,6 +1080,9 @@ export default function AdminDistancesPage() {
         maxSuccessesCap: number;
         avgMeters: number | null;
         avgMinutes: number | null;
+        avgGpsPlusMeters: number | null;
+        avgGpsPlusMinutes: number | null;
+        gpsPlusSuccessCount: number;
       }
     >
   >({});
@@ -613,18 +1090,45 @@ export default function AdminDistancesPage() {
   const wineryListId = useMemo(() => 'distances-winery-options', []);
   const vineyardListId = useMemo(() => 'distances-vineyard-options', []);
 
-  const load = useCallback(async (winery: string, vineyard: string) => {
+  const load = useCallback(async (winery: string, vineyard: string, client: string) => {
     setLoading(true);
     setError(null);
     try {
-      const r = await fetch(`/api/admin/distances${listParams(winery, vineyard)}`, {
+      const r = await fetch(`/api/admin/distances${listParams(winery, vineyard, client)}`, {
         cache: 'no-store',
       });
-      const json = await r.json();
-      if (json.error) throw new Error(json.error);
+      const json = (await r.json()) as {
+        error?: string;
+        debug?: Record<string, unknown>;
+        rows?: unknown;
+      };
+      if (!r.ok || json.error) {
+        const parts = [json.error ?? `HTTP ${r.status}`];
+        if (json.debug && typeof json.debug === 'object') {
+          parts.push(JSON.stringify(json.debug, null, 2));
+        }
+        if (!json.debug && r.status >= 500) {
+          parts.push(
+            'Tip: open /api/admin/distances?debug=1 for PostgreSQL code/detail, or check the server terminal for [GET /api/admin/distances].'
+          );
+        }
+        throw new Error(parts.join('\n\n'));
+      }
       const d = json as ListResponse;
       setWineryOptions(d.wineryOptions ?? []);
       setVineyardOptions(d.vineyardOptions ?? []);
+      const custOpts = d.customerOptions ?? [];
+      setCustomerOptions(custOpts);
+      setClientFilter((prev) => {
+        if (!prev) return prev;
+        if (custOpts.length === 0) return '';
+        return custOpts.includes(prev) ? prev : '';
+      });
+      setAppliedClient((applied) => {
+        if (!applied) return applied;
+        if (custOpts.length === 0) return '';
+        return custOpts.includes(applied) ? applied : '';
+      });
       setGpsWineryMappings(d.gpsWineryMappings ?? {});
       setGpsVineyardMappings(d.gpsVineyardMappings ?? {});
       setRows(d.rows ?? []);
@@ -662,7 +1166,7 @@ export default function AdminDistancesPage() {
   }, []);
 
   useEffect(() => {
-    void load('', '');
+    void load('', '', '');
   }, [load]);
 
   useEffect(() => {
@@ -673,19 +1177,40 @@ export default function AdminDistancesPage() {
     void loadSamples(selectedId);
   }, [selectedId, loadSamples]);
 
+  useEffect(() => {
+    const row = rows.find((r) => r.id === selectedId);
+    setManualMsg(null);
+    if (!row) {
+      setManualDm('');
+      setManualDur('');
+      setManualNotes('');
+      return;
+    }
+    setManualDm(row.manual_distance_m != null && row.manual_distance_m > 0 ? String(row.manual_distance_m) : '');
+    const md = row.manual_duration_min;
+    setManualDur(md != null && String(md).trim() !== '' && !Number.isNaN(Number(md)) ? String(Number(md)) : '');
+    setManualNotes(row.manual_notes ?? '');
+  }, [selectedId, rows]);
+
   const applyFilters = useCallback(() => {
+    const c = clientFilter.trim();
     setAppliedWinery(wineryFilter);
     setAppliedVineyard(vineyardFilter);
-    void load(wineryFilter, vineyardFilter);
-  }, [load, wineryFilter, vineyardFilter]);
+    setAppliedClient(c);
+    void load(wineryFilter, vineyardFilter, c);
+  }, [load, wineryFilter, vineyardFilter, clientFilter]);
 
   const clearFilters = useCallback(() => {
     setWineryFilter('');
     setVineyardFilter('');
+    setClientFilter('');
     setAppliedWinery('');
     setAppliedVineyard('');
+    setAppliedClient('');
     setFilterNoDataOnly(false);
-    void load('', '');
+    setFilterFailNoManualOnly(false);
+    setTableGridFilterVia('');
+    void load('', '', '');
   }, [load]);
 
   const saveCell = useCallback(
@@ -747,13 +1272,80 @@ export default function AdminDistancesPage() {
       const j = await r.json();
       if (!r.ok || j.error) {
         setSaveError(j.error ?? r.statusText);
-        await load(appliedWinery, appliedVineyard);
+        await load(appliedWinery, appliedVineyard, appliedClient);
         return;
       }
-      await load(appliedWinery, appliedVineyard);
+      await load(appliedWinery, appliedVineyard, appliedClient);
     },
-    [load, appliedWinery, appliedVineyard]
+    [load, appliedWinery, appliedVineyard, appliedClient]
   );
+
+  const saveManualDistance = useCallback(async () => {
+    const row = rows.find((r) => r.id === selectedId);
+    if (!row) return;
+    setManualBusy(true);
+    setManualMsg(null);
+    try {
+      const m = Math.round(Number(manualDm));
+      if (!Number.isFinite(m) || m <= 0) {
+        setManualMsg('Manual distance (m) must be a positive whole number.');
+        return;
+      }
+      let duration_min: number | null = null;
+      if (manualDur.trim() !== '') {
+        const t = Number(manualDur);
+        if (Number.isNaN(t) || t < 0) {
+          setManualMsg('Manual minutes must be empty or a non-negative number.');
+          return;
+        }
+        duration_min = t;
+      }
+      const r = await fetch('/api/admin/distances/manual', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          delivery_winery: row.delivery_winery,
+          vineyard_name: row.vineyard_name,
+          distance_m: m,
+          duration_min,
+          notes: manualNotes.trim() === '' ? null : manualNotes.trim(),
+        }),
+      });
+      const j = await r.json();
+      if (!r.ok || j.error) throw new Error(j.error ?? r.statusText);
+      await load(appliedWinery, appliedVineyard, appliedClient);
+      setManualMsg('Saved manual distance for this pair.');
+    } catch (e) {
+      setManualMsg(e instanceof Error ? e.message : String(e));
+    } finally {
+      setManualBusy(false);
+    }
+  }, [rows, selectedId, manualDm, manualDur, manualNotes, load, appliedWinery, appliedVineyard, appliedClient]);
+
+  const clearManualDistance = useCallback(async () => {
+    const row = rows.find((r) => r.id === selectedId);
+    if (!row) return;
+    setManualBusy(true);
+    setManualMsg(null);
+    try {
+      const r = await fetch('/api/admin/distances/manual', {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          delivery_winery: row.delivery_winery,
+          vineyard_name: row.vineyard_name,
+        }),
+      });
+      const j = await r.json();
+      if (!r.ok || j.error) throw new Error(j.error ?? r.statusText);
+      await load(appliedWinery, appliedVineyard, appliedClient);
+      setManualMsg('Cleared manual override.');
+    } catch (e) {
+      setManualMsg(e instanceof Error ? e.message : String(e));
+    } finally {
+      setManualBusy(false);
+    }
+  }, [rows, selectedId, load, appliedWinery, appliedVineyard, appliedClient]);
 
   const runHarvest = useCallback(
     async (distanceId: number, dryRun: boolean) => {
@@ -766,6 +1358,7 @@ export default function AdminDistancesPage() {
           body: JSON.stringify({
             distanceId,
             dryRun,
+            dryRunUpdateDistanceRow: dryRun && dryRunUpdatePairRow,
             resetExistingSamples: dryRun ? false : true,
             maxJobs: GPS_HARVEST_DEFAULT_MAX_JOBS,
             maxSuccesses: GPS_HARVEST_DEFAULT_MAX_SUCCESSES,
@@ -787,10 +1380,21 @@ export default function AdminDistancesPage() {
           Number(j.maxSuccessesCap ?? GPS_HARVEST_DEFAULT_MAX_SUCCESSES) ||
           GPS_HARVEST_DEFAULT_MAX_SUCCESSES;
         if (dryRun) {
+          const jobMatchDebug =
+            j && typeof j === 'object' && 'jobMatchDebug' in j && j.jobMatchDebug != null && typeof j.jobMatchDebug === 'object'
+              ? (j.jobMatchDebug as DryRunDebugSnapshot['jobMatchDebug'])
+              : undefined;
+          const rollupFromApi =
+            j && typeof j === 'object' && 'rollup' in j && j.rollup != null && typeof j.rollup === 'object'
+              ? (j.rollup as DryRunDebugSnapshot['rollup'])
+              : undefined;
+          const dryRowUp =
+            j && typeof j === 'object' && 'dryDistanceRowUpdated' in j && j.dryDistanceRowUpdated === true;
           const snapshot: DryRunDebugSnapshot = {
             distanceId,
             distancePair,
             vworkJobsMatchCount,
+            jobMatchDebug,
             candidateJobs,
             jobsPolled,
             successCount,
@@ -799,6 +1403,8 @@ export default function AdminDistancesPage() {
             maxSuccessesCap,
             message: typeof j.message === 'string' ? j.message : undefined,
             attempts,
+            rollup: rollupFromApi,
+            dryDistanceRowUpdated: dryRowUp,
           };
           setDryRunDebugSnapshotById((prev) => ({ ...prev, [distanceId]: snapshot }));
           setLastPersistRun(null);
@@ -812,6 +1418,9 @@ export default function AdminDistancesPage() {
               maxSuccessesCap,
               avgMeters: av.avgMeters,
               avgMinutes: av.avgMinutes,
+              avgGpsPlusMeters: av.avgGpsPlusMeters,
+              avgGpsPlusMinutes: av.avgGpsPlusMinutes,
+              gpsPlusSuccessCount: attempts.filter((a) => a.gps_plus?.ok === true).length,
             },
           }));
         }
@@ -823,6 +1432,17 @@ export default function AdminDistancesPage() {
           throw new Error(`${(j as any).error ?? r.statusText}${extra}`);
         }
         if (!dryRun) {
+          const rollup =
+            j && typeof j === 'object' && 'rollup' in j && j.rollup != null && typeof j.rollup === 'object'
+              ? (j.rollup as {
+                  distance_via?: string | null;
+                  gps_sample_count?: number | null;
+                  gps_plus_sample_count?: number | null;
+                  distance_m?: number | null;
+                  gps_avg_distance_m?: number | null;
+                  gps_plus_avg_distance_m?: number | null;
+                })
+              : undefined;
           setLastPersistRun({
             distanceId,
             insertedOrUpdated: j.insertedOrUpdated ?? 0,
@@ -834,14 +1454,33 @@ export default function AdminDistancesPage() {
             vworkJobsMatchCount,
             candidateJobs,
             message: j.message,
+            rollup: rollup
+              ? {
+                  distance_via: rollup.distance_via ?? null,
+                  gps_sample_count: rollup.gps_sample_count ?? null,
+                  gps_plus_sample_count: rollup.gps_plus_sample_count ?? null,
+                  distance_m: rollup.distance_m ?? null,
+                  gps_avg_distance_m: rollup.gps_avg_distance_m ?? null,
+                  gps_plus_avg_distance_m: rollup.gps_plus_avg_distance_m ?? null,
+                }
+              : undefined,
           });
           setGpsDryRunPreviewById((prev) => {
             const next = { ...prev };
             delete next[distanceId];
             return next;
           });
-          await load(appliedWinery, appliedVineyard);
+          await load(appliedWinery, appliedVineyard, appliedClient);
           if (selectedId === distanceId) void loadSamples(distanceId);
+        }
+        if (
+          dryRun &&
+          j &&
+          typeof j === 'object' &&
+          'dryDistanceRowUpdated' in j &&
+          (j as { dryDistanceRowUpdated?: boolean }).dryDistanceRowUpdated === true
+        ) {
+          await load(appliedWinery, appliedVineyard, appliedClient);
         }
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
@@ -849,7 +1488,7 @@ export default function AdminDistancesPage() {
         setHarvestBusyId(null);
       }
     },
-    [load, appliedWinery, appliedVineyard, selectedId, loadSamples]
+    [load, appliedWinery, appliedVineyard, appliedClient, selectedId, loadSamples, dryRunUpdatePairRow]
   );
 
   const openGpsScoreDebug = useCallback(
@@ -898,11 +1537,11 @@ export default function AdminDistancesPage() {
         setSeedMsg(
           `Sync: removed ${del} pair(s) with no vWork jobs; inserted ${ins} new pair(s). Existing valid pairs unchanged (distance/duration not updated).`
         );
-        return load(appliedWinery, appliedVineyard);
+        return load(appliedWinery, appliedVineyard, appliedClient);
       })
       .catch((e) => setError(e instanceof Error ? e.message : String(e)))
       .finally(() => setSeeding(false));
-  }, [load, appliedWinery, appliedVineyard]);
+  }, [load, appliedWinery, appliedVineyard, appliedClient]);
 
   const runPopulateVwork = useCallback(() => {
     setPopulateVworkBusy(true);
@@ -920,7 +1559,7 @@ export default function AdminDistancesPage() {
         }
         const n = Number(j.updated ?? 0) || 0;
         setPopulateVworkMsg(
-          `Updated ${n} job row(s): distance and minutes set from tbl_distances where the winery+vineyard pair matches (trim, case-insensitive). Jobs with no matching pair were left unchanged.`
+          `Updated ${n} job row(s): distance set to round-trip km (pair m÷1000×2), minutes to one-way duration, where winery+vineyard matches (trim, case-insensitive). Jobs with no matching pair were left unchanged.`
         );
       })
       .catch((e) => setError(e instanceof Error ? e.message : String(e)))
@@ -985,6 +1624,7 @@ export default function AdminDistancesPage() {
             body: JSON.stringify({
               distanceId: t.id,
               dryRun: true,
+              dryRunUpdateDistanceRow: false,
               resetExistingSamples: false,
               maxJobs: GPS_HARVEST_DEFAULT_MAX_JOBS,
               maxSuccesses: GPS_HARVEST_DEFAULT_MAX_SUCCESSES,
@@ -1039,6 +1679,9 @@ export default function AdminDistancesPage() {
               maxSuccessesCap: maxSuccessesCapDry,
               avgMeters: av.avgMeters,
               avgMinutes: av.avgMinutes,
+              avgGpsPlusMeters: av.avgGpsPlusMeters,
+              avgGpsPlusMinutes: av.avgGpsPlusMinutes,
+              gpsPlusSuccessCount: attempts.filter((a) => a.gps_plus?.ok === true).length,
             },
           }));
 
@@ -1072,7 +1715,15 @@ export default function AdminDistancesPage() {
                 ? {
                     ...x,
                     status: 'ok' as const,
-                    detail: `dry ${successCount}/${maxSuccessesCapDry} ok · ${jobsPolled}/${maxJobsCapDry} polled; saved ${Number(jSave.successCount ?? 0) || 0} OK`,
+                    detail: `dry ${successCount}/${maxSuccessesCapDry} ok · ${jobsPolled}/${maxJobsCapDry} polled; saved ${Number(jSave.successCount ?? 0) || 0} OK${
+                      jSave &&
+                      typeof jSave === 'object' &&
+                      'rollup' in jSave &&
+                      jSave.rollup != null &&
+                      typeof (jSave.rollup as { distance_via?: string }).distance_via === 'string'
+                        ? ` · via ${(jSave.rollup as { distance_via: string }).distance_via}`
+                        : ''
+                    }`,
                   }
                 : x
             );
@@ -1118,7 +1769,7 @@ export default function AdminDistancesPage() {
         );
         setRunAllProgress((prev) => (prev ? { ...prev, current: undefined } : prev));
       }
-      await load(appliedWinery, appliedVineyard);
+      await load(appliedWinery, appliedVineyard, appliedClient);
       if (selectedId != null) void loadSamples(selectedId);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -1129,6 +1780,7 @@ export default function AdminDistancesPage() {
     [
       appliedWinery,
       appliedVineyard,
+      appliedClient,
       load,
       selectedId,
       loadSamples,
@@ -1139,7 +1791,8 @@ export default function AdminDistancesPage() {
   );
 
   const hasRowsInDb = wineryOptions.length > 0 || vineyardOptions.length > 0;
-  const filterActive = appliedWinery.trim() !== '' || appliedVineyard.trim() !== '';
+  const filterActive =
+    appliedWinery.trim() !== '' || appliedVineyard.trim() !== '' || appliedClient.trim() !== '';
 
   const selectedRow = selectedId != null ? rows.find((r) => r.id === selectedId) : null;
 
@@ -1158,8 +1811,29 @@ export default function AdminDistancesPage() {
     }
   }, [sortKey]);
 
+  const tableGridFilteredRows = useMemo(() => {
+    let list = rows;
+    if (filterNoDataOnly) list = list.filter(rowHasNoDistanceData);
+    if (filterFailNoManualOnly) {
+      list = list.filter((r) => {
+        const rv = (r.distance_via ?? '').trim().toUpperCase();
+        const noManual = r.manual_distance_m == null || Number(r.manual_distance_m) <= 0;
+        return rv === 'FAIL' && noManual;
+      });
+    }
+    return list.filter((r) => {
+      if (tableGridFilterVia) {
+        const rollup = (r.distance_via ?? '').trim().toUpperCase();
+        if (tableGridFilterVia === 'MANUAL') {
+          if (viaLabelForRow(r).toUpperCase() !== 'MANUAL') return false;
+        } else if (rollup !== tableGridFilterVia) return false;
+      }
+      return true;
+    });
+  }, [rows, filterNoDataOnly, filterFailNoManualOnly, tableGridFilterVia]);
+
   const displayRows = useMemo(() => {
-    const list = filterNoDataOnly ? rows.filter(rowHasNoDistanceData) : rows;
+    const list = tableGridFilteredRows;
     const dir = sortDir === 'asc' ? 1 : -1;
     const cmpLocale = (a: string, b: string) =>
       dir * a.localeCompare(b, undefined, { sensitivity: 'base' });
@@ -1178,21 +1852,139 @@ export default function AdminDistancesPage() {
         case 'vwork_jobs':
           return dir * ((a.vwork_job_count ?? 0) - (b.vwork_job_count ?? 0));
         case 'meters':
-          return cmpNullLastNum(
-            a.distance_m == null ? null : Number(a.distance_m),
-            b.distance_m == null ? null : Number(b.distance_m)
-          );
+          return cmpNullLastNum(effectiveDistanceM(a), effectiveDistanceM(b));
         case 'minutes':
           return cmpNullLastNum(durationMinSortValue(a), durationMinSortValue(b));
+        case 'tag_avg_m':
+          return cmpNullLastNum(
+            a.gps_avg_distance_m == null ? null : Number(a.gps_avg_distance_m),
+            b.gps_avg_distance_m == null ? null : Number(b.gps_avg_distance_m)
+          );
+        case 'gps_plus_avg_m':
+          return cmpNullLastNum(
+            a.gps_plus_avg_distance_m == null ? null : Number(a.gps_plus_avg_distance_m),
+            b.gps_plus_avg_distance_m == null ? null : Number(b.gps_plus_avg_distance_m)
+          );
         case 'gps_ok':
           return (
             dir * (gpsOkCountForSort(a, gpsDryRunPreviewById) - gpsOkCountForSort(b, gpsDryRunPreviewById))
           );
+        case 'gps_success':
+          return dir * ((a.gps_sample_count ?? 0) - (b.gps_sample_count ?? 0));
+        case 'distance_via': {
+          const rank = (row: DistanceRow) => {
+            const t = viaLabelForRow(row).toUpperCase();
+            if (t === 'FAIL' || t === '') return 0;
+            if (t === 'GPS+') return 1;
+            if (t === 'GPSTAGS') return 2;
+            if (t === 'MANUAL') return 3;
+            return 4;
+          };
+          return dir * (rank(a) - rank(b));
+        }
         default:
           return 0;
       }
     });
-  }, [rows, filterNoDataOnly, sortKey, sortDir, gpsDryRunPreviewById]);
+  }, [tableGridFilteredRows, sortKey, sortDir, gpsDryRunPreviewById]);
+
+  const tableColumnFiltersActive = useMemo(
+    () => tableGridFilterVia !== '' || filterFailNoManualOnly,
+    [tableGridFilterVia, filterFailNoManualOnly]
+  );
+
+  const noDataRowCount = useMemo(() => rows.filter(rowHasNoDistanceData).length, [rows]);
+
+  const exportXlsx = useCallback(async () => {
+    setError(null);
+    try {
+      const XLSX = await import('xlsx');
+      const data = displayRows.map((r) => {
+        const via = viaLabelForRow(r).toUpperCase();
+        const used =
+          via === 'MANUAL'
+            ? 'MANUAL'
+            : via === 'GPSTAGS'
+              ? 'GPS'
+              : via === 'GPS+'
+                ? 'GPS+'
+                : 'NA';
+        const effM = effectiveDistanceM(r);
+        const jobs = r.vwork_job_count ?? 0;
+        const totalM = totalDistanceTimesJobs(r);
+        return {
+          Used: used,
+          Winery: r.delivery_winery,
+          Vineyard: r.vineyard_name,
+          Client: (r.pair_clients ?? '').trim() || null,
+          Jobs: jobs,
+          Total_m_times_jobs: totalM == null ? null : totalM,
+          'GPS avg m': r.gps_avg_distance_m == null ? null : Number(r.gps_avg_distance_m),
+          'GPS avg min':
+            r.gps_avg_duration_min == null || String(r.gps_avg_duration_min).trim() === ''
+              ? null
+              : Number(r.gps_avg_duration_min),
+          'GPS+ avg m': r.gps_plus_avg_distance_m == null ? null : Number(r.gps_plus_avg_distance_m),
+          'GPS+ avg min':
+            r.gps_plus_avg_duration_min == null || String(r.gps_plus_avg_duration_min).trim() === ''
+              ? null
+              : Number(r.gps_plus_avg_duration_min),
+          distance_via_rollup: r.distance_via ?? '',
+          display_via: via || null,
+          distance_m_tbl: r.distance_m == null ? null : Number(r.distance_m),
+          duration_min_tbl:
+            r.duration_min == null || String(r.duration_min).trim() === '' ? null : Number(r.duration_min),
+          effective_distance_m: effM == null ? null : effM,
+          effective_duration_min: (() => {
+            const t = effectiveDurationMinStr(r);
+            if (t == null) return null;
+            const n = Number(t);
+            return Number.isNaN(n) ? null : n;
+          })(),
+          manual_notes: (r.manual_notes ?? '').trim() || null,
+          maps_drive_url: r.maps_drive_url ?? null,
+        };
+      });
+      const ws = XLSX.utils.json_to_sheet(data, {
+        header: [
+          'Used',
+          'Winery',
+          'Vineyard',
+          'Client',
+          'Jobs',
+          'Total_m_times_jobs',
+          'GPS avg m',
+          'GPS avg min',
+          'GPS+ avg m',
+          'GPS+ avg min',
+          'distance_via_rollup',
+          'display_via',
+          'distance_m_tbl',
+          'duration_min_tbl',
+          'effective_distance_m',
+          'effective_duration_min',
+          'manual_notes',
+          'maps_drive_url',
+        ],
+      });
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, 'Distances');
+      const out = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
+      const blob = new Blob([out], {
+        type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'distances_export.xlsx';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }, [displayRows]);
 
   useEffect(() => {
     if (harvestDebugModal == null) return;
@@ -1204,8 +1996,8 @@ export default function AdminDistancesPage() {
   }, [harvestDebugModal]);
 
   return (
-    <div className="min-h-screen bg-zinc-50 p-6 text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100">
-      <div className="mx-auto max-w-7xl">
+    <div className="min-h-screen bg-zinc-50 px-4 py-6 text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100">
+      <div className="w-full max-w-none">
         <h1 className="text-2xl font-semibold tracking-tight">Distances</h1>
         <p className="mt-2 max-w-3xl text-sm text-zinc-600 dark:text-zinc-400">
           Winery–vineyard pairs from vWork jobs with distance (metres) and time (minutes).{' '}
@@ -1215,13 +2007,21 @@ export default function AdminDistancesPage() {
           of {GPS_HARVEST_SQL_JOB_LIMIT}) and stops after {GPS_HARVEST_DEFAULT_MAX_SUCCESSES} successful samples; Save
           persists those samples and updates <code className="rounded bg-zinc-200 px-1 dark:bg-zinc-800">distance_m</code> /{' '}
           <code className="rounded bg-zinc-200 px-1 dark:bg-zinc-800">duration_min</code>. Run{' '}
-          <code className="rounded bg-zinc-200 px-1 dark:bg-zinc-800">create_tbl_distances_gps_samples.sql</code> and{' '}
-          <code className="rounded bg-zinc-200 px-1 dark:bg-zinc-800">add_gps_avg_tbl_distances.sql</code> if needed.{' '}
-          <strong>Populate vWork</strong> copies <code className="rounded bg-zinc-200 px-1 dark:bg-zinc-800">distance_m</code> /{' '}
-          <code className="rounded bg-zinc-200 px-1 dark:bg-zinc-800">duration_min</code> from each matching pair into{' '}
-          <code className="rounded bg-zinc-200 px-1 dark:bg-zinc-800">tbl_vworkjobs.distance</code> and{' '}
-          <code className="rounded bg-zinc-200 px-1 dark:bg-zinc-800">minutes</code> (
-          <code className="rounded bg-zinc-200 px-1 dark:bg-zinc-800">add_distance_minutes_tbl_vworkjobs.sql</code>).
+          <code className="rounded bg-zinc-200 px-1 dark:bg-zinc-800">create_tbl_distances_gps_samples.sql</code>,{' '}
+          <code className="rounded bg-zinc-200 px-1 dark:bg-zinc-800">add_gps_avg_tbl_distances.sql</code>,{' '}
+          <code className="rounded bg-zinc-200 px-1 dark:bg-zinc-800">add_gps_plus_distances.sql</code>, and{' '}
+          <code className="rounded bg-zinc-200 px-1 dark:bg-zinc-800">add_distance_via_tbl_distances.sql</code> if needed.{' '}
+          Rollup sets <code className="rounded bg-zinc-200 px-1 dark:bg-zinc-800">distance_via</code> to GPSTAGS, GPS+, or FAIL
+          and writes <code className="rounded bg-zinc-200 px-1 dark:bg-zinc-800">distance_m</code> from tag averages when possible,
+          else from GPS+ averages.{' '}
+          <strong>Populate vWork</strong> sets <code className="rounded bg-zinc-200 px-1 dark:bg-zinc-800">tbl_vworkjobs.distance</code> to{' '}
+          round-trip <strong>km</strong>{' '}
+          <code className="rounded bg-zinc-200 px-1 dark:bg-zinc-800">(effective distance_m / 1000) × 2</code> (to the vineyard and back;
+          manual overrides <code className="rounded bg-zinc-200 px-1 dark:bg-zinc-800">tbl_distances</code>) and{' '}
+          <code className="rounded bg-zinc-200 px-1 dark:bg-zinc-800">minutes</code> to one-way{' '}
+          <code className="rounded bg-zinc-200 px-1 dark:bg-zinc-800">duration_min</code> (
+          <code className="rounded bg-zinc-200 px-1 dark:bg-zinc-800">add_distance_minutes_tbl_vworkjobs.sql</code>). Optional
+          manual overrides: <code className="rounded bg-zinc-200 px-1 dark:bg-zinc-800">create_tbl_distances_manual.sql</code>.
         </p>
 
         <div className="mt-4 flex flex-wrap items-center gap-3">
@@ -1229,35 +2029,64 @@ export default function AdminDistancesPage() {
             type="button"
             onClick={runSeed}
             disabled={seeding || loading}
+            title={
+              'Step 1 — Update pairs (tbl_distances seed):\n' +
+              '- Deletes tbl_distances rows whose winery→vineyard pair no longer exists in tbl_vworkjobs\n' +
+              '- Inserts any new distinct (trimmed) delivery_winery + vineyard_name pairs from tbl_vworkjobs\n' +
+              "- Does NOT overwrite existing distance_m / duration_min values\n" +
+              '- Also deletes any saved GPS samples for deleted pairs (via cascade)'
+            }
             className="rounded-md bg-amber-600 px-4 py-2 text-sm font-medium text-white hover:bg-amber-500 disabled:opacity-50"
           >
-            {seeding ? 'Updating…' : 'Update pairs'}
-          </button>
-          <button
-            type="button"
-            onClick={() => void runPopulateVwork()}
-            disabled={populateVworkBusy || loading}
-            title="Set tbl_vworkjobs.distance and minutes from tbl_distances for each job’s delivery_winery + vineyard_name pair"
-            className="rounded-md bg-sky-700 px-4 py-2 text-sm font-medium text-white hover:bg-sky-600 disabled:opacity-50"
-          >
-            {populateVworkBusy ? 'Populating…' : 'Populate vWork'}
+            {seeding ? '1) Updating…' : '1) Update pairs'}
           </button>
           <button
             type="button"
             onClick={() => void runAllHarvest()}
             disabled={runAllBusy || loading}
             className="rounded-md bg-emerald-700 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-600 disabled:opacity-50"
-            title={`Dry-run + save only for pairs with fewer than ${GPS_HARVEST_DEFAULT_MAX_SUCCESSES} saved OK GPS samples (skips pairs already at ${GPS_HARVEST_DEFAULT_MAX_SUCCESSES}+). Clears previous samples per pair that runs.`}
+            title={
+              'Step 2 — Run all (dry + save):\n' +
+              `- For each visible pair with < ${GPS_HARVEST_DEFAULT_MAX_SUCCESSES} saved OK primary GPS sample(s), runs Dry run then Save\n` +
+              `- Skips pairs already at ${GPS_HARVEST_DEFAULT_MAX_SUCCESSES}+ saved OK primary GPS samples\n` +
+              '- Save clears previous samples for that pair, writes new per-job samples, then updates rollups (distance_via / averages / distance_m / duration_min)\n' +
+              '- Uses caps: maxJobs / maxSuccesses shown at top; jobs are taken by job_id asc (up to SQL limit)\n' +
+              '- Dry step in Run all never updates tbl_distances directly (only Save does)'
+            }
           >
-            {runAllBusy ? 'Running all…' : 'Run all (dry + save)'}
+            {runAllBusy ? '2) Running all…' : '2) Run all (dry + save)'}
           </button>
           <button
             type="button"
-            onClick={() => void load(appliedWinery, appliedVineyard)}
+            onClick={() => void runPopulateVwork()}
+            disabled={populateVworkBusy || loading}
+            title={
+              'Step 3 — Populate vWork:\n' +
+              '- distance = (effective pair metres / 1000) × 2 round-trip km; minutes = one-way duration_min\n' +
+              '- COALESCE(tbl_distances_manual, tbl_distances) for effective metres/minutes when manual table exists\n' +
+              '- Match by delivery_winery + vineyard_name (case-insensitive trim)\n' +
+              '- Requires: add_distance_minutes_tbl_vworkjobs.sql; optional: create_tbl_distances_manual.sql'
+            }
+            className="rounded-md bg-sky-700 px-4 py-2 text-sm font-medium text-white hover:bg-sky-600 disabled:opacity-50"
+          >
+            {populateVworkBusy ? '3) Populating…' : '3) Populate vWork'}
+          </button>
+          <button
+            type="button"
+            onClick={() => void load(appliedWinery, appliedVineyard, appliedClient)}
             disabled={loading}
             className="rounded-md border border-zinc-300 bg-white px-4 py-2 text-sm hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-600 dark:bg-zinc-900 dark:hover:bg-zinc-800"
           >
             Refresh
+          </button>
+          <button
+            type="button"
+            onClick={() => void exportXlsx()}
+            disabled={loading || displayRows.length === 0}
+            title="Export visible pairs: Client, Total (m×jobs), effective distance, rollup vs display via, Maps URL, manual notes, GPS averages."
+            className="rounded-md border border-zinc-300 bg-white px-4 py-2 text-sm hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-600 dark:bg-zinc-900 dark:hover:bg-zinc-800"
+          >
+            Export XLSX
           </button>
           {seedMsg && (
             <span className="text-sm text-green-700 dark:text-green-400">{seedMsg}</span>
@@ -1272,13 +2101,43 @@ export default function AdminDistancesPage() {
           <div className="mt-3 rounded-lg border border-zinc-200 bg-white p-3 text-sm dark:border-zinc-700 dark:bg-zinc-900">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <div className="font-medium">
-                Run all progress: {runAllProgress.done}/{runAllProgress.total}
+                Run all progress:{' '}
+                <span className="tabular-nums">
+                  {runAllProgress.done}/{runAllProgress.total}
+                </span>{' '}
+                completed
+                {runAllProgress.current ? (
+                  <span className="text-zinc-600 dark:text-zinc-400">
+                    {' '}
+                    (processing{' '}
+                    <span className="tabular-nums">
+                      {Math.min(runAllProgress.done + 1, runAllProgress.total)}/{runAllProgress.total}
+                    </span>
+                    )
+                  </span>
+                ) : null}
               </div>
               {runAllProgress.current && (
                 <div className="text-xs text-zinc-600 dark:text-zinc-400">
                   Current: <span className="font-mono">{runAllProgress.current}</span>
                 </div>
               )}
+            </div>
+            <div className="mt-1 text-xs text-zinc-600 dark:text-zinc-400">
+              {(() => {
+                const ok = runAllProgress.rows.filter((r) => r.status === 'ok').length;
+                const err = runAllProgress.rows.filter((r) => r.status === 'error').length;
+                const running = runAllProgress.rows.filter((r) => r.status === 'running').length;
+                const pending = runAllProgress.rows.filter((r) => r.status === 'pending').length;
+                return (
+                  <>
+                    <span className="tabular-nums">{ok}</span> ok ·{' '}
+                    <span className="tabular-nums">{err}</span> error ·{' '}
+                    <span className="tabular-nums">{running}</span> running ·{' '}
+                    <span className="tabular-nums">{pending}</span> pending
+                  </>
+                );
+              })()}
             </div>
             <div className="mt-2 max-h-56 overflow-auto rounded border border-zinc-100 dark:border-zinc-800">
               <table className="w-full text-left text-[11px]">
@@ -1330,49 +2189,111 @@ export default function AdminDistancesPage() {
         )}
 
         {hasRowsInDb && (
-          <div className="mt-6 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900">
-            <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-end">
-              <div className="min-w-[12rem] flex-1">
-                <label htmlFor="filter-winery" className="block text-xs font-medium text-zinc-600 dark:text-zinc-400">
-                  Filter winery (contains)
-                </label>
-                <input
-                  id="filter-winery"
-                  list={wineryListId}
-                  value={wineryFilter}
-                  onChange={(e) => setWineryFilter(e.target.value)}
-                  onKeyDown={(e) => e.key === 'Enter' && applyFilters()}
-                  className="mt-1 w-full rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-950"
-                  placeholder="e.g. Villa Maria"
-                  autoComplete="off"
-                />
-                <datalist id={wineryListId}>
-                  {wineryOptions.map((w) => (
-                    <option key={w} value={w} />
-                  ))}
-                </datalist>
+          <div className="mt-6 space-y-3 border-b border-zinc-200 pb-5 dark:border-zinc-700">
+            <div className="flex flex-col gap-4">
+              <div className="flex flex-col gap-3 lg:flex-row lg:flex-wrap lg:items-end">
+                <div className="min-w-[10rem] flex-1">
+                  <label htmlFor="filter-winery" className="block text-xs font-medium text-zinc-600 dark:text-zinc-400">
+                    Winery (contains)
+                  </label>
+                  <input
+                    id="filter-winery"
+                    list={wineryListId}
+                    value={wineryFilter}
+                    onChange={(e) => setWineryFilter(e.target.value)}
+                    onKeyDown={(e) => e.key === 'Enter' && applyFilters()}
+                    className="mt-1 w-full rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-950"
+                    placeholder="e.g. Villa Maria"
+                    autoComplete="off"
+                  />
+                  <datalist id={wineryListId}>
+                    {wineryOptions.map((w) => (
+                      <option key={w} value={w} />
+                    ))}
+                  </datalist>
+                </div>
+                <div className="min-w-[10rem] flex-1">
+                  <label htmlFor="filter-vineyard" className="block text-xs font-medium text-zinc-600 dark:text-zinc-400">
+                    Vineyard (contains)
+                  </label>
+                  <input
+                    id="filter-vineyard"
+                    list={vineyardListId}
+                    value={vineyardFilter}
+                    onChange={(e) => setVineyardFilter(e.target.value)}
+                    onKeyDown={(e) => e.key === 'Enter' && applyFilters()}
+                    className="mt-1 w-full rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-950"
+                    placeholder="e.g. Rapaura"
+                    autoComplete="off"
+                  />
+                  <datalist id={vineyardListId}>
+                    {vineyardOptions.map((v) => (
+                      <option key={v} value={v} />
+                    ))}
+                  </datalist>
+                </div>
+                <div className="min-w-[12rem] max-w-[20rem] flex-1">
+                  <label htmlFor="filter-client" className="block text-xs font-medium text-zinc-600 dark:text-zinc-400">
+                    Client
+                  </label>
+                  <select
+                    id="filter-client"
+                    value={clientFilter}
+                    onChange={(e) => setClientFilter(e.target.value)}
+                    className="mt-1 w-full rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-950"
+                    title={
+                      customerOptions.length === 0
+                        ? 'No customers in tbl_vworkjobs (or customer column missing).'
+                        : 'tbl_vworkjobs.customer — pairs whose aggregated Client list includes this value'
+                    }
+                  >
+                    <option value="">All clients</option>
+                    {customerOptions.map((c) => (
+                      <option key={c} value={c}>
+                        {c}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="min-w-[8rem]">
+                  <label htmlFor="filter-via" className="block text-xs font-medium text-zinc-600 dark:text-zinc-400">
+                    Via (loaded rows)
+                  </label>
+                  <select
+                    id="filter-via"
+                    value={tableGridFilterVia}
+                    onChange={(e) =>
+                      setTableGridFilterVia(e.target.value as '' | 'GPSTAGS' | 'GPS+' | 'FAIL' | 'MANUAL')
+                    }
+                    className="mt-1 w-full rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-950"
+                  >
+                    <option value="">Any</option>
+                    <option value="GPSTAGS">GPSTAGS</option>
+                    <option value="GPS+">GPS+</option>
+                    <option value="FAIL">FAIL</option>
+                    <option value="MANUAL">MANUAL</option>
+                  </select>
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={applyFilters}
+                    disabled={loading}
+                    className="rounded border border-zinc-800 bg-zinc-800 px-3 py-1.5 text-sm font-medium text-white hover:bg-zinc-700 disabled:opacity-50 dark:border-zinc-200 dark:bg-zinc-200 dark:text-zinc-900 dark:hover:bg-zinc-300"
+                  >
+                    Apply
+                  </button>
+                  <button
+                    type="button"
+                    onClick={clearFilters}
+                    disabled={loading}
+                    className="rounded border border-zinc-300 bg-white px-3 py-1.5 text-sm hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-600 dark:bg-zinc-900 dark:hover:bg-zinc-800"
+                  >
+                    Clear all
+                  </button>
+                </div>
               </div>
-              <div className="min-w-[12rem] flex-1">
-                <label htmlFor="filter-vineyard" className="block text-xs font-medium text-zinc-600 dark:text-zinc-400">
-                  Filter vineyard (contains)
-                </label>
-                <input
-                  id="filter-vineyard"
-                  list={vineyardListId}
-                  value={vineyardFilter}
-                  onChange={(e) => setVineyardFilter(e.target.value)}
-                  onKeyDown={(e) => e.key === 'Enter' && applyFilters()}
-                  className="mt-1 w-full rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-950"
-                  placeholder="e.g. Rapaura"
-                  autoComplete="off"
-                />
-                <datalist id={vineyardListId}>
-                  {vineyardOptions.map((v) => (
-                    <option key={v} value={v} />
-                  ))}
-                </datalist>
-              </div>
-              <div className="flex flex-col justify-end gap-2 sm:flex-row sm:items-center">
+              <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center">
                 <label className="flex cursor-pointer items-center gap-2 text-sm text-zinc-700 dark:text-zinc-300">
                   <input
                     type="checkbox"
@@ -1380,33 +2301,39 @@ export default function AdminDistancesPage() {
                     onChange={(e) => setFilterNoDataOnly(e.target.checked)}
                     className="rounded border-zinc-400"
                   />
-                  <span title="Metres and minutes still unset or zero (e.g. seed defaults, harvest never filled data)">
+                  <span title="After merging manual distances: effective metres and minutes still unset or zero">
                     No data
                   </span>
                 </label>
-                <div className="flex gap-2">
-                  <button
-                    type="button"
-                    onClick={applyFilters}
-                    disabled={loading}
-                    className="rounded-md bg-zinc-800 px-4 py-2 text-sm font-medium text-white hover:bg-zinc-700 disabled:opacity-50 dark:bg-zinc-200 dark:text-zinc-900 dark:hover:bg-zinc-300"
-                  >
-                    Apply filters
-                  </button>
-                  <button
-                    type="button"
-                    onClick={clearFilters}
-                    disabled={loading}
-                    className="rounded-md border border-zinc-300 px-4 py-2 text-sm hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-600 dark:hover:bg-zinc-800"
-                  >
-                    Clear
-                  </button>
-                </div>
+                <label className="flex cursor-pointer items-center gap-2 text-sm text-zinc-700 dark:text-zinc-300">
+                  <input
+                    type="checkbox"
+                    checked={filterFailNoManualOnly}
+                    onChange={(e) => setFilterFailNoManualOnly(e.target.checked)}
+                    className="rounded border-zinc-400"
+                  />
+                  <span title="GPS rollup is FAIL and there is no manual distance row for this pair">
+                    FAIL, no manual
+                  </span>
+                </label>
+                <label className="flex max-w-xl cursor-pointer items-start gap-2 text-sm text-zinc-700 dark:text-zinc-300">
+                  <input
+                    type="checkbox"
+                    className="mt-0.5 rounded border-zinc-400"
+                    checked={dryRunUpdatePairRow}
+                    onChange={(e) => setDryRunUpdatePairRow(e.target.checked)}
+                  />
+                  <span>
+                    Dry run updates <code className="text-xs">tbl_distances</code> (m, min, via, averages) — no sample
+                    rows
+                  </span>
+                </label>
               </div>
             </div>
-            <p className="mt-2 text-xs text-zinc-500">
-              Case-insensitive partial match on winery/vineyard (Apply reloads from API). <strong>No data</strong> narrows
-              the loaded list to pairs with m and min still 0/empty. Column headers sort (toggle ↑/↓).
+            <p className="text-xs text-zinc-500 dark:text-zinc-400">
+              <strong>Apply</strong> reloads from the API (case-insensitive partial winery/vineyard;{' '}
+              <strong>Client</strong> is a vWork customer chosen from the dropdown). <strong>No data</strong> and{' '}
+              <strong>Via</strong> narrow the rows already loaded. Sort by clicking column headers (↑/↓).
             </p>
           </div>
         )}
@@ -1416,23 +2343,49 @@ export default function AdminDistancesPage() {
         {!loading && hasRowsInDb && (
           <>
             <p className="mt-4 text-sm text-zinc-600 dark:text-zinc-400">
+              Showing <strong>{displayRows.length}</strong> pair{displayRows.length === 1 ? '' : 's'}
               {filterNoDataOnly ? (
                 <>
-                  Showing <strong>{displayRows.length}</strong> of {rows.length} loaded row
-                  {rows.length === 1 ? '' : 's'} with <strong>No data</strong> (m/min unset or zero).
+                  {' '}
+                  (of <strong>{noDataRowCount}</strong> with <strong>No data</strong> in this load)
                 </>
               ) : (
                 <>
-                  {displayRows.length} row{displayRows.length === 1 ? '' : 's'}
-                  {filterActive ? ' (winery/vineyard filter from API)' : ''}.
+                  {' '}
+                  of <strong>{rows.length}</strong> loaded
                 </>
-              )}{' '}
-              Click a row to load saved GPS samples and debug JSON.
+              )}
+              {tableColumnFiltersActive ? (
+                <span className="text-zinc-500">
+                  {' '}
+                  — Via / FAIL-no-manual refinement active (client-side)
+                </span>
+              ) : null}
+              {filterActive ? (
+                <span className="text-zinc-500"> — API winery / vineyard / client filter</span>
+              ) : null}
+              . Click a row to load saved GPS samples and debug JSON.
             </p>
-            <div className="mt-2 overflow-x-auto rounded-lg border border-zinc-200 shadow-sm dark:border-zinc-700">
-              <table className="w-full min-w-[56rem] border-collapse text-left text-sm">
-                <thead>
-                  <tr className="border-b border-zinc-200 bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-800">
+            <div className="mt-4 w-full overflow-x-auto rounded-md border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-950">
+                <table className="w-full table-fixed border-collapse text-left text-xs text-zinc-900 dark:text-zinc-100">
+                  <colgroup>
+                    <col className="w-[12%]" />
+                    <col className="w-[12%]" />
+                    <col className="w-[10%]" />
+                    <col className="w-[5%]" />
+                    <col className="w-[6%]" />
+                    <col className="w-[5%]" />
+                    <col className="w-[5%]" />
+                    <col className="w-[6%]" />
+                    <col className="w-[6%]" />
+                    <col className="w-[5%]" />
+                    <col className="w-[6%]" />
+                    <col className="w-[9%]" />
+                    <col className="w-[5%]" />
+                    <col className="w-[8%]" />
+                  </colgroup>
+                  <thead className="sticky top-0 z-20 bg-zinc-100 dark:bg-zinc-900">
+                    <tr>
                     <DistancesSortHeader
                       label="Winery"
                       columnKey="winery"
@@ -1447,6 +2400,13 @@ export default function AdminDistancesPage() {
                       sortDir={sortDir}
                       onSort={toggleDistancesSort}
                     />
+                    <th
+                      scope="col"
+                      className="border-b border-zinc-200 bg-zinc-100 px-2 py-2.5 text-left text-xs font-semibold uppercase tracking-wide text-zinc-700 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300"
+                      title="Distinct tbl_vworkjobs.customer for this pair"
+                    >
+                      Client
+                    </th>
                     <DistancesSortHeader
                       label="vWork jobs"
                       columnKey="vwork_jobs"
@@ -1456,6 +2416,13 @@ export default function AdminDistancesPage() {
                       center
                       title="Jobs in tbl_vworkjobs with this winery + vineyard (trim, case-insensitive)"
                     />
+                    <th
+                      scope="col"
+                      className="border-b border-zinc-200 bg-zinc-100 px-2 py-2.5 text-center text-xs font-semibold uppercase tracking-wide text-zinc-700 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300"
+                      title="Effective metres × job count (manual overrides tbl_distances)"
+                    >
+                      Total
+                    </th>
                     <DistancesSortHeader
                       label="m"
                       columnKey="meters"
@@ -1471,38 +2438,109 @@ export default function AdminDistancesPage() {
                       onSort={toggleDistancesSort}
                     />
                     <DistancesSortHeader
-                      label="GPS (dry/saved)"
+                      label="Tag m"
+                      columnKey="tag_avg_m"
+                      sortKey={sortKey}
+                      sortDir={sortDir}
+                      onSort={toggleDistancesSort}
+                      center
+                      title="Mean primary GPS path (fence tag / Steps+ enter), saved rollup"
+                    />
+                    <DistancesSortHeader
+                      label="GPS+ m"
+                      columnKey="gps_plus_avg_m"
+                      sortKey={sortKey}
+                      sortDir={sortDir}
+                      onSort={toggleDistancesSort}
+                      center
+                      title="Mean GPS+ path (100m vineyard buffer), saved rollup"
+                    />
+                    <DistancesSortHeader
+                      label="# tag OK"
+                      columnKey="gps_success"
+                      sortKey={sortKey}
+                      sortDir={sortDir}
+                      onSort={toggleDistancesSort}
+                      center
+                      title="Successful primary GPS samples (asc = low counts first)"
+                    />
+                    <DistancesSortHeader
+                      label="Via"
+                      columnKey="distance_via"
+                      sortKey={sortKey}
+                      sortDir={sortDir}
+                      onSort={toggleDistancesSort}
+                      center
+                      title="MANUAL when a manual pair row exists; else GPSTAGS / GPS+ / FAIL from GPS rollup"
+                    />
+                    <DistancesSortHeader
+                      label={
+                        <>
+                          GPS
+                          <span className="block text-[10px] font-normal normal-case leading-tight text-zinc-500">
+                            dry / saved
+                          </span>
+                        </>
+                      }
                       columnKey="gps_ok"
                       sortKey={sortKey}
                       sortDir={sortDir}
                       onSort={toggleDistancesSort}
-                      title="Sort by OK sample count (latest dry-run successes, else saved gps_sample_count)"
+                      title="Sort by OK sample count (latest dry-run successes, else saved gps_sample_count). Column is narrow — text wraps."
                     />
-                    <th className="px-2 py-2 font-semibold">Harvest</th>
+                    <th
+                      scope="col"
+                      className="border-b border-zinc-200 bg-zinc-100 px-2 py-2.5 text-center text-xs font-semibold uppercase tracking-wide text-zinc-700 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300"
+                      title="Google Maps driving directions between winery and vineyard fence centroids"
+                    >
+                      Maps
+                    </th>
+                    <th
+                      scope="col"
+                      className="border-b border-zinc-200 bg-zinc-100 px-2 py-2.5 text-center text-xs font-semibold uppercase tracking-wide text-zinc-700 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300"
+                      title="Harvest — Dry run / Save"
+                    >
+                      H
+                    </th>
                   </tr>
                 </thead>
                 <tbody>
                   {rows.length === 0 ? (
                     <tr>
-                      <td colSpan={7} className="px-3 py-8 text-center text-zinc-500">
+                      <td colSpan={14} className="px-3 py-8 text-center text-zinc-500">
                         No rows match these filters. Try clearing filters or broadening the text.
                       </td>
                     </tr>
                   ) : displayRows.length === 0 ? (
                     <tr>
-                      <td colSpan={7} className="px-3 py-8 text-center text-zinc-500">
-                        No rows match <strong>No data</strong> (every loaded row has metres or minutes set). Turn off the
-                        checkbox to see all {rows.length} row{rows.length === 1 ? '' : 's'}.
+                      <td colSpan={14} className="px-3 py-8 text-center text-zinc-500">
+                        {filterNoDataOnly && noDataRowCount === 0 ? (
+                          <>
+                            Every loaded pair already has metres or minutes set. Turn off <strong>No data</strong> to see
+                            all {rows.length} row{rows.length === 1 ? '' : 's'}.
+                          </>
+                        ) : tableColumnFiltersActive && tableGridFilteredRows.length === 0 ? (
+                          <>
+                            No pairs match <strong>Via</strong> or <strong>FAIL, no manual</strong>. Use{' '}
+                            <strong>Clear all</strong> or change those filters.
+                          </>
+                        ) : (
+                          <>No rows in view. Adjust filters.</>
+                        )}
                       </td>
                     </tr>
                   ) : (
                     displayRows.map((row) => {
+                      const fmtComma2 = (n: number) =>
+                        n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
                       const d0 =
                         draft[row.id]?.d ??
-                        (row.distance_m == null ? '' : String(row.distance_m));
+                        (row.distance_m == null ? '' : fmtComma2(Number(row.distance_m)));
                       const t0 =
                         draft[row.id]?.t ??
-                        (row.duration_min == null ? '' : String(row.duration_min));
+                        (row.duration_min == null || String(row.duration_min).trim() === ''
+                          ? ''
+                          : fmtComma2(Number(row.duration_min)));
                       const busy = harvestBusyId === row.id;
                       const sel = selectedId === row.id;
                       const dbGpsCount = row.gps_sample_count ?? 0;
@@ -1529,6 +2567,16 @@ export default function AdminDistancesPage() {
                             parts.join(' · ') +
                             ` (mean of ${n} dry OK${n === 1 ? '' : 's'})`;
                         }
+                        if (dryPrev.avgGpsPlusMeters != null) {
+                          const gpParts: string[] = [`GPS+ ${Math.round(dryPrev.avgGpsPlusMeters)} m`];
+                          if (dryPrev.avgGpsPlusMinutes != null)
+                            gpParts.push(`${dryPrev.avgGpsPlusMinutes.toFixed(2)} min`);
+                          const nGp = dryPrev.gpsPlusSuccessCount ?? 0;
+                          gpsAvgLine =
+                            (gpsAvgLine ? `${gpsAvgLine}; ` : '') +
+                            gpParts.join(' · ') +
+                            ` (mean of ${nGp} GPS+ OK${nGp === 1 ? '' : 's'})`;
+                        }
                       } else if (useSavedGps) {
                         const parts: string[] = [];
                         if (row.gps_avg_distance_m != null)
@@ -1546,6 +2594,10 @@ export default function AdminDistancesPage() {
                             parts.join(' · ') +
                             ` (mean of ${n} saved OK${n === 1 ? '' : 's'})`;
                         }
+                        if (row.distance_via != null && String(row.distance_via).trim() !== '') {
+                          gpsAvgLine =
+                            (gpsAvgLine ? `${gpsAvgLine} · ` : '') + `via ${String(row.distance_via).trim()}`;
+                        }
                       }
                       return (
                         <tr
@@ -1559,14 +2611,14 @@ export default function AdminDistancesPage() {
                               setSelectedId(row.id);
                             }
                           }}
-                          className={`cursor-pointer border-b border-zinc-100 dark:border-zinc-800 ${
+                          className={`cursor-pointer border-b border-zinc-200/80 dark:border-zinc-800 ${
                             sel
                               ? 'bg-amber-50 dark:bg-amber-950/30'
-                              : 'odd:bg-white even:bg-zinc-50/80 dark:odd:bg-zinc-950 dark:even:bg-zinc-900/40'
+                              : 'even:bg-zinc-50/70 dark:even:bg-zinc-900/35'
                           }`}
                         >
-                          <td className="max-w-[14rem] px-2 py-2 align-top text-zinc-800 dark:text-zinc-200">
-                            <span className="line-clamp-2 text-sm" title={row.delivery_winery}>
+                          <td className="min-w-0 break-words px-2 py-2 align-top text-zinc-800 dark:text-zinc-200">
+                            <span className="text-sm leading-snug" title={row.delivery_winery}>
                               {row.delivery_winery}
                             </span>
                             <GpsMappingHint
@@ -1575,8 +2627,8 @@ export default function AdminDistancesPage() {
                               maps={gpsWineryMappings[row.delivery_winery.trim()] ?? []}
                             />
                           </td>
-                          <td className="max-w-[14rem] px-2 py-2 align-top text-zinc-800 dark:text-zinc-200">
-                            <span className="line-clamp-2 text-sm" title={row.vineyard_name}>
+                          <td className="min-w-0 break-words px-2 py-2 align-top text-zinc-800 dark:text-zinc-200">
+                            <span className="text-sm leading-snug" title={row.vineyard_name}>
                               {row.vineyard_name}
                             </span>
                             <GpsMappingHint
@@ -1585,8 +2637,21 @@ export default function AdminDistancesPage() {
                               maps={gpsVineyardMappings[row.vineyard_name.trim()] ?? []}
                             />
                           </td>
+                          <td className="min-w-0 break-words px-2 py-2 align-top text-xs text-zinc-600 dark:text-zinc-400">
+                            <span
+                              className="leading-snug"
+                              title={(row.pair_clients ?? '').trim() || undefined}
+                            >
+                              {(row.pair_clients ?? '').trim() || '—'}
+                            </span>
+                          </td>
                           <td className="whitespace-nowrap px-2 py-2 align-middle text-center tabular-nums text-zinc-700 dark:text-zinc-300">
                             {row.vwork_job_count ?? 0}
+                          </td>
+                          <td className="whitespace-nowrap px-2 py-2 align-middle text-center tabular-nums text-xs text-zinc-600 dark:text-zinc-400">
+                            {totalDistanceTimesJobs(row) == null
+                              ? '—'
+                              : Math.round(totalDistanceTimesJobs(row)!).toLocaleString()}
                           </td>
                           <td className="px-2 py-2 align-middle">
                             <input
@@ -1620,7 +2685,37 @@ export default function AdminDistancesPage() {
                               inputMode="decimal"
                             />
                           </td>
-                          <td className="min-w-[7rem] px-2 py-2 align-middle text-xs text-zinc-600 dark:text-zinc-400">
+                          <td className="whitespace-nowrap px-2 py-2 text-center align-middle font-mono text-xs text-zinc-700 dark:text-zinc-300">
+                            {row.gps_avg_distance_m != null ? fmtComma2(Number(row.gps_avg_distance_m)) : '—'}
+                          </td>
+                          <td className="whitespace-nowrap px-2 py-2 text-center align-middle font-mono text-xs text-zinc-700 dark:text-zinc-300">
+                            {row.gps_plus_avg_distance_m != null
+                              ? fmtComma2(Number(row.gps_plus_avg_distance_m))
+                              : '—'}
+                          </td>
+                          <td className="whitespace-nowrap px-2 py-2 text-center align-middle font-mono text-xs text-zinc-700 dark:text-zinc-300">
+                            {row.gps_sample_count ?? 0}
+                          </td>
+                          <td className="px-2 py-2 text-center align-middle">
+                            {viaLabelForRow(row) !== '' ? (
+                              <span
+                                className={`inline-block rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase ${
+                                  viaLabelForRow(row) === 'GPSTAGS'
+                                    ? 'bg-emerald-100 text-emerald-900 dark:bg-emerald-900/40 dark:text-emerald-100'
+                                    : viaLabelForRow(row) === 'GPS+'
+                                      ? 'bg-violet-100 text-violet-900 dark:bg-violet-900/40 dark:text-violet-100'
+                                      : viaLabelForRow(row) === 'MANUAL'
+                                        ? 'bg-slate-200 text-slate-900 dark:bg-slate-700 dark:text-slate-100'
+                                        : 'bg-amber-100 text-amber-950 dark:bg-amber-900/40 dark:text-amber-100'
+                                }`}
+                              >
+                                {viaLabelForRow(row)}
+                              </span>
+                            ) : (
+                              <span className="text-zinc-400">—</span>
+                            )}
+                          </td>
+                          <td className="min-w-0 break-words px-1.5 py-2 align-top text-left text-[10px] leading-snug text-zinc-600 dark:text-zinc-400">
                             {gpsCountShown !== '—' ? (
                               <button
                                 type="button"
@@ -1634,7 +2729,7 @@ export default function AdminDistancesPage() {
                                   e.stopPropagation();
                                   void openGpsScoreDebug(row);
                                 }}
-                                className="whitespace-nowrap rounded px-0.5 text-left font-medium text-blue-700 underline decoration-blue-400 underline-offset-2 hover:bg-blue-50 enabled:cursor-pointer disabled:opacity-60 dark:text-blue-300 dark:hover:bg-blue-950/50"
+                                className="w-full break-words rounded px-0.5 text-left font-medium text-blue-700 underline decoration-blue-400 underline-offset-2 hover:bg-blue-50 enabled:cursor-pointer disabled:opacity-60 dark:text-blue-300 dark:hover:bg-blue-950/50"
                               >
                                 {gpsDebugOpeningId === row.id ? 'Loading…' : gpsCountShown}
                                 {showDryPreview && gpsDebugOpeningId !== row.id && (
@@ -1642,14 +2737,27 @@ export default function AdminDistancesPage() {
                                 )}
                               </button>
                             ) : (
-                              <div className="whitespace-nowrap font-medium text-zinc-800 dark:text-zinc-200">
-                                {gpsCountShown}
-                              </div>
+                              <div className="font-medium text-zinc-800 dark:text-zinc-200">{gpsCountShown}</div>
                             )}
                             {gpsAvgLine != null && (
-                              <div className="mt-0.5 whitespace-nowrap text-[10px] leading-tight text-zinc-500 dark:text-zinc-400">
+                              <div className="mt-0.5 break-words text-[10px] leading-snug text-zinc-500 dark:text-zinc-400">
                                 {gpsAvgLine}
                               </div>
+                            )}
+                          </td>
+                          <td className="px-1 py-2 align-middle text-center">
+                            {row.maps_drive_url ? (
+                              <a
+                                href={row.maps_drive_url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                onClick={(e) => e.stopPropagation()}
+                                className="text-xs font-medium text-blue-700 underline underline-offset-2 dark:text-blue-300"
+                              >
+                                Drive
+                              </a>
+                            ) : (
+                              <span className="text-xs text-zinc-400">—</span>
                             )}
                           </td>
                           <td className="whitespace-nowrap px-2 py-2 align-middle">
@@ -1687,11 +2795,13 @@ export default function AdminDistancesPage() {
                 </tbody>
               </table>
             </div>
-            <p className="mt-2 text-xs text-zinc-500">
-              Manual edits save on blur. <strong>Save</strong> polls up to 5 jobs and writes each to the DB (success or
-              failure) with full debug. <strong>Dry run</strong> does not write. Click the <strong>GPS (dry/saved)</strong>{' '}
-              score (e.g. 2/7) for a job-by-job report: uses the last dry-run snapshot in this session if present, otherwise
-              loads from saved samples in the database.
+            <p className="mt-2 text-xs text-zinc-500 dark:text-zinc-400">
+              Manual edits save on blur. <strong>Save</strong> polls jobs and writes per-job rows to{' '}
+              <code className="text-[11px]">tbl_distances_gps_samples</code>, then refreshes rollups on{' '}
+              <code className="text-[11px]">tbl_distances</code>. <strong>Dry run</strong> does not write samples; if
+              &quot;Dry run updates tbl_distances&quot; is checked, it still updates that pair&apos;s distance, minutes,
+              via, and averages from the dry attempt summary only. Click the <strong>GPS dry / saved</strong> cell for a
+              job-by-job report (session dry snapshot if present, else saved samples).
             </p>
 
             {(selectedId != null || lastPersistRun != null) && (
@@ -1703,11 +2813,87 @@ export default function AdminDistancesPage() {
                   </p>
                 )}
 
+                {selectedRow && (
+                  <div className="mt-4 rounded-md border border-zinc-200 bg-zinc-50/80 p-3 text-sm dark:border-zinc-700 dark:bg-zinc-950/40">
+                    <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
+                      Manual drive distance{' '}
+                      <span className="font-normal text-zinc-500 dark:text-zinc-400">
+                        (<code className="text-[11px]">tbl_distances_manual</code>)
+                      </span>
+                    </h3>
+                    <p className="mt-1 text-xs text-zinc-600 dark:text-zinc-400">
+                      Use <strong>Drive</strong> in the grid for Google Maps directions between fence centroids, then
+                      enter the road distance here. <strong>Populate vWork</strong> uses manual metres when present and
+                      writes <code className="text-[11px]">tbl_vworkjobs.distance</code> as round-trip km (m÷1000×2).
+                    </p>
+                    <div className="mt-3 flex flex-wrap items-end gap-3">
+                      <label className="flex flex-col gap-0.5 text-xs font-medium text-zinc-600 dark:text-zinc-400">
+                        Distance (m)
+                        <input
+                          value={manualDm}
+                          onChange={(e) => setManualDm(e.target.value)}
+                          className="w-28 rounded border border-zinc-300 bg-white px-2 py-1 font-mono text-sm dark:border-zinc-600 dark:bg-zinc-900"
+                          inputMode="numeric"
+                        />
+                      </label>
+                      <label className="flex flex-col gap-0.5 text-xs font-medium text-zinc-600 dark:text-zinc-400">
+                        Minutes (optional)
+                        <input
+                          value={manualDur}
+                          onChange={(e) => setManualDur(e.target.value)}
+                          className="w-24 rounded border border-zinc-300 bg-white px-2 py-1 font-mono text-sm dark:border-zinc-600 dark:bg-zinc-900"
+                          inputMode="decimal"
+                        />
+                      </label>
+                      <label className="flex min-w-[12rem] flex-1 flex-col gap-0.5 text-xs font-medium text-zinc-600 dark:text-zinc-400">
+                        Notes
+                        <input
+                          value={manualNotes}
+                          onChange={(e) => setManualNotes(e.target.value)}
+                          className="rounded border border-zinc-300 bg-white px-2 py-1 text-sm dark:border-zinc-600 dark:bg-zinc-900"
+                          placeholder="e.g. measured 2026-04-01"
+                        />
+                      </label>
+                    </div>
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      <button
+                        type="button"
+                        disabled={manualBusy}
+                        onClick={() => void saveManualDistance()}
+                        className="rounded-md bg-slate-800 px-3 py-1.5 text-xs font-medium text-white hover:bg-slate-700 disabled:opacity-50 dark:bg-slate-200 dark:text-zinc-900 dark:hover:bg-slate-300"
+                      >
+                        {manualBusy ? 'Saving…' : 'Save manual'}
+                      </button>
+                      <button
+                        type="button"
+                        disabled={manualBusy}
+                        onClick={() => void clearManualDistance()}
+                        className="rounded-md border border-zinc-300 px-3 py-1.5 text-xs hover:bg-zinc-100 disabled:opacity-50 dark:border-zinc-600 dark:hover:bg-zinc-800"
+                      >
+                        Clear manual
+                      </button>
+                    </div>
+                    {manualMsg && (
+                      <p className="mt-2 text-xs text-zinc-700 dark:text-zinc-300">{manualMsg}</p>
+                    )}
+                  </div>
+                )}
+
                 {lastPersistRun && (
                   <div className="mt-4 rounded-md border border-emerald-200 bg-emerald-50/80 p-3 text-sm dark:border-emerald-900 dark:bg-emerald-950/40">
                     <div className="font-medium text-emerald-900 dark:text-emerald-100">
                       Last save run: {lastPersistRun.insertedOrUpdated} row(s) upserted in tbl_distances_gps_samples
                     </div>
+                    {lastPersistRun.rollup && (
+                      <p className="mt-2 font-mono text-xs text-emerald-950 dark:text-emerald-100">
+                        Rollup: distance_via={lastPersistRun.rollup.distance_via ?? 'null'} · tag_OK=
+                        {lastPersistRun.rollup.gps_sample_count ?? '—'} · gps+_OK=
+                        {lastPersistRun.rollup.gps_plus_sample_count ?? '—'} · distance_m=
+                        {lastPersistRun.rollup.distance_m ?? 'null'} · avg_tag_m=
+                        {lastPersistRun.rollup.gps_avg_distance_m ?? 'null'} · avg_gps+_m=
+                        {lastPersistRun.rollup.gps_plus_avg_distance_m ?? 'null'}
+                      </p>
+                    )}
                     <p className="mt-2 text-xs text-emerald-800 dark:text-emerald-200">
                       Pair from tbl_distances (matched in tbl_vworkjobs):{' '}
                       <span className="font-mono">{lastPersistRun.distancePair.delivery_winery}</span>

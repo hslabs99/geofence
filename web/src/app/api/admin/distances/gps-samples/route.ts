@@ -24,6 +24,9 @@ export async function GET(request: Request) {
       run_index: number | null;
       created_at: string;
       updated_at: string;
+      gps_plus_meters: string | null;
+      gps_plus_minutes: string | null;
+      gps_plus_outcome: string | null;
     }>(
       `SELECT id::text, job_id::text,
               COALESCE(outcome, 'success') AS outcome,
@@ -31,7 +34,8 @@ export async function GET(request: Request) {
               winery_tracking_id::text, vineyard_tracking_id::text,
               meters::text, minutes::text, segment_point_count, debug_json, run_index,
               to_char(created_at, 'YYYY-MM-DD HH24:MI:SS') AS created_at,
-              to_char(updated_at, 'YYYY-MM-DD HH24:MI:SS') AS updated_at
+              to_char(updated_at, 'YYYY-MM-DD HH24:MI:SS') AS updated_at,
+              gps_plus_meters::text, gps_plus_minutes::text, gps_plus_outcome
        FROM tbl_distances_gps_samples
        WHERE distance_id = $1
        ORDER BY COALESCE(run_index, 9999), updated_at DESC`,
@@ -53,6 +57,11 @@ export async function GET(request: Request) {
         run_index: r.run_index,
         created_at: r.created_at,
         updated_at: r.updated_at,
+        gps_plus_meters:
+          r.gps_plus_meters != null && r.gps_plus_meters !== '' ? Number(r.gps_plus_meters) : null,
+        gps_plus_minutes:
+          r.gps_plus_minutes != null && r.gps_plus_minutes !== '' ? Number(r.gps_plus_minutes) : null,
+        gps_plus_outcome: r.gps_plus_outcome,
       })),
     });
   } catch (err) {

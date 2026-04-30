@@ -3,7 +3,12 @@
 import { useState, useRef, useEffect } from 'react';
 import Link from 'next/link';
 
-type GeofenceRow = { fence_id: number; fence_name: string };
+type GeofenceRow = {
+  fence_id: number;
+  fence_name: string;
+  map_lat: number | null;
+  map_lon: number | null;
+};
 
 export default function GeoFencesPage() {
   const [file, setFile] = useState<File | null>(null);
@@ -231,22 +236,20 @@ export default function GeoFencesPage() {
                       {row.fence_name || '—'}
                     </td>
                     <td className="px-3 py-2">
-                      <a
-                        href="#"
-                        onClick={(e) => {
-                          e.preventDefault();
-                          if (typeof window === 'undefined') return;
-                          const kmlUrl = `${window.location.origin}/api/admin/geofences/${row.fence_id}/kml`;
-                          window.open(
-                            `https://www.google.com/maps?q=${encodeURIComponent(kmlUrl)}`,
-                            '_blank',
-                            'noopener,noreferrer'
-                          );
-                        }}
-                        className="text-blue-600 hover:underline dark:text-blue-400"
-                      >
-                        View on map
-                      </a>
+                      {row.map_lat != null && row.map_lon != null ? (
+                        <a
+                          href={`https://www.google.com/maps?q=${row.map_lat},${row.map_lon}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-blue-600 hover:underline dark:text-blue-400"
+                        >
+                          View on map
+                        </a>
+                      ) : (
+                        <span className="text-zinc-400 dark:text-zinc-500" title="No coordinates for this geometry">
+                          View on map
+                        </span>
+                      )}
                       {' · '}
                       <a
                         href={`/api/admin/geofences/${row.fence_id}/kml`}
