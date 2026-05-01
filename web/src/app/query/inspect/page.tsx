@@ -852,6 +852,7 @@ function InspectContent() {
   /** URL params: with locateJobId (Recent jobs / Summary job link), only truck — clear other persisted filters and all date filters so the job is not hidden. */
   useEffect(() => {
     const truck = searchParams.get('truckId') ?? '';
+    const worker = searchParams.get('worker') ?? '';
     const actualFrom = searchParams.get('actualFrom') ?? '';
     const actualTo = searchParams.get('actualTo') ?? '';
     const jobId = searchParams.get('jobId') ?? '';
@@ -872,9 +873,17 @@ function InspectContent() {
       setFilterActualTo('');
       setFilterActualEndFrom('');
       setFilterActualEndTo('');
-      setFilterTruckId(truck);
+      // Prefer worker filter when provided (audit links), otherwise allow truck filter (recent jobs).
+      if (worker && worker.trim()) {
+        setFilterTruckId('');
+        setFilterWorker(worker);
+      } else {
+        setFilterWorker('');
+        setFilterTruckId(truck);
+      }
     } else {
       if (truck) setFilterTruckId(truck);
+      if (worker) setFilterWorker(worker);
       if (actualFrom) setFilterActualFrom(actualFrom);
       if (actualTo) setFilterActualTo(actualTo);
       if (jobId && !locateJobId) {

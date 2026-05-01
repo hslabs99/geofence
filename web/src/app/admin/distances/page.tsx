@@ -31,6 +31,8 @@ type DistanceRow = {
   effective_duration_min?: string | null;
   display_distance_via?: string | null;
   maps_drive_url?: string | null;
+  winery_geofence_resolved?: boolean;
+  vineyard_geofence_resolved?: boolean;
 };
 
 type GpsMappingRow = { vwname: string | null; gpsname: string | null };
@@ -182,6 +184,19 @@ function GpsMappingHint({
       )}
     </div>
   );
+}
+
+/** No tbl_geofences row matches any candidate fence name (vWork name + tbl_gpsmappings) for that side. */
+function missingGeofenceFenceLabel(
+  wineryOk: boolean | undefined,
+  vineyardOk: boolean | undefined
+): string | null {
+  const wMissing = wineryOk === false;
+  const vMissing = vineyardOk === false;
+  if (!wMissing && !vMissing) return null;
+  if (wMissing && vMissing) return 'MISSING FENCE — winery & vineyard';
+  if (wMissing) return 'MISSING FENCE — winery';
+  return 'MISSING FENCE — vineyard';
 }
 
 type GpsSampleRow = {
@@ -1943,6 +1958,8 @@ export default function AdminDistancesPage() {
           })(),
           manual_notes: (r.manual_notes ?? '').trim() || null,
           maps_drive_url: r.maps_drive_url ?? null,
+          winery_geofence_resolved: r.winery_geofence_resolved ?? null,
+          vineyard_geofence_resolved: r.vineyard_geofence_resolved ?? null,
         };
       });
       const ws = XLSX.utils.json_to_sheet(data, {
@@ -1965,6 +1982,8 @@ export default function AdminDistancesPage() {
           'effective_duration_min',
           'manual_notes',
           'maps_drive_url',
+          'winery_geofence_resolved',
+          'vineyard_geofence_resolved',
         ],
       });
       const wb = XLSX.utils.book_new();
@@ -2491,7 +2510,7 @@ export default function AdminDistancesPage() {
                     <th
                       scope="col"
                       className="border-b border-zinc-200 bg-zinc-100 px-2 py-2.5 text-center text-xs font-semibold uppercase tracking-wide text-zinc-700 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300"
-                      title="Google Maps driving directions between winery and vineyard fence centroids"
+                      title="SanityCheck opens Google Maps driving directions between fence centroids (lat,lng). Red if tbl_geofences has no matching fence name for winery and/or vineyard."
                     >
                       Maps
                     </th>
@@ -2745,20 +2764,36 @@ export default function AdminDistancesPage() {
                               </div>
                             )}
                           </td>
-                          <td className="px-1 py-2 align-middle text-center">
-                            {row.maps_drive_url ? (
-                              <a
-                                href={row.maps_drive_url}
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                onClick={(e) => e.stopPropagation()}
-                                className="text-xs font-medium text-blue-700 underline underline-offset-2 dark:text-blue-300"
-                              >
-                                Drive
-                              </a>
-                            ) : (
-                              <span className="text-xs text-zinc-400">—</span>
-                            )}
+                          <td className="min-w-[7rem] px-1 py-2 align-middle text-center">
+                            <div className="flex flex-col items-center gap-1">
+                              {(() => {
+                                const miss = missingGeofenceFenceLabel(
+                                  row.winery_geofence_resolved,
+                                  row.vineyard_geofence_resolved
+                                );
+                                return miss ? (
+                                  <span
+                                    className="block max-w-[11rem] text-[10px] font-semibold leading-tight text-red-600 dark:text-red-400"
+                                    title="No tbl_geofences.fence_name matches the vWork name or tbl_gpsmappings names for this side"
+                                  >
+                                    {miss}
+                                  </span>
+                                ) : null;
+                              })()}
+                              {row.maps_drive_url ? (
+                                <a
+                                  href={row.maps_drive_url}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  onClick={(e) => e.stopPropagation()}
+                                  className="text-xs font-medium text-blue-700 underline underline-offset-2 dark:text-blue-300"
+                                >
+                                  SanityCheck
+                                </a>
+                              ) : (
+                                <span className="text-xs text-zinc-400">—</span>
+                              )}
+                            </div>
                           </td>
                           <td className="whitespace-nowrap px-2 py-2 align-middle">
                             <div className="flex flex-wrap gap-1">
@@ -2822,7 +2857,8 @@ export default function AdminDistancesPage() {
                       </span>
                     </h3>
                     <p className="mt-1 text-xs text-zinc-600 dark:text-zinc-400">
-                      Use <strong>Drive</strong> in the grid for Google Maps directions between fence centroids, then
+                      Use <strong>SanityCheck</strong> in the grid for Google Maps directions between fence centroids,
+                      then
                       enter the road distance here. <strong>Populate vWork</strong> uses manual metres when present and
                       writes <code className="text-[11px]">tbl_vworkjobs.distance</code> as round-trip km (m÷1000×2).
                     </p>

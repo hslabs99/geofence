@@ -367,7 +367,7 @@ export default function GpsMappingsPage() {
       ) : (
         <div className="flex flex-col gap-4 lg:flex-row lg:flex-wrap lg:items-start">
           {/* Left: Mappings table + Add row above it */}
-          <div className="min-w-0 flex-1 rounded-lg border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900 lg:max-w-xl">
+          <div className="min-w-0 w-full flex-1 rounded-lg border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900 lg:min-w-[min(100%,50rem)]">
             <div className="flex items-center justify-between border-b border-zinc-200 px-3 py-2 dark:border-zinc-700">
               <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Mappings</h2>
               <button
@@ -459,53 +459,54 @@ export default function GpsMappingsPage() {
               </form>
             )}
             <div className="overflow-x-auto">
-              <table className="min-w-full text-left text-xs">
+              <table className="w-full min-w-[58rem] table-fixed text-left text-[10px] leading-tight text-zinc-700 dark:text-zinc-300">
                 <colgroup>
-                  <col className="w-12" />
-                  <col className="w-20" />
-                  <col className="min-w-[9.5rem]" />
-                  <col className="min-w-[10rem]" />
-                  <col className="w-14" />
-                  <col className="min-w-[6rem]" />
+                  <col className="w-9" />
+                  <col className="w-[4.25rem]" />
+                  {/* ~30% narrower than equal split of remainder; frees space for Actions */}
+                  <col className="w-[17%]" />
+                  <col className="w-[17%]" />
+                  <col className="w-11" />
+                  <col className="w-[16.5rem]" />
                 </colgroup>
                 <thead>
                   <tr className="border-b border-zinc-200 bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-800">
                     <th
-                      className="cursor-pointer select-none px-2 py-1.5 font-medium text-zinc-900 dark:text-zinc-100 hover:bg-zinc-200 dark:hover:bg-zinc-700"
+                      className="cursor-pointer select-none px-1.5 py-1 font-medium text-zinc-900 dark:text-zinc-100 hover:bg-zinc-200 dark:hover:bg-zinc-700"
                       onClick={() => toggleSort('id')}
                       title="Sort by ID"
                     >
                       ID{mappingsSortKey === 'id' ? (mappingsSortDir === 'asc' ? ' ↑' : ' ↓') : ''}
                     </th>
                     <th
-                      className="cursor-pointer select-none px-2 py-1.5 font-medium text-zinc-900 dark:text-zinc-100 hover:bg-zinc-200 dark:hover:bg-zinc-700"
+                      className="cursor-pointer select-none px-1.5 py-1 font-medium text-zinc-900 dark:text-zinc-100 hover:bg-zinc-200 dark:hover:bg-zinc-700"
                       onClick={() => toggleSort('type')}
                       title="Sort by Type"
                     >
                       Type{mappingsSortKey === 'type' ? (mappingsSortDir === 'asc' ? ' ↑' : ' ↓') : ''}
                     </th>
                     <th
-                      className="cursor-pointer select-none px-2 py-1.5 font-medium text-zinc-900 dark:text-zinc-100 hover:bg-zinc-200 dark:hover:bg-zinc-700"
+                      className="cursor-pointer select-none px-1.5 py-1 font-medium text-zinc-900 dark:text-zinc-100 hover:bg-zinc-200 dark:hover:bg-zinc-700"
                       onClick={() => toggleSort('vwname')}
                       title="Sort by VW name"
                     >
                       VW name{mappingsSortKey === 'vwname' ? (mappingsSortDir === 'asc' ? ' ↑' : ' ↓') : ''}
                     </th>
                     <th
-                      className="cursor-pointer select-none min-w-[10rem] px-2 py-1.5 font-medium text-zinc-900 dark:text-zinc-100 hover:bg-zinc-200 dark:hover:bg-zinc-700"
+                      className="cursor-pointer select-none px-1.5 py-1 font-medium text-zinc-900 dark:text-zinc-100 hover:bg-zinc-200 dark:hover:bg-zinc-700"
                       onClick={() => toggleSort('gpsname')}
                       title="Sort by GPS fence"
                     >
                       GPS fence{mappingsSortKey === 'gpsname' ? (mappingsSortDir === 'asc' ? ' ↑' : ' ↓') : ''}
                     </th>
                     <th
-                      className="cursor-pointer select-none px-2 py-1.5 font-medium text-zinc-900 dark:text-zinc-100 hover:bg-zinc-200 dark:hover:bg-zinc-700"
+                      className="cursor-pointer select-none px-1.5 py-1 font-medium text-zinc-900 dark:text-zinc-100 hover:bg-zinc-200 dark:hover:bg-zinc-700"
                       onClick={() => toggleSort('count')}
                       title="Sort by tbl_tracking count"
                     >
                       Count{mappingsSortKey === 'count' ? (mappingsSortDir === 'asc' ? ' ↑' : ' ↓') : ''}
                     </th>
-                    <th className="px-2 py-1.5 font-medium text-zinc-900 dark:text-zinc-100">Actions</th>
+                    <th className="px-1.5 py-1 font-medium text-zinc-900 dark:text-zinc-100">Actions</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -514,15 +515,15 @@ export default function GpsMappingsPage() {
                       key={r.id}
                       className="border-b border-zinc-100 dark:border-zinc-800 hover:bg-zinc-50 dark:hover:bg-zinc-800/50"
                     >
-                      <td className="whitespace-nowrap px-2 py-1.5 text-zinc-500 dark:text-zinc-400">{r.id}</td>
-                      <td className="whitespace-nowrap px-2 py-1.5 text-zinc-700 dark:text-zinc-300">{r.type}</td>
-                      <td className="max-w-[9.5rem] truncate px-2 py-1.5 text-zinc-700 dark:text-zinc-300" title={r.vwname}>
+                      <td className="whitespace-nowrap px-1.5 py-1 text-zinc-500 dark:text-zinc-400 tabular-nums">{r.id}</td>
+                      <td className="whitespace-nowrap px-1.5 py-1 text-zinc-700 dark:text-zinc-300">{r.type}</td>
+                      <td className="min-w-0 break-words px-1.5 py-1 align-top text-zinc-700 dark:text-zinc-300" title={r.vwname}>
                         {r.vwname}
                       </td>
-                      <td className="max-w-[10rem] truncate px-2 py-1.5 text-zinc-700 dark:text-zinc-300" title={r.gpsname}>
+                      <td className="min-w-0 break-words px-1.5 py-1 align-top text-zinc-700 dark:text-zinc-300" title={r.gpsname}>
                         {r.gpsname}
                       </td>
-                      <td className="whitespace-nowrap px-2 py-1.5 text-zinc-500 dark:text-zinc-400 tabular-nums" title="Click to load tbl_tracking rows below">
+                      <td className="whitespace-nowrap px-1.5 py-1 text-zinc-500 dark:text-zinc-400 tabular-nums" title="Click to load tbl_tracking rows below">
                         {(() => {
                           const count = getTrackingCountForRow(r);
                           const fence = (r.gpsname ?? '').trim() && options?.trackingFences
@@ -533,7 +534,7 @@ export default function GpsMappingsPage() {
                               <button
                                 type="button"
                                 onClick={() => openTrackingForFence(fence.fence_id, fence.fence_name ?? r.gpsname ?? '')}
-                                className="text-blue-600 underline hover:no-underline dark:text-blue-400"
+                                className="text-blue-600 underline hover:no-underline dark:text-blue-400 text-[10px]"
                               >
                                 {count}
                               </button>
@@ -542,7 +543,7 @@ export default function GpsMappingsPage() {
                           return count;
                         })()}
                       </td>
-                      <td className="whitespace-nowrap px-2 py-1.5">
+                      <td className="whitespace-nowrap px-1.5 py-1 align-top text-[10px]">
                         <button
                           type="button"
                           onClick={() => startRowEdit(r)}
@@ -551,7 +552,7 @@ export default function GpsMappingsPage() {
                         >
                           Edit
                         </button>
-                        <span className="mx-1 text-zinc-300 dark:text-zinc-600">|</span>
+                        <span className="mx-0.5 text-zinc-300 dark:text-zinc-600">|</span>
                         <button
                           type="button"
                           onClick={() => handleClone(r)}
@@ -560,7 +561,7 @@ export default function GpsMappingsPage() {
                         >
                           Clone
                         </button>
-                        <span className="mx-1 text-zinc-300 dark:text-zinc-600">|</span>
+                        <span className="mx-0.5 text-zinc-300 dark:text-zinc-600">|</span>
                         <button
                           type="button"
                           onClick={() => handleDelete(r)}

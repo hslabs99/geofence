@@ -71,7 +71,7 @@ function pushCleanupRulesAudit(out: InspectExplanationItem[], api: Record<string
       id: 'cleanup-audit-missing',
       headline: 'Cleanup Part 3b · no audit payload',
       detail: [
-        'Refetch steps after deploy — the API should return cleanupRulesReport (step 1 travel/start, Step3windback, step4_order).',
+        'Refetch steps after deploy — the API should return cleanupRulesReport (step 1 travel/start, Step3windback, step4_order, step4_mid_35).',
       ],
     });
     return;
@@ -126,12 +126,27 @@ function pushCleanupRulesAudit(out: InspectExplanationItem[], api: Record<string
     });
   }
 
-  if (!cr.step1.applied && cr.step3Windback == null && cr.step4Order == null) {
+  if (cr.step4Mid35) {
+    const m = cr.step4Mid35;
+    out.push({
+      id: 'cleanup-step4-mid35',
+      headline: 'Cleanup · step4_mid_35 · step 4 midpoint (step 3 ↔ step 5)',
+      detail: [
+        'Merged step 4 was still missing after GPS/VWork; step 3 and step 5 both present — set step 4 to the time halfway between them.',
+        `Step 3 at: ${m.step3At.slice(0, 19)}`,
+        `Step 5 at: ${m.step5At.slice(0, 19)}`,
+        `Step 4 after: ${m.step4After.slice(0, 19)}`,
+        'step_4_via = RULE when not overridden.',
+      ],
+    });
+  }
+
+  if (!cr.step1.applied && cr.step3Windback == null && cr.step4Order == null && cr.step4Mid35 == null) {
     out.push({
       id: 'cleanup-none',
       headline: 'Cleanup Part 3b · no rules applied',
       detail: [
-        'Merged GPS∨VWork times did not trigger cleanup_start, travel, Step3windback, or step4_order.',
+        'Merged GPS∨VWork times did not trigger cleanup_start, travel, Step3windback, step4_order, or step4_mid_35.',
       ],
     });
   }

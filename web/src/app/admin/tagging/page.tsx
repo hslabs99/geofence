@@ -165,6 +165,8 @@ export default function TaggingPage() {
   const [filterVineyard, setFilterVineyard] = useState('');
   const [filterWinery, setFilterWinery] = useState('');
   const [filterDevice, setFilterDevice] = useState('');
+  /** Steps-only override: run Steps for jobs in tbl_step4to5_audit_queue (ignores date + all filters). */
+  const [stepsUseStep4to5AuditQueue, setStepsUseStep4to5AuditQueue] = useState(false);
   const [vworkFilterOptions, setVworkFilterOptions] = useState<VworkFilterOptions>({
     vineyardNames: [],
     deliveryWineries: [],
@@ -298,6 +300,23 @@ export default function TaggingPage() {
   }, []);
 
   useEffect(() => {
+    if (stepsUseStep4to5AuditQueue) {
+      setVworkjobsCountLoading(true);
+      setVworkjobsCountError(null);
+      fetch('/api/admin/data-checks/step4to5-audit/queue-stats', { cache: 'no-store' })
+        .then(async (r) => {
+          const d = (await r.json()) as { ok?: boolean; total?: number; error?: string };
+          if (!r.ok) throw new Error(d?.error ?? `HTTP ${r.status}`);
+          if (!d.ok) throw new Error('Queue stats failed');
+          setVworkjobsMatchCount(typeof d.total === 'number' ? d.total : 0);
+        })
+        .catch((e: unknown) => {
+          setVworkjobsCountError(e instanceof Error ? e.message : String(e));
+          setVworkjobsMatchCount(null);
+        })
+        .finally(() => setVworkjobsCountLoading(false));
+      return;
+    }
     const from = dateFrom.trim();
     const to = dateTo.trim();
     if (!from || !to || dateRange(from, to).length === 0) {
@@ -339,7 +358,17 @@ export default function TaggingPage() {
       clearTimeout(t);
       ac.abort();
     };
-  }, [dateFrom, dateTo, stepsForce, filterCustomer, filterTemplate, filterVineyard, filterWinery, filterDevice]);
+  }, [
+    dateFrom,
+    dateTo,
+    stepsForce,
+    filterCustomer,
+    filterTemplate,
+    filterVineyard,
+    filterWinery,
+    filterDevice,
+    stepsUseStep4to5AuditQueue,
+  ]);
 
   const loadEntryexitLogs = useCallback(async () => {
     setEntryexitLogsLoading(true);
@@ -734,6 +763,69 @@ export default function TaggingPage() {
 
   /** After new GPS mappings only Steps need refreshing; skips ENTER/EXIT tagging. */
   const runStepsOnlyForRange = async () => {
+    if (stepsUseStep4to5AuditQueue) {
+      setRunStatus('running');
+      setStepsOnlyRunActive(true);
+      setStreamLogs([]);
+      setSummary(null);
+      setRunError(null);
+      setCurrentStage('Progress: Queue: Steps');
+
+      const appendLog = (line: string) => setStreamLogs((prev) => [...prev, line]);
+      try {
+        appendLog('Steps only from Step4to5 audit queue (ignores date + all filters)…');
+        const res = await fetch(
+          '/api/admin/tagging/steps-from-step4to5-queue?limit=20000',
+          { cache: 'no-store' }
+        );
+        const data = (await res.json()) as {
+          ok?: boolean;
+          jobs?: Record<string, unknown>[];
+          error?: string;
+        };
+        if (!res.ok || !data.ok) throw new Error(data?.error ?? `HTTP ${res.status}`);
+        const jobs = Array.isArray(data.jobs) ? data.jobs : [];
+        appendLog(`Queue jobs: ${jobs.length}`);
+        if (jobs.length === 0) {
+          appendLog('No pending queue jobs.');
+          setCurrentStage('Progress: Complete');
+          setRunStatus('done');
+          return;
+        }
+        const result = await runFetchStepsForJobs({
+          jobs,
+          startLessMinutes: stepsStartLessMinutes,
+          endPlusMinutes: stepsEndPlusMinutes,
+          jobDateForLog: 'queue',
+          onProgress: (current, total, log) => {
+            setCurrentStage(`Progress: Queue: Steps (Job ${current}/${total})`);
+            const last = log[log.length - 1];
+            if (!last) return;
+            appendLog(
+              `  ${current}/${total} ${last.job_id} — ${last.status}${last.message ? `: ${last.message}` : ''}`
+            );
+            if (last.status === 'ok' && last.stepVias?.length === 5) {
+              last.stepVias.forEach((via, si) => {
+                appendLog(`    job ${last.job_id} step ${si + 1}: ${via}`);
+              });
+            }
+          },
+        });
+        const okCount = result.log.filter((e) => e.status === 'ok').length;
+        const errCount = result.log.filter((e) => e.status === 'error').length;
+        appendLog(`Queue Steps set: ${okCount} ok, ${errCount} error`);
+        appendLog('Steps-only queue run complete.');
+        setCurrentStage('Progress: Complete');
+        setRunStatus('done');
+      } catch (err) {
+        setRunError(err instanceof Error ? err.message : String(err));
+        setRunStatus('error');
+        setCurrentStage('');
+      } finally {
+        setStepsOnlyRunActive(false);
+      }
+      return;
+    }
     const from = dateFrom.trim();
     const to = dateTo.trim();
     if (!from || !to) return;
@@ -1188,7 +1280,7 @@ export default function TaggingPage() {
                       setFilterCustomer(e.target.value);
                       setFilterTemplate('');
                     }}
-                    disabled={runStatus === 'running'}
+                    disabled={runStatus === 'running' || stepsUseStep4to5AuditQueue}
                     className="min-w-[10rem] max-w-[14rem] rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
                   >
                     <option value="">Any</option>
@@ -1204,7 +1296,7 @@ export default function TaggingPage() {
                   <select
                     value={filterTemplate}
                     onChange={(e) => setFilterTemplate(e.target.value)}
-                    disabled={runStatus === 'running' || !filterCustomer.trim()}
+                    disabled={runStatus === 'running' || stepsUseStep4to5AuditQueue || !filterCustomer.trim()}
                     className="min-w-[10rem] max-w-[14rem] rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm disabled:opacity-60 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
                   >
                     <option value="">Any</option>
@@ -1220,7 +1312,7 @@ export default function TaggingPage() {
                   <select
                     value={filterVineyard}
                     onChange={(e) => setFilterVineyard(e.target.value)}
-                    disabled={runStatus === 'running'}
+                    disabled={runStatus === 'running' || stepsUseStep4to5AuditQueue}
                     className="min-w-[10rem] max-w-[14rem] rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
                   >
                     <option value="">Any</option>
@@ -1236,7 +1328,7 @@ export default function TaggingPage() {
                   <select
                     value={filterWinery}
                     onChange={(e) => setFilterWinery(e.target.value)}
-                    disabled={runStatus === 'running'}
+                    disabled={runStatus === 'running' || stepsUseStep4to5AuditQueue}
                     className="min-w-[10rem] max-w-[14rem] rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
                   >
                     <option value="">Any</option>
@@ -1252,7 +1344,7 @@ export default function TaggingPage() {
                   <select
                     value={filterDevice}
                     onChange={(e) => setFilterDevice(e.target.value)}
-                    disabled={runStatus === 'running'}
+                    disabled={runStatus === 'running' || stepsUseStep4to5AuditQueue}
                     className="min-w-[10rem] max-w-[14rem] rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
                   >
                     <option value="">Any</option>
@@ -1275,11 +1367,26 @@ export default function TaggingPage() {
                           : '—'}
                   </span>
                   <span className="text-[10px] text-zinc-500 dark:text-zinc-500">
-                    Same filters as Steps run (incl. “force”){' '}
-                    <code className="rounded bg-zinc-100 px-0.5 dark:bg-zinc-800">actual_start_time</code> in range
+                    {stepsUseStep4to5AuditQueue ? (
+                      <>From <code className="rounded bg-zinc-100 px-0.5 dark:bg-zinc-800">tbl_step4to5_audit_queue</code> (all)</>
+                    ) : (
+                      <>
+                        Same filters as Steps run (incl. “force”){' '}
+                        <code className="rounded bg-zinc-100 px-0.5 dark:bg-zinc-800">actual_start_time</code> in range
+                      </>
+                    )}
                   </span>
                 </div>
               </div>
+              <label className="mt-2 flex items-center gap-2 text-xs text-zinc-700 dark:text-zinc-300">
+                <input
+                  type="checkbox"
+                  checked={stepsUseStep4to5AuditQueue}
+                  onChange={(e) => setStepsUseStep4to5AuditQueue(e.target.checked)}
+                  disabled={runStatus === 'running'}
+                />
+                Use Step4to5 audit queue (Steps-only; ignores date + all filters)
+              </label>
             </div>
             <div>
               <label className="block text-sm font-medium text-zinc-700 dark:text-zinc-300">
@@ -1347,9 +1454,8 @@ export default function TaggingPage() {
                 onClick={runStepsOnlyForRange}
                 disabled={
                   runStatus === 'running' ||
-                  !dateFrom ||
-                  !dateTo ||
-                  dateRange(dateFrom, dateTo).length === 0
+                  (!stepsUseStep4to5AuditQueue &&
+                    (!dateFrom || !dateTo || dateRange(dateFrom, dateTo).length === 0))
                 }
                 className="rounded border border-blue-600 bg-white px-4 py-2 text-sm font-medium text-blue-700 hover:bg-blue-50 disabled:opacity-50 dark:border-blue-500 dark:bg-zinc-900 dark:text-blue-300 dark:hover:bg-blue-950/40"
                 title="Same Steps pipeline as above, but skips ENTER/EXIT tagging. Use after new GPS fence mappings when only derived steps need refreshing."

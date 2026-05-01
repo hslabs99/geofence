@@ -30,7 +30,8 @@ export async function GET(request: Request) {
       const rows = await query<WineryMinutesRow>(
         vineyardGroup
           ? `SELECT ${SELECT_COLS} FROM tbl_wineryminutes
-             WHERE trim("Customer") = $1 AND trim(COALESCE("Template", '')) = $2 AND trim(COALESCE(vineyardgroup, '')) = $3 AND trim("Winery") = $4
+             WHERE trim("Customer") = $1 AND trim(COALESCE("Template", '')) = $2
+               AND lower(trim(COALESCE(vineyardgroup, ''))) = lower($3) AND trim("Winery") = $4
              LIMIT 1`
           : `SELECT ${SELECT_COLS} FROM tbl_wineryminutes
              WHERE trim("Customer") = $1 AND trim(COALESCE("Template", '')) = $2 AND (trim(COALESCE(vineyardgroup, '')) = '' OR vineyardgroup IS NULL) AND trim("Winery") = $3

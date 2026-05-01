@@ -39,6 +39,10 @@ export type DistanceRow = {
   display_distance_via?: string | null;
   /** Google Maps driving directions between fence centroids (when both resolve). */
   maps_drive_url?: string | null;
+  /** True when at least one name in the winery mapping set matches tbl_geofences.fence_name (case-insensitive). */
+  winery_geofence_resolved?: boolean;
+  /** True when at least one name in the vineyard mapping set matches tbl_geofences.fence_name (case-insensitive). */
+  vineyard_geofence_resolved?: boolean;
 };
 
 async function centroidByVworkNames(
@@ -365,8 +369,10 @@ export async function GET(request: Request) {
       rows: rows.map((c) => {
         const wo = wineryCentroids[c.delivery_winery] ?? null;
         const vo = vineyardCentroids[c.vineyard_name] ?? null;
+        const winery_geofence_resolved = wo != null;
+        const vineyard_geofence_resolved = vo != null;
         const maps_drive_url =
-          wo != null && vo != null ? googleMapsDrivingDirectionsUrl(wo, vo) : null;
+          wo != null && vo != null ? googleMapsDrivingDirectionsUrl(wo, vo) ?? null : null;
         return {
           id: c.id,
           delivery_winery: c.delivery_winery,
@@ -390,6 +396,8 @@ export async function GET(request: Request) {
           effective_duration_min: c.effective_duration_min,
           display_distance_via: c.display_distance_via,
           maps_drive_url,
+          winery_geofence_resolved,
+          vineyard_geofence_resolved,
         };
       }) satisfies DistanceRow[],
     });

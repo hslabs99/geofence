@@ -1108,6 +1108,14 @@ export type CleanupRulesReport = {
         step4After: string;
         outboundMinutes: number;
       };
+  /** No merged step 4 (GPS/VWork); step 3 and 5 present — midpoint on return leg (e.g. unmapped winery fences). */
+  step4Mid35:
+    | null
+    | {
+        step3At: string;
+        step5At: string;
+        step4After: string;
+      };
 };
 
 export type DerivedStepsResultWithDebug = DerivedStepsResult & {
@@ -2084,6 +2092,8 @@ function resolveActualFromGpsAndVwork(gps: DerivedStepsResult, job: JobForDerive
  *   step 3 = midpoint between step 2 and step 4. Does **not** move step 4.
  * step4_order (else): **Arrive winery** (step 4) is before **leave vineyard** (step 3) → step4 = step3 + outbound minutes
  *   (same duration as morning leg: step2 − step1). Skipped when Step3windback runs.
+ * step4_mid_35: merged step 4 still missing but step 3 and step 5 exist with step 3 &lt; step 5 → step4 = time midpoint
+ *   (e.g. no winery ENTER from GPS and no VWork step 4).
  */
 function applyCleanupRules(
   actual: DerivedStepsResult,
@@ -2094,6 +2104,7 @@ function applyCleanupRules(
     step1: { applied: false },
     step3Windback: null,
     step4Order: null,
+    step4Mid35: null,
   };
 
   const step1BeforeCleanup = actual.step1 != null ? normalizeTimestampString(actual.step1) : null;
@@ -2202,6 +2213,30 @@ function applyCleanupRules(
         actual.step4 = adjusted;
         step4RuleApplied = true;
       }
+    }
+  }
+
+  const s3Final = actual.step3 != null ? normalizeTimestampString(actual.step3) : null;
+  const s5Final = actual.step5 != null ? normalizeTimestampString(actual.step5) : null;
+  const s4Final = actual.step4 != null ? normalizeTimestampString(actual.step4) : null;
+  if (
+    s4Final == null &&
+    s3Final != null &&
+    s5Final != null &&
+    s3Final < s5Final &&
+    actual.step3 &&
+    actual.step5
+  ) {
+    const midRaw = midpointBetweenTimestamps(actual.step3, actual.step5);
+    const midNorm = midRaw != null ? normalizeTimestampString(midRaw) : null;
+    if (midNorm != null && midNorm > s3Final && midNorm < s5Final) {
+      actual.step4 = midNorm;
+      step4RuleApplied = true;
+      report.step4Mid35 = {
+        step3At: s3Final,
+        step5At: s5Final,
+        step4After: midNorm,
+      };
     }
   }
 
@@ -2612,6 +2647,7 @@ export async function deriveGpsStepsForJob(
     step1: { applied: false },
     step3Windback: null,
     step4Order: null,
+    step4Mid35: null,
   };
   if (!options.device || !options.positionAfter) {
     return { ...emptyResult, debug, step1ActualOverride: null, cleanupRulesReport: emptyCleanup };

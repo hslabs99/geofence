@@ -141,7 +141,7 @@ export async function GET(request: Request) {
       });
     }
 
-    const [truckRows, tmRows, trailerTypeRows, loadSizeRows, vineyardNames, deliveryWineries, workers, vineyardGroups] = await Promise.all([
+    const [truckRows, tmRows, trailerTypeRows, loadSizeRows, vineyardNames, deliveryWineries, workers, vineyardGroups, templates] = await Promise.all([
       query<{ v: string }>(
         `SELECT DISTINCT btrim(truck_id::text) AS v FROM tbl_vworkjobs
          WHERE truck_id IS NOT NULL AND btrim(truck_id::text) <> ''
@@ -166,6 +166,7 @@ export async function GET(request: Request) {
       distinctTextColumn('delivery_winery'),
       distinctTextColumn('worker'),
       distinctTextColumn('vineyard_group'),
+      distinctTextColumn('template'),
     ]);
 
     const truckIds = rowsToSortedDistinct(truckRows);
@@ -182,6 +183,7 @@ export async function GET(request: Request) {
       deliveryWineries,
       workers,
       vineyardGroups,
+      templates,
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

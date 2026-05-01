@@ -17,7 +17,7 @@ export type LimitException = ComboRow;
 
 /**
  * GET: vworkjobs key combinations (customer, template, winery, vineyard_group, TT) that have no matching tbl_wineryminutes row
- * (same rules as Summary: exact vineyard group; TT or TTT fallback for T/TT).
+ * (same rules as Summary: vineyard group case-insensitive; TT or TTT fallback for T/TT).
  */
 export async function GET() {
   try {

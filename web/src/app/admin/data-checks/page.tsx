@@ -1,7 +1,7 @@
 'use client';
 
 import Link from 'next/link';
-import { Suspense, useState, useEffect, useCallback, useRef } from 'react';
+import { Suspense, useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { useSearchParams } from 'next/navigation';
 import {
   JOBS_GPS_TAB_SETTINGS_NAME,
@@ -235,6 +235,13 @@ type VineyardGroupRow = {
   winery_name: string | null;
   vineyard_name: string;
   vineyard_group: string;
+  created_at: string;
+};
+
+type TemplateMappingRow = {
+  id: number;
+  template: string;
+  textmask: string;
   created_at: string;
 };
 
@@ -474,6 +481,55 @@ type Step4to5FixResponse = {
   afterPreview: Step4to5PreviewResponse;
 };
 
+type Step4to5AuditRow = {
+  job_id: string;
+  customer: string | null;
+  template: string | null;
+  worker: string | null;
+  delivery_winery: string | null;
+  vineyard_group: string | null;
+  trailermode: string | null;
+  step4to5: number | null;
+  step_3_completed_at: string | null;
+  step_4_completed_at: string | null;
+  step_4_actual_time: string | null;
+  step_4_safe: string | null;
+  step_5_completed_at: string | null;
+  step_5_actual_time: string | null;
+};
+
+type Step4to5AuditResponse = {
+  ok: true;
+  total: number;
+  rows: Step4to5AuditRow[];
+};
+
+type Step4to5AuditEnqueueResponse = {
+  ok: true;
+  requested: number;
+  found: number;
+  upserted: number;
+};
+
+type Step4to5AuditProcessResponse = {
+  ok: true;
+  fetched: number;
+  done: number;
+  skipped: number;
+  errored: number;
+  perJob: { job_id: string; status: string; updated: number; error?: string }[];
+};
+
+type Step4to5AuditQueueStatsResponse = {
+  ok: true;
+  pending: number;
+  processing: number;
+  done: number;
+  skipped: number;
+  error: number;
+  total: number;
+};
+
 function step4to5PreviewMatchesMode(
   p: Step4to5PreviewResponse,
   mode: 'normal' | 'rerun' | 'ordering',
@@ -569,6 +625,7 @@ type DataChecksTab =
   | 'db-check'
   | 'db-check-simple'
   | 'vineyard-mappings'
+  | 'na-template-mappings'
   | 'vwork-stale'
   | 'geofence-gaps'
   | 'geofence-enter-exit-gaps'
@@ -634,6 +691,7 @@ function DataChecksPageContent() {
   const [activeTab, setActiveTab] = useState<DataChecksTab>(() => {
     if (tabParam === 'data-health-overview') return 'data-health-overview';
     if (tabParam === 'vineyard-mappings') return 'vineyard-mappings';
+    if (tabParam === 'na-template-mappings') return 'na-template-mappings';
     if (tabParam === 'vwork-stale') return 'vwork-stale';
     if (tabParam === 'geofence-enter-exit-gaps') return 'geofence-enter-exit-gaps';
     if (tabParam === 'step4to5') return 'step4to5';
@@ -653,6 +711,7 @@ function DataChecksPageContent() {
   useEffect(() => {
     if (tabParam === 'data-health-overview') setActiveTab('data-health-overview');
     else if (tabParam === 'vineyard-mappings') setActiveTab('vineyard-mappings');
+    else if (tabParam === 'na-template-mappings') setActiveTab('na-template-mappings');
     else if (tabParam === 'vwork-stale') setActiveTab('vwork-stale');
     else if (tabParam === 'geofence-enter-exit-gaps') setActiveTab('geofence-enter-exit-gaps');
     else if (tabParam === 'step4to5') setActiveTab('step4to5');
@@ -811,6 +870,27 @@ function DataChecksPageContent() {
   const [vgEditVineyard, setVgEditVineyard] = useState('');
   const [vgEditGroup, setVgEditGroup] = useState('');
 
+  // NA Template Mappings tab
+  const [tmRows, setTmRows] = useState<TemplateMappingRow[]>([]);
+  const [tmLoading, setTmLoading] = useState(false);
+  const [tmError, setTmError] = useState<string | null>(null);
+  const [tmSaving, setTmSaving] = useState(false);
+  const [tmNewTemplate, setTmNewTemplate] = useState('');
+  const [tmNewTextmask, setTmNewTextmask] = useState('');
+  const [tmEditingId, setTmEditingId] = useState<number | null>(null);
+  const [tmEditTemplate, setTmEditTemplate] = useState('');
+  const [tmEditTextmask, setTmEditTextmask] = useState('');
+  /** Distinct templates from tbl_vworkjobs (GET /api/vworkjobs/templates). */
+  const [tmJobTemplates, setTmJobTemplates] = useState<string[]>([]);
+
+  const tmEditTemplateSelectOptions = useMemo(() => {
+    const cur = tmEditTemplate.trim();
+    if (tmEditingId != null && cur && !tmJobTemplates.includes(cur)) {
+      return [...tmJobTemplates, cur].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+    }
+    return tmJobTemplates;
+  }, [tmJobTemplates, tmEditingId, tmEditTemplate]);
+
   // GPS Integrity Check: devices × dates, API vs tbl_tracking.position_time (streams NDJSON)
   const [gpsIntegrityFrom, setGpsIntegrityFrom] = useState('');
   const [gpsIntegrityTo, setGpsIntegrityTo] = useState('');
@@ -867,6 +947,17 @@ function DataChecksPageContent() {
   const [step4to5FixResult, setStep4to5FixResult] = useState<Step4to5FixResponse | null>(null);
   const [step4to5FixConfirmOpen, setStep4to5FixConfirmOpen] = useState(false);
   const [step4to5Mode, setStep4to5Mode] = useState<'normal' | 'rerun' | 'ordering'>('normal');
+
+  const [step4to5Audit, setStep4to5Audit] = useState<Step4to5AuditResponse | null>(null);
+  const [step4to5AuditLoading, setStep4to5AuditLoading] = useState(false);
+  const [step4to5AuditError, setStep4to5AuditError] = useState<string | null>(null);
+  const [step4to5AuditEnqueueResult, setStep4to5AuditEnqueueResult] = useState<Step4to5AuditEnqueueResponse | null>(null);
+  const [step4to5AuditEnqueueError, setStep4to5AuditEnqueueError] = useState<string | null>(null);
+  const [step4to5AuditProcessResult, setStep4to5AuditProcessResult] = useState<Step4to5AuditProcessResponse | null>(null);
+  const [step4to5AuditProcessError, setStep4to5AuditProcessError] = useState<string | null>(null);
+  const [step4to5AuditProcessLoading, setStep4to5AuditProcessLoading] = useState(false);
+  const [step4to5AuditQueueStats, setStep4to5AuditQueueStats] = useState<Step4to5AuditQueueStatsResponse | null>(null);
+  const [step4to5AuditQueueStatsError, setStep4to5AuditQueueStatsError] = useState<string | null>(null);
 
   const [sqlRuns, setSqlRuns] = useState<SqlRunRow[]>([]);
   const [sqlRunsLoading, setSqlRunsLoading] = useState(false);
@@ -1089,6 +1180,130 @@ function DataChecksPageContent() {
       });
   }, []);
 
+  const fetchStep4to5Audit = useCallback(() => {
+    const c = step4to5Customer.trim();
+    const t = step4to5Template.trim();
+    if (!c || !t) {
+      setStep4to5AuditError('Select customer and template');
+      return;
+    }
+    setStep4to5AuditError(null);
+    setStep4to5AuditEnqueueError(null);
+    setStep4to5AuditProcessError(null);
+    setStep4to5AuditEnqueueResult(null);
+    setStep4to5AuditProcessResult(null);
+    setStep4to5AuditLoading(true);
+    const qs = new URLSearchParams({ customer: c, template: t, step4to5Only: '1', limit: '20000' });
+    fetch(`/api/admin/data-checks/step4to5-audit?${qs.toString()}`, { cache: 'no-store' })
+      .then(async (r) => {
+        const d = (await r.json()) as Step4to5AuditResponse & { ok?: boolean; error?: string };
+        if (!r.ok) throw new Error(d?.error ?? r.statusText);
+        if (!d.ok) throw new Error('Audit failed');
+        return d;
+      })
+      .then((d) => setStep4to5Audit(d))
+      .catch((e) => {
+        setStep4to5Audit(null);
+        setStep4to5AuditError(e instanceof Error ? e.message : String(e));
+      })
+      .finally(() => setStep4to5AuditLoading(false));
+  }, [step4to5Customer, step4to5Template]);
+
+  const fetchStep4to5AuditQueueStats = useCallback(() => {
+    setStep4to5AuditQueueStatsError(null);
+    fetch('/api/admin/data-checks/step4to5-audit/queue-stats', { cache: 'no-store' })
+      .then(async (r) => {
+        const d = (await r.json()) as Step4to5AuditQueueStatsResponse & { ok?: boolean; error?: string };
+        if (!r.ok) throw new Error(d?.error ?? r.statusText);
+        if (!d.ok) throw new Error('Queue stats failed');
+        return d;
+      })
+      .then((d) => setStep4to5AuditQueueStats(d))
+      .catch((e) => {
+        setStep4to5AuditQueueStats(null);
+        setStep4to5AuditQueueStatsError(e instanceof Error ? e.message : String(e));
+      });
+  }, []);
+
+  const enqueueStep4to5AuditJobs = useCallback((jobIds: string[], reason?: string) => {
+    setStep4to5AuditEnqueueError(null);
+    setStep4to5AuditEnqueueResult(null);
+    fetch('/api/admin/data-checks/step4to5-audit/enqueue', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jobIds, reason }),
+    })
+      .then(async (r) => {
+        const d = (await r.json()) as Step4to5AuditEnqueueResponse & { ok?: boolean; error?: string };
+        if (!r.ok) throw new Error(d?.error ?? r.statusText);
+        if (!d.ok) throw new Error('Enqueue failed');
+        return d;
+      })
+      .then((d) => {
+        setStep4to5AuditEnqueueResult(d);
+        fetchStep4to5AuditQueueStats();
+      })
+      .catch((e) => setStep4to5AuditEnqueueError(e instanceof Error ? e.message : String(e)));
+  }, [fetchStep4to5AuditQueueStats]);
+
+  const processStep4to5AuditQueue = useCallback((limit = 100) => {
+    setStep4to5AuditProcessError(null);
+    setStep4to5AuditProcessResult(null);
+    setStep4to5AuditProcessLoading(true);
+    fetch(`/api/admin/data-checks/step4to5-audit/process?limit=${encodeURIComponent(String(limit))}`, {
+      method: 'POST',
+      cache: 'no-store',
+    })
+      .then(async (r) => {
+        const d = (await r.json()) as Step4to5AuditProcessResponse & { ok?: boolean; error?: string };
+        if (!r.ok) throw new Error(d?.error ?? r.statusText);
+        if (!d.ok) throw new Error('Process failed');
+        return d;
+      })
+      .then((d) => setStep4to5AuditProcessResult(d))
+      .catch((e) => setStep4to5AuditProcessError(e instanceof Error ? e.message : String(e)))
+      .finally(() => setStep4to5AuditProcessLoading(false));
+  }, []);
+
+  const processAllPendingStep4to5AuditQueue = useCallback(async () => {
+    setStep4to5AuditProcessError(null);
+    setStep4to5AuditProcessResult(null);
+    setStep4to5AuditProcessLoading(true);
+    try {
+      let pending = step4to5AuditQueueStats?.pending ?? null;
+      // Refresh stats first if unknown.
+      if (pending == null) {
+        const r = await fetch('/api/admin/data-checks/step4to5-audit/queue-stats', { cache: 'no-store' });
+        const d = (await r.json()) as Step4to5AuditQueueStatsResponse & { ok?: boolean; error?: string };
+        if (!r.ok || d.ok !== true) throw new Error(d?.error ?? 'Queue stats failed');
+        setStep4to5AuditQueueStats(d);
+        pending = d.pending;
+      }
+      if (!pending || pending <= 0) return;
+
+      const BATCH = 200;
+      let last: Step4to5AuditProcessResponse | null = null;
+      // Loop until process returns fetched=0 (no pending rows) or safety guard.
+      for (let i = 0; i < 200; i++) {
+        const pr = await fetch(`/api/admin/data-checks/step4to5-audit/process?limit=${BATCH}`, { method: 'POST', cache: 'no-store' });
+        const pd = (await pr.json()) as Step4to5AuditProcessResponse & { ok?: boolean; error?: string };
+        if (!pr.ok || pd.ok !== true) throw new Error(pd?.error ?? 'Process failed');
+        last = pd;
+        setStep4to5AuditProcessResult(pd);
+        if (pd.fetched <= 0) break;
+        // Refresh stats so the button label updates promptly.
+        await new Promise((res) => setTimeout(res, 50));
+        fetchStep4to5AuditQueueStats();
+      }
+      if (last) setStep4to5AuditProcessResult(last);
+    } catch (e) {
+      setStep4to5AuditProcessError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setStep4to5AuditProcessLoading(false);
+      fetchStep4to5AuditQueueStats();
+    }
+  }, [fetchStep4to5AuditQueueStats, step4to5AuditQueueStats?.pending]);
+
   useEffect(() => {
     if (activeTab !== 'step4to5') return;
     let cancelled = false;
@@ -1104,6 +1319,11 @@ function DataChecksPageContent() {
       cancelled = true;
     };
   }, [activeTab]);
+
+  useEffect(() => {
+    if (activeTab !== 'step4to5') return;
+    fetchStep4to5AuditQueueStats();
+  }, [activeTab, fetchStep4to5AuditQueueStats]);
 
   useEffect(() => {
     if (activeTab !== 'step4to5') return;
@@ -2126,6 +2346,103 @@ function DataChecksPageContent() {
     }
   }, [activeTab, fetchVgRows, fetchVgOptions]);
 
+  const fetchTmRows = useCallback(() => {
+    setTmLoading(true);
+    setTmError(null);
+    fetch('/api/admin/data-checks/template-mappings')
+      .then((r) => {
+        if (!r.ok) return r.json().then((d) => Promise.reject(new Error(d?.error ?? r.statusText)));
+        return r.json();
+      })
+      .then((data: { rows: TemplateMappingRow[] }) => setTmRows(data.rows ?? []))
+      .catch((e) => setTmError(e instanceof Error ? e.message : String(e)))
+      .finally(() => setTmLoading(false));
+  }, []);
+
+  useEffect(() => {
+    if (activeTab !== 'na-template-mappings') return;
+    fetchTmRows();
+    fetch('/api/vworkjobs/templates', { cache: 'no-store' })
+      .then((r) => (r.ok ? r.json() : { templates: [] }))
+      .then((d: { templates?: string[] }) =>
+        setTmJobTemplates(Array.isArray(d.templates) ? d.templates : []),
+      )
+      .catch(() => setTmJobTemplates([]));
+  }, [activeTab, fetchTmRows]);
+
+  const createTmRow = () => {
+    const t = tmNewTemplate.trim();
+    const m = tmNewTextmask.trim();
+    if (!t || !m) {
+      setTmError('Choose a template and enter a text description.');
+      return;
+    }
+    setTmError(null);
+    setTmSaving(true);
+    fetch('/api/admin/data-checks/template-mappings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ template: t, textmask: m }),
+    })
+      .then((r) => {
+        if (!r.ok) return r.json().then((d) => Promise.reject(new Error(d?.error ?? r.statusText)));
+        return r.json();
+      })
+      .then(() => {
+        setTmNewTemplate('');
+        setTmNewTextmask('');
+        fetchTmRows();
+      })
+      .catch((e) => setTmError(e instanceof Error ? e.message : String(e)))
+      .finally(() => setTmSaving(false));
+  };
+
+  const updateTmRow = (id: number) => {
+    const t = tmEditTemplate.trim();
+    const m = tmEditTextmask.trim();
+    if (!t || !m) {
+      setTmError('Template and text description are required.');
+      return;
+    }
+    setTmError(null);
+    setTmSaving(true);
+    fetch(`/api/admin/data-checks/template-mappings/${id}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ template: t, textmask: m }),
+    })
+      .then((r) => {
+        if (!r.ok) return r.json().then((d) => Promise.reject(new Error(d?.error ?? r.statusText)));
+        return r.json();
+      })
+      .then(() => {
+        setTmEditingId(null);
+        fetchTmRows();
+      })
+      .catch((e) => setTmError(e instanceof Error ? e.message : String(e)))
+      .finally(() => setTmSaving(false));
+  };
+
+  const deleteTmRow = (id: number) => {
+    if (!confirm('Delete this template mapping?')) return;
+    setTmError(null);
+    setTmSaving(true);
+    fetch(`/api/admin/data-checks/template-mappings/${id}`, { method: 'DELETE' })
+      .then((r) => {
+        if (!r.ok) return r.json().then((d) => Promise.reject(new Error(d?.error ?? r.statusText)));
+        return r.json();
+      })
+      .then(() => fetchTmRows())
+      .catch((e) => setTmError(e instanceof Error ? e.message : String(e)))
+      .finally(() => setTmSaving(false));
+  };
+
+  const startEditTm = (row: TemplateMappingRow) => {
+    setTmEditingId(row.id);
+    setTmEditTemplate(row.template.trim());
+    setTmEditTextmask(row.textmask.trim());
+  };
+
   const createVgRow = () => {
     const vineyard = vgNewVineyard.trim();
     const group = vgNewGroup.trim();
@@ -2288,6 +2605,13 @@ function DataChecksPageContent() {
             className={`rounded-t px-4 py-2 text-sm font-medium ${activeTab === 'vineyard-mappings' ? 'border border-b-0 border-zinc-200 bg-white text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'}`}
           >
             7. Vineyard Mappings
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveTab('na-template-mappings')}
+            className={`rounded-t px-4 py-2 text-sm font-medium ${activeTab === 'na-template-mappings' ? 'border border-b-0 border-zinc-200 bg-white text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'}`}
+          >
+            NA Template Mappings
           </button>
           <button
             type="button"
@@ -5012,6 +5336,158 @@ function DataChecksPageContent() {
         </section>
         )}
 
+        {activeTab === 'na-template-mappings' && (
+        <section className="mt-0 rounded-b-lg border border-zinc-200 border-t-0 bg-white p-6 shadow-sm dark:border-zinc-700 dark:bg-zinc-900">
+          <h2 className="text-lg font-medium text-zinc-900 dark:text-zinc-100">NA Template Mappings</h2>
+          <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
+            When a job&apos;s <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">vineyard_group</code> is{' '}
+            <strong>NA</strong>, Summary → Time Limits and By Job show your <strong>text description</strong> instead, matched on{' '}
+            <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">tbl_vworkjobs.template</code>. Run{' '}
+            <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">create_tbl_templatemappings.sql</code> once if the table is missing.
+          </p>
+
+          <div className="mt-4 flex flex-wrap items-end gap-4 rounded border border-zinc-200 bg-zinc-50/50 p-4 dark:border-zinc-700 dark:bg-zinc-800/30">
+            <label className="flex flex-col gap-1">
+              <span className="text-xs font-medium text-zinc-500 dark:text-zinc-400">Template</span>
+              <select
+                value={tmNewTemplate}
+                onChange={(e) => setTmNewTemplate(e.target.value)}
+                className="min-w-[16rem] w-64 rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+              >
+                <option value="">— Select from tbl_vworkjobs —</option>
+                {tmJobTemplates.map((t) => (
+                  <option key={t} value={t}>
+                    {t}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="flex flex-col gap-1">
+              <span className="text-xs font-medium text-zinc-500 dark:text-zinc-400">Text description</span>
+              <input
+                type="text"
+                value={tmNewTextmask}
+                onChange={(e) => setTmNewTextmask(e.target.value)}
+                placeholder="Shown instead of NA in Summary"
+                className="w-72 rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+              />
+            </label>
+            <button
+              type="button"
+              onClick={createTmRow}
+              disabled={tmSaving}
+              className="rounded bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50 dark:bg-blue-700 dark:hover:bg-blue-600"
+            >
+              {tmSaving ? 'Saving…' : 'Add'}
+            </button>
+          </div>
+
+          {tmError && (
+            <div className="mt-4 rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-800 dark:bg-red-950/50 dark:text-red-200">
+              {tmError}
+            </div>
+          )}
+
+          <div className="mt-6">
+            {tmLoading ? (
+              <p className="text-sm text-zinc-500 dark:text-zinc-400">Loading…</p>
+            ) : (
+              <div className="overflow-x-auto rounded border border-zinc-200 dark:border-zinc-700">
+                <table className="w-full min-w-[480px] border-collapse text-left text-sm">
+                  <thead>
+                    <tr className="border-b border-zinc-200 bg-zinc-100/80 dark:border-zinc-700 dark:bg-zinc-800/80">
+                      <th className="px-3 py-2 font-medium text-zinc-700 dark:text-zinc-300">Template</th>
+                      <th className="px-3 py-2 font-medium text-zinc-700 dark:text-zinc-300">Text description</th>
+                      <th className="px-3 py-2 text-right font-medium text-zinc-700 dark:text-zinc-300">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {tmRows.length === 0 ? (
+                      <tr>
+                        <td colSpan={3} className="px-3 py-4 text-center text-zinc-500 dark:text-zinc-400">
+                          No mappings yet. Add one above.
+                        </td>
+                      </tr>
+                    ) : (
+                      tmRows.map((row) => (
+                        <tr key={row.id} className="border-b border-zinc-100 dark:border-zinc-800">
+                          {tmEditingId === row.id ? (
+                            <>
+                              <td className="px-3 py-2">
+                                <select
+                                  value={tmEditTemplate}
+                                  onChange={(e) => setTmEditTemplate(e.target.value)}
+                                  className="w-full min-w-[12rem] rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+                                >
+                                  <option value="">— Select —</option>
+                                  {tmEditTemplateSelectOptions.map((t) => (
+                                    <option key={t} value={t}>
+                                      {t}
+                                    </option>
+                                  ))}
+                                </select>
+                              </td>
+                              <td className="px-3 py-2">
+                                <input
+                                  type="text"
+                                  value={tmEditTextmask}
+                                  onChange={(e) => setTmEditTextmask(e.target.value)}
+                                  className="w-full rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+                                />
+                              </td>
+                              <td className="px-3 py-2 text-right">
+                                <button
+                                  type="button"
+                                  onClick={() => updateTmRow(row.id)}
+                                  disabled={tmSaving}
+                                  className="mr-2 rounded bg-emerald-600 px-2 py-1 text-xs font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
+                                >
+                                  Save
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setTmEditingId(null)}
+                                  className="rounded border border-zinc-300 bg-white px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-100 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700"
+                                >
+                                  Cancel
+                                </button>
+                              </td>
+                            </>
+                          ) : (
+                            <>
+                              <td className="px-3 py-2 text-zinc-900 dark:text-zinc-100">{row.template}</td>
+                              <td className="px-3 py-2 text-zinc-900 dark:text-zinc-100">{row.textmask}</td>
+                              <td className="px-3 py-2 text-right">
+                                <button
+                                  type="button"
+                                  onClick={() => startEditTm(row)}
+                                  disabled={tmSaving}
+                                  className="mr-2 rounded border border-zinc-300 bg-white px-2 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-100 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700"
+                                >
+                                  Edit
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => deleteTmRow(row.id)}
+                                  disabled={tmSaving}
+                                  className="rounded border border-red-200 bg-white px-2 py-1 text-xs font-medium text-red-700 hover:bg-red-50 dark:border-red-800 dark:bg-zinc-800 dark:text-red-300 dark:hover:bg-red-950/30"
+                                >
+                                  Delete
+                                </button>
+                              </td>
+                            </>
+                          )}
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        </section>
+        )}
+
         {activeTab === 'vwork-stale' && (
         <section className="mt-0 rounded-b-lg border border-zinc-200 border-t-0 bg-white p-6 shadow-sm dark:border-zinc-700 dark:bg-zinc-900">
           <h2 className="text-lg font-medium text-zinc-900 dark:text-zinc-100">VWork GPS steps</h2>
@@ -6190,6 +6666,152 @@ function DataChecksPageContent() {
               {step4to5FixResult.afterPreview.blockedCount}, will do {step4to5FixResult.afterPreview.willDoCount}).
             </div>
           )}
+
+          <div className="mt-8 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900">
+            <h3 className="text-sm font-medium text-zinc-900 dark:text-zinc-100">Step4to5 Audit (missing step 4)</h3>
+            <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
+              Lists <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">step4to5 = 1</code> jobs where{' '}
+              <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">step_4_completed_at</code> <strong>or</strong>{' '}
+              <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">step_4_actual_time</code> is missing. You can enqueue these jobs for a low-volume
+              fix that estimates <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">step_4_actual_time</code>.
+            </p>
+
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => fetchStep4to5Audit()}
+                disabled={step4to5AuditLoading}
+                className="rounded border border-zinc-300 bg-white px-3 py-1.5 text-sm font-medium text-zinc-800 hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100 dark:hover:bg-zinc-700"
+              >
+                {step4to5AuditLoading ? 'Loading…' : 'Load audit list'}
+              </button>
+              <button
+                type="button"
+                onClick={() => enqueueStep4to5AuditJobs((step4to5Audit?.rows ?? []).map((r) => r.job_id), 'Step4to5 audit: missing step 4')}
+                disabled={!step4to5Audit || step4to5Audit.rows.length === 0}
+                className="rounded bg-sky-700 px-3 py-1.5 text-sm font-medium text-white hover:bg-sky-800 disabled:opacity-50 dark:bg-sky-600 dark:hover:bg-sky-500"
+                title="Insert into tbl_step4to5_audit_queue (upsert)"
+              >
+                Enqueue all in list
+              </button>
+              <button
+                type="button"
+                onClick={() => processAllPendingStep4to5AuditQueue()}
+                disabled={step4to5AuditProcessLoading || (step4to5AuditQueueStats?.pending ?? 0) === 0}
+                className="rounded bg-amber-700 px-3 py-1.5 text-sm font-medium text-white hover:bg-amber-800 disabled:opacity-50 dark:bg-amber-600 dark:hover:bg-amber-500"
+                title="Process pending queue rows (server-side loop)"
+              >
+                {step4to5AuditProcessLoading
+                  ? 'Processing…'
+                  : `Process queue (${step4to5AuditQueueStats?.pending ?? 0})`}
+              </button>
+            </div>
+
+            {step4to5AuditError && (
+              <div className="mt-3 rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-900 dark:bg-red-950/40 dark:text-red-200">
+                {step4to5AuditError}
+              </div>
+            )}
+            {step4to5AuditEnqueueError && (
+              <div className="mt-3 rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-900 dark:bg-red-950/40 dark:text-red-200">
+                {step4to5AuditEnqueueError}
+              </div>
+            )}
+            {step4to5AuditProcessError && (
+              <div className="mt-3 rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-900 dark:bg-red-950/40 dark:text-red-200">
+                {step4to5AuditProcessError}
+              </div>
+            )}
+            {step4to5AuditQueueStatsError && (
+              <div className="mt-3 rounded border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-900 dark:bg-red-950/40 dark:text-red-200">
+                {step4to5AuditQueueStatsError}
+              </div>
+            )}
+
+            {step4to5AuditEnqueueResult && (
+              <div className="mt-3 rounded border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-900 dark:border-emerald-800 dark:bg-emerald-950/50 dark:text-emerald-200">
+                Enqueued <strong>{step4to5AuditEnqueueResult.upserted}</strong> job(s) (found {step4to5AuditEnqueueResult.found} of{' '}
+                {step4to5AuditEnqueueResult.requested} requested).
+              </div>
+            )}
+
+            {step4to5AuditProcessResult && (
+              <div className="mt-3 rounded border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-900 dark:border-emerald-800 dark:bg-emerald-950/50 dark:text-emerald-200">
+                Processed {step4to5AuditProcessResult.fetched} queued job(s): done {step4to5AuditProcessResult.done}, skipped{' '}
+                {step4to5AuditProcessResult.skipped}, error {step4to5AuditProcessResult.errored}.
+              </div>
+            )}
+
+            {step4to5Audit && (
+              <div className="mt-4 overflow-x-auto rounded border border-zinc-200 dark:border-zinc-700">
+                <table className="w-full min-w-[1120px] border-collapse text-sm">
+                  <thead>
+                    <tr className="border-b border-zinc-200 bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-800/80">
+                      <th className="px-2 py-2 text-left font-semibold text-zinc-700 dark:text-zinc-200">Job</th>
+                      <th className="px-2 py-2 text-left font-semibold text-zinc-700 dark:text-zinc-200">Worker</th>
+                      <th className="px-2 py-2 text-left font-semibold text-zinc-700 dark:text-zinc-200">Winery</th>
+                      <th className="px-2 py-2 text-left font-semibold text-zinc-700 dark:text-zinc-200">VG</th>
+                      <th className="px-2 py-2 text-left font-semibold text-zinc-700 dark:text-zinc-200">TT</th>
+                      <th className="px-2 py-2 text-left font-semibold text-zinc-700 dark:text-zinc-200">Step3 VWork</th>
+                      <th className="px-2 py-2 text-left font-semibold text-zinc-700 dark:text-zinc-200">Step4 VWork</th>
+                      <th className="px-2 py-2 text-left font-semibold text-zinc-700 dark:text-zinc-200">Step4 Actual</th>
+                      <th className="px-2 py-2 text-left font-semibold text-zinc-700 dark:text-zinc-200">Step4 Safe</th>
+                      <th className="px-2 py-2 text-left font-semibold text-zinc-700 dark:text-zinc-200">Step5 Actual</th>
+                      <th className="px-2 py-2 text-right font-semibold text-zinc-700 dark:text-zinc-200">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {step4to5Audit.rows.length === 0 ? (
+                      <tr className="border-b border-zinc-100 dark:border-zinc-800">
+                        <td className="px-2 py-3 text-zinc-500 dark:text-zinc-400" colSpan={11}>
+                          No rows found.
+                        </td>
+                      </tr>
+                    ) : (
+                      step4to5Audit.rows.map((r) => (
+                        <tr key={r.job_id} className="border-b border-zinc-100 dark:border-zinc-800">
+                          <td className="px-2 py-2 font-mono text-xs text-zinc-800 dark:text-zinc-100">
+                            <a
+                              href={`/query/inspect?locateJobId=${encodeURIComponent(r.job_id)}&worker=${encodeURIComponent(
+                                String(r.worker ?? '').trim(),
+                              )}`}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="text-blue-700 underline hover:text-blue-900 dark:text-blue-300 dark:hover:text-blue-200"
+                              title="Open in Inspect (new tab)"
+                            >
+                              {r.job_id}
+                            </a>
+                          </td>
+                          <td className="px-2 py-2 font-mono text-xs text-zinc-700 dark:text-zinc-200">{r.worker ?? '—'}</td>
+                          <td className="px-2 py-2 text-zinc-700 dark:text-zinc-200">{r.delivery_winery ?? '—'}</td>
+                          <td className="px-2 py-2 text-zinc-700 dark:text-zinc-200">{r.vineyard_group ?? '—'}</td>
+                          <td className="px-2 py-2 text-zinc-700 dark:text-zinc-200">{r.trailermode ?? '—'}</td>
+                          <td className="px-2 py-2 font-mono text-xs text-zinc-600 dark:text-zinc-300">{r.step_3_completed_at ?? '—'}</td>
+                          <td className="px-2 py-2 font-mono text-xs text-zinc-600 dark:text-zinc-300">{r.step_4_completed_at ?? '—'}</td>
+                          <td className="px-2 py-2 font-mono text-xs text-zinc-600 dark:text-zinc-300">{r.step_4_actual_time ?? '—'}</td>
+                          <td className="px-2 py-2 font-mono text-xs text-zinc-600 dark:text-zinc-300">{r.step_4_safe ?? '—'}</td>
+                          <td className="px-2 py-2 font-mono text-xs text-zinc-600 dark:text-zinc-300">{r.step_5_actual_time ?? '—'}</td>
+                          <td className="px-2 py-2 text-right">
+                            <button
+                              type="button"
+                              onClick={() => enqueueStep4to5AuditJobs([r.job_id], 'Step4to5 audit: missing step 4')}
+                              className="rounded bg-sky-700 px-2 py-1 text-xs font-medium text-white hover:bg-sky-800 dark:bg-sky-600 dark:hover:bg-sky-500"
+                            >
+                              Enqueue
+                            </button>
+                          </td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+                <div className="px-2 py-2 text-xs text-zinc-500 dark:text-zinc-400">
+                  Showing {step4to5Audit.rows.length} row(s) (total matches: {step4to5Audit.total}).
+                </div>
+              </div>
+            )}
+          </div>
 
           {step4to5FixConfirmOpen && step4to5Preview && (
             <div

@@ -30,6 +30,34 @@ export function synthStep4CompletedAtSql(capColumnExpr: string): string {
 END`;
 }
 
+/**
+ * Synthetic step_4_actual_time from derived actual steps 1–3, capped by `cap`.
+ * Mirrors synthStep4CompletedAtSql but operates on `step_n_actual_time`.
+ */
+export function synthStep4ActualTimeSql(capColumnExpr: string): string {
+  const cap = capColumnExpr.trim();
+  const s1 = `(step_1_actual_time)::timestamp`;
+  const s2 = `(step_2_actual_time)::timestamp`;
+  const s3 = `(step_3_actual_time)::timestamp`;
+  const c = `(${cap})::timestamp`;
+  const travel = `${s3} + (${s2} - ${s1})`;
+  return `CASE
+  WHEN ${c} IS NULL THEN NULL
+  WHEN step_1_actual_time IS NOT NULL
+    AND step_2_actual_time IS NOT NULL
+    AND step_3_actual_time IS NOT NULL
+    AND ${s2} > ${s1}
+  THEN (
+    CASE
+    WHEN ${travel} < ${c} THEN ${travel}
+    WHEN ${s3} < ${c} THEN ${s3} + (${c} - ${s3}) / 2
+    ELSE NULL
+    END
+  )
+  ELSE NULL
+END`;
+}
+
 /** During normal 4→5 migrate: cap = old step_4_completed_at (same instant copied to step 5). */
 export const SYNTH_STEP4_AT_NORMAL = synthStep4CompletedAtSql('step_4_completed_at');
 
