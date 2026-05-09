@@ -114,6 +114,11 @@ export async function getVineyardFenceIdsForVworkName(vineyardName: string): Pro
   return fenceIds;
 }
 
+export async function getWineryFenceIdsForVworkName(wineryName: string): Promise<number[]> {
+  const { fenceIds } = await getFenceIdsForVworkNameWithDebug('Winery', wineryName.trim());
+  return fenceIds;
+}
+
 export type TrackingLookupDebug = {
   device: string;
   positionAfter: string;
@@ -627,8 +632,8 @@ type FenceEventRow = {
   timeNorm: string;
 };
 
-/** All ENTER/EXIT rows in the tracking window, ordered by time (for GPS* step-3 aggregation only). */
-async function listFenceEnterExitEventsInWindow(
+/** All ENTER/EXIT rows in the tracking window, ordered by time (for GPS* step-3 aggregation and admin detour checks). */
+export async function listFenceEnterExitEventsInWindow(
   device: string,
   positionAfter: string,
   positionBefore: string | null

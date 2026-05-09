@@ -142,6 +142,81 @@ export async function GET(request: Request) {
       : device.trim());
 
     /**
+     * Guardrail: lastjobendstep1limiter
+     * Clamp the entire derived-steps tracking window start so it cannot extend into the previous job for this worker.
+     *
+     * Why: if the lookback window reaches into the previous job, the "first winery EXIT" (GPS step 1) can be
+     * picked from the prior job, which then cascades to step ordering (step 2/3) and wrong job story.
+     *
+     * Rule: previous job = same worker, same day, with actual_start_time < this actual_start_time, ordered by
+     * actual_start_time DESC, LIMIT 1. Use previous job's final step_5_actual_time as truth. Then:
+     *   positionAfter := max(original positionAfter, previous.step_5_actual_time - 2 minutes)
+     *
+     * Easy removal: delete this block and use raw request positionAfter everywhere.
+     */
+    const lastJobEndStep1Limiter: Record<string, unknown> = {
+      guardrail: 'lastjobendstep1limiter',
+      applied: false,
+      worker: deviceForTracking,
+      originalPositionAfter: positionAfter.trim(),
+      clampedPositionAfter: positionAfter.trim(),
+      previousJobId: null,
+      previousJobStep5ActualTime: null,
+      capAfter: null,
+      reason: 'not_computed',
+    };
+    const thisActualStart =
+      job.actual_start_time != null && String(job.actual_start_time).trim() !== ''
+        ? normalizeTimestampString(String(job.actual_start_time).trim())
+        : null;
+    let effectivePositionAfter: string = positionAfter.trim();
+    if (thisActualStart) {
+      type PrevRow = { job_id: unknown; step_5_actual_time: unknown; actual_start_time: unknown };
+      const prevRows = await query<PrevRow>(
+        `SELECT trim(job_id::text) AS job_id,
+                to_char(step_5_actual_time, 'YYYY-MM-DD HH24:MI:SS') AS step_5_actual_time,
+                to_char(actual_start_time, 'YYYY-MM-DD HH24:MI:SS') AS actual_start_time
+         FROM tbl_vworkjobs
+         WHERE LOWER(TRIM(COALESCE(worker::text, ''))) = LOWER(TRIM($1::text))
+           AND actual_start_time IS NOT NULL
+           AND (actual_start_time::date) = ($2::timestamp)::date
+           AND actual_start_time < $2::timestamp
+           AND step_5_actual_time IS NOT NULL
+         ORDER BY actual_start_time DESC, trim(job_id::text) DESC
+         LIMIT 1`,
+        [deviceForTracking, thisActualStart]
+      );
+      const prev = prevRows[0];
+      if (!prev) {
+        lastJobEndStep1Limiter.reason = 'no_previous_job';
+      } else {
+        const prevEndRaw = prev.step_5_actual_time != null ? String(prev.step_5_actual_time).trim() : '';
+        const prevEnd = prevEndRaw ? (normalizeTimestampString(prevEndRaw) ?? prevEndRaw.slice(0, 19)) : null;
+        lastJobEndStep1Limiter.previousJobId = prev.job_id != null ? String(prev.job_id).trim() : null;
+        lastJobEndStep1Limiter.previousJobStep5ActualTime = prevEnd;
+        if (!prevEnd) {
+          lastJobEndStep1Limiter.reason = 'previous_missing_step5_actual_time';
+        } else {
+          const capAfter = addMinutesToTimestampAsNZ(prevEnd, -2);
+          const capNorm = normalizeTimestampString(capAfter) ?? capAfter.slice(0, 19);
+          const origNorm =
+            normalizeTimestampString(effectivePositionAfter) ?? String(effectivePositionAfter).trim().slice(0, 19);
+          lastJobEndStep1Limiter.capAfter = capNorm;
+          if (capNorm && origNorm && capNorm > origNorm) {
+            effectivePositionAfter = capNorm;
+            lastJobEndStep1Limiter.applied = true;
+            lastJobEndStep1Limiter.clampedPositionAfter = effectivePositionAfter;
+            lastJobEndStep1Limiter.reason = 'clamped_to_previous_job_end_minus_2m';
+          } else {
+            lastJobEndStep1Limiter.reason = 'no_clamp_needed';
+          }
+        }
+      }
+    } else {
+      lastJobEndStep1Limiter.reason = 'no_actual_start_time';
+    }
+
+    /**
      * Window end for derivation + Steps+ (buffered vineyard). Client may omit positionBefore when the job
      * row has no actual_end (bulk tagging); without a real upper bound, runFetchSteps used to pass nothing
      * and Steps+ used positionAfter as both bounds → empty SQL window. Recompute from DB row + endPlusMinutes.
@@ -212,7 +287,7 @@ export async function GET(request: Request) {
         {
           windowMinutes,
           device: deviceForTracking,
-          positionAfter: positionAfter.trim(),
+          positionAfter: effectivePositionAfter,
           positionBefore: effectivePositionBefore,
           jobEndCeilingBufferMinutes,
           step5ExtendWineryExitMinutes,
@@ -236,7 +311,7 @@ export async function GET(request: Request) {
     let result = await deriveGpsStepsForJob(job, {
       windowMinutes,
       device: deviceForTracking,
-      positionAfter: positionAfter.trim(),
+      positionAfter: effectivePositionAfter,
       positionBefore: effectivePositionBefore,
       jobEndCeilingBufferMinutes,
       step5ExtendWineryExitMinutes,
@@ -312,10 +387,10 @@ export async function GET(request: Request) {
         const { bufferMeters: stepsPlusBufferM, minDurationSeconds: stepsPlusMinSec } =
           await getStepsPlusSettings();
         const stepsPlusEnd =
-          effectivePositionBefore ?? addMinutesToTimestampAsNZ(positionAfter.trim(), 24 * 60);
+          effectivePositionBefore ?? addMinutesToTimestampAsNZ(effectivePositionAfter, 24 * 60);
         const stepsPlusRows = await runStepsPlusQuery(
           deviceForTracking,
-          positionAfter.trim(),
+          effectivePositionAfter,
           stepsPlusEnd,
           fenceNames,
           stepsPlusBufferM
@@ -387,7 +462,7 @@ export async function GET(request: Request) {
           const merged = await aggregateStepsPlusBufferedSegments(
             staysInJob,
             deviceForTracking,
-            positionAfter.trim(),
+            effectivePositionAfter,
             stepsPlusEnd,
             vineyardFenceIds
           );
@@ -431,7 +506,7 @@ export async function GET(request: Request) {
               {
                 windowMinutes,
                 device: deviceForTracking,
-                positionAfter: positionAfter.trim(),
+                positionAfter: effectivePositionAfter,
                 positionBefore: effectivePositionBefore,
                 jobEndCeilingBufferMinutes,
                 step5ExtendWineryExitMinutes,
@@ -604,6 +679,7 @@ export async function GET(request: Request) {
             error: `Derived steps OK but write-back failed: ${wMsg}`,
             debug: {
               ...result.debug,
+              lastJobEndStep1Limiter,
               writeBackError: wMsg,
               cleanupRulesReport: result.cleanupRulesReport,
             },
@@ -621,6 +697,7 @@ export async function GET(request: Request) {
         step1LastJobEnd: step1LastJobEndReport,
         debug: {
           ...result.debug,
+          lastJobEndStep1Limiter,
           cleanupRulesReport: result.cleanupRulesReport,
         },
       })

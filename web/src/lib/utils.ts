@@ -18,6 +18,35 @@ export function formatDateNZ(s: string): string {
   return `${d}/${mo}/${y.slice(-2)} ${h}:${min}:${sec}`;
 }
 
+/** Narrow display for step grids: `dd/mm hh:mm` from a DB/API timestamp string (pattern match only, no Date parsing). */
+export function formatDateDdMmHhMm(s: string | null | undefined): string {
+  if (s == null) return '—';
+  const t = String(s).trim();
+  if (t === '') return '—';
+  // ISO: 2025-03-10T12:34:56 or ...Z or with fractional seconds
+  let m = t.match(/^(\d{4})-(\d{2})-(\d{2})[T\s](\d{2}):(\d{2})(?::(\d{2}))?(?:\.\d+)?(?:Z|[+-]\d{2}(?::?\d{2})?)?$/i);
+  if (m) {
+    const [, , mo, d, h, min] = m;
+    return `${d}/${mo} ${h}:${min}`;
+  }
+  // Space form from to_char / dateToLiteral
+  m = t.match(/^(\d{4})-(\d{2})-(\d{2})\s+(\d{2}):(\d{2})(?::(\d{2}))?/);
+  if (m) {
+    const [, , mo, d, h, min] = m;
+    return `${d}/${mo} ${h}:${min}`;
+  }
+  // d/m/y ... (optional time)
+  const dmy = t.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})[T\s]?(\d{1,2})?:?(\d{2})?:?(\d{2})?/);
+  if (dmy) {
+    const day = dmy[1].padStart(2, '0');
+    const mo = dmy[2].padStart(2, '0');
+    const h = (dmy[4] ?? '0').padStart(2, '0');
+    const min = (dmy[5] ?? '00').padStart(2, '0');
+    return `${day}/${mo} ${h}:${min}`;
+  }
+  return '—';
+}
+
 /** Format snake_case column name for display: actual_start_time → "Actual Start Time" */
 export function formatColumnLabel(col: string): string {
   return col

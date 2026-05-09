@@ -44,6 +44,49 @@ async function distinctForCustomer(sqlQuoted: string, sqlLower: string, customer
   }
 }
 
+/** Same as distinctForCustomer but scoped to customer + template (Summary subsidiary filters). */
+async function distinctForCustomerTemplate(
+  sqlQuoted: string,
+  sqlLower: string,
+  customer: string,
+  template: string
+): Promise<string[]> {
+  try {
+    const rows = await query(sqlQuoted, [customer, template]);
+    return rowsToSortedDistinct(rows);
+  } catch {
+    try {
+      const rows = await query(sqlLower, [customer, template]);
+      return rowsToSortedDistinct(rows);
+    } catch {
+      return [];
+    }
+  }
+}
+
+async function distinctWineryVineyardForCustomerTemplate(
+  customer: string,
+  template: string
+): Promise<{ vineyardNames: string[]; deliveryWineries: string[] }> {
+  const vineQuoted = `SELECT DISTINCT btrim(vineyard_name::text) AS val FROM tbl_vworkjobs
+    WHERE vineyard_name IS NOT NULL AND btrim(vineyard_name::text) <> ''
+    AND trim("Customer") = $1 AND trim("Template") = $2 ORDER BY 1`;
+  const vineLower = `SELECT DISTINCT btrim(vineyard_name::text) AS val FROM tbl_vworkjobs
+    WHERE vineyard_name IS NOT NULL AND btrim(vineyard_name::text) <> ''
+    AND trim(customer) = $1 AND trim(template) = $2 ORDER BY 1`;
+  const winQuoted = `SELECT DISTINCT btrim(delivery_winery::text) AS val FROM tbl_vworkjobs
+    WHERE delivery_winery IS NOT NULL AND btrim(delivery_winery::text) <> ''
+    AND trim("Customer") = $1 AND trim("Template") = $2 ORDER BY 1`;
+  const winLower = `SELECT DISTINCT btrim(delivery_winery::text) AS val FROM tbl_vworkjobs
+    WHERE delivery_winery IS NOT NULL AND btrim(delivery_winery::text) <> ''
+    AND trim(customer) = $1 AND trim(template) = $2 ORDER BY 1`;
+  const [vineyardNames, deliveryWineries] = await Promise.all([
+    distinctForCustomerTemplate(vineQuoted, vineLower, customer, template),
+    distinctForCustomerTemplate(winQuoted, winLower, customer, template),
+  ]);
+  return { vineyardNames, deliveryWineries };
+}
+
 type ScopedResult = {
   truckIds: string[];
   trailermodes: string[];
@@ -120,14 +163,30 @@ async function distinctAllForCustomer(customer: string): Promise<ScopedResult> {
 /**
  * GET: distinct filter values for Inspect / Summary.
  * Optional ?customer=X — when set, all lists are limited to that customer (for Summary filter bar without loading jobs).
+ * Optional ?template=Y with customer — narrows `deliveryWineries` and `vineyardNames` to jobs with that template (matches Summary subsidiary filters).
  */
 export async function GET(request: Request) {
   try {
     const { searchParams } = new URL(request.url);
     const customer = searchParams.get('customer')?.trim() ?? '';
+    const template = searchParams.get('template')?.trim() ?? '';
 
     if (customer) {
       const scoped = await distinctAllForCustomer(customer);
+      if (template) {
+        const { vineyardNames, deliveryWineries } = await distinctWineryVineyardForCustomerTemplate(customer, template);
+        return NextResponse.json({
+          truckIds: scoped.truckIds,
+          trailermodes: scoped.trailermodes,
+          trailerTypes: scoped.trailerTypes,
+          loadSizes: scoped.loadSizes,
+          vineyardNames,
+          deliveryWineries,
+          workers: scoped.workers,
+          vineyardGroups: scoped.vineyardGroups,
+          templates: scoped.templates,
+        });
+      }
       return NextResponse.json({
         truckIds: scoped.truckIds,
         trailermodes: scoped.trailermodes,

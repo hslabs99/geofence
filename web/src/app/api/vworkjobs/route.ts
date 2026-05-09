@@ -165,8 +165,14 @@ export async function GET(request: Request) {
       `SELECT ${selectList}, COUNT(*) OVER () AS _total FROM tbl_vworkjobs t${whereClause}${orderLimitOffset}`,
       values,
     );
-    if (Array.isArray(rows) && rows.length > 0 && typeof (rows[0] as Record<string, unknown>)._total === 'number') {
-      total = (rows[0] as Record<string, unknown>)._total as number;
+    if (Array.isArray(rows) && rows.length > 0) {
+      const rawTotal = (rows[0] as Record<string, unknown>)._total;
+      if (typeof rawTotal === 'number') {
+        total = rawTotal;
+      } else if (typeof rawTotal === 'string' && rawTotal.trim() !== '') {
+        const parsed = parseInt(rawTotal, 10);
+        if (Number.isFinite(parsed)) total = parsed;
+      }
     } else if (Array.isArray(rows)) {
       total = rows.length;
       if (limit != null && rows.length === limit) total = limit + offset;

@@ -159,6 +159,28 @@ export function appendSummaryHistory(payload: SummaryHistoryPayload): boolean {
   return true;
 }
 
+/**
+ * Push a new Summary history entry and return its id (for opening `/query/summary?sh=…` in a new tab).
+ * Skips duplicate detection so each deep link gets a fresh row.
+ */
+export function appendSummaryHistoryDeepLink(payload: SummaryHistoryPayload): string | null {
+  if (!isSignificantSummaryState(payload)) return null;
+  const prev = readRaw();
+  const label = buildSummaryHistoryLabel(payload);
+  const id =
+    typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID()
+      : `h_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+  const entry: SummaryHistoryEntry = {
+    id,
+    createdAt: Date.now(),
+    label,
+    payload: { ...payload, minsThresholds: { ...payload.minsThresholds } },
+  };
+  writeRaw([entry, ...prev].slice(0, MAX_ENTRIES));
+  return id;
+}
+
 export function clearSummaryHistory(): void {
   if (typeof window === 'undefined') return;
   try {

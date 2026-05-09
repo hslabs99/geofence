@@ -22,7 +22,7 @@ const PRIORITY_COLUMNS = [
   'truck_id', 'truck_rego',
 ];
 
-const INSPECT_PAGE_SIZE = 100;
+const INSPECT_PAGE_SIZE = 200;
 /** Must match API cap on repeated `jobId=` (Data Audit → Inspect). */
 const MAX_AUDIT_JOB_FILTER_IDS = 5000;
 const AUDIT_JOBS_STORAGE_PREFIX = 'geodata_inspect_audit_jobs_';
@@ -229,9 +229,9 @@ function InspectContent() {
   const [filterWinery, setFilterWinery] = useState<string>('');
   const [filterVineyard, setFilterVineyard] = useState<string>('');
   const [filterLoadsize, setFilterLoadsize] = useState<string>('');
-  /** Committed value sent to API; draft updates while typing and applies on Enter only (avoids DB load per keystroke). */
-  const [filterJobId, setFilterJobId] = useState<string>('');
-  const [filterJobIdDraft, setFilterJobIdDraft] = useState<string>('');
+  /** Job id find (Enter): jump to page containing this job; list is not narrowed (same as URL locateJobId). */
+  const [findJobIdDraft, setFindJobIdDraft] = useState<string>('');
+  const [findJobIdTarget, setFindJobIdTarget] = useState<string>('');
   const [filterPlannedFrom, setFilterPlannedFrom] = useState<string>('');
   const [filterPlannedTo, setFilterPlannedTo] = useState<string>('');
   const [filterActualFrom, setFilterActualFrom] = useState<string>('');
@@ -320,7 +320,6 @@ function InspectContent() {
         filterWinery,
         filterVineyard,
         filterLoadsize,
-        filterJobId,
         filterPlannedFrom,
         filterPlannedTo,
         filterActualFrom,
@@ -339,7 +338,6 @@ function InspectContent() {
       filterWinery,
       filterVineyard,
       filterLoadsize,
-      filterJobId,
       filterPlannedFrom,
       filterPlannedTo,
       filterActualFrom,
@@ -359,6 +357,11 @@ function InspectContent() {
     [inspectFilterOnlyKey, sortColumns],
   );
 
+  const locateTarget = useMemo(
+    () => findJobIdTarget.trim() || String(paramToLocate ?? '').trim(),
+    [findJobIdTarget, paramToLocate],
+  );
+
   useEffect(() => {
     if (prevFilterKeyRef.current !== '' && prevFilterKeyRef.current !== inspectFilterOnlyKey) {
       setJobsPage(0);
@@ -368,7 +371,7 @@ function InspectContent() {
 
   useEffect(() => {
     locateResolveDoneRef.current = false;
-  }, [paramToLocate]);
+  }, [locateTarget]);
 
   useEffect(() => {
     const ref = searchParams.get('auditJobIdsRef')?.trim();
@@ -652,7 +655,6 @@ function InspectContent() {
       if (filterWinery.trim()) p.set('winery', filterWinery.trim());
       if (filterVineyard.trim()) p.set('vineyard', filterVineyard.trim());
       if (filterLoadsize.trim()) p.set('loadsize', filterLoadsize.trim());
-      if (filterJobId.trim()) p.set('jobIdContains', filterJobId.trim());
       if (filterPlannedFrom?.trim() && /^\d{4}-\d{2}-\d{2}/.test(filterPlannedFrom)) p.set('plannedDateFrom', filterPlannedFrom.slice(0, 10));
       if (filterPlannedTo?.trim() && /^\d{4}-\d{2}-\d{2}/.test(filterPlannedTo)) p.set('plannedDateTo', filterPlannedTo.slice(0, 10));
       if (filterActualFrom?.trim() && /^\d{4}-\d{2}-\d{2}/.test(filterActualFrom)) p.set('dateFrom', filterActualFrom.slice(0, 10));
@@ -694,7 +696,6 @@ function InspectContent() {
       filterWinery,
       filterVineyard,
       filterLoadsize,
-      filterJobId,
       filterPlannedFrom,
       filterPlannedTo,
       filterActualFrom,
@@ -745,7 +746,7 @@ function InspectContent() {
       return;
     }
     let cancelled = false;
-    const want = (paramToLocate ?? '').trim();
+    const want = locateTarget.trim();
     const auditActive = !!(auditJobFilterIds && auditJobFilterIds.length > 0);
     const useResolve =
       !auditActive && !!want && !userClearedLocateRef.current && !locateResolveDoneRef.current;
@@ -789,7 +790,7 @@ function InspectContent() {
     return () => {
       cancelled = true;
     };
-  }, [inspectDataKey, jobsPage, buildInspectApiParams, paramToLocate, auditJobFilterIds]);
+  }, [inspectDataKey, jobsPage, buildInspectApiParams, locateTarget, auditJobFilterIds]);
 
   useEffect(() => {
     setFilterTemplate('');
@@ -808,8 +809,8 @@ function InspectContent() {
     setFilterWinery('');
     setFilterVineyard('');
     setFilterLoadsize('');
-    setFilterJobId('');
-    setFilterJobIdDraft('');
+    setFindJobIdDraft('');
+    setFindJobIdTarget('');
     setFilterPlannedFrom('');
     setFilterPlannedTo('');
     setFilterActualFrom('');
@@ -865,8 +866,8 @@ function InspectContent() {
       setFilterVineyard('');
       setFilterLoadsize('');
       setFilterWorker('');
-      setFilterJobId('');
-      setFilterJobIdDraft('');
+      setFindJobIdDraft('');
+      setFindJobIdTarget('');
       setFilterPlannedFrom('');
       setFilterPlannedTo('');
       setFilterActualFrom('');
@@ -887,48 +888,47 @@ function InspectContent() {
       if (actualFrom) setFilterActualFrom(actualFrom);
       if (actualTo) setFilterActualTo(actualTo);
       if (jobId && !locateJobId) {
-        setFilterJobId(jobId);
-        setFilterJobIdDraft(jobId);
+        setFindJobIdDraft(jobId);
       }
     }
   }, [searchParams]);
 
-  /** Add this job to sidebar "Recent jobs" history when we landed with locateJobId/jobId. */
+  /** Add this job to sidebar "Recent jobs" history when we landed with locateJobId/jobId or used Find. */
   useEffect(() => {
-    const jobId = (paramToLocate ?? '').trim();
+    const jobId = locateTarget.trim();
     if (!jobId) return;
     fetch('/api/inspect-history', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ job_id: jobId }),
     }).catch(() => {});
-  }, [paramToLocate]);
+  }, [locateTarget]);
 
   /** When user manually clicks a different row (not the located job), stop re-applying locate on sortedRows changes. */
   useEffect(() => {
-    if (!paramToLocate) userClearedLocateRef.current = false;
-  }, [paramToLocate]);
+    if (!locateTarget) userClearedLocateRef.current = false;
+  }, [locateTarget]);
 
   /** Hyperlink arrival: apply filters first (URL effect above), then after data + sort are ready, locate the job. Re-run whenever sortedRows changes so when sort/column config loads we re-locate; stop once user has selected a different row. */
   useEffect(() => {
-    if (!paramToLocate || !hasCompletedInitialFetch || sortedRows.length === 0 || userClearedLocateRef.current) return;
-    const want = paramToLocate.trim();
+    if (!locateTarget || !hasCompletedInitialFetch || sortedRows.length === 0 || userClearedLocateRef.current) return;
+    const want = locateTarget.trim();
     const idx = sortedRows.findIndex((r) => String(r.job_id ?? '').trim() === want);
     if (idx >= 0) {
       setSelectedRowIndex(idx);
     }
-  }, [paramToLocate, hasCompletedInitialFetch, sortedRows]);
+  }, [locateTarget, hasCompletedInitialFetch, sortedRows]);
 
-  /** Scroll to the located job row once it's rendered (paramToLocate = locateJobId or jobId from URL). */
+  /** Scroll to the located/found job row once it's rendered (URL locateJobId/jobId or Find box after Enter). */
   useEffect(() => {
-    if (!paramToLocate || selectedRowIndex < 0) return;
+    if (!locateTarget || selectedRowIndex < 0) return;
     const selectedRowForScroll = sortedRows[selectedRowIndex];
-    if (!selectedRowForScroll || String(selectedRowForScroll.job_id ?? '').trim() !== paramToLocate.trim()) return;
+    if (!selectedRowForScroll || String(selectedRowForScroll.job_id ?? '').trim() !== locateTarget.trim()) return;
     const raf = requestAnimationFrame(() => {
       selectedRowRef.current?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
     });
     return () => cancelAnimationFrame(raf);
-  }, [paramToLocate, selectedRowIndex, sortedRows]);
+  }, [locateTarget, selectedRowIndex, sortedRows]);
 
   /** Fixed Inspect UI labels (do not use raw VWork step_N_name here). */
   const STEP_ROWS = [
@@ -1388,19 +1388,18 @@ function InspectContent() {
         return (
           <input
             type="text"
-            value={filterJobIdDraft}
-            onChange={(e) => setFilterJobIdDraft(e.target.value)}
+            value={findJobIdDraft}
+            onChange={(e) => setFindJobIdDraft(e.target.value)}
             onKeyDown={(e) => {
               if (e.key !== 'Enter') return;
               e.preventDefault();
-              const t = filterJobIdDraft.trim();
-              setFilterJobId(t);
-              setFilterJobIdDraft(t);
+              setFindJobIdTarget(findJobIdDraft.trim());
+              userClearedLocateRef.current = false;
             }}
             list="filter-job-id-list"
-            placeholder="Id · Enter"
+            placeholder="Find id · Enter"
             className={fi}
-            title="Prefix, then Enter to query"
+            title="Type job id and Enter to jump to that row; the list stays full (same sort/filters), only the page and selection change"
           />
         );
       case 'customer':
@@ -1751,7 +1750,7 @@ function InspectContent() {
                     onClick={() => {
                       setSelectedRowIndex(i);
                       const jobId = String(row.job_id ?? '').trim();
-                      if (paramToLocate && jobId !== paramToLocate.trim()) {
+                      if (locateTarget && jobId !== locateTarget.trim()) {
                         userClearedLocateRef.current = true;
                       }
                     }}
@@ -1811,9 +1810,9 @@ function InspectContent() {
               </div>
             )}
           </div>
-          {locateJobNotFound && (paramToLocate ?? '').trim() !== '' && (
+          {locateJobNotFound && locateTarget.trim() !== '' && (
             <p className="mt-2 text-sm text-amber-700 dark:text-amber-300">
-              Job ID {(paramToLocate ?? '').trim()} was not found for the current API filters
+              Job ID {locateTarget.trim()} was not found for the current API filters
               {showListInfoApiDebug ? ' (see query below).' : ' (use “Show list info & API query” for the request URL).'} Adjust filters or check the job exists for this truck.
             </p>
           )}
@@ -1913,6 +1912,17 @@ function InspectContent() {
                   const gpsRowId = selectedRow?.[gpsIdKey] ?? selectedRow?.[gpsIdKeyAlt];
                   const gpsRowDisplay = gpsRowId != null && gpsRowId !== '' ? String(gpsRowId) : '—';
                   const vworkValue = selectedRow?.[completedKey];
+                  const step1CarryFromLastJobRaw =
+                    n === 1
+                      ? (selectedRow as unknown as { step1oridefromlastjob?: unknown; Step1oridefromlastjob?: unknown })
+                          ?.step1oridefromlastjob ??
+                        (selectedRow as unknown as { step1oridefromlastjob?: unknown; Step1oridefromlastjob?: unknown })
+                          ?.Step1oridefromlastjob
+                      : null;
+                  const step1CarryFromLastJob =
+                    step1CarryFromLastJobRaw != null && String(step1CarryFromLastJobRaw).trim() !== ''
+                      ? String(step1CarryFromLastJobRaw).trim()
+                      : '';
                   const orideValue = stepOverrides[orideKey] ?? '';
                   /** Final = oride if set, else existing actual/completed logic. */
                   let finalValue: unknown = orideValue ? orideValue : (selectedRow?.[actualTimeKey] ?? selectedRow?.[completedKey]);
@@ -1961,12 +1971,31 @@ function InspectContent() {
                       onClick={vworkClickable ? () => focusGpsOnStepTime(selectedRow![completedKey]) : undefined}
                       title={vworkClickable ? 'Show GPS raw around this time (step −2 min to job end +60)' : undefined}
                     >
-                      <span className="inline-flex items-baseline gap-1.5">
-                        {selectedRow ? formatCell(selectedRow[completedKey]) : '—'}
-                        {vworkMins != null && (
-                          <span className={`text-xs tabular-nums ${vworkEmpty ? 'text-zinc-400 dark:text-zinc-500' : 'text-zinc-600 dark:text-zinc-400'}`}>{vworkMins} min</span>
-                        )}
-                      </span>
+                      <div className="flex flex-col gap-0.5">
+                        {n === 1 && step1CarryFromLastJob ? (
+                          <button
+                            type="button"
+                            className="w-fit text-left text-xs font-medium text-purple-800 underline decoration-dotted hover:bg-zinc-100 dark:text-purple-300 dark:hover:bg-zinc-800"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              focusGpsOnStepTime(step1CarryFromLastJob);
+                            }}
+                            title="System carry-forward: Step 1 from previous job end (click to view GPS around this time)"
+                          >
+                            Carry fwd: {formatCell(step1CarryFromLastJob)}
+                          </button>
+                        ) : null}
+                        <span className="inline-flex items-baseline gap-1.5">
+                          {selectedRow ? formatCell(selectedRow[completedKey]) : '—'}
+                          {vworkMins != null && (
+                            <span
+                              className={`text-xs tabular-nums ${vworkEmpty ? 'text-zinc-400 dark:text-zinc-500' : 'text-zinc-600 dark:text-zinc-400'}`}
+                            >
+                              {vworkMins} min
+                            </span>
+                          )}
+                        </span>
+                      </div>
                     </td>
                     <td
                       className={`overflow-hidden whitespace-nowrap px-2 py-1.5 ${gpsStepEmpty ? 'text-zinc-400 dark:text-zinc-500' : 'font-medium text-blue-800 dark:text-blue-300'} ${gpsClickable ? clickableClass : ''}`}

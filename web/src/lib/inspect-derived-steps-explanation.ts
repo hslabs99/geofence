@@ -17,6 +17,36 @@ function str(v: unknown): string {
   return String(v).trim();
 }
 
+function buildLastJobEndStep1LimiterItem(api: Record<string, unknown>): InspectExplanationItem | null {
+  const dbg = api.debug && typeof api.debug === 'object' ? (api.debug as Record<string, unknown>) : null;
+  const raw = dbg?.lastJobEndStep1Limiter;
+  if (raw == null || typeof raw !== 'object') return null;
+  const r = raw as Record<string, unknown>;
+
+  const applied = r.applied === true;
+  const worker = str(r.worker);
+  const prevId = str(r.previousJobId);
+  const prevEnd = str(r.previousJobStep5ActualTime).slice(0, 19);
+  const capAfter = str(r.capAfter).slice(0, 19);
+  const orig = str(r.originalPositionAfter).slice(0, 19);
+  const clamp = str(r.clampedPositionAfter).slice(0, 19);
+  const reason = str(r.reason).replace(/_/g, ' ');
+
+  const headline = applied
+    ? `Guardrail · lastjobendstep1limiter · applied · positionAfter ${orig || '—'} → ${clamp || '—'}`
+    : `Guardrail · lastjobendstep1limiter · not applied · ${reason || '—'}`;
+
+  const detail: string[] = [];
+  if (worker) detail.push(`Worker/device: ${worker}.`);
+  if (orig) detail.push(`Original positionAfter: ${orig}.`);
+  if (clamp) detail.push(`Clamped positionAfter: ${clamp}.`);
+  if (prevId || prevEnd) detail.push(`Previous job: ${prevId || '—'} · step_5_actual_time ${prevEnd || '—'}.`);
+  if (capAfter) detail.push(`Cap (previous end − 2 min): ${capAfter}.`);
+  if (reason) detail.push(`Reason: ${reason}.`);
+  detail.push('Effect: derived-steps cannot consider any GPS rows before the previous job end (minus 2 minutes grace).');
+  return { id: 'guardrail-lastjobendstep1limiter', headline, detail };
+}
+
 /** Inspect → Steps debug → Explanation: first technical block after Run — Step1(lastJobEnd) acid test. */
 function buildAcidTestStep1Item(api: Record<string, unknown>): InspectExplanationItem | null {
   const raw = api.step1LastJobEnd;
@@ -245,6 +275,9 @@ export function buildInspectDerivedStepsExplanation(api: Record<string, unknown>
       'Headlines are the quick read; open a row for why.',
     ],
   });
+
+  const limiter = buildLastJobEndStep1LimiterItem(api);
+  if (limiter) out.push(limiter);
 
   const acid = buildAcidTestStep1Item(api);
   if (acid) out.push(acid);

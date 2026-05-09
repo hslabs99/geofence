@@ -9,6 +9,9 @@ import {
 } from '@/lib/jobs-gps-tab-settings';
 import { jobsGpsRowBreachesLimits, type JobsGpsReportRowBreachInput } from '@/lib/jobs-gps-breach';
 import type { JobsGpsGapsDetailResult, JobsGpsGapTrackingRow } from '@/lib/jobs-gps-window-report';
+import { appendSummaryHistoryDeepLink, type SummaryHistoryPayload } from '@/lib/summary-history-storage';
+import { formatDateDdMmHhMm } from '@/lib/utils';
+import { minutesBetweenFinalColumns } from '@/lib/vworkjob-inspect-step-display';
 
 type SummaryRow = {
   report_date: string;
@@ -630,7 +633,8 @@ type DataChecksTab =
   | 'geofence-gaps'
   | 'geofence-enter-exit-gaps'
   | 'step4to5'
-  | 'sql-updates';
+  | 'sql-updates'
+  | 'cancelled-jobs';
 
 type LoadsizeBackfillFileRow = {
   fileName: string;
@@ -653,6 +657,202 @@ type SqlRunRow = {
   created_at: string;
   updated_at: string;
 };
+
+type CjInspectStepRow = {
+  n: number;
+  vwork: string | null;
+  gps: string | null;
+  manual: string | null;
+  final: string | null;
+  via: string | null;
+};
+
+type CjDistanceContext = {
+  pair_label: string;
+  effective_distance_m: number | null;
+  effective_duration_min: number | null;
+  tbl_distance_m: number | null;
+  tbl_duration_min: number | null;
+  gps_avg_duration_min: number | null;
+  manual_override: boolean;
+  vwork_distance_round_trip_km: number | null;
+  vwork_minutes_one_way: number | null;
+};
+
+function formatMaybeNum(n: number | null, suffix = '', decimals?: number): string {
+  if (n == null || !Number.isFinite(n)) return '—';
+  if (decimals != null) return `${n.toFixed(decimals)}${suffix}`;
+  return `${Math.round(n).toLocaleString()}${suffix}`;
+}
+
+function CjDistanceContextStrip({ ctx }: { ctx: CjDistanceContext }) {
+  const roadMin = ctx.effective_duration_min;
+  const gpsAvg = ctx.gps_avg_duration_min;
+  return (
+    <div className="mb-2 rounded border border-zinc-200 bg-zinc-50/90 p-2 text-[11px] leading-snug text-zinc-700 dark:border-zinc-600 dark:bg-zinc-800/50 dark:text-zinc-300">
+      <div className="font-medium text-zinc-900 dark:text-zinc-100">{ctx.pair_label}</div>
+      <div className="mt-1">
+        <span className="text-zinc-500 dark:text-zinc-400">tbl_distances (one-way leg):</span>{' '}
+        <span className="tabular-nums">{formatMaybeNum(ctx.effective_distance_m, ' m')}</span>
+        {ctx.manual_override ? <span className="text-amber-800 dark:text-amber-300"> (manual)</span> : null},{' '}
+        <span className="tabular-nums">{roadMin != null ? `${roadMin} min` : '—'}</span>
+        {gpsAvg != null ? (
+          <>
+            {' · '}
+            <span className="text-zinc-500 dark:text-zinc-400">GPS avg</span> <span className="tabular-nums">{gpsAvg} min</span>
+          </>
+        ) : null}
+      </div>
+      <div className="mt-0.5">
+        <span className="text-zinc-500 dark:text-zinc-400">tbl_vworkjobs (Populate vWork):</span>{' '}
+        <span className="tabular-nums">
+          {formatMaybeNum(ctx.vwork_distance_round_trip_km, ' km', 2)} round-trip
+        </span>
+        {' · '}
+        <span className="tabular-nums">{formatMaybeNum(ctx.vwork_minutes_one_way, ' min', 2)} one-way</span>
+      </div>
+      <p className="mt-1 text-[10px] text-zinc-500 dark:text-zinc-400">
+        Road table stores one-way metres and minutes per leg. vWork <code className="rounded bg-zinc-200 px-0.5 dark:bg-zinc-700">distance</code> is{' '}
+        <strong className="font-medium text-zinc-700 dark:text-zinc-300">×2</strong> km (out and back); <code className="rounded bg-zinc-200 px-0.5 dark:bg-zinc-700">minutes</code> matches
+        one-way <code className="rounded bg-zinc-200 px-0.5 dark:bg-zinc-700">duration_min</code>. Step 2 Δ = travel toward vineyard; step 4 Δ = travel toward winery — both compared to the same one-way baseline (road min, else GPS avg).
+      </p>
+    </div>
+  );
+}
+
+function cjTravelThresholdMin(ctx: CjDistanceContext | null): { road: number | null; gpsAvg: number | null } {
+  if (!ctx) return { road: null, gpsAvg: null };
+  return {
+    road: ctx.effective_duration_min,
+    gpsAvg: ctx.gps_avg_duration_min,
+  };
+}
+
+function parseCjDistanceContext(raw: unknown): CjDistanceContext | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const o = raw as Record<string, unknown>;
+  const pl = o.pair_label;
+  if (typeof pl !== 'string' || !pl.trim()) return null;
+  const num = (k: string): number | null => {
+    const v = o[k];
+    if (v == null) return null;
+    const n = typeof v === 'number' ? v : Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
+  return {
+    pair_label: pl,
+    effective_distance_m: num('effective_distance_m'),
+    effective_duration_min: num('effective_duration_min'),
+    tbl_distance_m: num('tbl_distance_m'),
+    tbl_duration_min: num('tbl_duration_min'),
+    gps_avg_duration_min: num('gps_avg_duration_min'),
+    manual_override: o.manual_override === true,
+    vwork_distance_round_trip_km: num('vwork_distance_round_trip_km'),
+    vwork_minutes_one_way: num('vwork_minutes_one_way'),
+  };
+}
+
+function CjInspectStepsTable({
+  steps,
+  distanceContext,
+}: {
+  steps: CjInspectStepRow[];
+  distanceContext: CjDistanceContext | null;
+}) {
+  const { road, gpsAvg } = cjTravelThresholdMin(distanceContext);
+  const primaryThresh = road ?? gpsAvg;
+
+  return (
+    <table className="w-full text-[11px]">
+      <thead>
+        <tr className="border-b border-zinc-200 dark:border-zinc-700">
+          <th className="py-1 pr-1.5 text-left font-medium">Step</th>
+          <th className="py-1 pr-1.5 text-left font-medium">VWork</th>
+          <th className="py-1 pr-1.5 text-left font-medium">GPS</th>
+          <th className="py-1 pr-1.5 text-left font-medium">Manual</th>
+          <th className="py-1 pr-1.5 text-left font-medium">Final</th>
+          <th className="py-1 pr-1.5 text-left font-medium">Via</th>
+          <th className="w-px whitespace-nowrap py-1 pl-1 text-right font-medium">Δ Final</th>
+        </tr>
+      </thead>
+      <tbody>
+        {steps.map((s, idx) => {
+          const prevFinal = idx > 0 ? steps[idx - 1]?.final ?? null : null;
+          const deltaMin = idx > 0 ? minutesBetweenFinalColumns(prevFinal, s.final) : null;
+          const isTravelLeg = s.n === 2 || s.n === 4;
+          const overPrimary = isTravelLeg && deltaMin != null && primaryThresh != null && deltaMin > primaryThresh;
+          const deltaTitle =
+            isTravelLeg && primaryThresh != null
+              ? `Δ ${deltaMin ?? '—'} min vs road ${road ?? '—'} min / GPS avg ${gpsAvg ?? '—'} min (one-way baseline)`
+              : undefined;
+          return (
+            <tr key={s.n} className="border-b border-zinc-100 dark:border-zinc-800">
+              <td className="py-1 pr-1.5 tabular-nums">{s.n}</td>
+              <td className="whitespace-nowrap py-1 pr-1.5 font-mono">{formatDateDdMmHhMm(s.vwork)}</td>
+              <td className="whitespace-nowrap py-1 pr-1.5 font-mono">{formatDateDdMmHhMm(s.gps)}</td>
+              <td className={`whitespace-nowrap py-1 pr-1.5 font-mono ${s.manual ? 'text-red-800 dark:text-red-300' : ''}`}>
+                {formatDateDdMmHhMm(s.manual)}
+              </td>
+              <td className="whitespace-nowrap py-1 pr-1.5 font-mono">{formatDateDdMmHhMm(s.final)}</td>
+              <td className="max-w-[10rem] truncate py-1 pr-1.5" title={s.via ?? ''}>
+                {s.via ?? '—'}
+              </td>
+              <td
+                className={`w-px whitespace-nowrap py-1 pl-1 text-right font-mono tabular-nums ${
+                  overPrimary ? 'font-semibold text-red-700 dark:text-red-400' : 'text-zinc-600 dark:text-zinc-400'
+                }`}
+                title={deltaTitle}
+              >
+                {deltaMin != null ? `${deltaMin} min` : '—'}
+              </td>
+            </tr>
+          );
+        })}
+      </tbody>
+    </table>
+  );
+}
+
+function CjEnterExitTrackingGrid({ rows }: { rows: Record<string, unknown>[] }) {
+  return (
+    <div className="mt-2 max-h-[min(24rem,50vh)] overflow-auto rounded border border-zinc-200 dark:border-zinc-700">
+      <table className="w-full min-w-0 text-left text-[11px]">
+        <thead className="sticky top-0 bg-zinc-100 dark:bg-zinc-800">
+          <tr>
+            <th className="border-b border-zinc-200 px-1.5 py-1 font-medium dark:border-zinc-700">device</th>
+            <th className="border-b border-zinc-200 px-1.5 py-1 font-medium dark:border-zinc-700">fence</th>
+            <th className="border-b border-zinc-200 px-1.5 py-1 font-medium dark:border-zinc-700">type</th>
+            <th className="border-b border-zinc-200 px-1.5 py-1 font-medium dark:border-zinc-700">position_time_nz</th>
+            <th className="border-b border-zinc-200 px-1.5 py-1 font-medium dark:border-zinc-700">lat</th>
+            <th className="border-b border-zinc-200 px-1.5 py-1 font-medium dark:border-zinc-700">lon</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((tr, idx) => {
+            const dev = tr.device_name != null ? String(tr.device_name) : '';
+            const fn = tr.fence_name != null ? String(tr.fence_name) : '';
+            const gt = tr.geofence_type != null ? String(tr.geofence_type) : '';
+            const nz = tr.position_time_nz != null ? String(tr.position_time_nz) : '';
+            const lat = tr.lat != null ? String(tr.lat) : '';
+            const lon = tr.lon != null ? String(tr.lon) : '';
+            return (
+              <tr key={`${nz}-${idx}`} className="border-b border-zinc-100 dark:border-zinc-800">
+                <td className="whitespace-nowrap px-1.5 py-0.5 font-mono text-zinc-800 dark:text-zinc-200">{dev}</td>
+                <td className="max-w-[6rem] truncate px-1.5 py-0.5 text-zinc-700 dark:text-zinc-300" title={fn}>
+                  {fn || '—'}
+                </td>
+                <td className="whitespace-nowrap px-1.5 py-0.5">{gt || '—'}</td>
+                <td className="whitespace-nowrap px-1.5 py-0.5 font-mono text-zinc-700 dark:text-zinc-300">{nz || '—'}</td>
+                <td className="whitespace-nowrap px-1.5 py-0.5 font-mono">{lat || '—'}</td>
+                <td className="whitespace-nowrap px-1.5 py-0.5 font-mono">{lon || '—'}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
 
 type LoadsizeQuickTestResponse = {
   ok: boolean;
@@ -695,6 +895,7 @@ function DataChecksPageContent() {
     if (tabParam === 'vwork-stale') return 'vwork-stale';
     if (tabParam === 'geofence-enter-exit-gaps') return 'geofence-enter-exit-gaps';
     if (tabParam === 'step4to5') return 'step4to5';
+    if (tabParam === 'cancelled-jobs') return 'cancelled-jobs';
     if (tabParam === 'sql-updates') return 'sql-updates';
     if (tabParam === 'geofence-gaps' || tabParam === 'enter-exit-coverage') return 'geofence-gaps';
     if (tabParam === 'db-check-simple') return 'db-check-simple';
@@ -715,6 +916,7 @@ function DataChecksPageContent() {
     else if (tabParam === 'vwork-stale') setActiveTab('vwork-stale');
     else if (tabParam === 'geofence-enter-exit-gaps') setActiveTab('geofence-enter-exit-gaps');
     else if (tabParam === 'step4to5') setActiveTab('step4to5');
+    else if (tabParam === 'cancelled-jobs') setActiveTab('cancelled-jobs');
     else if (tabParam === 'sql-updates') setActiveTab('sql-updates');
     else if (tabParam === 'geofence-gaps' || tabParam === 'enter-exit-coverage') setActiveTab('geofence-gaps');
     else if (tabParam === 'db-check-simple') setActiveTab('db-check-simple');
@@ -773,6 +975,619 @@ function DataChecksPageContent() {
   const [jobsGpsGapDetailData, setJobsGpsGapDetailData] = useState<JobsGpsGapsDetailOk | null>(null);
   const [jobsGpsSubTab, setJobsGpsSubTab] = useState<'report' | 'days-devices' | 'gap-probability'>(
     'report'
+  );
+
+  /** Tab 14 — vineyard detour before winery return (std ENTER/EXIT). */
+  const [cjDateFrom, setCjDateFrom] = useState('');
+  const [cjDateTo, setCjDateTo] = useState('');
+  const [cjCustomer, setCjCustomer] = useState('');
+  const [cjTemplate, setCjTemplate] = useState('');
+  const [cjWinery, setCjWinery] = useState('');
+  const [cjVineyard, setCjVineyard] = useState('');
+  const [cjCustomerOptions, setCjCustomerOptions] = useState<string[]>([]);
+  const [cjTemplateOptions, setCjTemplateOptions] = useState<string[]>([]);
+  const [cjWineryOptions, setCjWineryOptions] = useState<string[]>([]);
+  const [cjVineyardOptions, setCjVineyardOptions] = useState<string[]>([]);
+  const [cjStartLess, setCjStartLess] = useState('10');
+  const [cjEndPlus, setCjEndPlus] = useState('60');
+  const [cjScanCap, setCjScanCap] = useState('4000');
+  const [cjLoading, setCjLoading] = useState(false);
+  const [cjError, setCjError] = useState<string | null>(null);
+  const [cjRows, setCjRows] = useState<
+    {
+      job_id: string;
+      actual_start_time: string | null;
+      worker: string | null;
+      delivery_winery: string | null;
+      vineyard_name: string | null;
+      customer: string | null;
+      template: string | null;
+      truck_id: string | null;
+    }[]
+  >([]);
+  const [cjMeta, setCjMeta] = useState<{
+    scanned: number;
+    truncated: boolean;
+    scanCap: number;
+    totalMatchingJobs: number;
+  } | null>(null);
+  const [cjScanProgress, setCjScanProgress] = useState<{
+    totalMatchingJobs: number;
+    scanTarget: number;
+    scanned: number;
+    identified: number;
+    truncated: boolean;
+  } | null>(null);
+  const [cjTrackingRows, setCjTrackingRows] = useState<Record<string, unknown>[]>([]);
+  const [cjTrackingTotal, setCjTrackingTotal] = useState(0);
+  const [cjTrackingLoading, setCjTrackingLoading] = useState(false);
+  const [cjTrackingError, setCjTrackingError] = useState<string | null>(null);
+  const [cjTrackingCaption, setCjTrackingCaption] = useState<string | null>(null);
+  const [cjNextTrackingRows, setCjNextTrackingRows] = useState<Record<string, unknown>[]>([]);
+  const [cjNextTrackingTotal, setCjNextTrackingTotal] = useState(0);
+  const [cjNextTrackingLoading, setCjNextTrackingLoading] = useState(false);
+  const [cjNextTrackingError, setCjNextTrackingError] = useState<string | null>(null);
+  const [cjNextTrackingCaption, setCjNextTrackingCaption] = useState<string | null>(null);
+  const [cjSelectedJobId, setCjSelectedJobId] = useState<string | null>(null);
+  const [cjDetailLoading, setCjDetailLoading] = useState(false);
+  const [cjDetailError, setCjDetailError] = useState<string | null>(null);
+  const [cjDetail, setCjDetail] = useState<{
+    job_id: string;
+    steps: CjInspectStepRow[];
+    distance_context: CjDistanceContext | null;
+    excluded: string | number | boolean | null;
+    excludednotes: string | null;
+    calcnotes: string | null;
+    next_job: {
+      job_id: string;
+      actual_start_time: string | null;
+      delivery_winery: string | null;
+      vineyard_name: string | null;
+      steps: CjInspectStepRow[];
+      distance_context: CjDistanceContext | null;
+    } | null;
+  } | null>(null);
+
+  const [cjFilterJobCount, setCjFilterJobCount] = useState<number | null>(null);
+  const [cjFilterJobCountLoading, setCjFilterJobCountLoading] = useState(false);
+
+  const cjCanPickWineryVineyard = cjCustomer.trim() !== '' && cjTemplate.trim() !== '';
+
+  useEffect(() => {
+    if (activeTab !== 'cancelled-jobs') return;
+    let cancelled = false;
+    fetch('/api/vworkjobs/customers', { cache: 'no-store' })
+      .then((r) => r.json())
+      .then((d: { customers?: string[]; error?: string }) => {
+        if (cancelled || d?.error) return;
+        const list = Array.isArray(d.customers) ? d.customers.map((x) => String(x).trim()).filter(Boolean) : [];
+        setCjCustomerOptions([...new Set(list)].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' })));
+      })
+      .catch(() => {
+        if (!cancelled) setCjCustomerOptions([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTab]);
+
+  useEffect(() => {
+    if (activeTab !== 'cancelled-jobs') return;
+    const c = cjCustomer.trim();
+    if (!c) {
+      setCjTemplateOptions([]);
+      setCjWineryOptions([]);
+      setCjVineyardOptions([]);
+      return;
+    }
+    let cancelled = false;
+    const p = new URLSearchParams({ customer: c });
+    const t = cjTemplate.trim();
+    if (t) p.set('template', t);
+    fetch(`/api/vworkjobs/filter-options?${p.toString()}`, { cache: 'no-store' })
+      .then((r) => r.json())
+      .then((d: { templates?: string[]; deliveryWineries?: string[]; vineyardNames?: string[]; error?: string }) => {
+        if (cancelled || d?.error) return;
+        const templates = Array.isArray(d.templates)
+          ? d.templates.map((x) => String(x).trim()).filter(Boolean)
+          : [];
+        setCjTemplateOptions([...new Set(templates)].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' })));
+        if (t) {
+          const w = Array.isArray(d.deliveryWineries)
+            ? d.deliveryWineries.map((x) => String(x).trim()).filter(Boolean)
+            : [];
+          const v = Array.isArray(d.vineyardNames)
+            ? d.vineyardNames.map((x) => String(x).trim()).filter(Boolean)
+            : [];
+          setCjWineryOptions([...new Set(w)].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' })));
+          setCjVineyardOptions([...new Set(v)].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' })));
+        } else {
+          setCjWineryOptions([]);
+          setCjVineyardOptions([]);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setCjTemplateOptions([]);
+          setCjWineryOptions([]);
+          setCjVineyardOptions([]);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTab, cjCustomer, cjTemplate]);
+
+  useEffect(() => {
+    if (activeTab !== 'cancelled-jobs') return;
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      const p = new URLSearchParams();
+      const df = cjDateFrom.trim();
+      const dt = cjDateTo.trim();
+      if (df) p.set('dateFrom', df);
+      if (dt) p.set('dateTo', dt);
+      if (cjCustomer.trim()) p.set('customer', cjCustomer.trim());
+      if (cjTemplate.trim()) p.set('template', cjTemplate.trim());
+      if (cjWinery.trim()) p.set('winery', cjWinery.trim());
+      if (cjVineyard.trim()) p.set('vineyard', cjVineyard.trim());
+      setCjFilterJobCountLoading(true);
+      fetch(`/api/admin/data-checks/cancelled-jobs/filter-count?${p.toString()}`, { cache: 'no-store' })
+        .then(async (r) => {
+          const d = (await r.json()) as { count?: number; error?: string };
+          if (!r.ok) throw new Error(typeof d?.error === 'string' ? d.error : r.statusText);
+          return d;
+        })
+        .then((d) => {
+          if (!cancelled) setCjFilterJobCount(typeof d.count === 'number' ? d.count : null);
+        })
+        .catch(() => {
+          if (!cancelled) setCjFilterJobCount(null);
+        })
+        .finally(() => {
+          if (!cancelled) setCjFilterJobCountLoading(false);
+        });
+    }, 400);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [activeTab, cjDateFrom, cjDateTo, cjCustomer, cjTemplate, cjWinery, cjVineyard]);
+
+  const runCancelledJobsQuery = useCallback(async () => {
+    setCjError(null);
+    setCjLoading(true);
+    setCjRows([]);
+    setCjMeta(null);
+    setCjScanProgress(null);
+    setCjSelectedJobId(null);
+    setCjDetail(null);
+    setCjTrackingRows([]);
+    setCjTrackingTotal(0);
+    setCjTrackingCaption(null);
+    setCjTrackingError(null);
+    setCjNextTrackingRows([]);
+    setCjNextTrackingTotal(0);
+    setCjNextTrackingCaption(null);
+    setCjNextTrackingError(null);
+    try {
+      const p = new URLSearchParams();
+      const df = cjDateFrom.trim();
+      const dt = cjDateTo.trim();
+      if (df) p.set('dateFrom', df);
+      if (dt) p.set('dateTo', dt);
+      if (cjCustomer.trim()) p.set('customer', cjCustomer.trim());
+      if (cjTemplate.trim()) p.set('template', cjTemplate.trim());
+      if (cjWinery.trim()) p.set('winery', cjWinery.trim());
+      if (cjVineyard.trim()) p.set('vineyard', cjVineyard.trim());
+      const sl = parseInt(cjStartLess, 10);
+      const ep = parseInt(cjEndPlus, 10);
+      if (Number.isFinite(sl)) p.set('startLessMinutes', String(sl));
+      if (Number.isFinite(ep)) p.set('endPlusMinutes', String(ep));
+      const cap = parseInt(cjScanCap, 10);
+      if (Number.isFinite(cap) && cap > 0) p.set('scanCap', String(cap));
+      p.set('stream', '1');
+
+      const res = await fetch(`/api/admin/data-checks/cancelled-jobs?${p.toString()}`, { cache: 'no-store' });
+      if (!res.ok) {
+        const errBody = await res.json().catch(() => ({}));
+        throw new Error(typeof errBody?.error === 'string' ? errBody.error : res.statusText);
+      }
+      const reader = res.body?.getReader();
+      if (!reader) throw new Error('No response body');
+
+      type CjStreamObj = {
+        type?: string;
+        error?: string;
+        totalMatchingJobs?: number;
+        scanCap?: number;
+        scanned?: number;
+        identified?: number;
+        truncated?: boolean;
+        rows?: {
+          job_id: string;
+          actual_start_time: string | null;
+          worker: string | null;
+          delivery_winery: string | null;
+          vineyard_name: string | null;
+          customer: string | null;
+          template: string | null;
+          truck_id: string | null;
+        }[];
+      };
+
+      const applyCjStreamObj = (obj: CjStreamObj) => {
+        if (obj.type === 'error') {
+          throw new Error(typeof obj.error === 'string' ? obj.error : 'Stream error');
+        }
+        if (obj.type === 'meta' && typeof obj.totalMatchingJobs === 'number' && typeof obj.scanCap === 'number') {
+          const scanTarget = Math.min(obj.scanCap, obj.totalMatchingJobs);
+          setCjScanProgress({
+            totalMatchingJobs: obj.totalMatchingJobs,
+            scanTarget,
+            scanned: 0,
+            identified: 0,
+            truncated: false,
+          });
+          return;
+        }
+        if (obj.type === 'progress') {
+          setCjScanProgress((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  scanned: typeof obj.scanned === 'number' ? obj.scanned : prev.scanned,
+                  identified: typeof obj.identified === 'number' ? obj.identified : prev.identified,
+                  truncated: obj.truncated === true,
+                }
+              : prev,
+          );
+          return;
+        }
+        if (obj.type === 'done') {
+          const rows = Array.isArray(obj.rows) ? obj.rows : [];
+          setCjRows(rows);
+          setCjMeta({
+            scanned: typeof obj.scanned === 'number' ? obj.scanned : 0,
+            truncated: obj.truncated === true,
+            scanCap: typeof obj.scanCap === 'number' ? obj.scanCap : 4000,
+            totalMatchingJobs: typeof obj.totalMatchingJobs === 'number' ? obj.totalMatchingJobs : 0,
+          });
+          setCjScanProgress((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  scanned: typeof obj.scanned === 'number' ? obj.scanned : prev.scanned,
+                  identified: rows.length,
+                  truncated: obj.truncated === true,
+                }
+              : {
+                  totalMatchingJobs: typeof obj.totalMatchingJobs === 'number' ? obj.totalMatchingJobs : 0,
+                  scanTarget: Math.min(
+                    typeof obj.scanCap === 'number' ? obj.scanCap : 4000,
+                    typeof obj.totalMatchingJobs === 'number' ? obj.totalMatchingJobs : 0,
+                  ),
+                  scanned: typeof obj.scanned === 'number' ? obj.scanned : 0,
+                  identified: rows.length,
+                  truncated: obj.truncated === true,
+                },
+          );
+        }
+      };
+
+      const dec = new TextDecoder();
+      let buf = '';
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        const lines = buf.split('\n');
+        buf = lines.pop() ?? '';
+        for (const line of lines) {
+          const t = line.trim();
+          if (!t) continue;
+          applyCjStreamObj(JSON.parse(t) as CjStreamObj);
+        }
+      }
+      const tail = buf.trim();
+      if (tail) {
+        try {
+          applyCjStreamObj(JSON.parse(tail) as CjStreamObj);
+        } catch (parseErr) {
+          if (parseErr instanceof SyntaxError) {
+            /* incomplete trailing chunk */
+          } else {
+            throw parseErr;
+          }
+        }
+      }
+    } catch (e) {
+      setCjError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setCjLoading(false);
+    }
+  }, [cjDateFrom, cjDateTo, cjCustomer, cjTemplate, cjWinery, cjVineyard, cjStartLess, cjEndPlus, cjScanCap]);
+
+  useEffect(() => {
+    if (!cjSelectedJobId?.trim()) {
+      setCjTrackingRows([]);
+      setCjTrackingTotal(0);
+      setCjTrackingCaption(null);
+      setCjTrackingError(null);
+      return;
+    }
+    let cancelled = false;
+    setCjTrackingLoading(true);
+    setCjTrackingError(null);
+    const tp = new URLSearchParams({
+      jobId: cjSelectedJobId.trim(),
+      startLessMinutes: cjStartLess.trim() || '10',
+      endPlusMinutes: cjEndPlus.trim() || '60',
+      limit: '200',
+      offset: '0',
+    });
+    fetch(`/api/admin/data-checks/cancelled-jobs/inspect-tracking?${tp.toString()}`, { cache: 'no-store' })
+      .then(async (r) => {
+        const data = await r.json();
+        if (!r.ok) throw new Error(typeof data?.error === 'string' ? data.error : r.statusText);
+        return data as {
+          ok?: boolean;
+          device?: string;
+          positionAfter?: string;
+          positionBefore?: string | null;
+          total?: number;
+          rows?: Record<string, unknown>[];
+        };
+      })
+      .then((data) => {
+        if (cancelled) return;
+        if (data.ok === false) {
+          setCjTrackingRows([]);
+          setCjTrackingTotal(0);
+          setCjTrackingCaption(null);
+          setCjTrackingError(typeof (data as { error?: string }).error === 'string' ? (data as { error: string }).error : 'No GPS window');
+          return;
+        }
+        setCjTrackingRows(Array.isArray(data.rows) ? data.rows : []);
+        setCjTrackingTotal(typeof data.total === 'number' ? data.total : 0);
+        const dev = (data.device ?? '').trim();
+        const pa = (data.positionAfter ?? '').trim();
+        const pb = data.positionBefore != null && String(data.positionBefore).trim() !== '' ? String(data.positionBefore).trim() : null;
+        setCjTrackingCaption(
+          dev
+            ? `device=${dev} · position_time_nz > ${pa}${pb ? ` and < ${pb}` : ''} · ENTER/EXIT only (same as Inspect Entry/Exit view, first 200 rows)`
+            : null,
+        );
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setCjTrackingError(err instanceof Error ? err.message : String(err));
+          setCjTrackingRows([]);
+          setCjTrackingTotal(0);
+          setCjTrackingCaption(null);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setCjTrackingLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [cjSelectedJobId, cjStartLess, cjEndPlus]);
+
+  useEffect(() => {
+    if (activeTab !== 'cancelled-jobs') {
+      setCjNextTrackingRows([]);
+      setCjNextTrackingTotal(0);
+      setCjNextTrackingCaption(null);
+      setCjNextTrackingError(null);
+      setCjNextTrackingLoading(false);
+      return;
+    }
+    const selected = cjSelectedJobId?.trim() ?? '';
+    const detailForSelection = cjDetail && cjDetail.job_id === selected ? cjDetail : null;
+    const nextId = detailForSelection?.next_job?.job_id?.trim();
+    if (!nextId) {
+      setCjNextTrackingRows([]);
+      setCjNextTrackingTotal(0);
+      setCjNextTrackingCaption(null);
+      setCjNextTrackingError(null);
+      setCjNextTrackingLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setCjNextTrackingLoading(true);
+    setCjNextTrackingError(null);
+    const tp = new URLSearchParams({
+      jobId: nextId,
+      startLessMinutes: cjStartLess.trim() || '10',
+      endPlusMinutes: cjEndPlus.trim() || '60',
+      limit: '200',
+      offset: '0',
+    });
+    fetch(`/api/admin/data-checks/cancelled-jobs/inspect-tracking?${tp.toString()}`, { cache: 'no-store' })
+      .then(async (r) => {
+        const data = await r.json();
+        if (!r.ok) throw new Error(typeof data?.error === 'string' ? data.error : r.statusText);
+        return data as {
+          ok?: boolean;
+          device?: string;
+          positionAfter?: string;
+          positionBefore?: string | null;
+          total?: number;
+          rows?: Record<string, unknown>[];
+        };
+      })
+      .then((data) => {
+        if (cancelled) return;
+        if (data.ok === false) {
+          setCjNextTrackingRows([]);
+          setCjNextTrackingTotal(0);
+          setCjNextTrackingCaption(null);
+          setCjNextTrackingError(typeof (data as { error?: string }).error === 'string' ? (data as { error: string }).error : 'No GPS window');
+          return;
+        }
+        setCjNextTrackingRows(Array.isArray(data.rows) ? data.rows : []);
+        setCjNextTrackingTotal(typeof data.total === 'number' ? data.total : 0);
+        const dev = (data.device ?? '').trim();
+        const pa = (data.positionAfter ?? '').trim();
+        const pb = data.positionBefore != null && String(data.positionBefore).trim() !== '' ? String(data.positionBefore).trim() : null;
+        setCjNextTrackingCaption(
+          dev
+            ? `device=${dev} · position_time_nz > ${pa}${pb ? ` and < ${pb}` : ''} · ENTER/EXIT only (same as Inspect Entry/Exit view, first 200 rows)`
+            : null,
+        );
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setCjNextTrackingError(err instanceof Error ? err.message : String(err));
+          setCjNextTrackingRows([]);
+          setCjNextTrackingTotal(0);
+          setCjNextTrackingCaption(null);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setCjNextTrackingLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTab, cjSelectedJobId, cjDetail, cjStartLess, cjEndPlus]);
+
+  useEffect(() => {
+    if (!cjSelectedJobId?.trim()) {
+      setCjDetail(null);
+      setCjDetailError(null);
+      return;
+    }
+    let cancelled = false;
+    setCjDetailLoading(true);
+    setCjDetailError(null);
+    fetch(`/api/admin/data-checks/cancelled-jobs/detail?jobId=${encodeURIComponent(cjSelectedJobId.trim())}`, {
+      cache: 'no-store',
+    })
+      .then(async (res) => {
+        const data = await res.json();
+        if (!res.ok) throw new Error(data?.error ?? res.statusText);
+        return data;
+      })
+      .then((data) => {
+        if (cancelled) return;
+        const nextRaw = data.next_job;
+        const nextJob =
+          nextRaw && typeof nextRaw === 'object' && nextRaw !== null && String((nextRaw as { job_id?: unknown }).job_id ?? '').trim()
+            ? {
+                job_id: String((nextRaw as { job_id: unknown }).job_id).trim(),
+                actual_start_time:
+                  (nextRaw as { actual_start_time?: string | null }).actual_start_time != null
+                    ? String((nextRaw as { actual_start_time: string | null }).actual_start_time).trim().slice(0, 19)
+                    : null,
+                delivery_winery:
+                  (nextRaw as { delivery_winery?: string | null }).delivery_winery != null
+                    ? String((nextRaw as { delivery_winery: string | null }).delivery_winery).trim()
+                    : null,
+                vineyard_name:
+                  (nextRaw as { vineyard_name?: string | null }).vineyard_name != null
+                    ? String((nextRaw as { vineyard_name: string | null }).vineyard_name).trim()
+                    : null,
+                steps: Array.isArray((nextRaw as { steps?: unknown }).steps)
+                  ? ((nextRaw as { steps: CjInspectStepRow[] }).steps as CjInspectStepRow[])
+                  : [],
+                distance_context: parseCjDistanceContext((nextRaw as { distance_context?: unknown }).distance_context),
+              }
+            : null;
+        setCjDetail({
+          job_id: String(data.job_id ?? cjSelectedJobId.trim()),
+          steps: Array.isArray(data.steps) ? data.steps : [],
+          distance_context: parseCjDistanceContext(data.distance_context),
+          excluded: data.excluded ?? null,
+          excludednotes: data.excludednotes ?? null,
+          calcnotes: data.calcnotes ?? null,
+          next_job: nextJob,
+        });
+      })
+      .catch((err) => {
+        if (!cancelled) setCjDetailError(err instanceof Error ? err.message : String(err));
+      })
+      .finally(() => {
+        if (!cancelled) setCjDetailLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [cjSelectedJobId]);
+
+  const openCancelledJobInSummary = useCallback(
+    (row: {
+      job_id: string;
+      actual_start_time: string | null;
+      worker: string | null;
+      customer: string | null;
+      template: string | null;
+    }) => {
+      const cust = (row.customer ?? '').trim();
+      const tpl = (row.template ?? '').trim();
+      if (!cust || !tpl) {
+        window.alert('This job is missing customer or template; Summary needs both to load jobs.');
+        return;
+      }
+      const day = (row.actual_start_time ?? '').trim().slice(0, 10);
+      const payload: SummaryHistoryPayload = {
+        filterActualFrom: day,
+        filterActualTo: day,
+        filterTemplate: tpl,
+        filterTruckId: '',
+        filterWorker: (row.worker ?? '').trim(),
+        filterTrailermode: '',
+        summaryTab: 'by_job',
+        filterWinery: '',
+        filterVineyardGroup: '',
+        filterVineyards: [],
+        splitMode: 'summary',
+        minsThresholds: { '2': '', '3': '', '4': '', '5': '', travel: '', in_vineyard: '', in_winery: '', total: '' },
+        selectedTimeLimitRowId: null,
+        showLimitsTable: true,
+        sortKey: 'actual_start_time',
+        sortDir: 'asc',
+        sortColumns: ['actual_start_time', '', ''],
+        jobsPage: 0,
+        clientCustomer: cust,
+        focusJobId: String(row.job_id).trim(),
+      };
+      const id = appendSummaryHistoryDeepLink(payload);
+      if (!id) {
+        window.alert('Could not save Summary view state.');
+        return;
+      }
+      window.open(`/query/summary?sh=${encodeURIComponent(id)}`, '_blank', 'noopener,noreferrer');
+    },
+    [],
+  );
+
+  const openCancelledJobInInspect = useCallback(
+    (row: {
+      job_id: string;
+      worker: string | null;
+      truck_id: string | null;
+      actual_start_time: string | null;
+    }) => {
+      const params = new URLSearchParams();
+      params.set('locateJobId', String(row.job_id).trim());
+      const w = (row.worker ?? '').trim();
+      if (w) {
+        params.set('worker', w);
+      } else {
+        const tid = (row.truck_id ?? '').trim();
+        if (tid) params.set('truckId', tid);
+      }
+      const day = (row.actual_start_time ?? '').trim().slice(0, 10);
+      if (/^\d{4}-\d{2}-\d{2}$/.test(day)) {
+        params.set('actualFrom', day);
+        params.set('actualTo', day);
+      }
+      window.open(`/query/inspect?${params.toString()}`, '_blank', 'noopener,noreferrer');
+    },
+    [],
   );
 
   const [healthDateFrom, setHealthDateFrom] = useState(() => {
@@ -2655,6 +3470,13 @@ function DataChecksPageContent() {
           >
             13. Jobs &amp; GPS window
           </button>
+          <button
+            type="button"
+            onClick={() => setActiveTab('cancelled-jobs')}
+            className={`rounded-t px-4 py-2 text-sm font-medium ${activeTab === 'cancelled-jobs' ? 'border border-b-0 border-zinc-200 bg-white text-zinc-900 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'}`}
+          >
+            14. Diverted Jobs
+          </button>
         </div>
 
         {activeTab === 'data-health-overview' && (
@@ -4189,6 +5011,544 @@ function DataChecksPageContent() {
               </div>
             </div>
           )}
+        </section>
+        )}
+
+        {activeTab === 'cancelled-jobs' && (
+        <section className="mt-0 rounded-b-lg border border-zinc-200 border-t-0 bg-white p-6 shadow-sm dark:border-zinc-700 dark:bg-zinc-900">
+          <h2 className="text-lg font-medium text-zinc-900 dark:text-zinc-100">14. Diverted Jobs</h2>
+          <p className="mt-1 max-w-4xl text-sm text-zinc-600 dark:text-zinc-400">
+            Surfaces jobs where GPS suggests the driver was <strong className="font-medium text-zinc-800 dark:text-zinc-200">diverted from the job vineyard toward another block</strong> before the first{' '}
+            <strong className="font-medium text-zinc-800 dark:text-zinc-200">delivery winery ENTER</strong>: after{' '}
+            <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">ENTER</code> /{' '}
+            <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">EXIT</code> on the job vineyard (mapped fences), they{' '}
+            <strong className="font-medium text-zinc-800 dark:text-zinc-200">ENTERed a different mapped vineyard</strong> on the return leg. Transit through another vineyard can look similar, so we{' '}
+            <strong className="font-medium text-zinc-800 dark:text-zinc-200">drop</strong> rows where the <strong className="font-medium text-zinc-800 dark:text-zinc-200">next job on the same truck</strong> is still{' '}
+            <strong className="font-medium text-zinc-800 dark:text-zinc-200">this vineyard</strong> (diversion is unlikely if the block still had fruit and the schedule stayed there). Real diversions usually show the next job at a{' '}
+            <strong className="font-medium text-zinc-800 dark:text-zinc-200">new vineyard</strong>. All jobs are stepped — use Inspect / Summary to step adjacent jobs. Same Inspect GPS window as tab 13 (
+            <code className="rounded bg-zinc-100 px-1 dark:bg-zinc-800">buildInspectGpsWindowForJob</code>). Query loads the list; only filters you set are sent (dates optional).
+          </p>
+
+          <div className="mt-4 flex flex-wrap items-end gap-4 border-b border-zinc-200 pb-4 dark:border-zinc-700">
+            <label className="flex flex-col gap-1">
+              <span
+                className="text-xs font-medium text-zinc-500 dark:text-zinc-400 cursor-help"
+                title="Optional. Filters jobs by actual_start_time (inclusive). Format: YYYY-MM-DD. Leave blank to scan across all dates (still limited by Max rows scan)."
+              >
+                Date from (actual_start, optional)
+              </span>
+              <input
+                type="date"
+                value={cjDateFrom}
+                onChange={(e) => setCjDateFrom(e.target.value)}
+                className="rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+              />
+            </label>
+            <label className="flex flex-col gap-1">
+              <span
+                className="text-xs font-medium text-zinc-500 dark:text-zinc-400 cursor-help"
+                title="Optional. Filters jobs by actual_start_time (inclusive). Use with Date from to narrow the scan window."
+              >
+                Date to (actual_start, optional)
+              </span>
+              <input
+                type="date"
+                value={cjDateTo}
+                onChange={(e) => setCjDateTo(e.target.value)}
+                className="rounded border border-zinc-300 bg-white px-3 py-2 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+              />
+            </label>
+            <label className="flex min-w-0 flex-col gap-1">
+              <span
+                className="text-xs font-medium text-zinc-500 dark:text-zinc-400 cursor-help"
+                title="Filters to one customer (from tbl_vworkjobs). This is the primary filter; pick this first to enable Template/Winery/Vineyard narrowing."
+              >
+                Customer
+              </span>
+              <select
+                value={cjCustomer}
+                onChange={(e) => {
+                  setCjCustomer(e.target.value);
+                  setCjTemplate('');
+                  setCjWinery('');
+                  setCjVineyard('');
+                }}
+                className="min-w-[10rem] max-w-[14rem] rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+              >
+                <option value="">— All —</option>
+                {cjCustomerOptions.map((x) => (
+                  <option key={x} value={x}>
+                    {x}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="flex min-w-0 flex-col gap-1">
+              <span
+                className="text-xs font-medium text-zinc-500 dark:text-zinc-400 cursor-help"
+                title="Filters to one template. Required before Winery/Vineyard options are populated (because those lists depend on the selected template)."
+              >
+                Template
+              </span>
+              <select
+                value={cjTemplate}
+                disabled={!cjCustomer.trim()}
+                onChange={(e) => {
+                  setCjTemplate(e.target.value);
+                  setCjWinery('');
+                  setCjVineyard('');
+                }}
+                className="min-w-[10rem] max-w-[14rem] rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm disabled:cursor-not-allowed disabled:opacity-60 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+              >
+                <option value="">— All —</option>
+                {cjTemplateOptions.map((x) => (
+                  <option key={x} value={x}>
+                    {x}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="flex min-w-0 flex-col gap-1">
+              <span
+                className="text-xs font-medium text-zinc-500 dark:text-zinc-400 cursor-help"
+                title="Optional. Filters to jobs whose delivery_winery matches the selected value. Enabled after you pick Customer + Template."
+              >
+                Winery
+              </span>
+              <select
+                value={cjWinery}
+                disabled={!cjCanPickWineryVineyard}
+                onChange={(e) => setCjWinery(e.target.value)}
+                className="min-w-[10rem] max-w-[14rem] rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm disabled:cursor-not-allowed disabled:opacity-60 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+              >
+                <option value="">— All —</option>
+                {cjWineryOptions.map((x) => (
+                  <option key={x} value={x}>
+                    {x}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="flex min-w-0 flex-col gap-1">
+              <span
+                className="text-xs font-medium text-zinc-500 dark:text-zinc-400 cursor-help"
+                title="Optional. Filters to jobs whose vineyard_name matches the selected value. Enabled after you pick Customer + Template."
+              >
+                Vineyard
+              </span>
+              <select
+                value={cjVineyard}
+                disabled={!cjCanPickWineryVineyard}
+                onChange={(e) => setCjVineyard(e.target.value)}
+                className="min-w-[10rem] max-w-[16rem] rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm disabled:cursor-not-allowed disabled:opacity-60 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+              >
+                <option value="">— All —</option>
+                {cjVineyardOptions.map((x) => (
+                  <option key={x} value={x}>
+                    {x}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="flex flex-col gap-1">
+              <span
+                className="text-xs font-medium text-zinc-500 dark:text-zinc-400 cursor-help"
+                title="Inspect GPS window setting. Expands the tracking query window to start this many minutes BEFORE the job’s actual_start_time. Bigger values include more GPS context (but more tracking rows)."
+              >
+                Start −min
+              </span>
+              <input
+                type="number"
+                min={0}
+                value={cjStartLess}
+                onChange={(e) => setCjStartLess(e.target.value)}
+                className="w-20 rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+              />
+            </label>
+            <label className="flex flex-col gap-1">
+              <span
+                className="text-xs font-medium text-zinc-500 dark:text-zinc-400 cursor-help"
+                title="Inspect GPS window setting. Extends the tracking query window this many minutes AFTER the job’s end bound (same logic as Inspect). Bigger values include more GPS context (but more tracking rows)."
+              >
+                End +min
+              </span>
+              <input
+                type="number"
+                min={0}
+                value={cjEndPlus}
+                onChange={(e) => setCjEndPlus(e.target.value)}
+                className="w-20 rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+              />
+            </label>
+            <label className="flex flex-col gap-1">
+              <span
+                className="text-xs font-medium text-zinc-500 dark:text-zinc-400 cursor-help"
+                title="Safety cap for how many tbl_vworkjobs rows we scan (after applying filters). If results look truncated, narrow filters or raise this (max 15,000)."
+              >
+                Max rows scan
+              </span>
+              <input
+                type="number"
+                min={1}
+                max={15000}
+                value={cjScanCap}
+                onChange={(e) => setCjScanCap(e.target.value)}
+                className="w-24 rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+              />
+            </label>
+            <button
+              type="button"
+              onClick={() => void runCancelledJobsQuery()}
+              disabled={cjLoading}
+              className="rounded bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50 dark:bg-blue-700 dark:hover:bg-blue-600"
+            >
+              {cjLoading ? 'Scanning…' : 'Query'}
+            </button>
+          </div>
+
+          <p className="mt-2 text-sm text-zinc-600 dark:text-zinc-400">
+            Jobs matching these filters (before detour scan):{' '}
+            {cjFilterJobCountLoading ? (
+              <span className="tabular-nums text-zinc-500">…</span>
+            ) : cjFilterJobCount != null ? (
+              <span className="font-medium tabular-nums text-zinc-900 dark:text-zinc-100">
+                {cjFilterJobCount.toLocaleString()}
+              </span>
+            ) : (
+              <span className="text-zinc-500">—</span>
+            )}
+          </p>
+
+          {cjError && <p className="mt-3 text-sm text-red-600 dark:text-red-400">{cjError}</p>}
+
+          {(cjLoading || cjScanProgress != null) && (
+            <div className="mt-4 rounded-lg border border-zinc-200 bg-zinc-50 p-4 dark:border-zinc-700 dark:bg-zinc-900/50">
+              <div className="flex flex-wrap items-baseline justify-between gap-2">
+                <span className="text-sm font-medium text-zinc-800 dark:text-zinc-200">
+                  {cjLoading ? 'Scan in progress' : 'Last scan'}
+                </span>
+                {cjScanProgress != null && (
+                  <span className="text-xs tabular-nums text-zinc-600 dark:text-zinc-400">
+                    Jobs matching filters: {cjScanProgress.totalMatchingJobs.toLocaleString()} · Scan cap:{' '}
+                    {(cjMeta?.scanCap ?? (Number.isFinite(parseInt(cjScanCap, 10)) ? parseInt(cjScanCap, 10) : 4000)).toLocaleString()}
+                  </span>
+                )}
+              </div>
+              {cjScanProgress != null && cjScanProgress.scanTarget > 0 && (
+                <div
+                  className="mt-3 h-2.5 w-full overflow-hidden rounded-full bg-zinc-200 dark:bg-zinc-700"
+                  role="progressbar"
+                  aria-valuemin={0}
+                  aria-valuemax={cjScanProgress.scanTarget}
+                  aria-valuenow={Math.min(cjScanProgress.scanned, cjScanProgress.scanTarget)}
+                  aria-label="Scan progress"
+                >
+                  <div
+                    className="h-full rounded-full bg-blue-600 transition-[width] duration-200 dark:bg-blue-500"
+                    style={{
+                      width: `${Math.min(100, Math.round((cjScanProgress.scanned / Math.max(1, cjScanProgress.scanTarget)) * 100))}%`,
+                    }}
+                  />
+                </div>
+              )}
+              {cjScanProgress != null && (
+                <p className="mt-2 text-sm text-zinc-700 dark:text-zinc-300">
+                  <span className="font-medium tabular-nums text-zinc-900 dark:text-zinc-100">
+                    Scanned {cjScanProgress.scanned.toLocaleString()} of {cjScanProgress.scanTarget.toLocaleString()}
+                  </span>
+                  {' · '}
+                  <span className="font-medium text-emerald-700 dark:text-emerald-400">
+                    Identified {cjScanProgress.identified.toLocaleString()} diverted job{cjScanProgress.identified === 1 ? '' : 's'}
+                  </span>
+                  {cjScanProgress.truncated ? (
+                    <span className="text-amber-700 dark:text-amber-400"> · Stopped at cap (narrow filters or raise max rows)</span>
+                  ) : null}
+                  {!cjLoading && cjMeta && cjMeta.scanned >= cjMeta.totalMatchingJobs && cjMeta.totalMatchingJobs > 0 ? (
+                    <span className="text-zinc-500 dark:text-zinc-400"> · Full pass (all matching rows)</span>
+                  ) : null}
+                </p>
+              )}
+              {cjLoading && cjScanProgress == null && (
+                <p className="mt-2 text-sm text-zinc-500 dark:text-zinc-400">Connecting…</p>
+              )}
+            </div>
+          )}
+
+          {cjMeta && !cjLoading && (
+            <p className="mt-2 text-xs text-zinc-500 dark:text-zinc-400">
+              Done: scanned {cjMeta.scanned.toLocaleString()} row{cjMeta.scanned === 1 ? '' : 's'} (max {cjMeta.scanCap.toLocaleString()}) out of{' '}
+              {cjMeta.totalMatchingJobs.toLocaleString()} matching filters
+              {cjMeta.truncated ? ' — truncated at cap' : ''}; list shows {cjRows.length} diverted job{cjRows.length === 1 ? '' : 's'}.
+            </p>
+          )}
+
+          <div className="mt-4 grid min-h-[24rem] grid-cols-1 gap-4 lg:grid-cols-2">
+            <div className="min-w-0 rounded border border-zinc-200 dark:border-zinc-700">
+              <div className="border-b border-zinc-200 bg-zinc-50 px-3 py-2 text-sm font-medium text-zinc-800 dark:border-zinc-700 dark:bg-zinc-800/80 dark:text-zinc-200">
+                Jobs ({cjRows.length})
+              </div>
+              <div className="max-h-[70vh] overflow-auto">
+                <table className="w-full min-w-0 table-fixed text-left text-xs">
+                  <colgroup>
+                    <col style={{ width: '6.5rem' }} />
+                    <col style={{ width: '5.25rem' }} />
+                    <col />
+                    <col />
+                    <col />
+                  </colgroup>
+                  <thead className="sticky top-0 bg-zinc-100 dark:bg-zinc-800">
+                    <tr>
+                      <th className="border-b border-zinc-200 px-1 py-1.5 font-medium dark:border-zinc-700">job_id</th>
+                      <th className="border-b border-zinc-200 px-1 py-1.5 font-medium dark:border-zinc-700">start</th>
+                      <th className="border-b border-zinc-200 px-2 py-1.5 font-medium dark:border-zinc-700">worker</th>
+                      <th className="border-b border-zinc-200 px-2 py-1.5 font-medium dark:border-zinc-700">winery</th>
+                      <th className="border-b border-zinc-200 px-2 py-1.5 font-medium dark:border-zinc-700">vineyard</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {cjRows.length === 0 ? (
+                      <tr>
+                        <td colSpan={5} className="px-3 py-6 text-center text-zinc-500">
+                          {cjLoading ? '…' : 'No results yet — choose filters and press Query.'}
+                        </td>
+                      </tr>
+                    ) : (
+                      cjRows.map((row) => {
+                        const sel = cjSelectedJobId === row.job_id;
+                        return (
+                          <tr
+                            key={row.job_id}
+                            onClick={() => setCjSelectedJobId(row.job_id)}
+                            className={`cursor-pointer border-b border-zinc-100 hover:bg-zinc-50 dark:border-zinc-800 dark:hover:bg-zinc-800/50${sel ? ' bg-sky-50 dark:bg-sky-950/40' : ''}`}
+                          >
+                            <td
+                              className="whitespace-nowrap px-1 py-1.5 font-mono text-[10px] text-zinc-900 dark:text-zinc-100"
+                              title={row.job_id}
+                            >
+                              {row.job_id}
+                            </td>
+                            <td
+                              className="whitespace-nowrap px-1 py-1.5 font-mono text-[10px] text-zinc-700 dark:text-zinc-300"
+                              title={row.actual_start_time ?? ''}
+                            >
+                              {row.actual_start_time ? formatDateDdMmHhMm(row.actual_start_time) : '—'}
+                            </td>
+                            <td className="max-w-[8rem] truncate px-2 py-1.5 text-zinc-700 dark:text-zinc-300" title={row.worker ?? ''}>
+                              {row.worker ?? '—'}
+                            </td>
+                            <td className="max-w-[8rem] truncate px-2 py-1.5 text-zinc-700 dark:text-zinc-300" title={row.delivery_winery ?? ''}>
+                              {row.delivery_winery ?? '—'}
+                            </td>
+                            <td className="max-w-[8rem] truncate px-2 py-1.5 text-zinc-700 dark:text-zinc-300" title={row.vineyard_name ?? ''}>
+                              {row.vineyard_name ?? '—'}
+                            </td>
+                          </tr>
+                        );
+                      })
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <div className="min-w-0 rounded border border-zinc-200 dark:border-zinc-700">
+              <div className="flex flex-wrap items-center justify-between gap-2 border-b border-zinc-200 bg-zinc-50 px-3 py-2 dark:border-zinc-700 dark:bg-zinc-800/80">
+                <span className="text-sm font-medium text-zinc-800 dark:text-zinc-200">
+                  {cjSelectedJobId ? `Job ${cjSelectedJobId}` : 'Select a job'}
+                </span>
+                {cjSelectedJobId ? (
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const row = cjRows.find((r) => r.job_id === cjSelectedJobId);
+                        if (row) openCancelledJobInInspect(row);
+                      }}
+                      className="rounded border border-zinc-300 bg-white px-3 py-1 text-xs font-medium text-zinc-800 hover:bg-zinc-100 dark:border-zinc-600 dark:bg-zinc-900 dark:text-zinc-100 dark:hover:bg-zinc-800"
+                    >
+                      View in Inspect
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const row = cjRows.find((r) => r.job_id === cjSelectedJobId);
+                        if (row) openCancelledJobInSummary(row);
+                      }}
+                      className="rounded border border-zinc-300 bg-white px-3 py-1 text-xs font-medium text-zinc-800 hover:bg-zinc-100 dark:border-zinc-600 dark:bg-zinc-900 dark:text-zinc-100 dark:hover:bg-zinc-800"
+                    >
+                      View in Summary
+                    </button>
+                  </div>
+                ) : null}
+              </div>
+              <div className="max-h-[70vh] overflow-auto p-3 text-sm">
+                {!cjSelectedJobId ? (
+                  <p className="text-zinc-500 dark:text-zinc-400">Click a row on the left for step details.</p>
+                ) : cjDetailLoading ? (
+                  <p className="text-zinc-500">Loading…</p>
+                ) : cjDetailError ? (
+                  <p className="text-red-600 dark:text-red-400">{cjDetailError}</p>
+                ) : cjDetail ? (
+                  <div className="space-y-4">
+                    <div>
+                      <h3 className="text-xs font-semibold uppercase tracking-wide text-zinc-500 dark:text-zinc-400">
+                        This job — steps
+                      </h3>
+                      {cjDetail.distance_context ? (
+                        <CjDistanceContextStrip ctx={cjDetail.distance_context} />
+                      ) : (
+                        <p className="mb-2 text-[11px] text-zinc-500 dark:text-zinc-400">
+                          No <code className="rounded bg-zinc-100 px-0.5 dark:bg-zinc-800">tbl_distances</code> row for this winery/vineyard pair — travel baseline unavailable.
+                        </p>
+                      )}
+                      <div className="mt-2">
+                        <CjInspectStepsTable steps={cjDetail.steps} distanceContext={cjDetail.distance_context} />
+                      </div>
+                    </div>
+                    <div>
+                      <h3 className="text-xs font-semibold uppercase tracking-wide text-zinc-500 dark:text-zinc-400">Notes</h3>
+                      <p className="mt-1 flex flex-wrap items-baseline gap-x-6 gap-y-1 text-sm text-zinc-800 dark:text-zinc-200">
+                        <span>
+                          <span className="font-medium">Excluded</span>{' '}
+                          <span
+                            className={`font-mono tabular-nums ${
+                              cjDetail.excluded === 'X' ||
+                              cjDetail.excluded === '1' ||
+                              cjDetail.excluded === 1 ||
+                              cjDetail.excluded === true
+                                ? 'text-red-700 dark:text-red-400'
+                                : 'text-zinc-700 dark:text-zinc-300'
+                            }`}
+                          >
+                            {cjDetail.excluded === 'X' ||
+                            cjDetail.excluded === '1' ||
+                            cjDetail.excluded === 1 ||
+                            cjDetail.excluded === true
+                              ? 'true'
+                              : cjDetail.excluded === '' ||
+                                  cjDetail.excluded === '0' ||
+                                  cjDetail.excluded === 0 ||
+                                  cjDetail.excluded === false ||
+                                  cjDetail.excluded == null
+                                ? 'false'
+                                : String(cjDetail.excluded)}
+                          </span>
+                        </span>
+                      </p>
+                      {cjDetail.excludednotes ? (
+                        <p className="mt-2 whitespace-pre-wrap text-zinc-700 dark:text-zinc-300">
+                          <span className="font-medium text-zinc-800 dark:text-zinc-200">Excluded notes:</span> {cjDetail.excludednotes}
+                        </p>
+                      ) : null}
+                      {cjDetail.calcnotes ? (
+                        <p className="mt-2 whitespace-pre-wrap text-zinc-700 dark:text-zinc-300">
+                          <span className="font-medium text-zinc-800 dark:text-zinc-200">Calc notes:</span> {cjDetail.calcnotes}
+                        </p>
+                      ) : null}
+                    </div>
+
+                    <div className="border-t border-zinc-200 pt-4 dark:border-zinc-700">
+                      <h3 className="text-xs font-semibold uppercase tracking-wide text-zinc-500 dark:text-zinc-400">
+                        This job — GPS window (Inspect — Entry/Exit)
+                      </h3>
+                      {cjTrackingCaption ? (
+                        <p className="mt-1 font-mono text-[11px] leading-snug text-zinc-600 dark:text-zinc-400">{cjTrackingCaption}</p>
+                      ) : null}
+                      {cjTrackingLoading && <p className="mt-2 text-sm text-zinc-500">Loading tracking…</p>}
+                      {cjTrackingError && <p className="mt-2 text-sm text-red-600 dark:text-red-400">{cjTrackingError}</p>}
+                      {!cjTrackingLoading && !cjTrackingError && cjTrackingTotal > 0 && (
+                        <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+                          Showing first {Math.min(200, cjTrackingRows.length)} of {cjTrackingTotal.toLocaleString()} row
+                          {cjTrackingTotal === 1 ? '' : 's'} (same query as Inspect tracking grid).
+                        </p>
+                      )}
+                      {!cjTrackingLoading && !cjTrackingError && cjTrackingRows.length > 0 && (
+                        <CjEnterExitTrackingGrid rows={cjTrackingRows} />
+                      )}
+                      {!cjTrackingLoading && !cjTrackingError && cjTrackingRows.length === 0 && cjTrackingTotal === 0 && cjTrackingCaption && (
+                        <p className="mt-2 text-sm text-zinc-500">No ENTER/EXIT rows in this window.</p>
+                      )}
+                    </div>
+
+                    {cjDetail.next_job ? (
+                      <div className="border-t border-zinc-200 pt-4 dark:border-zinc-700">
+                        <h3 className="text-xs font-semibold uppercase tracking-wide text-zinc-500 dark:text-zinc-400">
+                          Next job (same worker) — steps
+                        </h3>
+                        <p className="mt-1 flex flex-wrap gap-x-4 gap-y-1 text-xs text-zinc-700 dark:text-zinc-300">
+                          <span>
+                            <span className="text-zinc-500 dark:text-zinc-400">job</span>{' '}
+                            <span className="font-mono text-zinc-900 dark:text-zinc-100">{cjDetail.next_job.job_id}</span>
+                          </span>
+                          <span>
+                            <span className="text-zinc-500 dark:text-zinc-400">start</span>{' '}
+                            <span className="font-mono text-zinc-900 dark:text-zinc-100">
+                              {cjDetail.next_job.actual_start_time ? formatDateDdMmHhMm(cjDetail.next_job.actual_start_time) : '—'}
+                            </span>
+                          </span>
+                          <span>
+                            <span className="text-zinc-500 dark:text-zinc-400">winery</span>{' '}
+                            <span className="text-zinc-900 dark:text-zinc-100">{cjDetail.next_job.delivery_winery ?? '—'}</span>
+                          </span>
+                          <span>
+                            <span className="text-zinc-500 dark:text-zinc-400">vineyard</span>{' '}
+                            <span className="text-zinc-900 dark:text-zinc-100">{cjDetail.next_job.vineyard_name ?? '—'}</span>
+                          </span>
+                        </p>
+                        {cjDetail.next_job.distance_context ? (
+                          <CjDistanceContextStrip ctx={cjDetail.next_job.distance_context} />
+                        ) : (
+                          <p className="mb-2 text-[11px] text-zinc-500 dark:text-zinc-400">
+                            No <code className="rounded bg-zinc-100 px-0.5 dark:bg-zinc-800">tbl_distances</code> row for next job pair — travel baseline unavailable.
+                          </p>
+                        )}
+                        <div className="mt-2">
+                          <CjInspectStepsTable
+                            steps={cjDetail.next_job.steps}
+                            distanceContext={cjDetail.next_job.distance_context}
+                          />
+                        </div>
+                        <h3 className="mt-4 text-xs font-semibold uppercase tracking-wide text-zinc-500 dark:text-zinc-400">
+                          Next job — GPS window (Inspect — Entry/Exit)
+                        </h3>
+                        {cjNextTrackingCaption ? (
+                          <p className="mt-1 font-mono text-[11px] leading-snug text-zinc-600 dark:text-zinc-400">
+                            {cjNextTrackingCaption}
+                          </p>
+                        ) : null}
+                        {cjNextTrackingLoading && <p className="mt-2 text-sm text-zinc-500">Loading next job tracking…</p>}
+                        {cjNextTrackingError && (
+                          <p className="mt-2 text-sm text-red-600 dark:text-red-400">{cjNextTrackingError}</p>
+                        )}
+                        {!cjNextTrackingLoading && !cjNextTrackingError && cjNextTrackingTotal > 0 && (
+                          <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+                            Showing first {Math.min(200, cjNextTrackingRows.length)} of {cjNextTrackingTotal.toLocaleString()} row
+                            {cjNextTrackingTotal === 1 ? '' : 's'} (same query as Inspect tracking grid).
+                          </p>
+                        )}
+                        {!cjNextTrackingLoading && !cjNextTrackingError && cjNextTrackingRows.length > 0 && (
+                          <CjEnterExitTrackingGrid rows={cjNextTrackingRows} />
+                        )}
+                        {!cjNextTrackingLoading &&
+                          !cjNextTrackingError &&
+                          cjNextTrackingRows.length === 0 &&
+                          cjNextTrackingTotal === 0 &&
+                          cjNextTrackingCaption && (
+                            <p className="mt-2 text-sm text-zinc-500">No ENTER/EXIT rows in this window.</p>
+                          )}
+                      </div>
+                    ) : (
+                      <p className="border-t border-zinc-200 pt-4 text-xs text-zinc-500 dark:border-zinc-700 dark:text-zinc-400">
+                        No next job for this worker (missing worker/start on this job, or nothing later by actual_start_time).
+                      </p>
+                    )}
+                  </div>
+                ) : (
+                  <p className="text-zinc-500">—</p>
+                )}
+              </div>
+            </div>
+          </div>
         </section>
         )}
 
