@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useViewMode } from '@/contexts/ViewModeContext';
+import StaffOnlyGate from '@/components/StaffOnlyGate';
 import {
   buildDistancesReportRows,
   jobHasReportableDistanceKm,
@@ -29,7 +30,7 @@ const emptyOpts: FilterOptions = {
   trailermodes: [],
 };
 
-export default function DistancesPage() {
+function DistancesPageContent() {
   const { viewMode, clientCustomer, clientCustomerLocked } = useViewMode();
   const isClient = viewMode === 'client';
 
@@ -520,5 +521,13 @@ export default function DistancesPage() {
         </details>
       )}
     </div>
+  );
+}
+
+export default function DistancesPage() {
+  return (
+    <StaffOnlyGate>
+      <DistancesPageContent />
+    </StaffOnlyGate>
   );
 }

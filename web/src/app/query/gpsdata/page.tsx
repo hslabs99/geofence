@@ -4,6 +4,7 @@ import Link from 'next/link';
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'next/navigation';
 import { formatColumnLabel, formatDateNZ, computeColumnWidths } from '@/lib/utils';
+import StaffOnlyGate from '@/components/StaffOnlyGate';
 
 type Row = Record<string, unknown>;
 
@@ -805,8 +806,10 @@ function GpsDataContent() {
 
 export default function GpsDataPage() {
   return (
-    <Suspense fallback={<div className="flex min-h-[200px] items-center justify-center p-6 text-zinc-500">Loading…</div>}>
-      <GpsDataContent />
-    </Suspense>
+    <StaffOnlyGate>
+      <Suspense fallback={<div className="flex min-h-[200px] items-center justify-center p-6 text-zinc-500">Loading…</div>}>
+        <GpsDataContent />
+      </Suspense>
+    </StaffOnlyGate>
   );
 }

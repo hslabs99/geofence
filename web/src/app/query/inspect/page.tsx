@@ -8,6 +8,7 @@ import { formatIntNz } from '@/lib/format-nz';
 import { addMinutesToTimestampAsNZ, runFetchStepsForJobs } from '@/lib/fetch-steps';
 import { buildInspectDerivedStepsExplanation } from '@/lib/inspect-derived-steps-explanation';
 import { buildInspectGpsWindowForJob } from '@/lib/inspect-gps-window';
+import StaffOnlyGate from '@/components/StaffOnlyGate';
 
 type Row = Record<string, unknown>;
 
@@ -3283,8 +3284,10 @@ function InspectContent() {
 
 export default function InspectPage() {
   return (
-    <Suspense fallback={<div className="flex min-h-[200px] items-center justify-center p-6 text-zinc-500">Loading…</div>}>
-      <InspectContent />
-    </Suspense>
+    <StaffOnlyGate>
+      <Suspense fallback={<div className="flex min-h-[200px] items-center justify-center p-6 text-zinc-500">Loading…</div>}>
+        <InspectContent />
+      </Suspense>
+    </StaffOnlyGate>
   );
 }

@@ -3,6 +3,7 @@
 import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'next/navigation';
 import { formatColumnLabel, formatDateNZ, computeColumnWidths } from '@/lib/utils';
+import StaffOnlyGate from '@/components/StaffOnlyGate';
 
 type Row = Record<string, unknown>;
 
@@ -727,8 +728,10 @@ function VworkPageContent() {
 
 export default function VworkPage() {
   return (
-    <Suspense fallback={<div className="w-full min-w-0 p-6 text-zinc-500 dark:text-zinc-400">Loading…</div>}>
-      <VworkPageContent />
-    </Suspense>
+    <StaffOnlyGate>
+      <Suspense fallback={<div className="w-full min-w-0 p-6 text-zinc-500 dark:text-zinc-400">Loading…</div>}>
+        <VworkPageContent />
+      </Suspense>
+    </StaffOnlyGate>
   );
 }

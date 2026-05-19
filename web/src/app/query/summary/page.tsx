@@ -1108,7 +1108,7 @@ function SummaryPageInner() {
   const splitSeasonGrouped = splitMode !== 'summary';
   /** Over–Under layout is admin-only; client still uses grouped rows if `splitMode` is `winery_group_tt_over` but without Within/Over splits. */
   const splitByOverUnder = splitMode === 'winery_group_tt_over' && viewMode !== 'client';
-  /** Low-minutes (&lt; threshold) row highlighting is admin-only; clients still see red for negative minutes. */
+  /** Low-minutes (&lt; threshold) date highlighting is admin-only (Daily Summary). */
   const lowMinutesYellowForUi = viewMode !== 'client';
   const [minsThresholds, setMinsThresholds] = useState<Record<string, string>>({
     '2': '', '3': '', '4': '', '5': '', travel: '', in_vineyard: '', in_winery: '', total: '',
@@ -2441,6 +2441,8 @@ function SummaryPageInner() {
   );
 
   const dayClientView = summaryTab === 'by_day' && viewMode === 'client';
+  /** Daily Summary: limit reds, low-minutes date flags, and limit header row are admin-only. */
+  const dayLimitHighlightForUi = !dayClientView;
   const jobClientView = summaryTab === 'by_job' && viewMode === 'client';
   const seasonClientView = summaryTab === 'season' && viewMode === 'client';
   /** Client + split season: Time Limits uses `SeasonClientSplitColgroupLimits`; Season table uses `SeasonClientSplitColgroupSeasonData` (same cols 1–6 cumulative %, wider TT/Over). */
@@ -5022,6 +5024,7 @@ function SummaryPageInner() {
                 <thead
                   className={`${SUMMARY_THEAD_TH_ALIGNMENT} sticky top-0 z-10 bg-zinc-100 shadow-[0_1px_0_0_rgba(0,0,0,0.1)] dark:bg-zinc-800 dark:shadow-[0_1px_0_0_rgba(255,255,255,0.08)]`}
                 >
+                  {dayLimitHighlightForUi && (
                   <tr className="border-b border-zinc-200 dark:border-zinc-700">
                     <th className="border-r border-zinc-200 px-2 py-1 text-xs font-medium text-zinc-500 dark:border-zinc-700">Limit (red if &gt;)</th>
                     {splitByOverUnder && <th className="border-r border-zinc-200 px-2 py-1 dark:border-zinc-700" />}
@@ -5036,6 +5039,7 @@ function SummaryPageInner() {
                       ))
                     )}
                   </tr>
+                  )}
                   <tr className="border-b border-zinc-200 dark:border-zinc-700">
                     <th rowSpan={2} className="border-r border-zinc-200 px-3 py-2 font-medium text-zinc-900 dark:border-zinc-700 dark:text-zinc-100">Date</th>
                     {splitByOverUnder && (
@@ -5112,14 +5116,15 @@ function SummaryPageInner() {
                             ? ''
                             : 'hover:bg-zinc-200/50 dark:hover:bg-zinc-700/50',
                       ].filter(Boolean).join(' ');
-                      const dayTimeOutlier = isFirstRowOfDay
-                        ? dayRollupOutlierSeverity(
-                            r as RollupQuads,
-                            lowMinutesHighlightThreshold,
-                            lowMinutesExclusionSet,
-                            lowMinutesYellowForUi,
-                          )
-                        : null;
+                      const dayTimeOutlier =
+                        dayLimitHighlightForUi && isFirstRowOfDay
+                          ? dayRollupOutlierSeverity(
+                              r as RollupQuads,
+                              lowMinutesHighlightThreshold,
+                              lowMinutesExclusionSet,
+                              lowMinutesYellowForUi,
+                            )
+                          : null;
                       const dateCellFlag =
                         dayTimeOutlier === 'red'
                           ? SUMMARY_OUTLIER_RED
@@ -5167,7 +5172,8 @@ function SummaryPageInner() {
                           (['total', 'max', 'min', 'av'] as const).map((key) => {
                             const stepNum = i + 2;
                             const styleKey = stepNum === 2 ? 'step2' : stepNum === 3 ? 'step3' : stepNum === 4 ? 'step4' : 'step5';
-                            const redClass = key === 'av' ? redIfOverStepCol(q[key], stepNum) : '';
+                            const redClass =
+                              dayLimitHighlightForUi && key === 'av' ? redIfOverStepCol(q[key], stepNum) : '';
                             return (
                               <td
                                 key={`${i}-${key}`}
@@ -5180,7 +5186,8 @@ function SummaryPageInner() {
                           })
                         )}
                         {(dayClientView ? (['total', 'av'] as const) : (['total', 'max', 'min', 'av'] as const)).map((key) => {
-                          const redClass = key === 'av' ? redIfOver(r.travel[key], 'travel') : '';
+                          const redClass =
+                            dayLimitHighlightForUi && key === 'av' ? redIfOver(r.travel[key], 'travel') : '';
                           return (
                             <td
                               key={`travel-${key}`}
@@ -5192,7 +5199,8 @@ function SummaryPageInner() {
                           );
                         })}
                         {(dayClientView ? (['total', 'av'] as const) : (['total', 'max', 'min', 'av'] as const)).map((key) => {
-                          const redClass = key === 'av' ? redIfOver(r.mins_3[key], 'in_vineyard') : '';
+                          const redClass =
+                            dayLimitHighlightForUi && key === 'av' ? redIfOver(r.mins_3[key], 'in_vineyard') : '';
                           return (
                             <td
                               key={`in_vineyard-${key}`}
@@ -5204,7 +5212,8 @@ function SummaryPageInner() {
                           );
                         })}
                         {(dayClientView ? (['total', 'av'] as const) : (['total', 'max', 'min', 'av'] as const)).map((key) => {
-                          const redClass = key === 'av' ? redIfOver(r.mins_5[key], 'in_winery') : '';
+                          const redClass =
+                            dayLimitHighlightForUi && key === 'av' ? redIfOver(r.mins_5[key], 'in_winery') : '';
                           return (
                             <td
                               key={`in_winery-${key}`}
@@ -5216,7 +5225,8 @@ function SummaryPageInner() {
                           );
                         })}
                         {(dayClientView ? (['total', 'av'] as const) : (['total', 'max', 'min', 'av'] as const)).map((key) => {
-                          const redClass = key === 'av' ? redIfOver(r.total[key], 'total') : '';
+                          const redClass =
+                            dayLimitHighlightForUi && key === 'av' ? redIfOver(r.total[key], 'total') : '';
                           return (
                             <td
                               key={`total-${key}`}
@@ -5236,12 +5246,14 @@ function SummaryPageInner() {
                     {byDayFooterSets.map((set) => {
                       const s = set.stats;
                       const subKeys = dayClientView ? (['total', 'av'] as const) : (['total', 'max', 'min', 'av'] as const);
-                      const footOutlier = footerStatsOutlierSeverity(
-                        s,
-                        set.jobCount,
-                        lowMinutesHighlightThreshold,
-                        lowMinutesYellowForUi,
-                      );
+                      const footOutlier = dayLimitHighlightForUi
+                        ? footerStatsOutlierSeverity(
+                            s,
+                            set.jobCount,
+                            lowMinutesHighlightThreshold,
+                            lowMinutesYellowForUi,
+                          )
+                        : null;
                       const footFlag =
                         footOutlier === 'red'
                           ? SUMMARY_OUTLIER_RED
@@ -5274,7 +5286,10 @@ function SummaryPageInner() {
                           {!dayClientView && [s.mins_2, s.mins_3, s.mins_4, s.mins_5].map((quad, i) =>
                             subKeys.map((key) => {
                               const val = key === 'total' ? quad.total : key === 'max' ? quad.max : key === 'min' ? quad.min : quad.av;
-                              const redClass = key === 'av' && val != null ? redIfOverStepCol(val, i + 2) : '';
+                              const redClass =
+                                dayLimitHighlightForUi && key === 'av' && val != null
+                                  ? redIfOverStepCol(val, i + 2)
+                                  : '';
                               return (
                                 <td key={`${i}-${key}`} className={`border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums text-xs ${redClass ? redClass : `${STEP_GROUP_BG[(i + 2) as 2 | 3 | 4 | 5]} text-zinc-600 dark:text-zinc-400 dark:border-zinc-700`}`}>
                                   {val != null ? formatIntNz(val) : '—'}
@@ -5284,7 +5299,8 @@ function SummaryPageInner() {
                           )}
                           {subKeys.map((key) => {
                             const val = key === 'total' ? s.travel.total : key === 'max' ? s.travel.max : key === 'min' ? s.travel.min : s.travel.av;
-                            const redClass = key === 'av' && val != null ? redIfOver(val, 'travel') : '';
+                            const redClass =
+                              dayLimitHighlightForUi && key === 'av' && val != null ? redIfOver(val, 'travel') : '';
                             return (
                               <td key={`travel-${key}`} className={`border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums text-xs ${redClass || (val != null ? 'text-zinc-600 dark:border-zinc-700 dark:text-zinc-400' : 'text-zinc-600 dark:border-zinc-700 dark:text-zinc-400')}`}>
                                 {val != null ? formatIntNz(val) : '—'}
@@ -5293,7 +5309,10 @@ function SummaryPageInner() {
                           })}
                           {subKeys.map((key) => {
                             const val = key === 'total' ? s.mins_3.total : key === 'max' ? s.mins_3.max : key === 'min' ? s.mins_3.min : s.mins_3.av;
-                            const redClass = key === 'av' && val != null ? redIfOver(val, 'in_vineyard') : '';
+                            const redClass =
+                              dayLimitHighlightForUi && key === 'av' && val != null
+                                ? redIfOver(val, 'in_vineyard')
+                                : '';
                             return (
                               <td key={`in_vineyard-${key}`} className={`border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums text-xs ${redClass ? redClass : `${STEP_GROUP_BG[3]} text-zinc-600 dark:text-zinc-400 dark:border-zinc-700`}`}>
                                 {val != null ? formatIntNz(val) : '—'}
@@ -5302,7 +5321,8 @@ function SummaryPageInner() {
                           })}
                           {subKeys.map((key) => {
                             const val = key === 'total' ? s.mins_5.total : key === 'max' ? s.mins_5.max : key === 'min' ? s.mins_5.min : s.mins_5.av;
-                            const redClass = key === 'av' && val != null ? redIfOver(val, 'in_winery') : '';
+                            const redClass =
+                              dayLimitHighlightForUi && key === 'av' && val != null ? redIfOver(val, 'in_winery') : '';
                             return (
                               <td key={`in_winery-${key}`} className={`border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums text-xs ${redClass ? redClass : `${STEP_GROUP_BG[5]} text-zinc-600 dark:text-zinc-400 dark:border-zinc-700`}`}>
                                 {val != null ? formatIntNz(val) : '—'}
@@ -5311,7 +5331,8 @@ function SummaryPageInner() {
                           })}
                           {subKeys.map((key) => {
                             const val = key === 'total' ? s.total.total : key === 'max' ? s.total.max : key === 'min' ? s.total.min : s.total.av;
-                            const redClass = key === 'av' && val != null ? redIfOver(val, 'total') : '';
+                            const redClass =
+                              dayLimitHighlightForUi && key === 'av' && val != null ? redIfOver(val, 'total') : '';
                             return (
                               <td key={`total-${key}`} className={`border-zinc-200 px-2 py-1.5 text-right tabular-nums text-xs font-medium ${redClass || (val != null ? 'text-zinc-700 dark:border-zinc-700 dark:text-zinc-300' : 'text-zinc-700 dark:border-zinc-700 dark:text-zinc-300')}`}>
                                 {val != null ? formatIntNz(val) : '—'}
