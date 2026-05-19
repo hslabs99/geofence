@@ -1,8 +1,14 @@
 'use client';
 
+import Link from 'next/link';
 import { useCallback, useEffect, useState } from 'react';
 import { runFetchStepsForJobs } from '@/lib/fetch-steps';
 import { GPS_FENCE_SETTINGS_TYPE, GPS_STD_TIME_NAME } from '@/lib/gps-fence-settings-names';
+
+/** System settings — same keys as Admin → Settings and Query → Inspect (derived-steps window). */
+const INSPECT_WINDOW_SETTINGS_TYPE = 'System';
+const INSPECT_START_LESS_NAME = 'InspectStartLess';
+const INSPECT_END_PLUS_NAME = 'InspectEndPlus';
 
 type VworkFilterOptions = {
   vineyardNames: string[];
@@ -123,9 +129,11 @@ function stepsProgressStage(
 export default function TaggingPage() {
   const [dateFrom, setDateFrom] = useState(DEFAULT_DATE);
   const [dateTo, setDateTo] = useState(DEFAULT_DATE);
-  const [stepsForce, setStepsForce] = useState(true);
-  const [stepsStartLessMinutes, setStepsStartLessMinutes] = useState(15);
-  const [stepsEndPlusMinutes, setStepsEndPlusMinutes] = useState(60);
+  /** Inspect-aligned: from Admin → Settings (Inspect start less / Inspect end plus). */
+  const [inspectStartLessMinutes, setInspectStartLessMinutes] = useState(10);
+  const [inspectEndPlusMinutes, setInspectEndPlusMinutes] = useState(60);
+  const [inspectWindowSettingsLoading, setInspectWindowSettingsLoading] = useState(true);
+  const [inspectWindowSettingsError, setInspectWindowSettingsError] = useState<string | null>(null);
   /** Loaded from Settings (GPS Std time); null until loaded or if unset/invalid. */
   const [graceSeconds, setGraceSeconds] = useState<number | null>(null);
   const [graceSettingsLoading, setGraceSettingsLoading] = useState(true);
@@ -300,6 +308,56 @@ export default function TaggingPage() {
   }, []);
 
   useEffect(() => {
+    let cancelled = false;
+    setInspectWindowSettingsLoading(true);
+    setInspectWindowSettingsError(null);
+    Promise.all([
+      fetch(
+        `/api/settings?${new URLSearchParams({ type: INSPECT_WINDOW_SETTINGS_TYPE, name: INSPECT_START_LESS_NAME })}`,
+        { cache: 'no-store' }
+      ).then((r) => r.json()),
+      fetch(
+        `/api/settings?${new URLSearchParams({ type: INSPECT_WINDOW_SETTINGS_TYPE, name: INSPECT_END_PLUS_NAME })}`,
+        { cache: 'no-store' }
+      ).then((r) => r.json()),
+    ])
+      .then(([dataLess, dataPlus]: [{ settingvalue?: string | null }, { settingvalue?: string | null }]) => {
+        if (cancelled) return;
+        let err: string | null = null;
+        const v1 = dataLess?.settingvalue;
+        if (v1 != null && String(v1).trim() !== '') {
+          const n = parseInt(String(v1).trim(), 10);
+          if (!Number.isNaN(n) && n >= 0) setInspectStartLessMinutes(Math.min(1440, n));
+          else err = 'Inspect start less in Settings is not a valid number.';
+        } else {
+          setInspectStartLessMinutes(10);
+        }
+        const v2 = dataPlus?.settingvalue;
+        if (v2 != null && String(v2).trim() !== '') {
+          const n = parseInt(String(v2).trim(), 10);
+          if (!Number.isNaN(n) && n >= 0) setInspectEndPlusMinutes(Math.min(1440, n));
+          else err = err ?? 'Inspect end plus in Settings is not a valid number.';
+        } else {
+          setInspectEndPlusMinutes(60);
+        }
+        setInspectWindowSettingsError(err);
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setInspectWindowSettingsError('Could not load Inspect window minutes from Settings.');
+          setInspectStartLessMinutes(10);
+          setInspectEndPlusMinutes(60);
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setInspectWindowSettingsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
     if (stepsUseStep4to5AuditQueue) {
       setVworkjobsCountLoading(true);
       setVworkjobsCountError(null);
@@ -333,7 +391,6 @@ export default function TaggingPage() {
       u.searchParams.set('dateFrom', from);
       u.searchParams.set('dateTo', to);
       u.searchParams.set('countOnly', 'true');
-      if (!stepsForce) u.searchParams.set('stepsFetched', 'false');
       if (filterCustomer.trim()) u.searchParams.set('customer', filterCustomer.trim());
       if (filterTemplate.trim()) u.searchParams.set('template', filterTemplate.trim());
       if (filterVineyard) u.searchParams.set('vineyard', filterVineyard);
@@ -361,7 +418,6 @@ export default function TaggingPage() {
   }, [
     dateFrom,
     dateTo,
-    stepsForce,
     filterCustomer,
     filterTemplate,
     filterVineyard,
@@ -711,7 +767,11 @@ export default function TaggingPage() {
     appendLog(`=== ${date}: Steps ===`);
     const stepsParams = new URLSearchParams();
     stepsParams.set('date', date);
-    if (!stepsForce) stepsParams.set('stepsFetched', 'false');
+    /** True job order per driver for the day: prior same-worker jobs are stepped before later starts (see derived-steps lastjobend / chain). */
+    stepsParams.set('sortColumn', 'worker');
+    stepsParams.set('sortColumn2', 'actual_start_time');
+    stepsParams.set('sortColumn3', 'job_id');
+    stepsParams.set('sortDir', 'asc');
     if (filterCustomer.trim()) stepsParams.set('customer', filterCustomer.trim());
     if (filterTemplate.trim()) stepsParams.set('template', filterTemplate.trim());
     if (filterVineyard) stepsParams.set('vineyard', filterVineyard);
@@ -737,8 +797,8 @@ export default function TaggingPage() {
     if (jobs.length > 0) {
       const result = await runFetchStepsForJobs({
         jobs,
-        startLessMinutes: stepsStartLessMinutes,
-        endPlusMinutes: stepsEndPlusMinutes,
+        startLessMinutes: inspectStartLessMinutes,
+        endPlusMinutes: inspectEndPlusMinutes,
         jobDateForLog: date,
         onProgress: (current, total, log) => {
           setCurrentStage(stepsProgressStage(date, dayIndex, totalDays, current, total));
@@ -794,8 +854,8 @@ export default function TaggingPage() {
         }
         const result = await runFetchStepsForJobs({
           jobs,
-          startLessMinutes: stepsStartLessMinutes,
-          endPlusMinutes: stepsEndPlusMinutes,
+          startLessMinutes: inspectStartLessMinutes,
+          endPlusMinutes: inspectEndPlusMinutes,
           jobDateForLog: 'queue',
           onProgress: (current, total, log) => {
             setCurrentStage(`Progress: Queue: Steps (Job ${current}/${total})`);
@@ -1179,39 +1239,54 @@ export default function TaggingPage() {
                     className="mt-0.5 rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
                   />
                 </div>
-                <label className="flex cursor-pointer items-center gap-2 text-sm text-zinc-700 dark:text-zinc-300">
-                  <input
-                    type="checkbox"
-                    checked={stepsForce}
-                    onChange={(e) => setStepsForce(e.target.checked)}
-                    disabled={runStatus === 'running'}
-                    className="rounded"
-                  />
-                  Steps: force (all jobs for date; default on)
-                </label>
-                <div className="flex items-center gap-2 text-xs text-zinc-600 dark:text-zinc-400">
-                  <span>Window:</span>
-                  <input
-                    type="number"
-                    min={0}
-                    max={120}
-                    value={stepsStartLessMinutes}
-                    onChange={(e) => setStepsStartLessMinutes(Math.max(0, Math.min(120, parseInt(e.target.value, 10) || 0)))}
-                    disabled={runStatus === 'running'}
-                    className="w-12 rounded border border-zinc-300 bg-white px-1 py-0.5 dark:border-zinc-600 dark:bg-zinc-800"
-                  />
-                  <span>min before,</span>
-                  <input
-                    type="number"
-                    min={0}
-                    max={120}
-                    value={stepsEndPlusMinutes}
-                    onChange={(e) => setStepsEndPlusMinutes(Math.max(0, Math.min(120, parseInt(e.target.value, 10) || 0)))}
-                    disabled={runStatus === 'running'}
-                    className="w-12 rounded border border-zinc-300 bg-white px-1 py-0.5 dark:border-zinc-600 dark:bg-zinc-800"
-                  />
-                  <span>min after</span>
-                </div>
+              </div>
+              <div className="mt-3 rounded-md border border-zinc-200 bg-white px-3 py-2 text-xs text-zinc-700 dark:border-zinc-600 dark:bg-zinc-900/40 dark:text-zinc-300">
+                <p className="font-medium text-zinc-800 dark:text-zinc-200">Steps (Inspect-aligned, read-only)</p>
+                <p className="mt-1.5 text-zinc-600 dark:text-zinc-400">
+                  Job list per day matches Query → Inspect: <strong>all jobs</strong> for that calendar day (no{' '}
+                  <code className="rounded bg-zinc-100 px-0.5 font-mono dark:bg-zinc-800">steps_fetched</code> filter). Derived
+                  steps use the same tracking window as Inspect — values come from{' '}
+                  <Link
+                    href="/admin/settings"
+                    className="text-blue-600 underline hover:text-blue-800 dark:text-blue-400 dark:hover:text-blue-300"
+                  >
+                    Admin → Settings
+                  </Link>
+                  :
+                </p>
+                <ul className="mt-1.5 list-inside list-disc space-y-0.5 text-zinc-600 dark:text-zinc-400">
+                  <li>
+                    <span className="font-medium text-zinc-700 dark:text-zinc-300">Inspect start less:</span>{' '}
+                    {inspectWindowSettingsLoading ? (
+                      '…'
+                    ) : (
+                      <>
+                        <span className="font-mono text-zinc-900 dark:text-zinc-100">{inspectStartLessMinutes}</span> min
+                        before <code className="rounded bg-zinc-100 px-0.5 font-mono dark:bg-zinc-800">actual_start_time</code>{' '}
+                        when querying tracking for each step.
+                      </>
+                    )}
+                  </li>
+                  <li>
+                    <span className="font-medium text-zinc-700 dark:text-zinc-300">Inspect end plus:</span>{' '}
+                    {inspectWindowSettingsLoading ? (
+                      '…'
+                    ) : (
+                      <>
+                        <span className="font-mono text-zinc-900 dark:text-zinc-100">{inspectEndPlusMinutes}</span> min after{' '}
+                        <code className="rounded bg-zinc-100 px-0.5 font-mono dark:bg-zinc-800">actual_end_time</code> (or start
+                        if no end) for the tracking upper bound.
+                      </>
+                    )}
+                  </li>
+                </ul>
+                {inspectWindowSettingsError && (
+                  <p className="mt-1.5 text-amber-700 dark:text-amber-400">{inspectWindowSettingsError}</p>
+                )}
+                <p className="mt-1.5 text-[0.65rem] text-zinc-500 dark:text-zinc-500">
+                  These are not editable here so tagging Steps runs stay identical to Inspect. Edit the two “Inspect … (minutes)”
+                  fields in Settings if you need a different window.
+                </p>
               </div>
               <div className="mt-3 rounded-md border border-zinc-200 bg-white px-3 py-2 text-xs dark:border-zinc-600 dark:bg-zinc-900/40">
                 <div className="flex flex-wrap items-center justify-between gap-2">
@@ -1371,7 +1446,7 @@ export default function TaggingPage() {
                       <>From <code className="rounded bg-zinc-100 px-0.5 dark:bg-zinc-800">tbl_step4to5_audit_queue</code> (all)</>
                     ) : (
                       <>
-                        Same filters as Steps run (incl. “force”){' '}
+                        Same filters as Steps run (Inspect-aligned job list){' '}
                         <code className="rounded bg-zinc-100 px-0.5 dark:bg-zinc-800">actual_start_time</code> in range
                       </>
                     )}
@@ -1464,7 +1539,7 @@ export default function TaggingPage() {
               </button>
             </div>
             <p className="text-xs text-zinc-500 dark:text-zinc-400">
-              Run tagging: applies the NZ <code className="rounded bg-zinc-100 px-0.5 dark:bg-zinc-800">position_time_nz</code> SQL only (not <code className="rounded bg-zinc-100 px-0.5 dark:bg-zinc-800">store_fences</code>), then fetches devices for the range and tags ENTER/EXIT. Tag Enter/Exit and Steps: for each day, gets devices for that day from tbl_tracking and runs Enter/Exit then Steps (vworkjobs); the same derived-steps pipeline as Inspect, including <strong>Steps+</strong> (buffered vineyard) when step 2/3 are still missing. <strong>Rerun Steps only</strong> uses the same date range and Steps options (force, window) but does not call tagging — for example after new mappings when tracking tags are already correct. Device lists appear in the log. Run Fence tagging above first if needed.
+              Run tagging: applies the NZ <code className="rounded bg-zinc-100 px-0.5 dark:bg-zinc-800">position_time_nz</code> SQL only (not <code className="rounded bg-zinc-100 px-0.5 dark:bg-zinc-800">store_fences</code>), then fetches devices for the range and tags ENTER/EXIT. Tag Enter/Exit and Steps: for each day, gets devices for that day from tbl_tracking and runs Enter/Exit then Steps (vworkjobs); the same derived-steps pipeline as Inspect, including <strong>Steps+</strong> (buffered vineyard) when step 2/3 are still missing. <strong>Rerun Steps only</strong> uses the same date range and the same Inspect window from Settings but does not call tagging — for example after new mappings when tracking tags are already correct. Device lists appear in the log. Run Fence tagging above first if needed.
             </p>
           </div>
         </section>

@@ -5,7 +5,7 @@ import { buildInspectStyleStepsFromJobRow } from '@/lib/vworkjob-inspect-step-di
 
 /**
  * GET ?jobId=: one job row fields for Data Checks → Diverted Jobs detail pane (steps 1–5 + notes).
- * Step columns match Query → Inspect (VWork / GPS / Manual / Final + step-5 rule).
+ * Step columns match Query → Inspect (VWork / GPS / Manual / Final = oride else actual else VWork tap).
  */
 export async function GET(request: Request) {
   try {

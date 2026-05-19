@@ -70,10 +70,15 @@ export async function PUT(request: Request) {
       return NextResponse.json({ error: 'columnOrder must be a non-empty string array' }, { status: 400 });
     const hiddenColumns = parseHidden(body) ?? [];
     const stored = JSON.stringify({ columnOrder, hiddenColumns });
+    // tbl_table_column_order.id is a NOT NULL text column with no default in
+    // this DB. table_name is already unique (ON CONFLICT target), so reusing
+    // it as the id satisfies the NOT NULL on first insert and is ignored by
+    // the UPDATE branch on subsequent saves.
     await execute(
-      `INSERT INTO tbl_table_column_order (table_name, column_order)
-       VALUES ($1, $2)
-       ON CONFLICT (table_name) DO UPDATE SET column_order = EXCLUDED.column_order, updated_at = NOW()`,
+      `INSERT INTO tbl_table_column_order (id, table_name, column_order)
+       VALUES ($1, $1, $2)
+       ON CONFLICT (table_name) DO UPDATE
+         SET column_order = EXCLUDED.column_order, updated_at = NOW()`,
       [table, stored]
     );
     return NextResponse.json({ ok: true });

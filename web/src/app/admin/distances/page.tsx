@@ -1024,6 +1024,9 @@ export default function AdminDistancesPage() {
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc');
   /** Client-side Via filter on loaded rows (after API apply). */
   const [tableGridFilterVia, setTableGridFilterVia] = useState<'' | 'GPSTAGS' | 'GPS+' | 'FAIL' | 'MANUAL'>('');
+  /** Case-insensitive substring on loaded pairs (does not refetch). */
+  const [tableGridFilterWinery, setTableGridFilterWinery] = useState('');
+  const [tableGridFilterVineyard, setTableGridFilterVineyard] = useState('');
   /** When true, dry run also UPDATEs tbl_distances for that pair (no sample rows written). */
   const [dryRunUpdatePairRow, setDryRunUpdatePairRow] = useState(true);
   const [saveError, setSaveError] = useState<string | null>(null);
@@ -1225,6 +1228,8 @@ export default function AdminDistancesPage() {
     setFilterNoDataOnly(false);
     setFilterFailNoManualOnly(false);
     setTableGridFilterVia('');
+    setTableGridFilterWinery('');
+    setTableGridFilterVineyard('');
     void load('', '', '');
   }, [load]);
 
@@ -1826,6 +1831,27 @@ export default function AdminDistancesPage() {
     }
   }, [sortKey]);
 
+  /** Distinct trimmed values from the current API load (column filter dropdowns). */
+  const loadedRowWineryOptions = useMemo(() => {
+    const s = new Set<string>();
+    for (const r of rows) {
+      const w = (r.delivery_winery ?? '').trim();
+      if (w) s.add(w);
+    }
+    return [...s].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+  }, [rows]);
+
+  const loadedRowVineyardOptions = useMemo(() => {
+    const winEq = tableGridFilterWinery.trim();
+    const s = new Set<string>();
+    for (const r of rows) {
+      if (winEq && (r.delivery_winery ?? '').trim() !== winEq) continue;
+      const v = (r.vineyard_name ?? '').trim();
+      if (v) s.add(v);
+    }
+    return [...s].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+  }, [rows, tableGridFilterWinery]);
+
   const tableGridFilteredRows = useMemo(() => {
     let list = rows;
     if (filterNoDataOnly) list = list.filter(rowHasNoDistanceData);
@@ -1836,7 +1862,11 @@ export default function AdminDistancesPage() {
         return rv === 'FAIL' && noManual;
       });
     }
+    const winEq = tableGridFilterWinery.trim();
+    const vineEq = tableGridFilterVineyard.trim();
     return list.filter((r) => {
+      if (winEq && (r.delivery_winery ?? '').trim() !== winEq) return false;
+      if (vineEq && (r.vineyard_name ?? '').trim() !== vineEq) return false;
       if (tableGridFilterVia) {
         const rollup = (r.distance_via ?? '').trim().toUpperCase();
         if (tableGridFilterVia === 'MANUAL') {
@@ -1845,7 +1875,14 @@ export default function AdminDistancesPage() {
       }
       return true;
     });
-  }, [rows, filterNoDataOnly, filterFailNoManualOnly, tableGridFilterVia]);
+  }, [
+    rows,
+    filterNoDataOnly,
+    filterFailNoManualOnly,
+    tableGridFilterVia,
+    tableGridFilterWinery,
+    tableGridFilterVineyard,
+  ]);
 
   const displayRows = useMemo(() => {
     const list = tableGridFilteredRows;
@@ -1904,9 +1941,23 @@ export default function AdminDistancesPage() {
   }, [tableGridFilteredRows, sortKey, sortDir, gpsDryRunPreviewById]);
 
   const tableColumnFiltersActive = useMemo(
-    () => tableGridFilterVia !== '' || filterFailNoManualOnly,
-    [tableGridFilterVia, filterFailNoManualOnly]
+    () =>
+      tableGridFilterVia !== '' ||
+      filterFailNoManualOnly ||
+      tableGridFilterWinery.trim() !== '' ||
+      tableGridFilterVineyard.trim() !== '',
+    [tableGridFilterVia, filterFailNoManualOnly, tableGridFilterWinery, tableGridFilterVineyard]
   );
+
+  useEffect(() => {
+    const w = tableGridFilterWinery.trim();
+    if (w && !loadedRowWineryOptions.includes(w)) setTableGridFilterWinery('');
+  }, [loadedRowWineryOptions, tableGridFilterWinery]);
+
+  useEffect(() => {
+    const v = tableGridFilterVineyard.trim();
+    if (v && !loadedRowVineyardOptions.includes(v)) setTableGridFilterVineyard('');
+  }, [loadedRowVineyardOptions, tableGridFilterVineyard]);
 
   const noDataRowCount = useMemo(() => rows.filter(rowHasNoDistanceData).length, [rows]);
 
@@ -2274,25 +2325,6 @@ export default function AdminDistancesPage() {
                     ))}
                   </select>
                 </div>
-                <div className="min-w-[8rem]">
-                  <label htmlFor="filter-via" className="block text-xs font-medium text-zinc-600 dark:text-zinc-400">
-                    Via (loaded rows)
-                  </label>
-                  <select
-                    id="filter-via"
-                    value={tableGridFilterVia}
-                    onChange={(e) =>
-                      setTableGridFilterVia(e.target.value as '' | 'GPSTAGS' | 'GPS+' | 'FAIL' | 'MANUAL')
-                    }
-                    className="mt-1 w-full rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-950"
-                  >
-                    <option value="">Any</option>
-                    <option value="GPSTAGS">GPSTAGS</option>
-                    <option value="GPS+">GPS+</option>
-                    <option value="FAIL">FAIL</option>
-                    <option value="MANUAL">MANUAL</option>
-                  </select>
-                </div>
                 <div className="flex flex-wrap items-center gap-2">
                   <button
                     type="button"
@@ -2351,8 +2383,9 @@ export default function AdminDistancesPage() {
             </div>
             <p className="text-xs text-zinc-500 dark:text-zinc-400">
               <strong>Apply</strong> reloads from the API (case-insensitive partial winery/vineyard;{' '}
-              <strong>Client</strong> is a vWork customer chosen from the dropdown). <strong>No data</strong> and{' '}
-              <strong>Via</strong> narrow the rows already loaded. Sort by clicking column headers (↑/↓).
+              <strong>Client</strong> is a vWork customer chosen from the dropdown). Use the <strong>dropdown row under
+              the table headers</strong> to filter loaded pairs by winery, vineyard, and Via. <strong>No data</strong> and{' '}
+              <strong>FAIL, no manual</strong> narrow loaded rows further. Sort by clicking column headers (↑/↓).
             </p>
           </div>
         )}
@@ -2377,7 +2410,7 @@ export default function AdminDistancesPage() {
               {tableColumnFiltersActive ? (
                 <span className="text-zinc-500">
                   {' '}
-                  — Via / FAIL-no-manual refinement active (client-side)
+                  — Column filters / FAIL-no-manual active (loaded rows only)
                 </span>
               ) : null}
               {filterActive ? (
@@ -2522,6 +2555,98 @@ export default function AdminDistancesPage() {
                       H
                     </th>
                   </tr>
+                  <tr className="bg-zinc-50 dark:bg-zinc-900/90">
+                    <th scope="col" className="border-b border-zinc-300 p-1 align-middle dark:border-zinc-700">
+                      <label htmlFor="col-filter-winery" className="sr-only">
+                        Filter winery
+                      </label>
+                      <select
+                        id="col-filter-winery"
+                        value={tableGridFilterWinery}
+                        disabled={rows.length === 0}
+                        onChange={(e) => {
+                          const w = e.target.value;
+                          setTableGridFilterWinery(w);
+                          const vine = tableGridFilterVineyard.trim();
+                          if (vine && w) {
+                            const ok = rows.some(
+                              (r) =>
+                                (r.delivery_winery ?? '').trim() === w &&
+                                (r.vineyard_name ?? '').trim() === vine,
+                            );
+                            if (!ok) setTableGridFilterVineyard('');
+                          }
+                        }}
+                        className="box-border w-full min-w-0 max-w-full rounded border border-zinc-300 bg-white py-1 pl-1 pr-6 text-[11px] leading-tight text-zinc-900 dark:border-zinc-600 dark:bg-zinc-900 dark:text-zinc-100"
+                        title="Show only pairs with this delivery winery (current load)"
+                      >
+                        <option value="">All</option>
+                        {loadedRowWineryOptions.map((w) => (
+                          <option key={w} value={w}>
+                            {w}
+                          </option>
+                        ))}
+                      </select>
+                    </th>
+                    <th scope="col" className="border-b border-zinc-300 p-1 align-middle dark:border-zinc-700">
+                      <label htmlFor="col-filter-vineyard" className="sr-only">
+                        Filter vineyard
+                      </label>
+                      <select
+                        id="col-filter-vineyard"
+                        value={tableGridFilterVineyard}
+                        disabled={rows.length === 0}
+                        onChange={(e) => setTableGridFilterVineyard(e.target.value)}
+                        className="box-border w-full min-w-0 max-w-full rounded border border-zinc-300 bg-white py-1 pl-1 pr-6 text-[11px] leading-tight text-zinc-900 dark:border-zinc-600 dark:bg-zinc-900 dark:text-zinc-100"
+                        title={
+                          tableGridFilterWinery.trim()
+                            ? 'Vineyards that appear with the selected winery in this load'
+                            : 'Show only pairs with this vineyard name (current load)'
+                        }
+                      >
+                        <option value="">All</option>
+                        {loadedRowVineyardOptions.map((v) => (
+                          <option key={v} value={v}>
+                            {v}
+                          </option>
+                        ))}
+                      </select>
+                    </th>
+                    <th
+                      colSpan={8}
+                      className="border-b border-zinc-300 bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-900/90"
+                      aria-hidden="true"
+                    />
+                    <th
+                      scope="col"
+                      className="border-b border-zinc-300 p-1 text-center align-middle dark:border-zinc-700"
+                    >
+                      <label htmlFor="col-filter-via" className="sr-only">
+                        Filter Via
+                      </label>
+                      <select
+                        id="col-filter-via"
+                        value={tableGridFilterVia}
+                        disabled={rows.length === 0}
+                        onChange={(e) =>
+                          setTableGridFilterVia(e.target.value as '' | 'GPSTAGS' | 'GPS+' | 'FAIL' | 'MANUAL')
+                        }
+                        className="box-border w-full min-w-0 max-w-full rounded border border-zinc-300 bg-white py-1 pl-1 pr-6 text-[11px] leading-tight text-zinc-900 dark:border-zinc-600 dark:bg-zinc-900 dark:text-zinc-100"
+                        title="Filter loaded rows by Via / MANUAL display"
+                      >
+                        <option value="">Any</option>
+                        <option value="GPSTAGS">GPSTAGS</option>
+                        <option value="GPS+">GPS+</option>
+                        <option value="FAIL">FAIL</option>
+                        <option value="MANUAL">MANUAL</option>
+                      </select>
+                    </th>
+                    <th
+                      colSpan={3}
+                      className="border-b border-zinc-300 bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-900/90"
+                      aria-hidden="true"
+                    />
+                  </tr>
                 </thead>
                 <tbody>
                   {rows.length === 0 ? (
@@ -2540,8 +2665,8 @@ export default function AdminDistancesPage() {
                           </>
                         ) : tableColumnFiltersActive && tableGridFilteredRows.length === 0 ? (
                           <>
-                            No pairs match <strong>Via</strong> or <strong>FAIL, no manual</strong>. Use{' '}
-                            <strong>Clear all</strong> or change those filters.
+                            No pairs match the column filters (winery / vineyard / Via) or <strong>FAIL, no manual</strong>
+                            . Clear the header dropdowns or use <strong>Clear all</strong>.
                           </>
                         ) : (
                           <>No rows in view. Adjust filters.</>

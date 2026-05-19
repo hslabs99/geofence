@@ -1,47 +1,21 @@
 /**
  * Derive VWork **job steps 1–5** from tbl_tracking ENTER/EXIT and business rules.
- * **Steps+** (buffered vineyard polygon fallback for missing step 2/3) runs in `/api/tracking/derived-steps`, not in this module.
+ * **Steps+** (buffered vineyard polygon fallback for missing step 2/3): snapshot merge runs once in
+ * `/api/tracking/derived-steps` via `@/lib/steps-plus-merge-snapshot` before Part 1; same snapshot feeds
+ * `tentativeVineyardEnterForStep1Bracket` and VineFence+ apply (no second `runStepsPlusQuery`).
  */
 import { query } from '@/lib/db';
 import { addMinutesToTimestampAsNZ } from '@/lib/fetch-steps';
 import { JOB_END_CEILING_BUFFER_DEFAULT_MINUTES } from '@/lib/job-end-ceiling-buffer-setting-names';
+import { normalizeTimestampString } from '@/lib/normalize-timestamp-string';
 import { STEP5_EXTEND_WINERY_EXIT_DEFAULT_MINUTES } from '@/lib/step5-winery-exit-extend-setting-names';
 import { dateToLiteral } from '@/lib/utils';
+
+export { normalizeTimestampString };
 
 /** Vineyard special rule 1: Bankhouse South — if step 2/3 missing for South fences, use Bankhouse fences (tag VineSR1). */
 const VINE_SR1_SOUTH_NAME = 'Bankhouse South';
 const VINE_SR1_FALLBACK_VINEYARD_NAME = 'Bankhouse';
-
-/** Same as tracking API: parse to YYYY-MM-DD HH:mm:ss only — no timezone in output. Handles Date (e.g. from DB) and strings; strips GMT+1300 etc. so PostgreSQL never sees them. */
-export function normalizeTimestampString(s: string | Date | null): string | null {
-  if (s == null) return null;
-  let t: string = typeof s === 'string' ? s.trim() : s.toString().trim();
-  // Strip timezone suffix so we never pass "GMT+1300" etc. to PostgreSQL (not recognized)
-  t = t.replace(/\s+(?:GMT|UTC)[+-]\d{3,4}.*$/i, '').trim();
-  if (!t) return null;
-
-  const dmy = t.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})\s+(\d{1,2}):(\d{2}):(\d{2})/);
-  if (dmy) {
-    const yy = dmy[3].length === 2 ? `20${dmy[3]}` : dmy[3];
-    return `${yy}-${dmy[2].padStart(2, '0')}-${dmy[1].padStart(2, '0')} ${dmy[4].padStart(2, '0')}:${dmy[5]}:${dmy[6]}`;
-  }
-  const iso = t.match(/^(\d{4})-(\d{2})-(\d{2})[T\s](\d{2})?:?(\d{2})?:?(\d{2})?/);
-  if (iso) {
-    const h = iso[4]?.padStart(2, '0') ?? '00';
-    const m = iso[5]?.padStart(2, '0') ?? '00';
-    const sec = iso[6]?.padStart(2, '0') ?? '00';
-    return `${iso[1]}-${iso[2]}-${iso[3]} ${h}:${m}:${sec}`;
-  }
-  if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(t)) return t.slice(0, 19);
-  // Date.toString() style e.g. "Tue Feb 19 2026 21:08:34" (after stripping GMT+1300)
-  const d = new Date(t);
-  if (!Number.isNaN(d.getTime())) {
-    const pad = (n: number) => String(n).padStart(2, '0');
-    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
-  }
-  // Do not return t.slice(0, 19) — English month strings truncate to invalid SQL (e.g. "Thu Mar 19 2026 02:").
-  return null;
-}
 
 export type FenceResolutionDebug = {
   type: 'Vineyard' | 'Winery';
@@ -108,6 +82,18 @@ async function getFenceIdsForVworkNameWithDebug(
   return { fenceIds: debug.fenceIds, debug };
 }
 
+/** Appended to vineyard polygon trace lines: each tbl_geofences row as name + numeric id (matches GPS grid / ANY query). */
+function formatResolvedFenceNamesForGpsTrace(resolved: FenceResolutionDebug['resolvedFenceNames']): string {
+  if (!resolved?.length) return '';
+  return resolved
+    .map((r) => {
+      const name =
+        r.fence_name != null && String(r.fence_name).trim() !== '' ? String(r.fence_name).trim() : '(unnamed)';
+      return `${name} geofence_id=${r.fence_id}`;
+    })
+    .join('; ');
+}
+
 /** Job vineyard fence_ids (tbl_geofences) for GPS* / Steps+ alien-fence checks. */
 export async function getVineyardFenceIdsForVworkName(vineyardName: string): Promise<number[]> {
   const { fenceIds } = await getFenceIdsForVworkNameWithDebug('Vineyard', vineyardName.trim());
@@ -117,6 +103,87 @@ export async function getVineyardFenceIdsForVworkName(vineyardName: string): Pro
 export async function getWineryFenceIdsForVworkName(wineryName: string): Promise<number[]> {
   const { fenceIds } = await getFenceIdsForVworkNameWithDebug('Winery', wineryName.trim());
   return fenceIds;
+}
+
+/** Dedupe + sort for stable SQL `ANY` arrays and audits. */
+function sortedUniqueFenceIds(ids: number[]): number[] {
+  const set = new Set<number>();
+  for (const n of ids) {
+    if (typeof n === 'number' && Number.isFinite(n)) set.add(n);
+  }
+  return [...set].sort((a, b) => a - b);
+}
+
+export type Step1MorningWineryFenceUnionDebug = {
+  /** Chronologically prior same-day job (same worker), if any. */
+  previousJobId: string | null;
+  /** Previous job `delivery_winery` when loaded (trimmed). */
+  previousDeliveryWinery: string | null;
+  mergedFenceIdCount: number;
+  /** True when fence ids from the previous job’s winery were merged into the Step 1 morning EXIT search set. */
+  unionedPreviousWinery: boolean;
+};
+
+/**
+ * GPS Step 1 morning winery EXIT: fence_ids for **this** job’s `delivery_winery` plus, when the chained previous
+ * same-day job has a **different** delivery winery, union that job’s mapped winery fences too — so the physical
+ * EXIT leaving the prior stop still qualifies as “start this leg” before vineyard ENTER. Steps 4–5 remain this job’s winery only.
+ */
+async function mergeWineryFenceIdsForStep1MorningExit(
+  job: JobForDerivedSteps,
+  deviceForTracking: string,
+  currentFenceIds: number[]
+): Promise<{
+  merged: number[];
+  previousJobId: string | null;
+  previousDeliveryWinery: string | null;
+}> {
+  const base = sortedUniqueFenceIds(currentFenceIds);
+  const currentDelivery = job.delivery_winery != null ? String(job.delivery_winery).trim() : '';
+  const workerTrim =
+    job.worker != null && String(job.worker).trim() !== ''
+      ? String(job.worker).trim()
+      : deviceForTracking.trim();
+  const emptyMeta = {
+    merged: base,
+    previousJobId: null as string | null,
+    previousDeliveryWinery: null as string | null,
+  };
+  if (!workerTrim) return emptyMeta;
+  const actualStartRaw = job.actual_start_time;
+  if (actualStartRaw == null || String(actualStartRaw).trim() === '') return emptyMeta;
+  const actualStartNorm = normalizeTimestampString(actualStartRaw as string | Date);
+  if (!actualStartNorm) return emptyMeta;
+
+  const prevRows = await query<{ job_id: string; delivery_winery: string | null }>(
+    `SELECT trim(job_id::text) AS job_id,
+            TRIM(COALESCE(delivery_winery::text, '')) AS delivery_winery
+     FROM tbl_vworkjobs
+     WHERE LOWER(TRIM(COALESCE(worker::text, ''))) = LOWER(TRIM($1::text))
+       AND actual_start_time IS NOT NULL
+       AND (actual_start_time::date) = ($2::timestamp)::date
+       AND actual_start_time < $2::timestamp
+     ORDER BY actual_start_time DESC, trim(job_id::text) DESC
+     LIMIT 1`,
+    [workerTrim, actualStartNorm]
+  );
+  const prev = prevRows[0];
+  if (!prev) return emptyMeta;
+  const prevJobId = prev.job_id != null ? String(prev.job_id).trim() : null;
+  const prevDelivery = (prev.delivery_winery ?? '').trim();
+  if (!prevDelivery) {
+    return { merged: base, previousJobId: prevJobId, previousDeliveryWinery: null };
+  }
+  if (currentDelivery && prevDelivery.toLowerCase() === currentDelivery.toLowerCase()) {
+    return { merged: base, previousJobId: prevJobId, previousDeliveryWinery: prevDelivery };
+  }
+  const { fenceIds: prevFenceIds } = await getFenceIdsForVworkNameWithDebug('Winery', prevDelivery);
+  const merged = sortedUniqueFenceIds([...base, ...prevFenceIds]);
+  return {
+    merged,
+    previousJobId: prevJobId,
+    previousDeliveryWinery: prevDelivery,
+  };
 }
 
 export type TrackingLookupDebug = {
@@ -135,7 +202,103 @@ export type TrackingLookupDebug = {
   matchedFenceName: string | null;
   /** Approximate SQL used for traceability */
   sqlHint: string;
+  /** Inspect: ordered plain-English window + inherited bounds for this lookup. */
+  tracePlain?: string;
+  /** Inspect: all rows matching the same WHERE as LIMIT 1 (ordered); guardrails may still drop the winner later. */
+  matchingRowsOrdered?: Array<{
+    id: number;
+    position_time_nz: string;
+    geofence_id: number | null;
+    fence_name: string | null;
+  }>;
+  matchingRowsTruncated?: boolean;
+  matchingRowsCaption?: string;
+  /**
+   * Step 4 audit only: rows with position_time_nz strictly after max(positionAfter option, step2, step3) — no step1 leg.
+   * When job step-1 anchor (oride∨VWork) is after that relaxed bound, lists winery ENTERs excluded from Part 1 only because the step1 leg raised the fetch floor.
+   */
+  auditLowerExclusive?: string | null;
+  auditMatchingRowsOrdered?: Array<{
+    id: number;
+    position_time_nz: string;
+    geofence_id: number | null;
+    fence_name: string | null;
+  }>;
+  auditMatchingRowsTruncated?: boolean;
+  auditMatchingRowsCaption?: string;
 };
+
+const VINEYARD_WINDOW_MATCH_LIST_CAP = 100;
+
+async function fetchOrderedMatchListForSameWindow(
+  device: string,
+  rawAfter: string,
+  rawBefore: string | null,
+  fenceIds: number[],
+  geofenceType: 'ENTER' | 'EXIT',
+  orderDesc: boolean,
+  maxRows: number
+): Promise<{
+  rows: NonNullable<TrackingLookupDebug['matchingRowsOrdered']>;
+  truncated: boolean;
+}> {
+  const cap = Math.min(200, Math.max(1, maxRows));
+  const fetchLimit = cap + 1;
+  const params: unknown[] = [device, fenceIds, geofenceType, rawAfter];
+  let timeCondition = 't.position_time_nz > $4';
+  if (rawBefore) {
+    params.push(rawBefore);
+    timeCondition += ' AND t.position_time_nz < $5';
+  }
+  params.push(fetchLimit);
+  const limIdx = params.length;
+  const orderClause = orderDesc ? 'DESC' : 'ASC';
+  const listRows = await query<{ id: unknown; geofence_id: unknown; position_time_nz: unknown; fence_name: unknown }>(
+    `SELECT t.id, t.geofence_id,
+            to_char(t.position_time_nz, 'YYYY-MM-DD HH24:MI:SS') AS position_time_nz,
+            g.fence_name
+     FROM tbl_tracking t
+     LEFT JOIN tbl_geofences g ON g.fence_id = t.geofence_id
+     WHERE t.device_name = $1 AND t.geofence_id = ANY($2::int[]) AND t.geofence_type = $3 AND ${timeCondition}
+     ORDER BY t.position_time_nz ${orderClause} LIMIT $${limIdx}`,
+    params
+  );
+  const truncated = listRows.length > cap;
+  const slice = truncated ? listRows.slice(0, cap) : listRows;
+  const out: NonNullable<TrackingLookupDebug['matchingRowsOrdered']> = [];
+  for (const row of slice) {
+    const pid = row.id;
+    const idNum =
+      pid != null && typeof pid === 'number'
+        ? pid
+        : pid != null && (typeof pid === 'string' || typeof pid === 'bigint')
+          ? Number(pid)
+          : null;
+    if (idNum == null || !Number.isFinite(idNum)) continue;
+    const val = row.position_time_nz;
+    let tnz = '';
+    if (val != null) {
+      if (typeof val === 'string') tnz = normalizeTimestampString(val) ?? val.slice(0, 19);
+      else if (val instanceof Date) tnz = dateToLiteral(val);
+      else tnz = String(val).slice(0, 19);
+    }
+    const rawGf = row.geofence_id;
+    const gid =
+      rawGf != null && typeof rawGf === 'number'
+        ? rawGf
+        : rawGf != null && (typeof rawGf === 'string' || typeof rawGf === 'bigint')
+          ? Number(rawGf)
+          : null;
+    const fn = row.fence_name != null && String(row.fence_name).trim() !== '' ? String(row.fence_name).trim() : null;
+    out.push({
+      id: idNum,
+      position_time_nz: tnz,
+      geofence_id: gid != null && Number.isFinite(gid) ? gid : null,
+      fence_name: fn,
+    });
+  }
+  return { rows: out, truncated };
+}
 
 /** First (or last if orderDesc) tracking row in window at any of the given fences with given geofence_type (ENTER or EXIT). */
 async function getFirstTrackingInWindowWithDebug(
@@ -144,7 +307,10 @@ async function getFirstTrackingInWindowWithDebug(
   positionBefore: string | null,
   fenceIds: number[],
   geofenceType: 'ENTER' | 'EXIT',
-  orderDesc = false
+  orderDesc = false,
+  tracePlain?: string,
+  /** When > 0, also fetch ordered rows (same WHERE) for Inspect — vineyard step 2/3 only at call sites. */
+  orderedMatchListMax?: number
 ): Promise<{ value: string | null; trackingId: number | null; debug: TrackingLookupDebug }> {
   const rawAfter = normalizeTimestampString(positionAfter) ?? String(positionAfter).trim().slice(0, 19);
   const rawBefore = positionBefore ? (normalizeTimestampString(positionBefore) ?? String(positionBefore).trim().slice(0, 19)) : null;
@@ -165,6 +331,7 @@ async function getFirstTrackingInWindowWithDebug(
         matchedGeofenceId: null,
         matchedFenceName: null,
         sqlHint: `(no fence_ids)`,
+        ...(tracePlain != null && tracePlain.trim() !== '' ? { tracePlain: tracePlain.trim() } : {}),
       },
     };
   }
@@ -227,7 +394,23 @@ async function getFirstTrackingInWindowWithDebug(
     matchedGeofenceId: matchedGeofenceIdSafe,
     matchedFenceName,
     sqlHint,
+    ...(tracePlain != null && tracePlain.trim() !== '' ? { tracePlain: tracePlain.trim() } : {}),
   };
+
+  if (orderedMatchListMax != null && orderedMatchListMax > 0) {
+    const { rows, truncated } = await fetchOrderedMatchListForSameWindow(
+      device,
+      rawAfter,
+      rawBefore,
+      fenceIds,
+      geofenceType,
+      orderDesc,
+      Math.min(VINEYARD_WINDOW_MATCH_LIST_CAP, orderedMatchListMax)
+    );
+    debug.matchingRowsOrdered = rows;
+    debug.matchingRowsTruncated = truncated;
+    debug.matchingRowsCaption = `Rows matching this lookup’s WHERE (device_name, geofence_id ANY mapped set, ${geofenceType}, strict position_time_nz window — same predicates as the LIMIT 1 query). Ordered ${orderDesc ? 'DESC' : 'ASC'}; up to ${Math.min(VINEYARD_WINDOW_MATCH_LIST_CAP, orderedMatchListMax)} listed; later guardrails may still exclude the chosen row.`;
+  }
 
   return { value, trackingId: trackingIdSafe, debug };
 }
@@ -333,7 +516,7 @@ async function getFirstWineryMorningExitInWindowWithDebug(
 }
 
 const STEP1_MORNING_EXIT_RULE_ENGLISH =
-  'GPS step 1 is the first mapped winery EXIT with lowerExclusive < t_exit < upperExclusive (strict). When a mapped vineyard ENTER exists, upperExclusive is capped to be strictly before that vineyard ENTER (so Step 1 cannot land after arriving at vineyard). Winery ENTER rows do not disqualify the EXIT.';
+  'GPS step 1 is the first mapped winery EXIT (fence_ids = this job delivery winery ∪ previous same-day job delivery winery when different) with lowerExclusive < t_exit < upperExclusive (strict). When a mapped vineyard ENTER exists, upperExclusive is capped to be strictly before that vineyard ENTER (so Step 1 cannot land after arriving at vineyard). Winery ENTER rows do not disqualify the EXIT.';
 
 function parseLatLonForAudit(v: unknown): number | null {
   if (v == null) return null;
@@ -394,7 +577,8 @@ function step1MorningExitSnapshotFromRow(
   const latLon =
     lat != null && lon != null ? `${lat}, ${lon}` : lat != null ? String(lat) : lon != null ? String(lon) : '—';
   const idStr = tid != null && Number.isFinite(tid) ? String(tid) : '—';
-  const asGridRow = `${dev ?? '—'} | ${fn ?? '—'} | ${geofenceType} | ${tNz} | ${latLon} | tbl_tracking.id=${idStr}`;
+  const gidStr = gid != null && Number.isFinite(gid) ? String(gid) : '—';
+  const asGridRow = `${dev ?? '—'} | ${fn ?? '—'} | geofence_id=${gidStr} | ${geofenceType} | ${tNz} | ${latLon} | tbl_tracking.id=${idStr}`;
   return {
     tblTrackingId: tid != null && Number.isFinite(tid) ? tid : null,
     deviceName: dev,
@@ -543,6 +727,15 @@ async function attachWineryStep1MorningExitAudit(
   );
   comparisons.push(`device_name for all queries: ${args.device}.`);
   comparisons.push(`Mapped winery geofence_id list (ENTER and EXIT on these ids only): [${fenceIdList.join(', ')}].`);
+  comparisons.push(
+    `Ordered Part 1 context: polygon vineyard ENTER (tentative Step 2) is fetched first; this Step 1 morning-EXIT audit uses that tentative ENTER to cap the exclusive upper when present (see polygonGpsStep2EnterAtAudit).`
+  );
+  comparisons.push(
+    `Inherited lower X = trackingWindowAfter = min(options.positionAfter=${normalizeTimestampString(args.positionAfter) ?? String(args.positionAfter).trim().slice(0, 19)}, jobStartAnchor=${args.anchor != null ? normalizeTimestampString(args.anchor) ?? String(args.anchor).slice(0, 19) : '—'}) → ${lowerRaw}.`
+  );
+  comparisons.push(
+    `Tentative polygon Step 2 ENTER (pre-refine, caps step-1 upper when set): ${args.step2PolygonEnter != null ? (normalizeTimestampString(args.step2PolygonEnter) ?? String(args.step2PolygonEnter).slice(0, 19)) : '(null — upper may use VWork step 2 or window end)'}. VWork step_2_completed_at cap: ${args.vworkStep2Cap != null ? normalizeTimestampString(args.vworkStep2Cap) ?? String(args.vworkStep2Cap).slice(0, 19) : '(null)'}.`
+  );
 
   let notExistsCheckPlain: string | null = null;
   if (naiveFirst != null && naiveExitTimeForNotExists != null) {
@@ -950,30 +1143,33 @@ export type WineryStep5SearchWindowDebug = {
     | 'no_delivery_winery_on_job'
     | 'no_gps_step4_enter'
     | 'no_vwork_job_end_for_step5_rule'
-    | 'no_step5_upper_bound'
-    | 'vwork_step5_not_after_step4_enter';
+    | 'no_step5_upper_bound';
   /** Lower bound (exclusive) passed to tbl_tracking for step 5 EXIT — same instant as chosen winery ENTER for step 4. */
   lowerExclusive: string | null;
-  /** Upper bound (exclusive) — `min(positionBefore from options, jobEnd + Step5ExtendWineryExit)` when both exist. */
+  /** Upper bound (exclusive) — `max(positionBefore from options, anchor + Step5ExtendWineryExit)` when both exist. */
   upperExclusive: string | null;
   /** `step_5_completed_at ?? actual_end_time` (normalized), used for extend cap — not `gps_end_time`. */
   jobEndForStep5Rule: string | null;
   step5ExtendWineryExitMinutes: number;
-  /** `jobEndForStep5Rule + extend` when extend &gt; 0; else same as job end; null if no job end. */
+  /** max(tap, GPS step 4 ENTER); extend is added to this (not to tap alone when GPS 4 is later). */
+  step5ExtendAnchor: string | null;
+  /** `step5ExtendAnchor + extend` when extend &gt; 0; else same as anchor; null if no anchor. */
   jobEndPlusExtend: string | null;
   /** `options.positionBefore` passed into derivation (Inspect / tagging job window end). */
   positionBeforeFromOptions: string | null;
   /**
-   * Which side set `upperExclusive` when both job-end+extend and positionBefore exist:
-   * `position_before` = tighter cap from job window; `job_end_plus_extend` = tighter cap from step-5 rule.
+   * How `upperExclusive` was chosen from `positionBefore` vs `anchor + Step5Extend`:
+   * `anchor_plus_extend_wider_than_position_before` = extend band extends past job window end (max used);
+   * `position_before_wider_than_anchor_plus_extend` = job window end is later than extend cap;
+   * `position_before_equals_job_end_plus_extend` = position before, anchor+extend, and upperExclusive all the same instant.
    */
   upperExclusiveSource:
     | 'not_computed'
     | 'only_position_before'
     | 'only_job_end_plus_extend'
     | 'only_vwork_step5_no_extend_zero'
-    | 'position_before_tighter'
-    | 'job_end_plus_extend_tighter'
+    | 'anchor_plus_extend_wider_than_position_before'
+    | 'position_before_wider_than_anchor_plus_extend'
     | 'position_before_equals_job_end_plus_extend';
   /** True when `getFirstTrackingInWindowWithDebug` ran for winery EXIT after step 4. */
   step5ExitQueryRan: boolean;
@@ -1036,6 +1232,48 @@ export type WineryStep1MorningExitSearchDebug = {
   summaryLine: string;
 };
 
+/**
+ * Part 1: why GPS step 1 (morning winery EXIT) was kept or cleared in {@link applyGpsGuardrails}.
+ * GPS2 values are snapshots at the anchor-vs-G2 bracket check (before floor/dedup mutates step2).
+ */
+export type GpsStep1GuardrailDebug = {
+  vworkJobEndForStep12Ceiling: string | null;
+  droppedGps1AtOrAfterVworkJobEnd: boolean;
+  gps1BeforeJobEndCheck: string | null;
+  gps1TrackingIdBeforeJobEndCheck: number | null;
+  jobStartAnchor: string | null;
+  /** True when anchor and GPS1 existed so the G1&gt;anchor vs GPS2 rule was evaluated. */
+  anchorBracketEvaluated: boolean;
+  gps1AtAnchorBracket: string | null;
+  gps1TrackingIdAtAnchorBracket: number | null;
+  /** GPS step 2 at bracket check (same moment as `keepG1AfterV1` in code). */
+  gps2AtAnchorBracketCheck: string | null;
+  gps2TrackingIdAtAnchorBracketCheck: number | null;
+  gps1StrictlyAfterAnchor: boolean | null;
+  /** `g2 != null && g1 < g2` — required to keep GPS1 when `g1 > anchor`. */
+  keepG1AfterAnchorConditionMet: boolean | null;
+  droppedGps1ByAfterAnchorBracket: boolean;
+  /** `min(positionAfter, job-start anchor)` — tentative G2 must be strictly after this (same as tracking window lower). */
+  step1BracketTrackingFloor: string | null;
+  /** Caller-supplied VineFence+ merged enter (read-only for bracket). */
+  tentativeVineyardEnterFromOptions: string | null;
+  /** Tentative time after anchor and floor checks; null if absent or rejected. */
+  tentativeG2QualifiedForBracket: string | null;
+  /** True when bracket used Steps+ tentative enter because polygon GPS2 was null. */
+  bracketUsedTentativeG2: boolean;
+  /** Effective G2 instant for strict `g1 < g2` (committed polygon GPS2, else qualified tentative). */
+  g2EffectiveForAnchorBracket: string | null;
+  anchorBracketOutcome:
+    | 'not_evaluated_no_anchor'
+    | 'not_evaluated_no_gps1'
+    | 'not_evaluated_gps1_cleared_by_job_end_first'
+    | 'evaluated_gps1_not_after_anchor_unchanged'
+    | 'kept_g1_after_anchor_g2_exists_and_g1_before_g2'
+    | 'dropped_g1_after_anchor_no_gps2'
+    | 'dropped_g1_after_anchor_g1_not_strictly_before_gps2';
+  summaryLine: string;
+};
+
 /** Why Part 2 kept or dropped GPS step 5 after guardrails (same rules as `decideFinalSteps`). */
 export type Step5DecideDebug = {
   vworkStep5: string | null;
@@ -1043,8 +1281,10 @@ export type Step5DecideDebug = {
   /** Candidate entering `decideFinalSteps` (after `applyGpsGuardrails`). */
   fetchCandidateTime: string | null;
   fetchCandidateTrackingId: number | null;
-  /** Exclusive upper for “after job end” acceptance: job end + extend (Part 2). */
+  /** Exclusive upper for “after tap” acceptance: max(tap, GPS step 4 ENTER) + extend (Part 2). */
   acceptAfterJobEndExclusiveUpper: string | null;
+  /** Same anchor as Part 1 step-5 window: max(VWork tap, GPS winery ENTER step 4). */
+  step5ExtendAnchor: string | null;
   step5GpsAccepted: boolean;
   outcome:
     | 'no_candidate_after_guardrails'
@@ -1054,6 +1294,71 @@ export type Step5DecideDebug = {
     | 'rejected_extend_disabled_and_exit_not_before_job_end'
     | 'skipped_no_vwork_job_end';
   summaryLine: string;
+};
+
+export type VineyardGpsOrderingFloorRule =
+  | 'oride_only'
+  | 'max_oride_and_gps1'
+  | 'min_tap_and_gps1_no_oride'
+  | 'gps1_only'
+  | 'tap_only';
+
+export type VineyardGpsOrderingFloorDebug = {
+  orideNorm: string | null;
+  gps1NormAfterBracket: string | null;
+  tapOnlyNorm: string | null;
+  floorFor235: string | null;
+  rule: VineyardGpsOrderingFloorRule;
+  summaryLine: string;
+};
+
+/** Snapshot of one vineyard/winery GPS step before post-fetch guardrails (Inspect: why a grid row was not kept). */
+export type VineyardStepPreclearSnapshot = {
+  positionTimeNz: string | null;
+  trackingId: number | null;
+  matchedGeofenceId: number | null;
+  matchedFenceName: string | null;
+  device: string | null;
+};
+
+/**
+ * After Part 1 fetch, `applyGpsGuardrails` may clear steps 2/3/5. Inspect uses this to separate
+ * “SQL never picked this row” vs “picked then dropped by floor / job end / duplicate tracking id”.
+ */
+export type VineyardPart1FetchGuardrailDebug = {
+  orderingFloorExclusive: string | null;
+  preclearStep2: VineyardStepPreclearSnapshot | null;
+  preclearStep3: VineyardStepPreclearSnapshot | null;
+  preclearStep5: VineyardStepPreclearSnapshot | null;
+  /** GPS winery ENTER after fetch, before max(vineyard ordering floor, step2, step3) guardrail on step 4. */
+  preclearStep4: VineyardStepPreclearSnapshot | null;
+  clearedByOrderingFloorStep2: boolean;
+  clearedByOrderingFloorStep3: boolean;
+  clearedByOrderingFloorStep5: boolean;
+  /** Step 4 cleared because winery ENTER was not strictly after max(ordering floor, step2, step3). */
+  clearedByStep4OrderingFloor: boolean;
+  /** Floor used with step 4 (same components as fetch lower when both vineyard GPS steps exist; else see code). */
+  step4OrderingFloorExclusive: string | null;
+  clearedVworkJobEndStep2And3: boolean;
+  clearedStep3OnlyJobEndCeiling: boolean;
+  duplicateTrackingIdClears: string[];
+  /** One paragraph for polygon Step 2 fail / audit. */
+  summaryLineStep2Polygon: string;
+};
+
+/** Inspect: how Part 1 computed the strict lower bound for winery ENTER (step 4) vs relaxed audit lower. */
+export type Step4FetchLowerBreakdownDebug = {
+  anchor: string | null;
+  gpsMorningExit: string | null;
+  /** Value in max() for the step-1 leg: anchor when set, else GPS morning winery EXIT. */
+  step1LegUsedForFetch: string | null;
+  step2: string | null;
+  step3: string | null;
+  positionAfterOption: string | null;
+  fetchLowerExclusive: string | null;
+  /** max(positionAfter, step2, step3) — winery ENTER audit window when this is strictly before fetch lower. */
+  auditRelaxedLowerExclusive: string | null;
+  bothVineyardGpsStepsMissing: boolean;
 };
 
 export type DerivedStepsDebug = {
@@ -1067,6 +1372,8 @@ export type DerivedStepsDebug = {
   vineyard: FenceResolutionDebug & {
     step2?: TrackingLookupDebug;
     step3?: TrackingLookupDebug;
+    /** Part 1 fetch → guardrails: which candidate existed and whether floor / job end / dedupe cleared it. */
+    part1FetchGuardrail?: VineyardPart1FetchGuardrailDebug;
   };
   winery: FenceResolutionDebug & {
     step1?: TrackingLookupDebug; // Winery EXIT before Vineyard ENTER
@@ -1074,11 +1381,19 @@ export type DerivedStepsDebug = {
     step5?: TrackingLookupDebug; // Winery EXIT after step 4, before job end = GPS job end
     /** Auditable morning winery EXIT (step 1) window + re-enter rule; Inspect Explanation surfaces this. */
     step1MorningExitSearch?: WineryStep1MorningExitSearchDebug;
+    /** Step 1 morning EXIT fence_id union: this job delivery winery ∪ previous same-day job winery when chained. */
+    step1MorningFenceUnion?: Step1MorningWineryFenceUnionDebug;
     /** Auditable (X,Y) window for step 5 EXIT fetch; Inspect Explanation surfaces this. */
     step5SearchWindow?: WineryStep5SearchWindowDebug;
+    /** Step 4: anchor vs GPS1 vs step2/3 → strict fetch lower vs relaxed audit lower (Inspect Explanation). */
+    step4FetchLowerBreakdown?: Step4FetchLowerBreakdownDebug;
   };
   /** Part 2: why GPS step 5 was kept or dropped vs VWork job end + extend. */
   step5Decide?: Step5DecideDebug;
+  /** Part 1: auditable floor used to drop vineyard GPS steps 2/3/5 when t ≤ floor (and step‑4 winery lower bound). */
+  vineyardGpsOrderingFloor?: VineyardGpsOrderingFloorDebug;
+  /** Part 1: why GPS step 1 was kept or dropped in `applyGpsGuardrails` (anchor vs GPS2 bracket). */
+  gpsStep1Guardrail?: GpsStep1GuardrailDebug;
   /** Step 3 extended via same-vineyard re-entry smoothing (GPS*). */
   step3GpsStar?: boolean;
   /** True when VineSR1 fallback (Bankhouse South → Bankhouse) produced step 2/3. */
@@ -1149,35 +1464,44 @@ export type DerivedStepsOptions = {
    */
   jobEndCeilingBufferMinutes?: number;
   /**
-   * Minutes after VWork job end to search for winery EXIT and accept it as GPS step 5 (early “job complete” before physical leave).
+   * Minutes after max(VWork tap, GPS winery ENTER step 4) to search for winery EXIT and accept it as GPS step 5
+   * (early “job complete” before physical leave, or tap before GPS return to winery).
    * Defaults to `STEP5_EXTEND_WINERY_EXIT_DEFAULT_MINUTES` when omitted (tbl_settings Step5ExtendWineryExit).
    */
   step5ExtendWineryExitMinutes?: number;
+  /**
+   * VineFence+ merged vineyard ENTER from the same Steps+ snapshot as `/api/tracking/derived-steps`
+   * (computed once before Part 1). Used only inside {@link applyGpsGuardrails} to qualify morning GPS step 1
+   * when polygon `candidates.step2` is missing — never written to `candidates.step2`.
+   */
+  tentativeVineyardEnterForStep1Bracket?: string | null;
 };
 
 /**
  * STEP RULES (GPS-derived steps)
  * ------------------------------
- * Part 1 — Fetch: Get a valid (or probably valid) GPS entry (Winery/Vineyard, ENTER/EXIT). Part 2 — Decide: Steps 1–4 use GPS if exists else VWork; Step 5 use GPS if winery EXIT is before job end or within step-5 extend after job end.
- * Step 1 — Job start by GPS: First Winery EXIT strictly before arrive vineyard.
+ * Part 1 — Fetch: Get a valid (or probably valid) GPS entry (Winery/Vineyard, ENTER/EXIT). Part 2 — Decide: Steps 1–4 use GPS if exists else VWork; Step 5 use GPS if winery EXIT is before job end or within step-5 extend after max(tap, GPS step 4 ENTER).
+ * Step 1 — Job start by GPS: First Winery EXIT strictly before arrive vineyard (mapped winery fences for **this**
+ *   job’s delivery_winery **∪** when chained, the same-day **previous** job’s delivery_winery — same worker ordering as lastjobendstep1limiter).
  *   - Upper bound: if polygon vineyard ENTER exists, min(data window end, polygon ENTER) only — VWork step 2 is not used (can be early vs GPS). If polygon step 2 is missing, min(data window end, VWork step 2) so we do not take a return-leg EXIT as “start job”.
  *   - May be absent if the job started after the driver had already left the winery fence.
- * Step 2 — Arrive vineyard: First Vineyard ENTER in window.
+ * Step 2 — Arrive vineyard: First Vineyard ENTER in window (SQL lowerExclusive is max(geometry/window lower, vineyard ordering floor) so LIMIT 1 matches the same strictly-after-floor rule as Part 1 guardrails).
  * Step 3 — Leave vineyard: First Vineyard EXIT after step 2 (so we don't pick an earlier exit before the enter).
  *   GPS* (optional): If the driver briefly exits and re-enters the same vineyard fence set with no other fence
  *   ENTER/EXIT between, aggregate up to 3 such loops; step 3 becomes the last EXIT in the chain. Any alien fence
  *   event voids GPS* for that job (revert to first exit only). Marked step3Via = GPS* and calcnotes GPS*:.
  * Step 4 — Arrive winery (return leg): First mapped Winery ENTER strictly &lt; data window end (positionBefore).
- * Lower bound: **if both GPS step 2 and step 3 are present**, strictly &gt; max(GPS step1, step2, step3) (step 1 uses anchor∨GPS for the step‑1 leg). **If both GPS step 2 and step 3 are missing**, do not use vineyard times in the max — use max(GPS step1 leg, positionAfter) only so a partial or absent vineyard GPS leg does not block a valid winery ENTER/EXIT pair in the window.
- * Step 5 — Job end by GPS: VWork step 5 = step_5_completed_at (job completed in system). Use GPS when Winery EXIT is strictly &lt; VWork step 5 (forgot to end job), OR when EXIT is ≥ job end and strictly &lt; job end + `step5ExtendWineryExitMinutes` (tapped complete before leaving). Search first EXIT after step 4 with upper bound min(positionBefore, job end + extend). FIRST such EXIT wins.
+ * Lower bound: **if both GPS step 2 and step 3 are present**, strictly &gt; max(**job step-1 anchor (oride∨VWork) ?? GPS morning winery EXIT**, step2, step3) (anchor replaces GPS step 1 in that max when set — early winery ENTER before anchor is excluded from Part 1).
+ * **If both GPS step 2 and step 3 are missing**, do not use vineyard times in the max — use max(GPS step1 leg, positionAfter) only so a partial or absent vineyard GPS leg does not block a valid winery ENTER/EXIT pair in the window.
+ * Step 5 — Job end by GPS: VWork step 5 = step_5_completed_at (job completed in system). Use GPS when Winery EXIT is strictly &lt; VWork step 5 (forgot to end job), OR when EXIT is ≥ job end and strictly &lt; max(tap, GPS step 4 ENTER) + `step5ExtendWineryExitMinutes` (tapped complete before leaving, or tap before physical return to winery). Search first EXIT after step 4 with upper bound max(positionBefore, that anchor + extend). FIRST such EXIT wins.
  *
  * Derive GPS step timestamps for a job using these rules. Window is passed in (same as tbl_tracking UI)
  * — no server-side timezone or date logic. Uses tbl_gpsmappings + original vwork name → tbl_geofences
  * → fence_ids; then scans tbl_tracking in window.
  *
- * Guardrail (after fetch): If GPS step 1 exists, steps 2–3 and 5 must be strictly &gt; step 1 time (step 4 uses max(step1–3) floor — see below). Each tbl_tracking id may appear at most once. Step 5 cleared if step 4 cleared.
- * Guardrail — step 4: same floor as fetch (when GPS step 2 and 3 both present, max with step2/step3; when both missing, max(step1 leg, positionAfter) only).
- * Guardrail — VWork job end: GPS steps 1–2 must be strictly **before** VWork step 5. Step 3 may be before VWork step 5 plus `jobEndCeilingBufferMinutes` (Job End Ceiling Buffer). Step 5 fetch/accept may extend past job end by `step5ExtendWineryExitMinutes` (tbl_settings Step5ExtendWineryExit).
+ * Guardrail (after fetch): Steps 2–3 and 5 must be strictly after the **vineyard ordering floor** from {@link computeVineyardGpsOrderingFloorDebug} (with oride: max(oride, GPS1); without oride: min(tap, GPS1) when both exist). Step 4 uses the same step‑1 leg in max(step1 leg, step2, step3). Each tbl_tracking id may appear at most once. Step 5 cleared if step 4 cleared.
+ * Guardrail — step 4: when GPS step 2 and 3 both present, max(step1 leg, step2, step3); when both missing, max(step1 leg, positionAfter) only.
+ * Guardrail — VWork job end: GPS steps 1–2 must be strictly **before** VWork step 5. Step 3 may be before VWork step 5 plus `jobEndCeilingBufferMinutes` (Job End Ceiling Buffer). Step 5 fetch/accept may extend past job end by `step5ExtendWineryExitMinutes` from max(tap, GPS step 4 ENTER) (tbl_settings Step5ExtendWineryExit).
  */
 
 /**
@@ -1256,6 +1580,50 @@ function maxTimestampString(...vals: (string | null | undefined)[]): string | nu
   return best;
 }
 
+/**
+ * Step 5 extend anchor: max(VWork tap, GPS winery ENTER step 4). Extend minutes are added to this instant
+ * (not to tap alone) so when tap is before physical return to winery, the EXIT search upper bound is still wide enough.
+ */
+function step5ExtendAnchorMaxTapAndGps4(
+  vworkTap5: string | null | undefined,
+  gpsStep4Enter: string | null | undefined
+): string | null {
+  const tap =
+    vworkTap5 != null && String(vworkTap5).trim() !== ''
+      ? normalizeTimestampString(vworkTap5 as string | Date) ?? String(vworkTap5).trim().slice(0, 19)
+      : null;
+  if (tap == null) return null;
+  const e4 =
+    gpsStep4Enter != null && String(gpsStep4Enter).trim() !== ''
+      ? normalizeTimestampString(gpsStep4Enter as string | Date) ?? String(gpsStep4Enter).trim().slice(0, 19)
+      : null;
+  if (e4 == null) return tap;
+  return maxTimestampString(tap, e4) ?? tap;
+}
+
+/**
+ * Step 5 EXIT fetch upper (exclusive): max(job `positionBefore`, anchor + Step5Extend) when both exist,
+ * so a tight job/Inspect window does not clip the extend band after a late GPS step 4.
+ */
+function step5ExitExclusiveUpper(
+  positionBefore: string | null | undefined,
+  anchorPlusExtend: string | null | undefined
+): string | null {
+  const ext =
+    anchorPlusExtend != null && String(anchorPlusExtend).trim() !== ''
+      ? normalizeTimestampString(anchorPlusExtend as string | Date) ??
+        String(anchorPlusExtend).trim().slice(0, 19)
+      : null;
+  const pb =
+    positionBefore != null && String(positionBefore).trim() !== ''
+      ? normalizeTimestampString(positionBefore as string | Date) ??
+        String(positionBefore).trim().slice(0, 19)
+      : null;
+  if (ext == null) return pb ?? null;
+  if (pb == null) return ext;
+  return maxTimestampString(pb, ext) ?? ext;
+}
+
 /** Lexicographic min (earliest instant); ignores nulls. */
 function minTimestampString(...vals: (string | null | undefined)[]): string | null {
   let best: string | null = null;
@@ -1302,10 +1670,68 @@ function pruneVineyardGpsForJobEnd(
   return { step2: step2Value, step3: step3Value };
 }
 
+function vineyardPreclearSnapshot(
+  cand: GpsStepCandidate | null | undefined,
+  cell: TrackingLookupDebug | undefined
+): VineyardStepPreclearSnapshot | null {
+  if (cand?.value == null || String(cand.value).trim() === '') return null;
+  const positionTimeNz =
+    cell?.position_time_nz != null && String(cell.position_time_nz).trim() !== ''
+      ? normalizeTimestampString(String(cell.position_time_nz)) ?? String(cell.position_time_nz).trim().slice(0, 19)
+      : normalizeTimestampString(cand.value) ?? String(cand.value).trim().slice(0, 19);
+  return {
+    positionTimeNz,
+    trackingId:
+      cand.trackingId != null && Number.isFinite(cand.trackingId)
+        ? cand.trackingId
+        : cell?.trackingId != null && Number.isFinite(cell.trackingId)
+          ? cell.trackingId
+          : null,
+    matchedGeofenceId: cell?.matchedGeofenceId ?? null,
+    matchedFenceName: cell?.matchedFenceName ?? null,
+    device: cell?.device ?? null,
+  };
+}
+
+function buildSummaryLineStep2Polygon(g: VineyardPart1FetchGuardrailDebug, fetchFoundStep2: boolean): string {
+  const floor = g.orderingFloorExclusive;
+  if (!fetchFoundStep2 || g.preclearStep2 == null) {
+    return `Part 1 did not return a vineyard ENTER for this device in the strict polygon window on the mapped geofence_id set — there was no LIMIT 1 row for decideFinalSteps. A row you see in Inspect (same fence name and geofence_id) is not necessarily that answer: check device_name, ENTER type, exclusive time bounds vs position_time_nz, and whether an earlier ENTER on the same fence set wins ORDER BY ASC LIMIT 1.`;
+  }
+  const p = g.preclearStep2;
+  const head = `Part 1 selected ENTER position_time_nz=${p.positionTimeNz ?? '—'} · tbl_tracking.id=${p.trackingId ?? '—'} · geofence_id=${p.matchedGeofenceId ?? '—'} (${p.matchedFenceName ?? '—'}) · device=${p.device ?? '—'}.`;
+  const reasons: string[] = [];
+  if (g.clearedByOrderingFloorStep2) {
+    reasons.push(
+      `Dropped by vineyard ordering floor — need strictly position_time_nz > ${floor ?? '—'} (candidate was not strictly after that instant).`
+    );
+  }
+  if (g.clearedVworkJobEndStep2And3) {
+    reasons.push('Dropped: vineyard ENTER at or after VWork job end — steps 2 and 3 cleared together.');
+  }
+  if (g.duplicateTrackingIdClears.includes('step2')) {
+    reasons.push(
+      'Dropped: duplicate tbl_tracking.id — same id already used by an earlier step in guardrail pass order (steps 1→5).'
+    );
+  }
+  if (reasons.length === 0) {
+    if (fetchFoundStep2 && g.preclearStep2 != null) {
+      reasons.push(
+        'This pass did not log floor, job-end, or duplicate-id removal for the Part-1 vineyard ENTER above — if merged GPS step 2 is still empty, compare API snapshot timing or refetch steps after deploy.'
+      );
+    } else {
+      reasons.push(
+        'Guardrails did not record floor, job-end, or duplicate-id removal for this Part-1 step 2 candidate — if final GPS step 2 is still empty, check merge / orides / buffer path.'
+      );
+    }
+  }
+  return `${head} ${reasons.join(' ')}`;
+}
+
 /**
- * If GPS step 1 exists, drop steps 2–3 and 5 with time &lt;= **job-start anchor** (step 4 excluded — uses max(step1–3) floor below).
- * Anchor = `step1oride` if set, else VWork step 1. **G1 vs anchor:** if G1 &gt; anchor, keep G1 only when G2 exists and G1 &lt; G2 (tap before physical exit, but left before vineyard); if G2 missing and G1 &gt; anchor, clear G1.
- * Step 4: drop if &lt;= floor (when GPS step 2+3 both present: max(anchor or GPS step1, step2, step3); when both missing: max(anchor or GPS step1, positionAfter) only).
+ * Drop steps 2–3 and 5 with time &lt;= **vineyard GPS ordering floor** from {@link computeVineyardGpsOrderingFloorDebug} (step 4 uses same leg in max with step2/step3).
+ * **G1 vs jobStep1Anchor (tap∨oride):** if G1 &gt; anchor, keep G1 only when effective G2 exists and G1 &lt; G2 (tap before physical exit, but left before vineyard). Effective G2 = polygon GPS step 2 if present, else optional VineFence+ merged enter from {@link DerivedStepsOptions.tentativeVineyardEnterForStep1Bracket} when it is strictly after anchor and after `step1BracketTrackingFloor` — never written to `candidates.step2`.
+ * Step 4: drop if &lt;= floor (when GPS step 2+3 both present: max(step1 leg from same floor helper, step2, step3); when both missing: max(same step1 leg, positionAfter) only).
  * VWork ceiling: steps 1–2 must be &lt; VWork job end. Step 3 must be &lt; job end + buffer (see `jobEndCeilingBufferMinutes`).
  */
 function applyGpsGuardrails(
@@ -1313,7 +1739,12 @@ function applyGpsGuardrails(
   job: JobForDerivedSteps,
   jobEndCeilingBufferMinutes: number = JOB_END_CEILING_BUFFER_DEFAULT_MINUTES,
   /** Data window start; used for step 4 floor when GPS step 2 or 3 is missing. */
-  positionAfter?: string | null
+  positionAfter?: string | null,
+  debug?: DerivedStepsDebug | null,
+  step1Bracket?: {
+    tentativeVineyardEnterForStep1Bracket: string | null;
+    step1BracketTrackingFloor: string | null;
+  } | null
 ): void {
   const vworkEnd =
     job.step_5_completed_at != null || job.actual_end_time != null
@@ -1323,54 +1754,159 @@ function applyGpsGuardrails(
     vworkEnd != null && jobEndCeilingBufferMinutes > 0
       ? normalizeTimestampString(addMinutesToTimestampAsNZ(vworkEnd, jobEndCeilingBufferMinutes))
       : vworkEnd;
+
+  const gps1BeforeJobEndCheck =
+    candidates.step1?.value != null ? normalizeTimestampString(candidates.step1.value) : null;
+  const gps1TrackingIdBeforeJobEndCheck =
+    candidates.step1?.trackingId != null && Number.isFinite(candidates.step1.trackingId)
+      ? candidates.step1.trackingId
+      : null;
+
+  let droppedGps1AtOrAfterVworkJobEnd = false;
   if (vworkEnd != null && candidates.step1?.value != null) {
     const s1c = normalizeTimestampString(candidates.step1.value);
     if (s1c != null && s1c >= vworkEnd) {
       candidates.step1 = null;
+      droppedGps1AtOrAfterVworkJobEnd = true;
     }
   }
+
   const anchor = jobStep1Anchor(job);
   const s1 = candidates.step1;
-  /** GPS step 1 (morning winery EXIT) vs anchor: keep when anchor < GPS step 1 < GPS step 2 (arrive vineyard). If no step 2 GPS and step 1 > anchor, clear. Do not use VWork step 2/3 to qualify step 1. */
-  if (anchor != null && s1?.value != null) {
+
+  const tentativeRawForDebug =
+    step1Bracket?.tentativeVineyardEnterForStep1Bracket != null &&
+    String(step1Bracket.tentativeVineyardEnterForStep1Bracket).trim() !== ''
+      ? String(step1Bracket.tentativeVineyardEnterForStep1Bracket).trim().slice(0, 19)
+      : null;
+  const tentativeFromOpt =
+    tentativeRawForDebug != null ? normalizeTimestampString(tentativeRawForDebug) ?? tentativeRawForDebug : null;
+  const step1BracketTrackingFloorNorm =
+    step1Bracket?.step1BracketTrackingFloor != null &&
+    String(step1Bracket.step1BracketTrackingFloor).trim() !== ''
+      ? normalizeTimestampString(step1Bracket.step1BracketTrackingFloor) ??
+        String(step1Bracket.step1BracketTrackingFloor).trim().slice(0, 19)
+      : null;
+
+  let anchorBracketEvaluated = false;
+  let gps1AtAnchorBracket: string | null = null;
+  let gps1TrackingIdAtAnchorBracket: number | null = null;
+  let gps2AtAnchorBracketCheck: string | null = null;
+  let gps2TrackingIdAtAnchorBracketCheck: number | null = null;
+  let gps1StrictlyAfterAnchor: boolean | null = null;
+  let keepG1AfterAnchorConditionMet: boolean | null = null;
+  let droppedGps1ByAfterAnchorBracket = false;
+  let anchorBracketOutcome: GpsStep1GuardrailDebug['anchorBracketOutcome'] = 'not_evaluated_no_gps1';
+  let tentativeG2QualifiedForBracket: string | null = null;
+  let bracketUsedTentativeG2 = false;
+  let g2EffectiveForAnchorBracket: string | null = null;
+
+  if (anchor == null) {
+    anchorBracketOutcome = 'not_evaluated_no_anchor';
+  } else if (s1?.value == null) {
+    anchorBracketOutcome = droppedGps1AtOrAfterVworkJobEnd
+      ? 'not_evaluated_gps1_cleared_by_job_end_first'
+      : 'not_evaluated_no_gps1';
+  } else {
+    anchorBracketEvaluated = true;
     const g1 = normalizeTimestampString(s1.value);
-    if (g1 != null && g1 > anchor) {
-      const g2 = candidates.step2?.value != null ? normalizeTimestampString(candidates.step2.value) : null;
-      const keepG1AfterV1 = g2 != null && g1 < g2;
-      if (!keepG1AfterV1) {
-        candidates.step1 = null;
+    gps1AtAnchorBracket = g1;
+    gps1TrackingIdAtAnchorBracket =
+      s1.trackingId != null && Number.isFinite(s1.trackingId) ? s1.trackingId : null;
+    const g2Cell = candidates.step2;
+    const g2Committed =
+      g2Cell?.value != null && String(g2Cell.value).trim() !== ''
+        ? normalizeTimestampString(g2Cell.value)
+        : null;
+    gps2AtAnchorBracketCheck = g2Committed;
+    gps2TrackingIdAtAnchorBracketCheck =
+      g2Cell?.trackingId != null && Number.isFinite(g2Cell.trackingId) ? g2Cell.trackingId : null;
+
+    let g2Eff = g2Committed;
+    if (g2Eff == null && tentativeFromOpt != null) {
+      const tNorm = normalizeTimestampString(tentativeFromOpt) ?? tentativeFromOpt;
+      const passesAnchorOnly = tNorm > anchor;
+      const passesFloorBound =
+        step1BracketTrackingFloorNorm == null || tNorm > step1BracketTrackingFloorNorm;
+      if (passesAnchorOnly && passesFloorBound) {
+        g2Eff = tNorm;
+        tentativeG2QualifiedForBracket = tNorm;
+        bracketUsedTentativeG2 = true;
       }
     }
+    g2EffectiveForAnchorBracket = g2Eff;
+
+    if (g1 != null && g1 > anchor) {
+      gps1StrictlyAfterAnchor = true;
+      const keepG1AfterV1 = g2Eff != null && g1 < g2Eff;
+      keepG1AfterAnchorConditionMet = keepG1AfterV1;
+      if (!keepG1AfterV1) {
+        candidates.step1 = null;
+        droppedGps1ByAfterAnchorBracket = true;
+        anchorBracketOutcome =
+          g2Eff == null ? 'dropped_g1_after_anchor_no_gps2' : 'dropped_g1_after_anchor_g1_not_strictly_before_gps2';
+      } else {
+        anchorBracketOutcome = 'kept_g1_after_anchor_g2_exists_and_g1_before_g2';
+      }
+    } else {
+      gps1StrictlyAfterAnchor = g1 != null ? g1 > anchor : false;
+      anchorBracketOutcome = 'evaluated_gps1_not_after_anchor_unchanged';
+    }
   }
+
   const s1AfterDrop = candidates.step1;
   const s1Norm = s1AfterDrop?.value != null ? normalizeTimestampString(s1AfterDrop.value) : null;
-  /** Ordering floor for steps 2/3/5: must be after leaving the winery (GPS step 1) and after business anchor. When both exist, use the **earlier** instant so a late VWork tap (e.g. 10:15) does not wipe a valid vineyard ENTER (e.g. 10:09) that is still after morning winery EXIT (09:47). */
-  const floorFor235 =
-    anchor != null && s1Norm != null ? minTimestampString(anchor, s1Norm) ?? s1Norm : anchor ?? s1Norm;
+  const vFloorDbg = computeVineyardGpsOrderingFloorDebug(job, s1Norm);
+  const floorFor235 = vFloorDbg.floorFor235;
+  const vineStep2Cell = debug?.vineyard?.step2;
+  const vineStep3Cell = debug?.vineyard?.step3;
+  const wineryStep5Cell = debug?.winery?.step5;
+  const wineryStep4Cell = debug?.winery?.step4;
+  const preclearStep2 = vineyardPreclearSnapshot(candidates.step2, vineStep2Cell);
+  const preclearStep3 = vineyardPreclearSnapshot(candidates.step3, vineStep3Cell);
+  const preclearStep5 = vineyardPreclearSnapshot(candidates.step5, wineryStep5Cell);
+  const preclearStep4 = vineyardPreclearSnapshot(candidates.step4, wineryStep4Cell);
+  let clearedByOrderingFloorStep2 = false;
+  let clearedByOrderingFloorStep3 = false;
+  let clearedByOrderingFloorStep5 = false;
+
+  if (debug != null) {
+    debug.vineyardGpsOrderingFloor = vFloorDbg;
+  }
   if (floorFor235 != null) {
     for (const key of ['step2', 'step3', 'step5'] as const) {
       const c = candidates[key];
       if (c?.value == null) continue;
       const n = normalizeTimestampString(c.value);
-      if (n != null && n <= floorFor235) candidates[key] = null;
+      if (n != null && n <= floorFor235) {
+        if (key === 'step2') clearedByOrderingFloorStep2 = true;
+        if (key === 'step3') clearedByOrderingFloorStep3 = true;
+        if (key === 'step5') clearedByOrderingFloorStep5 = true;
+        candidates[key] = null;
+      }
     }
   }
+  const hadStep2BeforeVworkClear = candidates.step2 != null;
+  const hadStep3BeforeVworkClear = candidates.step3 != null;
+  let clearedVworkJobEndStep2And3 = false;
+  let clearedStep3OnlyJobEndCeiling = false;
   if (vworkEnd != null) {
     const s2 = candidates.step2?.value != null ? normalizeTimestampString(candidates.step2!.value) : null;
     if (s2 != null && s2 >= vworkEnd) {
+      clearedVworkJobEndStep2And3 = hadStep2BeforeVworkClear || hadStep3BeforeVworkClear;
       candidates.step2 = null;
       candidates.step3 = null;
     } else {
       const s3 = candidates.step3?.value != null ? normalizeTimestampString(candidates.step3!.value) : null;
       const ceiling = step3Ceiling ?? vworkEnd;
       if (s3 != null && s3 >= ceiling) {
+        if (candidates.step3 != null) clearedStep3OnlyJobEndCeiling = true;
         candidates.step3 = null;
       }
     }
   }
   const s1ForMax = candidates.step1?.value != null ? normalizeTimestampString(candidates.step1.value) : null;
-  const step1ForStep4Max =
-    anchor != null && s1ForMax != null ? minTimestampString(anchor, s1ForMax) ?? s1ForMax : anchor ?? s1ForMax;
+  const step1ForStep4Max = vFloorDbg.floorFor235;
   const rawPosAfter =
     positionAfter != null && String(positionAfter).trim() !== ''
       ? normalizeTimestampString(positionAfter) ?? String(positionAfter).trim().slice(0, 19)
@@ -1379,18 +1915,24 @@ function applyGpsGuardrails(
     candidates.step2 == null && candidates.step3 == null
       ? maxTimestampString(step1ForStep4Max, rawPosAfter)
       : maxTimestampString(step1ForStep4Max, candidates.step2?.value, candidates.step3?.value);
+  const step4OrderingFloorExclusiveNorm =
+    step4Floor != null ? normalizeTimestampString(step4Floor) ?? String(step4Floor).trim().slice(0, 19) : null;
+  let clearedByStep4OrderingFloor = false;
   if (step4Floor != null && candidates.step4?.value != null) {
     const s4 = normalizeTimestampString(candidates.step4.value);
     if (s4 != null && s4 <= step4Floor) {
+      clearedByStep4OrderingFloor = true;
       candidates.step4 = null;
     }
   }
+  const duplicateTrackingIdClears: string[] = [];
   const seen = new Set<number>();
   for (const key of ['step1', 'step2', 'step3', 'step4', 'step5'] as const) {
     const c = candidates[key];
     const id = c?.trackingId;
     if (id == null || !Number.isFinite(id)) continue;
     if (seen.has(id)) {
+      duplicateTrackingIdClears.push(key);
       candidates[key] = null;
     } else {
       seen.add(id);
@@ -1402,6 +1944,102 @@ function applyGpsGuardrails(
   if (candidates.step3 == null) {
     delete candidates.step3GpsStar;
   }
+
+  if (debug != null) {
+    const fetchFoundStep2 = debug.vineyard.step2?.found === true;
+    const part1FetchGuardrail: VineyardPart1FetchGuardrailDebug = {
+      orderingFloorExclusive: floorFor235,
+      preclearStep2,
+      preclearStep3,
+      preclearStep5,
+      preclearStep4,
+      clearedByOrderingFloorStep2,
+      clearedByOrderingFloorStep3,
+      clearedByOrderingFloorStep5,
+      clearedByStep4OrderingFloor,
+      step4OrderingFloorExclusive: step4OrderingFloorExclusiveNorm,
+      clearedVworkJobEndStep2And3,
+      clearedStep3OnlyJobEndCeiling,
+      duplicateTrackingIdClears: [...duplicateTrackingIdClears],
+      summaryLineStep2Polygon: '',
+    };
+    part1FetchGuardrail.summaryLineStep2Polygon = buildSummaryLineStep2Polygon(
+      part1FetchGuardrail,
+      fetchFoundStep2
+    );
+    debug.vineyard.part1FetchGuardrail = part1FetchGuardrail;
+  }
+
+  if (debug != null) {
+    const parts: string[] = [];
+    if (droppedGps1AtOrAfterVworkJobEnd) {
+      parts.push(
+        `GPS1 cleared at/after VWork job end ${vworkEnd ?? '—'} (candidate was ${gps1BeforeJobEndCheck ?? '—'} id ${gps1TrackingIdBeforeJobEndCheck ?? '—'}).`
+      );
+    }
+    if (droppedGps1ByAfterAnchorBracket) {
+      parts.push(
+        `GPS1 cleared after anchor ${anchor ?? '—'}: need effective G2 and strict GPS1<G2eff; GPS1@bracket=${gps1AtAnchorBracket ?? '—'} polygon GPS2=${gps2AtAnchorBracketCheck ?? '—'} tentative merged enter=${tentativeRawForDebug ?? '—'} qualified tentative=${tentativeG2QualifiedForBracket ?? '—'} G2eff=${g2EffectiveForAnchorBracket ?? '—'} floor=${step1BracketTrackingFloorNorm ?? '—'}.`
+      );
+    }
+    if (
+      !droppedGps1AtOrAfterVworkJobEnd &&
+      !droppedGps1ByAfterAnchorBracket &&
+      anchorBracketOutcome === 'kept_g1_after_anchor_g2_exists_and_g1_before_g2'
+    ) {
+      parts.push(
+        `GPS1 kept: after anchor ${anchor ?? '—'}, G2eff=${g2EffectiveForAnchorBracket ?? '—'} strictly after GPS1=${gps1AtAnchorBracket ?? '—'}${bracketUsedTentativeG2 ? ' (VineFence+ tentative enter used for bracket only; polygon GPS2 unchanged).' : ''}`
+      );
+    }
+    if (
+      !droppedGps1AtOrAfterVworkJobEnd &&
+      !droppedGps1ByAfterAnchorBracket &&
+      anchorBracketOutcome === 'evaluated_gps1_not_after_anchor_unchanged' &&
+      gps1BeforeJobEndCheck != null
+    ) {
+      parts.push(
+        `GPS1 not strictly after anchor (${anchor ?? '—'}) — morning EXIT left as fetched (GPS1=${gps1BeforeJobEndCheck}).`
+      );
+    }
+    if (gps1BeforeJobEndCheck == null && !droppedGps1AtOrAfterVworkJobEnd) {
+      parts.push('No GPS step 1 from Part 1 fetch — anchor bracket not applied to a candidate.');
+    }
+    if (anchorBracketOutcome === 'not_evaluated_no_anchor') {
+      parts.push('Job step-1 anchor missing — anchor vs GPS2 bracket skipped.');
+    }
+    if (
+      anchorBracketOutcome === 'not_evaluated_no_gps1' &&
+      gps1BeforeJobEndCheck == null &&
+      !droppedGps1AtOrAfterVworkJobEnd
+    ) {
+      parts.push('No GPS1 time to evaluate (fetch miss).');
+    }
+    const summaryLine =
+      parts.length > 0 ? parts.join(' ') : `GPS step 1 guardrail: ${anchorBracketOutcome.replace(/_/g, ' ')}.`;
+
+    debug.gpsStep1Guardrail = {
+      vworkJobEndForStep12Ceiling: vworkEnd,
+      droppedGps1AtOrAfterVworkJobEnd,
+      gps1BeforeJobEndCheck,
+      gps1TrackingIdBeforeJobEndCheck,
+      jobStartAnchor: anchor,
+      anchorBracketEvaluated,
+      gps1AtAnchorBracket,
+      gps1TrackingIdAtAnchorBracket,
+      gps2AtAnchorBracketCheck,
+      gps2TrackingIdAtAnchorBracketCheck,
+      gps1StrictlyAfterAnchor,
+      keepG1AfterAnchorConditionMet,
+      droppedGps1ByAfterAnchorBracket,
+      step1BracketTrackingFloor: step1BracketTrackingFloorNorm,
+      tentativeVineyardEnterFromOptions: tentativeRawForDebug,
+      tentativeG2QualifiedForBracket,
+      bracketUsedTentativeG2,
+      g2EffectiveForAnchorBracket,
+      anchorBracketOutcome,
+      summaryLine,
+    };
+  }
 }
 
 /**
@@ -1409,7 +2047,7 @@ function applyGpsGuardrails(
  * Lower bound: if **both** step2 and step3 values are non-null, max(step1, step2, step3); if **both** are null,
  * max(step1, positionAfter) only. Callers should pass step2/step3 **after** {@link pruneVineyardGpsForJobEnd} so times that
  * guardrails will drop (e.g. vineyard ENTER after VWork job end) do not raise the floor.
- * Step 5: upper bound min(positionBefore, VWork job end + step5ExtendWineryExitMinutes) when applicable.
+ * Step 5: upper bound max(positionBefore, max(tap, GPS step 4 ENTER) + step5ExtendWineryExitMinutes) when applicable.
  * Updates debug.winery.step4 / step5 and debug.winery.step5SearchWindow (Inspect-only audit).
  */
 function assignWineryStep5SearchWindowDebug(
@@ -1418,6 +2056,8 @@ function assignWineryStep5SearchWindowDebug(
     wineryFenceIds: number[];
     step4Value: string | null;
     vworkStep5: string | null;
+    /** max(tap, GPS step 4); extend added here. */
+    step5ExtendAnchor: string | null;
     step5ExtMin: number;
     vworkStep5SearchEnd: string | null;
     step5WindowEnd: string | null;
@@ -1436,9 +2076,10 @@ function assignWineryStep5SearchWindowDebug(
   if (args.fetchSkippedReason != null) {
     upperExclusiveSource = 'not_computed';
   } else if (winEnd != null && jPlus != null && pbNorm != null) {
-    if (pbNorm === jPlus) upperExclusiveSource = 'position_before_equals_job_end_plus_extend';
-    else if (pbNorm < jPlus) upperExclusiveSource = 'position_before_tighter';
-    else upperExclusiveSource = 'job_end_plus_extend_tighter';
+    if (winEnd === pbNorm && pbNorm === jPlus) upperExclusiveSource = 'position_before_equals_job_end_plus_extend';
+    else if (winEnd === jPlus && jPlus > pbNorm) upperExclusiveSource = 'anchor_plus_extend_wider_than_position_before';
+    else if (winEnd === pbNorm && pbNorm > jPlus) upperExclusiveSource = 'position_before_wider_than_anchor_plus_extend';
+    else upperExclusiveSource = 'not_computed';
   } else if (winEnd != null && jPlus != null && pbNorm == null) {
     upperExclusiveSource = args.step5ExtMin > 0 ? 'only_job_end_plus_extend' : 'only_vwork_step5_no_extend_zero';
   } else if (winEnd != null && pbNorm != null) {
@@ -1446,6 +2087,8 @@ function assignWineryStep5SearchWindowDebug(
   }
 
   const lowerEx = args.step4Value != null ? normalizeTimestampString(args.step4Value) : null;
+  const anchorEx =
+    args.step5ExtendAnchor != null ? normalizeTimestampString(args.step5ExtendAnchor) : null;
   const lines: string[] = [];
   lines.push(
     'Step 5 GPS fetch: first winery EXIT on mapped delivery_winery fences where (strict) step4_ENTER < t < upperExclusive.'
@@ -1454,11 +2097,12 @@ function assignWineryStep5SearchWindowDebug(
     lines.push(`Fetch skipped: ${args.fetchSkippedReason.replace(/_/g, ' ')}.`);
   } else {
     lines.push(`X (lowerExclusive) = GPS step 4 winery ENTER: ${lowerEx ?? '—'}.`);
-    lines.push(`Y (upperExclusive) = min(job window end, job end + Step5Extend): ${winEnd ?? '—'}.`);
-    lines.push(`Job end for step-5 rule (step_5_completed_at ?? actual_end_time): ${args.vworkStep5 ?? '—'}.`);
+    lines.push(`Y (upperExclusive) = max(positionBefore, max(tap, GPS4) + Step5Extend): ${winEnd ?? '—'}.`);
+    lines.push(`Step5 extend anchor max(tap, GPS step 4 ENTER): ${anchorEx ?? '—'}.`);
+    lines.push(`Job end (tap) for step-5 rule (step_5_completed_at ?? actual_end_time): ${args.vworkStep5 ?? '—'}.`);
     lines.push(`positionBefore from request/options: ${pbNorm ?? '—'}.`);
     lines.push(`Step5ExtendWineryExit minutes: ${args.step5ExtMin}.`);
-    lines.push(`jobEnd + extend (candidate for min): ${jPlus ?? '—'}.`);
+    lines.push(`anchor + extend (input to max with position before): ${jPlus ?? '—'}.`);
     lines.push(`upperExclusiveSource: ${upperExclusiveSource.replace(/_/g, ' ')}.`);
     lines.push(
       args.step5ExitQueryRan
@@ -1473,6 +2117,7 @@ function assignWineryStep5SearchWindowDebug(
     upperExclusive: winEnd,
     jobEndForStep5Rule: args.vworkStep5,
     step5ExtendWineryExitMinutes: args.step5ExtMin,
+    step5ExtendAnchor: anchorEx,
     jobEndPlusExtend: jPlus,
     positionBeforeFromOptions: pbNorm,
     upperExclusiveSource,
@@ -1489,7 +2134,8 @@ async function fetchWineryStep4And5ForValues(
   wineryFenceIds: number[],
   step1Value: string | null,
   step2Value: string | null,
-  step3Value: string | null
+  step3Value: string | null,
+  step4AuditInputs: { anchor: string | null; gpsMorningExit: string | null }
 ): Promise<{ step4: GpsStepCandidate | null; step5: GpsStepCandidate | null }> {
   const { positionAfter, positionBefore } = options;
   const vworkStep5Early =
@@ -1501,18 +2147,15 @@ async function fetchWineryStep4And5ForValues(
     vworkStep5Early != null && step5ExtMinEarly > 0
       ? normalizeTimestampString(addMinutesToTimestampAsNZ(vworkStep5Early, step5ExtMinEarly))
       : vworkStep5Early;
-  const step5WindowEndEarly =
-    vworkStep5SearchEndEarly != null
-      ? positionBefore != null && positionBefore < vworkStep5SearchEndEarly
-        ? positionBefore
-        : vworkStep5SearchEndEarly
-      : positionBefore;
+  const step5WindowEndEarly = step5ExitExclusiveUpper(positionBefore, vworkStep5SearchEndEarly);
 
   if (wineryFenceIds.length === 0) {
+    const anchorEarly = step5ExtendAnchorMaxTapAndGps4(vworkStep5Early, null);
     assignWineryStep5SearchWindowDebug(debug, {
       wineryFenceIds,
       step4Value: null,
       vworkStep5: vworkStep5Early,
+      step5ExtendAnchor: anchorEarly,
       step5ExtMin: step5ExtMinEarly,
       vworkStep5SearchEnd: vworkStep5SearchEndEarly,
       step5WindowEnd: step5WindowEndEarly != null ? normalizeTimestampString(step5WindowEndEarly) : null,
@@ -1530,8 +2173,87 @@ async function fetchWineryStep4And5ForValues(
     step2Value == null && step3Value == null
       ? maxTimestampString(step1Value, rawPosAfter) ?? positionAfter
       : maxTimestampString(step1Value, step2Value, step3Value) ?? positionAfter;
-  const step4Result = await getFirstTrackingInWindowWithDebug(truckId, step4LowerBound, positionBefore, wineryFenceIds, 'ENTER');
-  debug.winery.step4 = step4Result.debug;
+  const fetchLowerNorm =
+    normalizeTimestampString(step4LowerBound) ?? String(step4LowerBound).trim().slice(0, 19);
+  const auditRelaxedLower =
+    step2Value == null && step3Value == null
+      ? rawPosAfter
+      : maxTimestampString(rawPosAfter, step2Value, step3Value);
+  const auditRelaxedNorm =
+    auditRelaxedLower != null && String(auditRelaxedLower).trim() !== ''
+      ? normalizeTimestampString(auditRelaxedLower) ?? String(auditRelaxedLower).trim().slice(0, 19)
+      : null;
+  const step1LegNorm =
+    step1Value != null && String(step1Value).trim() !== ''
+      ? normalizeTimestampString(step1Value) ?? String(step1Value).trim().slice(0, 19)
+      : null;
+  const anchorNorm =
+    step4AuditInputs.anchor != null && String(step4AuditInputs.anchor).trim() !== ''
+      ? normalizeTimestampString(step4AuditInputs.anchor) ?? String(step4AuditInputs.anchor).trim().slice(0, 19)
+      : null;
+  const gps1Norm =
+    step4AuditInputs.gpsMorningExit != null && String(step4AuditInputs.gpsMorningExit).trim() !== ''
+      ? normalizeTimestampString(step4AuditInputs.gpsMorningExit) ??
+        String(step4AuditInputs.gpsMorningExit).trim().slice(0, 19)
+      : null;
+  const bothVineMissing = step2Value == null && step3Value == null;
+  const tracePlain =
+    `Step 4 (winery return ENTER) — first mapped delivery_winery ENTER with strict position_time_nz > fetchLowerExclusive AND ` +
+    `(if set) position_time_nz < positionBefore. fetchLowerExclusive = max(step1 leg, ${bothVineMissing ? 'positionAfter only when both vineyard GPS steps missing' : 'step2, step3'}) where step1 leg = anchor(step1 oride∨VWork) ?? GPS morning winery EXIT = ${step1LegNorm ?? '—'}. ` +
+    `Parts: anchor=${anchorNorm ?? '—'} · GPS morning EXIT=${gps1Norm ?? '—'} · step2=${step2Value != null ? (normalizeTimestampString(step2Value) ?? String(step2Value).slice(0, 19)) : '—'} · step3=${step3Value != null ? (normalizeTimestampString(step3Value) ?? String(step3Value).slice(0, 19)) : '—'} · positionAfter(options)=${rawPosAfter ?? '—'} · fetchLowerExclusive=${fetchLowerNorm}. ` +
+    (auditRelaxedNorm != null && auditRelaxedNorm < fetchLowerNorm
+      ? `Audit relaxed lower (max(positionAfter, step2, step3) only) = ${auditRelaxedNorm} — strictly before fetch lower, so ENTER rows between these bounds are excluded from Part 1 only because the step1 leg raised the floor (e.g. early re-entry before contractual job start).`
+      : `Audit relaxed lower matches fetch lower (no anchor-only gap) — same WHERE as audit list would duplicate Part 1 list.`);
+  const step4Result = await getFirstTrackingInWindowWithDebug(
+    truckId,
+    step4LowerBound,
+    positionBefore,
+    wineryFenceIds,
+    'ENTER',
+    false,
+    tracePlain,
+    VINEYARD_WINDOW_MATCH_LIST_CAP
+  );
+  const breakdown: Step4FetchLowerBreakdownDebug = {
+    anchor: anchorNorm,
+    gpsMorningExit: gps1Norm,
+    step1LegUsedForFetch: step1LegNorm,
+    step2:
+      step2Value != null && String(step2Value).trim() !== ''
+        ? normalizeTimestampString(step2Value) ?? String(step2Value).trim().slice(0, 19)
+        : null,
+    step3:
+      step3Value != null && String(step3Value).trim() !== ''
+        ? normalizeTimestampString(step3Value) ?? String(step3Value).trim().slice(0, 19)
+        : null,
+    positionAfterOption: rawPosAfter,
+    fetchLowerExclusive: fetchLowerNorm,
+    auditRelaxedLowerExclusive: auditRelaxedNorm,
+    bothVineyardGpsStepsMissing: bothVineMissing,
+  };
+  debug.winery.step4FetchLowerBreakdown = breakdown;
+
+  const mergedDebug: TrackingLookupDebug = { ...step4Result.debug };
+  if (auditRelaxedNorm != null && auditRelaxedNorm < fetchLowerNorm) {
+    const { rows, truncated } = await fetchOrderedMatchListForSameWindow(
+      truckId,
+      auditRelaxedNorm,
+      positionBefore != null && String(positionBefore).trim() !== ''
+        ? normalizeTimestampString(positionBefore) ?? String(positionBefore).trim().slice(0, 19)
+        : null,
+      wineryFenceIds,
+      'ENTER',
+      false,
+      VINEYARD_WINDOW_MATCH_LIST_CAP
+    );
+    mergedDebug.auditLowerExclusive = auditRelaxedNorm;
+    mergedDebug.auditMatchingRowsOrdered = rows;
+    mergedDebug.auditMatchingRowsTruncated = truncated;
+    mergedDebug.auditMatchingRowsCaption =
+      'Winery ENTER rows with position_time_nz strictly after max(positionAfter, step2, step3) — no step1 leg. ' +
+      'Rows at or before fetchLowerExclusive (max(step1 leg, step2, step3)) are excluded from Part 1 only because anchor ?? GPS step 1 raised the floor; ORDER BY ASC; capped for payload.';
+  }
+  debug.winery.step4 = mergedDebug;
   let step4: GpsStepCandidate | null = null;
   if (step4Result.value != null) {
     step4 = { value: step4Result.value, trackingId: step4Result.trackingId };
@@ -1542,16 +2264,12 @@ async function fetchWineryStep4And5ForValues(
       ? normalizeTimestampString((job.step_5_completed_at ?? job.actual_end_time) as string | Date)
       : null;
   const step5ExtMin = options.step5ExtendWineryExitMinutes ?? STEP5_EXTEND_WINERY_EXIT_DEFAULT_MINUTES;
+  const step5ExtendAnchor = vworkStep5 != null ? step5ExtendAnchorMaxTapAndGps4(vworkStep5, step4Value) : null;
   const vworkStep5SearchEnd =
-    vworkStep5 != null && step5ExtMin > 0
-      ? normalizeTimestampString(addMinutesToTimestampAsNZ(vworkStep5, step5ExtMin))
-      : vworkStep5;
-  const step5WindowEnd =
-    vworkStep5SearchEnd != null
-      ? positionBefore != null && positionBefore < vworkStep5SearchEnd
-        ? positionBefore
-        : vworkStep5SearchEnd
-      : positionBefore;
+    step5ExtendAnchor != null && step5ExtMin > 0
+      ? normalizeTimestampString(addMinutesToTimestampAsNZ(step5ExtendAnchor, step5ExtMin))
+      : step5ExtendAnchor;
+  const step5WindowEnd = step5ExitExclusiveUpper(positionBefore, vworkStep5SearchEnd);
   let step5: GpsStepCandidate | null = null;
   let fetchSkip: WineryStep5SearchWindowDebug['fetchSkippedReason'] = null;
   let exitRan = false;
@@ -1562,8 +2280,6 @@ async function fetchWineryStep4And5ForValues(
     fetchSkip = 'no_vwork_job_end_for_step5_rule';
   } else if (step5WindowEnd == null) {
     fetchSkip = 'no_step5_upper_bound';
-  } else if (vworkStep5 <= step4Value) {
-    fetchSkip = 'vwork_step5_not_after_step4_enter';
   } else {
     exitRan = true;
     const step5Result = await getFirstTrackingInWindowWithDebug(truckId, step4Value, step5WindowEnd, wineryFenceIds, 'EXIT', false);
@@ -1578,6 +2294,7 @@ async function fetchWineryStep4And5ForValues(
     wineryFenceIds,
     step4Value,
     vworkStep5,
+    step5ExtendAnchor,
     step5ExtMin,
     vworkStep5SearchEnd,
     step5WindowEnd: winEndNorm,
@@ -1604,6 +2321,10 @@ async function fetchGpsStepCandidates(
       ? minTimestampString(positionAfter, anchor) ?? positionAfter
       : positionAfter;
   const vineyardBefore = vineyardFetchPositionBefore(positionBefore, job, jobEndCeilingBufferMinutes);
+  const vineyardUpperTrace =
+    vineyardBefore != null && String(vineyardBefore).trim() !== ''
+      ? `t < ${String(vineyardBefore).trim()} (exclusive)`
+      : 'no exclusive upper on vineyard window end';
   const vineyardName = job.vineyard_name ? String(job.vineyard_name).trim() : '';
   const deliveryWinery = job.delivery_winery ? String(job.delivery_winery).trim() : '';
   let step2Value: string | null = null;
@@ -1612,17 +2333,55 @@ async function fetchGpsStepCandidates(
   let vineyardFenceIdsForRefine: number[] | null = null;
 
   if (vineyardName) {
+    const twaForVineyardFloor =
+      trackingWindowAfter != null && String(trackingWindowAfter).trim() !== ''
+        ? String(trackingWindowAfter).trim()
+        : '';
+    const pass1FloorMerge = mergeVineyardPolygonLowerWithOrderingFloor(twaForVineyardFloor, job, null);
+    const step2SqlLowerPass1 = pass1FloorMerge.merged;
+
     const { fenceIds: vineyardFenceIds, debug: vineyardDebug } = await getFenceIdsForVworkNameWithDebug('Vineyard', vineyardName);
     Object.assign(debug.vineyard, vineyardDebug);
     if (vineyardFenceIds.length > 0) {
       vineyardFenceIdsForRefine = vineyardFenceIds;
-      const step2Result = await getFirstTrackingInWindowWithDebug(truckId, trackingWindowAfter, vineyardBefore, vineyardFenceIds, 'ENTER');
+      const mappedNames = vineyardDebug.fenceNamesInList.join('; ') || '—';
+      const resolvedFenceTrace = formatResolvedFenceNamesForGpsTrace(vineyardDebug.resolvedFenceNames);
+      const pass1FloorHint =
+        pass1FloorMerge.floor != null
+          ? ` Ordering-floor merge (same rule as Part 1 guardrail): strictly > ${pass1FloorMerge.floor} (${String(pass1FloorMerge.rule).replace(/_/g, ' ')}); SQL lowerExclusive = max(X, floor) = ${step2SqlLowerPass1}.`
+          : '';
+      const step2Trace =
+        `Step 2 (polygon pass 1) — Vineyard ENTER on mapped geofence_id ANY([${vineyardFenceIds.join(', ')}]) for vWork vineyard "${vineyardName}". Names: [${mappedNames}].` +
+        (resolvedFenceTrace ? ` Fences (name + id): ${resolvedFenceTrace}.` : '') +
+        ` Strict: position_time_nz > ${step2SqlLowerPass1} AND ${vineyardUpperTrace}. Lower inherits X = min(options.positionAfter, jobStep1Anchor): positionAfter=${String(positionAfter ?? '')}; anchor(step1oride∨tap)=${anchor ?? '—'}; X=${trackingWindowAfter}.${pass1FloorHint}`;
+      const step2Result = await getFirstTrackingInWindowWithDebug(
+        truckId,
+        step2SqlLowerPass1,
+        vineyardBefore,
+        vineyardFenceIds,
+        'ENTER',
+        false,
+        step2Trace,
+        VINEYARD_WINDOW_MATCH_LIST_CAP
+      );
       step2Value = step2Result.value;
       debug.vineyard.step2 = step2Result.debug;
       if (step2Result.value != null) candidates.step2 = { value: step2Result.value, trackingId: step2Result.trackingId };
       // Step 3 (Depart Vineyard): first Vineyard EXIT after step 2 (Enter Vineyard), so we don't pick an earlier exit
-      const step3After = step2Value ?? trackingWindowAfter;
-      const step3Result = await getFirstTrackingInWindowWithDebug(truckId, step3After, vineyardBefore, vineyardFenceIds, 'EXIT');
+      const step3After = step2Value ?? step2SqlLowerPass1;
+      const step3Trace =
+        `Step 3 (polygon pass 1) — Vineyard EXIT after step-2 ENTER; lowerExclusive = prior ENTER time or X if no step2: position_time_nz > ${step3After}. Upper: ${vineyardUpperTrace}. Same fence set as step 2.` +
+        (resolvedFenceTrace ? ` Fences (name + id): ${resolvedFenceTrace}.` : '');
+      const step3Result = await getFirstTrackingInWindowWithDebug(
+        truckId,
+        step3After,
+        vineyardBefore,
+        vineyardFenceIds,
+        'EXIT',
+        false,
+        step3Trace,
+        VINEYARD_WINDOW_MATCH_LIST_CAP
+      );
       step3Value = step3Result.value;
       debug.vineyard.step3 = step3Result.debug;
       if (step3Result.value != null) candidates.step3 = { value: step3Result.value, trackingId: step3Result.trackingId };
@@ -1654,25 +2413,43 @@ async function fetchGpsStepCandidates(
       );
       Object.assign(debug.vineyard, sr1VineyardDebug);
       if (sr1FenceIds.length > 0) {
+        const sr1Names = sr1VineyardDebug.fenceNamesInList.join('; ') || '—';
+        const sr1ResolvedTrace = formatResolvedFenceNamesForGpsTrace(sr1VineyardDebug.resolvedFenceNames);
+        const sr2Trace =
+          `Step 2 (VineSR1 fallback, ${VINE_SR1_FALLBACK_VINEYARD_NAME}) — Vineyard ENTER. Fences: [${sr1Names}].` +
+          (sr1ResolvedTrace ? ` Fences (name + id): ${sr1ResolvedTrace}.` : '') +
+          ` Strict: t > ${step2SqlLowerPass1}; ${vineyardUpperTrace}.` +
+          (pass1FloorMerge.floor != null
+            ? ` Same ordering-floor merge as pass 1: max(X, floor) = ${step2SqlLowerPass1}.`
+            : '');
         const sr1Step2 = await getFirstTrackingInWindowWithDebug(
           truckId,
-          trackingWindowAfter,
+          step2SqlLowerPass1,
           vineyardBefore,
           sr1FenceIds,
-          'ENTER'
+          'ENTER',
+          false,
+          sr2Trace,
+          VINEYARD_WINDOW_MATCH_LIST_CAP
         );
         step2Value = sr1Step2.value;
         debug.vineyard.step2 = sr1Step2.debug;
         if (sr1Step2.value != null) {
           candidates.step2 = { value: sr1Step2.value, trackingId: sr1Step2.trackingId };
         }
-        const sr1Step3After = step2Value ?? trackingWindowAfter;
+        const sr1Step3After = step2Value ?? step2SqlLowerPass1;
+        const sr3Trace =
+          `Step 3 (VineSR1) — Vineyard EXIT; lowerExclusive t > ${sr1Step3After}. ${vineyardUpperTrace}.` +
+          (sr1ResolvedTrace ? ` Fences (name + id): ${sr1ResolvedTrace}.` : '');
         const sr1Step3 = await getFirstTrackingInWindowWithDebug(
           truckId,
           sr1Step3After,
           vineyardBefore,
           sr1FenceIds,
-          'EXIT'
+          'EXIT',
+          false,
+          sr3Trace,
+          VINEYARD_WINDOW_MATCH_LIST_CAP
         );
         step3Value = sr1Step3.value;
         debug.vineyard.step3 = sr1Step3.debug;
@@ -1704,7 +2481,17 @@ async function fetchGpsStepCandidates(
   if (deliveryWinery) {
     const { fenceIds: wineryFenceIds, debug: wineryDebug } = await getFenceIdsForVworkNameWithDebug('Winery', deliveryWinery);
     Object.assign(debug.winery, wineryDebug);
-    if (wineryFenceIds.length > 0) {
+    const step1Union = await mergeWineryFenceIdsForStep1MorningExit(job, truckId, wineryFenceIds);
+    const step1MorningFenceIds = step1Union.merged;
+    const baseFenceCount = sortedUniqueFenceIds(wineryFenceIds).length;
+    debug.winery.step1MorningFenceUnion = {
+      previousJobId: step1Union.previousJobId,
+      previousDeliveryWinery: step1Union.previousDeliveryWinery,
+      mergedFenceIdCount: step1MorningFenceIds.length,
+      unionedPreviousWinery:
+        step1MorningFenceIds.length > baseFenceCount && step1Union.previousDeliveryWinery != null,
+    };
+    if (wineryFenceIds.length > 0 || step1MorningFenceIds.length > 0) {
       /**
        * Morning winery EXIT must be strictly before arrive vineyard.
        * When polygon vineyard ENTER (step2Value) exists, cap only with min(window end, polygon ENTER).
@@ -1728,7 +2515,7 @@ async function fetchGpsStepCandidates(
         truckId,
         trackingWindowAfter,
         step1Before,
-        wineryFenceIds
+        step1MorningFenceIds
       );
       debug.winery.step1 = step1Result.debug;
       let step1Value: string | null = null;
@@ -1749,12 +2536,25 @@ async function fetchGpsStepCandidates(
         const exitNorm = normalizeTimestampString(step1Value);
         const lowerEnter = maxTimestampString(trackingWindowAfter, step1Value);
         if (exitNorm != null && lowerEnter != null) {
+          const refineFloorMerge = mergeVineyardPolygonLowerWithOrderingFloor(lowerEnter, job, exitNorm);
+          const step2RefineSqlLower = refineFloorMerge.merged;
+          const refineFloorHint =
+            refineFloorMerge.floor != null
+              ? ` Vineyard ordering floor (Part 1 guardrail): strictly > ${refineFloorMerge.floor} (${String(refineFloorMerge.rule).replace(/_/g, ' ')}); SQL lowerExclusive = max(max(trackingWindowAfter, GPS winery EXIT), floor) = ${step2RefineSqlLower}.`
+              : '';
+          const refineResolvedTrace = formatResolvedFenceNamesForGpsTrace(debug.vineyard.resolvedFenceNames);
+          const r2Trace =
+            `Step 2 (refine after morning winery EXIT) — Vineyard ENTER. Base lowerExclusive = max(trackingWindowAfter, GPS winery EXIT) = max(${trackingWindowAfter}, ${step1Value}) = ${lowerEnter}.${refineFloorHint} ${vineyardUpperTrace}. Replaces pass-1 if first ENTER after exit is strictly after exit time.` +
+            (refineResolvedTrace ? ` Fences (name + id): ${refineResolvedTrace}.` : '');
           const r2AfterExit = await getFirstTrackingInWindowWithDebug(
             truckId,
-            lowerEnter,
+            step2RefineSqlLower,
             vineyardBefore,
             vineyardFenceIdsForRefine,
-            'ENTER'
+            'ENTER',
+            false,
+            r2Trace,
+            VINEYARD_WINDOW_MATCH_LIST_CAP
           );
           const entNorm =
             r2AfterExit.value != null ? normalizeTimestampString(r2AfterExit.value) : null;
@@ -1763,12 +2563,18 @@ async function fetchGpsStepCandidates(
             step2Value = r2AfterExit.value;
             debug.vineyard.step2 = r2AfterExit.debug;
             const step3AfterRefine = step2Value ?? lowerEnter;
+            const r3Trace =
+              `Step 3 (refine) — Vineyard EXIT; lowerExclusive t > ${step3AfterRefine} (step-2 ENTER or lowerEnter). ${vineyardUpperTrace}.` +
+              (refineResolvedTrace ? ` Fences (name + id): ${refineResolvedTrace}.` : '');
             const r3After = await getFirstTrackingInWindowWithDebug(
               truckId,
               step3AfterRefine,
               vineyardBefore,
               vineyardFenceIdsForRefine,
-              'EXIT'
+              'EXIT',
+              false,
+              r3Trace,
+              VINEYARD_WINDOW_MATCH_LIST_CAP
             );
             step3Value = r3After.value;
             debug.vineyard.step3 = r3After.debug;
@@ -1809,7 +2615,7 @@ async function fetchGpsStepCandidates(
               truckId,
               trackingWindowAfter,
               step1BeforeRef,
-              wineryFenceIds
+              step1MorningFenceIds
             );
             debug.winery.step1 = step1Refined.debug;
             if (step1Refined.value != null) {
@@ -1825,7 +2631,7 @@ async function fetchGpsStepCandidates(
       }
       await attachWineryStep1MorningExitAudit(debug, {
         device: truckId,
-        wineryFenceIds,
+        wineryFenceIds: step1MorningFenceIds,
         trackingWindowAfter,
         step1MorningUpperExclusive: step1MorningUpperForAudit,
         positionAfter,
@@ -1843,38 +2649,63 @@ async function fetchGpsStepCandidates(
         job,
         jobEndCeilingBufferMinutes
       );
-      const { step4, step5 } = await fetchWineryStep4And5ForValues(
-        job,
-        options,
-        debug,
-        truckId,
-        wineryFenceIds,
-        step1ValueForStep4,
-        step23ForStep4Floor.step2,
-        step23ForStep4Floor.step3
-      );
-      if (step4 != null) candidates.step4 = step4;
-      if (step5 != null) candidates.step5 = step5;
+      if (wineryFenceIds.length > 0) {
+        const { step4, step5 } = await fetchWineryStep4And5ForValues(
+          job,
+          options,
+          debug,
+          truckId,
+          wineryFenceIds,
+          step1ValueForStep4,
+          step23ForStep4Floor.step2,
+          step23ForStep4Floor.step3,
+          { anchor, gpsMorningExit: step1Value }
+        );
+        if (step4 != null) candidates.step4 = step4;
+        if (step5 != null) candidates.step5 = step5;
+      } else {
+        const vworkStep5NoFence =
+          (job.step_5_completed_at ?? job.actual_end_time) != null
+            ? normalizeTimestampString((job.step_5_completed_at ?? job.actual_end_time) as string | Date)
+            : null;
+        const step5ExtNoFence = options.step5ExtendWineryExitMinutes ?? STEP5_EXTEND_WINERY_EXIT_DEFAULT_MINUTES;
+        const anchorNoFence = step5ExtendAnchorMaxTapAndGps4(vworkStep5NoFence, null);
+        const vworkSearchEndNoFence =
+          anchorNoFence != null && step5ExtNoFence > 0
+            ? normalizeTimestampString(addMinutesToTimestampAsNZ(anchorNoFence, step5ExtNoFence))
+            : anchorNoFence;
+        const step5WinEndNoFence = step5ExitExclusiveUpper(positionBefore, vworkSearchEndNoFence);
+        assignWineryStep5SearchWindowDebug(debug, {
+          wineryFenceIds,
+          step4Value: null,
+          vworkStep5: vworkStep5NoFence,
+          step5ExtendAnchor: anchorNoFence,
+          step5ExtMin: step5ExtNoFence,
+          vworkStep5SearchEnd: vworkSearchEndNoFence,
+          step5WindowEnd:
+            step5WinEndNoFence != null ? normalizeTimestampString(step5WinEndNoFence) : null,
+          positionBefore,
+          step5ExitQueryRan: false,
+          fetchSkippedReason: 'no_mapped_winery_fences',
+        });
+      }
     } else {
       const vworkStep5NoFence =
         (job.step_5_completed_at ?? job.actual_end_time) != null
           ? normalizeTimestampString((job.step_5_completed_at ?? job.actual_end_time) as string | Date)
           : null;
       const step5ExtNoFence = options.step5ExtendWineryExitMinutes ?? STEP5_EXTEND_WINERY_EXIT_DEFAULT_MINUTES;
+      const anchorNoFence2 = step5ExtendAnchorMaxTapAndGps4(vworkStep5NoFence, null);
       const vworkSearchEndNoFence =
-        vworkStep5NoFence != null && step5ExtNoFence > 0
-          ? normalizeTimestampString(addMinutesToTimestampAsNZ(vworkStep5NoFence, step5ExtNoFence))
-          : vworkStep5NoFence;
-      const step5WinEndNoFence =
-        vworkSearchEndNoFence != null
-          ? positionBefore != null && positionBefore < vworkSearchEndNoFence
-            ? positionBefore
-            : vworkSearchEndNoFence
-          : positionBefore;
+        anchorNoFence2 != null && step5ExtNoFence > 0
+          ? normalizeTimestampString(addMinutesToTimestampAsNZ(anchorNoFence2, step5ExtNoFence))
+          : anchorNoFence2;
+      const step5WinEndNoFence = step5ExitExclusiveUpper(positionBefore, vworkSearchEndNoFence);
       assignWineryStep5SearchWindowDebug(debug, {
         wineryFenceIds,
         step4Value: null,
         vworkStep5: vworkStep5NoFence,
+        step5ExtendAnchor: anchorNoFence2,
         step5ExtMin: step5ExtNoFence,
         vworkStep5SearchEnd: vworkSearchEndNoFence,
         step5WindowEnd:
@@ -1890,20 +2721,17 @@ async function fetchGpsStepCandidates(
         ? normalizeTimestampString((job.step_5_completed_at ?? job.actual_end_time) as string | Date)
         : null;
     const step5ExtNd = options.step5ExtendWineryExitMinutes ?? STEP5_EXTEND_WINERY_EXIT_DEFAULT_MINUTES;
+    const anchorNd = step5ExtendAnchorMaxTapAndGps4(vworkStep5NoDel, null);
     const vworkSearchNd =
-      vworkStep5NoDel != null && step5ExtNd > 0
-        ? normalizeTimestampString(addMinutesToTimestampAsNZ(vworkStep5NoDel, step5ExtNd))
-        : vworkStep5NoDel;
-    const step5WinNd =
-      vworkSearchNd != null
-        ? positionBefore != null && positionBefore < vworkSearchNd
-          ? positionBefore
-          : vworkSearchNd
-        : positionBefore;
+      anchorNd != null && step5ExtNd > 0
+        ? normalizeTimestampString(addMinutesToTimestampAsNZ(anchorNd, step5ExtNd))
+        : anchorNd;
+    const step5WinNd = step5ExitExclusiveUpper(positionBefore, vworkSearchNd);
     assignWineryStep5SearchWindowDebug(debug, {
       wineryFenceIds: [],
       step4Value: null,
       vworkStep5: vworkStep5NoDel,
+      step5ExtendAnchor: anchorNd,
       step5ExtMin: step5ExtNd,
       vworkStep5SearchEnd: vworkSearchNd,
       step5WindowEnd: step5WinNd != null ? normalizeTimestampString(step5WinNd) : null,
@@ -1912,7 +2740,14 @@ async function fetchGpsStepCandidates(
       fetchSkippedReason: 'no_delivery_winery_on_job',
     });
   }
-  applyGpsGuardrails(candidates, job, jobEndCeilingBufferMinutes, positionAfter);
+  const step1BracketFloor =
+    trackingWindowAfter != null && String(trackingWindowAfter).trim() !== ''
+      ? normalizeTimestampString(trackingWindowAfter) ?? String(trackingWindowAfter).trim().slice(0, 19)
+      : null;
+  applyGpsGuardrails(candidates, job, jobEndCeilingBufferMinutes, positionAfter, debug, {
+    tentativeVineyardEnterForStep1Bracket: options.tentativeVineyardEnterForStep1Bracket ?? null,
+    step1BracketTrackingFloor: step1BracketFloor,
+  });
   if (candidates.vineSr1Fallback && (candidates.step2 == null || candidates.step3 == null)) {
     delete candidates.vineSr1Fallback;
     delete debug.vineSr1;
@@ -2033,6 +2868,73 @@ function vworkStep1FromJobFields(job: JobForDerivedSteps): string | null {
 function normalizedStep1Oride(job: JobForDerivedSteps): string | null {
   if (job.step1oride == null || String(job.step1oride).trim() === '') return null;
   return normalizeTimestampString(String(job.step1oride).trim());
+}
+
+/**
+ * Floor for dropping vineyard GPS steps 2/3/5 when t ≤ floor (and winery step‑4 max lower bound).
+ * With **step1oride:** use **max(oride, GPS1)** when GPS1 survived brackets (cannot arrive before physical exit).
+ * Without oride: **min(tap, GPS1)** when both exist (late tap must not kill ENTER after morning EXIT).
+ * Else: GPS1 only, else tap only.
+ */
+function computeVineyardGpsOrderingFloorDebug(
+  job: JobForDerivedSteps,
+  gps1NormAfterBracket: string | null
+): VineyardGpsOrderingFloorDebug {
+  const orideNorm = normalizedStep1Oride(job);
+  const tapOnlyNorm = vworkStep1FromJobFields(job);
+  let rule: VineyardGpsOrderingFloorRule;
+  let floorFor235: string | null;
+
+  if (orideNorm != null) {
+    if (gps1NormAfterBracket != null) {
+      floorFor235 = maxTimestampString(orideNorm, gps1NormAfterBracket) ?? orideNorm;
+      rule = 'max_oride_and_gps1';
+    } else {
+      floorFor235 = orideNorm;
+      rule = 'oride_only';
+    }
+  } else if (gps1NormAfterBracket != null && tapOnlyNorm != null) {
+    floorFor235 = minTimestampString(tapOnlyNorm, gps1NormAfterBracket) ?? gps1NormAfterBracket;
+    rule = 'min_tap_and_gps1_no_oride';
+  } else if (gps1NormAfterBracket != null) {
+    floorFor235 = gps1NormAfterBracket;
+    rule = 'gps1_only';
+  } else {
+    floorFor235 = tapOnlyNorm;
+    rule = 'tap_only';
+  }
+
+  const summaryLine = `Vineyard GPS steps 2/3/5: drop when t≤${floorFor235 ?? '—'} (need strictly t>${floorFor235 ?? '—'}). Rule=${rule}; parts: step1oride=${orideNorm ?? '—'}, GPS1(after bracket)=${gps1NormAfterBracket ?? '—'}, tap=${tapOnlyNorm ?? '—'}.`;
+
+  return { orideNorm, gps1NormAfterBracket, tapOnlyNorm, floorFor235, rule, summaryLine };
+}
+
+/**
+ * Raise vineyard Step 2 polygon SQL `lowerExclusive` so LIMIT 1 matches the same “strictly after floor”
+ * rule as {@link applyGpsGuardrails} ({@link computeVineyardGpsOrderingFloorDebug}: oride / max(oride, GPS1) /
+ * min(tap, GPS1) / …). Pass **morning winery EXIT** norm for `gps1MorningExitNorm` once known so the floor
+ * can be max(oride, GPS1); use `null` before GPS1 exists (oride∨tap-only branch). Without this merge, the
+ * query can return the first ENTER after winery EXIT that is still on or before the floor and is later
+ * dropped, while a later ENTER would qualify but never wins LIMIT 1.
+ */
+function mergeVineyardPolygonLowerWithOrderingFloor(
+  polygonLowerExclusive: string,
+  job: JobForDerivedSteps,
+  gps1MorningExitNorm: string | null
+): { merged: string; floor: string | null; rule: VineyardGpsOrderingFloorRule } {
+  const raw = polygonLowerExclusive != null ? String(polygonLowerExclusive).trim() : '';
+  const lo = raw !== '' ? normalizeTimestampString(raw) ?? raw.slice(0, 19) : '';
+  const floorDbg = computeVineyardGpsOrderingFloorDebug(job, gps1MorningExitNorm);
+  const floor = floorDbg.floorFor235;
+  if (floor == null) {
+    return { merged: lo || raw, floor: null, rule: floorDbg.rule };
+  }
+  const f = normalizeTimestampString(floor) ?? floor.slice(0, 19);
+  if (!lo) {
+    return { merged: f, floor, rule: floorDbg.rule };
+  }
+  const merged = maxTimestampString(lo, f) ?? lo;
+  return { merged, floor, rule: floorDbg.rule };
 }
 
 /**
@@ -2357,12 +3259,13 @@ function decideFinalSteps(
   }
   if (candidates.step5 && vworkStep5 != null) {
     const gpsNorm = normalizeTimestampString(candidates.step5.value);
+    const anchor = step5ExtendAnchorMaxTapAndGps4(vworkStep5, candidates.step4?.value ?? null);
     if (gpsNorm != null) {
       if (gpsNorm < vworkStep5) {
         result.step5Gps = candidates.step5.value;
         result.step5TrackingId = candidates.step5.trackingId;
-      } else if (step5ExtendWineryExitMinutes > 0) {
-        const upper = normalizeTimestampString(addMinutesToTimestampAsNZ(vworkStep5, step5ExtendWineryExitMinutes));
+      } else if (step5ExtendWineryExitMinutes > 0 && anchor != null) {
+        const upper = normalizeTimestampString(addMinutesToTimestampAsNZ(anchor, step5ExtendWineryExitMinutes));
         if (upper != null && gpsNorm >= vworkStep5 && gpsNorm < upper) {
           result.step5Gps = candidates.step5.value;
           result.step5TrackingId = candidates.step5.trackingId;
@@ -2379,7 +3282,8 @@ function attachStep5DecideDebug(
   step5Candidate: GpsStepCandidate | null | undefined,
   job: JobForDerivedSteps,
   step5ExtendWineryExitMinutes: number,
-  acceptedStep5Gps: string | null
+  acceptedStep5Gps: string | null,
+  step4GpsEnter: string | null | undefined
 ): void {
   const vworkStep5 =
     (job.step_5_completed_at ?? job.actual_end_time) != null
@@ -2387,9 +3291,11 @@ function attachStep5DecideDebug(
       : null;
   const candNorm =
     step5Candidate?.value != null ? normalizeTimestampString(step5Candidate.value) : null;
+  const step5ExtendAnchor =
+    vworkStep5 != null ? step5ExtendAnchorMaxTapAndGps4(vworkStep5, step4GpsEnter) : null;
   const upperExclusive =
-    vworkStep5 != null && step5ExtendWineryExitMinutes > 0
-      ? normalizeTimestampString(addMinutesToTimestampAsNZ(vworkStep5, step5ExtendWineryExitMinutes))
+    step5ExtendAnchor != null && step5ExtendWineryExitMinutes > 0
+      ? normalizeTimestampString(addMinutesToTimestampAsNZ(step5ExtendAnchor, step5ExtendWineryExitMinutes))
       : null;
 
   let outcome: Step5DecideDebug['outcome'];
@@ -2408,7 +3314,7 @@ function attachStep5DecideDebug(
       summaryLine = `GPS step 5 kept: EXIT ${candNorm} is strictly before VWork job end ${vworkStep5}.`;
     } else {
       outcome = 'accepted_exit_after_job_end_within_extend';
-      summaryLine = `GPS step 5 kept: EXIT ${candNorm} is on/after job end ${vworkStep5} but strictly before exclusive upper ${upperExclusive ?? 'n/a'} (Step5Extend ${step5ExtendWineryExitMinutes} min).`;
+      summaryLine = `GPS step 5 kept: EXIT ${candNorm} is on/after job end ${vworkStep5} but strictly before exclusive upper ${upperExclusive ?? 'n/a'} (max(tap, GPS step 4) + Step5Extend ${step5ExtendWineryExitMinutes} min).`;
     }
   } else if (candNorm < vworkStep5) {
     outcome = 'no_candidate_after_guardrails';
@@ -2418,10 +3324,10 @@ function attachStep5DecideDebug(
     summaryLine = `EXIT ${candNorm} is at/after job end ${vworkStep5} and Step5ExtendWineryExit is ${step5ExtendWineryExitMinutes} — Part 2 rejects.`;
   } else if (upperExclusive != null && candNorm >= upperExclusive) {
     outcome = 'rejected_exit_at_or_after_job_end_outside_extend';
-    summaryLine = `EXIT ${candNorm} is at/after exclusive upper ${upperExclusive} (job end + Step5Extend) — Part 2 rejects (outside “complete before leave” band).`;
+    summaryLine = `EXIT ${candNorm} is at/after exclusive upper ${upperExclusive} (max(tap, GPS4) + Step5Extend) — Part 2 rejects (outside “complete before leave” band).`;
   } else {
     outcome = 'rejected_exit_at_or_after_job_end_outside_extend';
-    summaryLine = `EXIT ${candNorm} not accepted as GPS step 5 vs job end ${vworkStep5} / extend ${step5ExtendWineryExitMinutes} min.`;
+    summaryLine = `EXIT ${candNorm} not accepted as GPS step 5 vs job end ${vworkStep5} / anchor ${step5ExtendAnchor ?? 'n/a'} / extend ${step5ExtendWineryExitMinutes} min.`;
   }
 
   debug.step5Decide = {
@@ -2433,6 +3339,7 @@ function attachStep5DecideDebug(
         ? step5Candidate.trackingId
         : null,
     acceptAfterJobEndExclusiveUpper: upperExclusive,
+    step5ExtendAnchor: step5ExtendAnchor != null ? normalizeTimestampString(step5ExtendAnchor) : null,
     step5GpsAccepted: acceptedStep5Gps != null,
     outcome,
     summaryLine,
@@ -2485,7 +3392,8 @@ export async function deriveGpsLayerAfterVineFencePlus(
         wineryFenceIds,
         step1ForStep4,
         step23ForStep4Floor.step2,
-        step23ForStep4Floor.step3
+        step23ForStep4Floor.step3,
+        { anchor, gpsMorningExit: step123.step1?.value ?? null }
       );
       if (step4 != null) candidates.step4 = step4;
       if (step5 != null) candidates.step5 = step5;
@@ -2494,22 +3402,17 @@ export async function deriveGpsLayerAfterVineFencePlus(
         (job.step_5_completed_at ?? job.actual_end_time) != null
           ? normalizeTimestampString((job.step_5_completed_at ?? job.actual_end_time) as string | Date)
           : null;
+      const anchorVfp = step5ExtendAnchorMaxTapAndGps4(vworkStep5NoFence, null);
       const vworkSearchEndNoFence =
-        vworkStep5NoFence != null && step5Ext > 0
-          ? normalizeTimestampString(addMinutesToTimestampAsNZ(vworkStep5NoFence, step5Ext))
-          : vworkStep5NoFence;
-      const step5WinEndNoFence =
-        vworkSearchEndNoFence != null
-          ? options.positionBefore != null &&
-            String(options.positionBefore).trim() !== '' &&
-            options.positionBefore < vworkSearchEndNoFence
-            ? options.positionBefore
-            : vworkSearchEndNoFence
-          : options.positionBefore;
+        anchorVfp != null && step5Ext > 0
+          ? normalizeTimestampString(addMinutesToTimestampAsNZ(anchorVfp, step5Ext))
+          : anchorVfp;
+      const step5WinEndNoFence = step5ExitExclusiveUpper(options.positionBefore, vworkSearchEndNoFence);
       assignWineryStep5SearchWindowDebug(debug, {
         wineryFenceIds,
         step4Value: null,
         vworkStep5: vworkStep5NoFence,
+        step5ExtendAnchor: anchorVfp,
         step5ExtMin: step5Ext,
         vworkStep5SearchEnd: vworkSearchEndNoFence,
         step5WindowEnd:
@@ -2524,22 +3427,17 @@ export async function deriveGpsLayerAfterVineFencePlus(
       (job.step_5_completed_at ?? job.actual_end_time) != null
         ? normalizeTimestampString((job.step_5_completed_at ?? job.actual_end_time) as string | Date)
         : null;
+    const anchorVfpNd = step5ExtendAnchorMaxTapAndGps4(vworkStep5NoDel, null);
     const vworkSearchNd =
-      vworkStep5NoDel != null && step5Ext > 0
-        ? normalizeTimestampString(addMinutesToTimestampAsNZ(vworkStep5NoDel, step5Ext))
-        : vworkStep5NoDel;
-    const step5WinNd =
-      vworkSearchNd != null
-        ? options.positionBefore != null &&
-          String(options.positionBefore).trim() !== '' &&
-          options.positionBefore < vworkSearchNd
-          ? options.positionBefore
-          : vworkSearchNd
-        : options.positionBefore;
+      anchorVfpNd != null && step5Ext > 0
+        ? normalizeTimestampString(addMinutesToTimestampAsNZ(anchorVfpNd, step5Ext))
+        : anchorVfpNd;
+    const step5WinNd = step5ExitExclusiveUpper(options.positionBefore, vworkSearchNd);
     assignWineryStep5SearchWindowDebug(debug, {
       wineryFenceIds: [],
       step4Value: null,
       vworkStep5: vworkStep5NoDel,
+      step5ExtendAnchor: anchorVfpNd,
       step5ExtMin: step5Ext,
       vworkStep5SearchEnd: vworkSearchNd,
       step5WindowEnd: step5WinNd != null ? normalizeTimestampString(step5WinNd) : null,
@@ -2549,9 +3447,23 @@ export async function deriveGpsLayerAfterVineFencePlus(
     });
   }
   const buf = options.jobEndCeilingBufferMinutes ?? JOB_END_CEILING_BUFFER_DEFAULT_MINUTES;
-  applyGpsGuardrails(candidates, job, buf, options.positionAfter);
+  const anchorVfpBracket = jobStep1Anchor(job);
+  const twVfp =
+    anchorVfpBracket != null &&
+    options.positionAfter != null &&
+    String(options.positionAfter).trim() !== ''
+      ? minTimestampString(options.positionAfter, anchorVfpBracket) ?? options.positionAfter
+      : options.positionAfter;
+  const step1BracketFloorVfp =
+    twVfp != null && String(twVfp).trim() !== ''
+      ? normalizeTimestampString(twVfp) ?? String(twVfp).trim().slice(0, 19)
+      : null;
+  applyGpsGuardrails(candidates, job, buf, options.positionAfter, debug, {
+    tentativeVineyardEnterForStep1Bracket: options.tentativeVineyardEnterForStep1Bracket ?? null,
+    step1BracketTrackingFloor: step1BracketFloorVfp,
+  });
   const decided = decideFinalSteps(candidates, job, step5Ext);
-  attachStep5DecideDebug(debug, candidates.step5, job, step5Ext, decided.step5Gps);
+  attachStep5DecideDebug(debug, candidates.step5, job, step5Ext, decided.step5Gps, candidates.step4?.value);
   return decided;
 }
 
@@ -2660,7 +3572,7 @@ export async function deriveGpsStepsForJob(
   const candidates = await fetchGpsStepCandidates(job, options, debug);
   const step5Ext = options.step5ExtendWineryExitMinutes ?? STEP5_EXTEND_WINERY_EXIT_DEFAULT_MINUTES;
   const gpsOnly = decideFinalSteps(candidates, job, step5Ext);
-  attachStep5DecideDebug(debug, candidates.step5, job, step5Ext, gpsOnly.step5Gps);
+  attachStep5DecideDebug(debug, candidates.step5, job, step5Ext, gpsOnly.step5Gps, candidates.step4?.value);
   const finalized = finalizeDerivedSteps(gpsOnly, job);
   const { step1Via, step2Via, step3Via, step4Via, step5Via, step1ActualOverride, cleanupRulesReport, ...rest } =
     finalized;

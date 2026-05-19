@@ -9,6 +9,7 @@ import { useSummaryHistory } from '@/contexts/SummaryHistoryContext';
 import { listSummaryHistory } from '@/lib/summary-history-storage';
 
 type InspectHistoryEntry = {
+  id: number;
   job_id: string;
   delivery_winery: string | null;
   vineyard_name: string | null;
@@ -69,7 +70,7 @@ function SidebarFlyoutPortal({
   return createPortal(
     <div
       ref={contentRef}
-      className="fixed z-[10000] max-h-[min(80vh,480px)] overflow-y-auto rounded-lg border border-zinc-200 bg-white py-1 shadow-xl dark:border-zinc-600 dark:bg-zinc-800"
+      className="fixed z-[10000] max-h-[min(85vh,560px)] overflow-y-auto rounded-lg border border-zinc-200 bg-white py-1 shadow-xl dark:border-zinc-600 dark:bg-zinc-800"
       style={{
         top: pos.top,
         left: pos.left,
@@ -144,7 +145,8 @@ export default function Sidebar() {
   const router = useRouter();
   const { viewMode, setViewMode, clientCustomer, setClientCustomer, clientCustomerLocked, allowedViewModes, userType, refreshUser } = useViewMode();
   const [customers, setCustomers] = useState<string[]>([]);
-  const [inspectHistory, setInspectHistory] = useState<InspectHistoryEntry[]>([]);
+  const [inspectPinned, setInspectPinned] = useState<InspectHistoryEntry[]>([]);
+  const [inspectRecent, setInspectRecent] = useState<InspectHistoryEntry[]>([]);
   const [historyOpen, setHistoryOpen] = useState(false);
   const [recentViewsOpen, setRecentViewsOpen] = useState(false);
   const historyRef = useRef<HTMLDivElement>(null);
@@ -155,8 +157,16 @@ export default function Sidebar() {
   const fetchInspectHistory = useCallback(() => {
     fetch('/api/inspect-history')
       .then((r) => r.json())
-      .then((data) => setInspectHistory(data?.entries ?? []))
-      .catch(() => setInspectHistory([]));
+      .then((data) => {
+        const pinned = Array.isArray(data?.pinned) ? (data.pinned as InspectHistoryEntry[]) : [];
+        const recent = Array.isArray(data?.recent) ? (data.recent as InspectHistoryEntry[]) : [];
+        setInspectPinned(pinned);
+        setInspectRecent(recent);
+      })
+      .catch(() => {
+        setInspectPinned([]);
+        setInspectRecent([]);
+      });
   }, []);
 
   useEffect(() => {
@@ -265,26 +275,14 @@ export default function Sidebar() {
         )}
         <div className="my-1 border-t border-zinc-200 dark:border-zinc-700" />
         {viewMode === 'client' ? (
-          <>
-            <div className="flex flex-col gap-0.5">
-              <Link
-                href="/query/summary"
-                className={`rounded px-3 py-2 text-sm ${
-                  pathname === '/query/summary' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
-                }`}
-              >
-                Summary
-              </Link>
-              <Link
-                href="/query/distances"
-                className={`rounded px-3 py-1.5 pl-5 text-[13px] ${
-                  pathname === '/query/distances' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
-                }`}
-              >
-                Distances
-              </Link>
-            </div>
-          </>
+          <Link
+            href="/query/summary"
+            className={`rounded px-3 py-2 text-sm ${
+              pathname === '/query/summary' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
+            }`}
+          >
+            Summary
+          </Link>
         ) : (
           <>
             <div className="mt-2 rounded-md border-l-4 border-blue-500 bg-blue-50 px-3 py-1.5 text-xs font-bold uppercase tracking-wider text-blue-800 dark:border-blue-400 dark:bg-blue-950/50 dark:text-blue-200">
@@ -337,49 +335,89 @@ export default function Sidebar() {
                 }}
                 className="w-full rounded px-3 py-1.5 text-left text-xs text-zinc-500 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800"
               >
-                Recent jobs {inspectHistory.length > 0 ? `(${inspectHistory.length})` : ''}
+                Recent jobs{' '}
+                {inspectPinned.length + inspectRecent.length > 0
+                  ? `(${inspectPinned.length + inspectRecent.length})`
+                  : ''}
               </button>
               <SidebarFlyoutPortal open={historyOpen} anchorRef={historyRef} contentRef={inspectFlyoutRef}>
-                {inspectHistory.length === 0 ? (
+                {inspectPinned.length === 0 && inspectRecent.length === 0 ? (
                   <div className="px-3 py-2 text-xs text-zinc-500 dark:text-zinc-400">No recent jobs</div>
                 ) : (
-                  inspectHistory.map((entry) => (
-                    <button
-                      key={entry.job_id}
-                      type="button"
-                      role="option"
-                      onClick={() => {
-                        setHistoryOpen(false);
-                        setInspectHistory((prev) => {
-                          const rest = prev.filter((e) => String(e.job_id).trim() !== String(entry.job_id).trim());
-                          return [entry, ...rest];
-                        });
-                        router.push(buildInspectUrl(entry));
-                      }}
-                      className="w-full px-3 py-2 text-left text-xs hover:bg-zinc-100 dark:hover:bg-zinc-700"
-                    >
-                      <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0">
-                        <span className="font-medium text-zinc-900 dark:text-zinc-100">{entry.job_id}</span>
-                        {entry.note ? (
-                          <span className="rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-900 dark:bg-amber-900/40 dark:text-amber-100">
-                            Pinned
-                          </span>
-                        ) : null}
-                      </div>
-                      {entry.note ? (
-                        <div className="mt-0.5 line-clamp-2 text-[11px] italic text-amber-900 dark:text-amber-100/90" title={entry.note}>
-                          {entry.note}
+                  <>
+                    {inspectPinned.length > 0 ? (
+                      <div className="border-b border-zinc-200 pb-1 dark:border-zinc-600">
+                        <div className="px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wide text-amber-800 dark:text-amber-200">
+                          Pinned
                         </div>
-                      ) : null}
-                      <div className="mt-0.5 truncate text-zinc-600 dark:text-zinc-400">
-                        {[entry.delivery_winery, entry.vineyard_name].filter(Boolean).join(' · ') || '—'}
+                        {inspectPinned.map((entry) => {
+                          const noteText = entry.note?.trim() ?? '';
+                          return (
+                            <button
+                              key={entry.id}
+                              type="button"
+                              role="option"
+                              aria-selected={false}
+                              onClick={() => {
+                                setHistoryOpen(false);
+                                setInspectPinned((prev) => {
+                                  const rest = prev.filter((e) => e.id !== entry.id);
+                                  return [entry, ...rest];
+                                });
+                                router.push(buildInspectUrl(entry));
+                              }}
+                              className="w-full px-3 py-2 text-left text-xs hover:bg-zinc-100 dark:hover:bg-zinc-700"
+                            >
+                              <div className="font-mono text-[13px] font-medium text-zinc-900 dark:text-zinc-100">{entry.job_id}</div>
+                              <div
+                                className="mt-0.5 line-clamp-4 text-[11px] italic text-amber-900 dark:text-amber-100/90"
+                                title={noteText || undefined}
+                              >
+                                {noteText || <span className="text-zinc-400 not-italic dark:text-zinc-500">No comment</span>}
+                              </div>
+                            </button>
+                          );
+                        })}
                       </div>
-                      <div className="mt-0.5 flex flex-wrap gap-x-2 gap-y-0 text-zinc-500 dark:text-zinc-500">
-                        {entry.worker && <span>{entry.worker}</span>}
-                        {entry.actual_start_time && <span>{entry.actual_start_time}</span>}
+                    ) : null}
+                    {inspectRecent.length > 0 ? (
+                      <div className={inspectPinned.length > 0 ? 'pt-1' : ''}>
+                        {inspectPinned.length > 0 ? (
+                          <div className="px-3 py-1.5 text-[10px] font-semibold uppercase tracking-wide text-zinc-500 dark:text-zinc-400">
+                            Recent
+                          </div>
+                        ) : null}
+                        {inspectRecent.map((entry) => (
+                          <button
+                            key={entry.id}
+                            type="button"
+                            role="option"
+                            aria-selected={false}
+                            onClick={() => {
+                              setHistoryOpen(false);
+                              setInspectRecent((prev) => {
+                                const rest = prev.filter((e) => e.id !== entry.id);
+                                return [entry, ...rest];
+                              });
+                              router.push(buildInspectUrl(entry));
+                            }}
+                            className="w-full px-3 py-2 text-left text-xs hover:bg-zinc-100 dark:hover:bg-zinc-700"
+                          >
+                            <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0">
+                              <span className="font-medium text-zinc-900 dark:text-zinc-100">{entry.job_id}</span>
+                            </div>
+                            <div className="mt-0.5 truncate text-zinc-600 dark:text-zinc-400">
+                              {[entry.delivery_winery, entry.vineyard_name].filter(Boolean).join(' · ') || '—'}
+                            </div>
+                            <div className="mt-0.5 flex flex-wrap gap-x-2 gap-y-0 text-zinc-500 dark:text-zinc-500">
+                              {entry.worker && <span>{entry.worker}</span>}
+                              {entry.actual_start_time && <span>{entry.actual_start_time}</span>}
+                            </div>
+                          </button>
+                        ))}
                       </div>
-                    </button>
-                  ))
+                    ) : null}
+                  </>
                 )}
               </SidebarFlyoutPortal>
             </div>

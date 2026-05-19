@@ -14,6 +14,7 @@ export type DistancesReportRow =
       customer: string;
       template: string;
       winery: string;
+      vineyard: string;
       truck: string;
       distanceKm: number;
     }
@@ -61,6 +62,7 @@ function labelOf(row: DistancesJobRow) {
     customer: String(row.Customer ?? row.customer ?? '').trim() || '—',
     template: String(row.template ?? '').trim() || '—',
     winery: String(row.delivery_winery ?? '').trim() || '—',
+    vineyard: String(row.vineyard_name ?? '').trim() || '—',
     truck: String(row.truck_id ?? '').trim() || '—',
   };
 }
@@ -109,11 +111,13 @@ function buildCustomerTemplateWineryTruck(withKm: DistancesJobRow[]): DistancesR
           let trKm = 0;
           for (const row of bucket) {
             const km = distanceRoundTripKmFromRow(row)!;
+            const { vineyard } = labelOf(row);
             out.push({
               kind: 'detail',
               customer: c,
               template: t,
               winery: w,
+              vineyard,
               truck: tr,
               distanceKm: km,
             });

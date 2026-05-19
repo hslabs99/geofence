@@ -16,10 +16,20 @@ const COLUMN_ORDER_TABLE = 'tbl_vworkjobs_inspect';
 const SORT_SETTING_TYPE = 'System';
 const SORT_SETTING_NAME = 'Inspectsort';
 
+/**
+ * Virtual columns G1..G5: green Y / red N flag for whether step_N_gps_completed_at has data.
+ * Computed client-side; not sortable; not filterable. Replaces the wide truck_id column on Inspect.
+ */
+const GPS_STEP_VIRTUAL_COLUMNS = ['g1', 'g2', 'g3', 'g4', 'g5'] as const;
+const GPS_STEP_VIRTUAL_COLUMN_SET = new Set<string>(GPS_STEP_VIRTUAL_COLUMNS);
+
+/** API columns kept on row data (so right-pane logic still works) but never shown as a grid column. */
+const HIDDEN_API_COLUMNS = new Set<string>(['truck_id']);
+
 const PRIORITY_COLUMNS = [
   'job_id', 'planned_start_time', 'customer', 'template',
   'delivery_winery', 'vineyard_name', 'distance', 'loadsize', 'trailermode', 'worker',
-  'truck_id', 'truck_rego',
+  ...GPS_STEP_VIRTUAL_COLUMNS, 'truck_rego',
 ];
 
 const INSPECT_PAGE_SIZE = 200;
@@ -31,7 +41,7 @@ function isIsoDateString(v: unknown): v is string {
   return typeof v === 'string' && /^\d{4}-\d{2}-\d{2}/.test(v);
 }
 
-/** Normalize timestamp to YYYY-MM-DD HH:mm:ss for comparison (step 5 rule: only use GPS when < VWork). */
+/** Normalize timestamp to YYYY-MM-DD HH:mm:ss for comparison (e.g. step deltas). */
 function normalizeForCompare(v: unknown): string | null {
   if (v == null || v === '') return null;
   const s = String(v).trim().replace(/\s+(?:GMT|UTC)[+-]\d{3,4}.*$/i, '').trim();
@@ -217,7 +227,8 @@ function InspectContent() {
   const [error, setError] = useState<string | null>(null);
   const [errorDetail, setErrorDetail] = useState<{ hint?: string; code?: string } | null>(null);
   const [sortColumns, setSortColumns] = useState<[string, string, string]>(['', '', '']);
-  const sortColumnsInitialized = useRef(false);
+  /** When the jobs list is empty, keep the last non-empty row shape so filters/sort/columns stay usable. */
+  const lastNonEmptyInspectColumnKeysRef = useRef<string[]>([]);
   /** Column-date filter for `actual_end_time` only (datetime-local → API columnDate*). */
   const [filterActualEndFrom, setFilterActualEndFrom] = useState<string>('');
   const [filterActualEndTo, setFilterActualEndTo] = useState<string>('');
@@ -266,6 +277,7 @@ function InspectContent() {
   const [selectedRowIndex, setSelectedRowIndex] = useState(0);
   const selectedRowRef = useRef<HTMLTableRowElement>(null);
   const [gpsMappings, setGpsMappings] = useState<{ type: string; vwname: string; gpsname: string }[]>([]);
+  const [gpsMappingsLoading, setGpsMappingsLoading] = useState(false);
   const [trackingRows, setTrackingRows] = useState<Row[]>([]);
   const [trackingSql, setTrackingSql] = useState<string>('');
   const [trackingLoading, setTrackingLoading] = useState(false);
@@ -289,6 +301,11 @@ function InspectContent() {
   const [refetchStepsRunning, setRefetchStepsRunning] = useState(false);
   const [retagAndRefetchRunning, setRetagAndRefetchRunning] = useState(false);
   const [trackingRefreshKey, setTrackingRefreshKey] = useState(0);
+  /** Inspect-only: Steps+ buffer containment per tbl_tracking.id (current page). */
+  const [fencePlusById, setFencePlusById] = useState<Record<string, string | null>>({});
+  const [fencePlusMeta, setFencePlusMeta] = useState<{ bufferMeters: number; fenceNames: string[] } | null>(null);
+  const [fencePlusLoading, setFencePlusLoading] = useState(false);
+  const [fencePlusErr, setFencePlusErr] = useState<string | null>(null);
   const [pinJobModalOpen, setPinJobModalOpen] = useState(false);
   const [pinJobNoteDraft, setPinJobNoteDraft] = useState('');
   const [pinJobSaving, setPinJobSaving] = useState(false);
@@ -303,10 +320,39 @@ function InspectContent() {
   const [excludedFromSummaries, setExcludedFromSummaries] = useState(false);
   const [excludednotes, setExcludednotes] = useState('');
   const [saveOverridesStatus, setSaveOverridesStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
-  const apiColumns = useMemo(
-    () => (rows.length > 0 ? Object.keys(rows[0]) : []),
-    [rows],
-  );
+  const apiColumns = useMemo(() => {
+    let keys: string[];
+    if (rows.length > 0) {
+      keys = Object.keys(rows[0]);
+      lastNonEmptyInspectColumnKeysRef.current = keys;
+    } else {
+      keys = lastNonEmptyInspectColumnKeysRef.current;
+    }
+    // CRITICAL: return [] when we have no real columns yet. Otherwise the
+    // saved-column-order load effect fires on initial mount with only the
+    // synthetic G1..G5 columns; mergeColumnOrder then filters the user's
+    // saved order down to just those five and locks it in via the
+    // columnOrderInitialized ref. Real columns appear later but get appended
+    // at the end, the user's saved order is effectively lost on refresh, and
+    // the next save persists that scrambled order.
+    if (keys.length === 0) return [];
+    // Drop columns we never display (truck_id, *_raw plumbing, _total window-fn artifact) and
+    // append the synthetic G1..G5 GPS-presence flags so the column-config / sort / order machinery
+    // treats them as first-class columns.
+    //
+    // *_raw is critical: the /api/vworkjobs response only deletes a `<col>_raw` key when its value
+    // is a string; null timestamps leave the *_raw key on the row, so the visible key set drifts
+    // depending on which row is rows[0]. That made `inspectSortInitKey` change on every refetch
+    // and re-applied the saved sort each time, clobbering the user's Sort 1/2/3 picks.
+    const filtered = keys.filter(
+      (k) =>
+        !HIDDEN_API_COLUMNS.has(k) &&
+        !GPS_STEP_VIRTUAL_COLUMN_SET.has(k) &&
+        k !== '_total' &&
+        !k.endsWith('_raw'),
+    );
+    return [...filtered, ...GPS_STEP_VIRTUAL_COLUMNS];
+  }, [rows]);
 
   /** Filters only (not sort) — changing sort does not reset page; sort is applied in API. */
   const inspectFilterOnlyKey = useMemo(
@@ -402,12 +448,6 @@ function InspectContent() {
     router.replace(q ? `${pathname}?${q}` : pathname, { scroll: false });
   }, [searchParams, pathname, router]);
 
-  /** Recent jobs / Summary link: primary sort by actual start (sort init may have already run without locate). */
-  useEffect(() => {
-    if (!locateJobIdParam?.trim()) return;
-    setSortColumns(['actual_start_time', '', '']);
-  }, [locateJobIdParam]);
-
   useEffect(() => {
     fetch('/api/vworkjobs/customers')
       .then((r) => r.json())
@@ -469,7 +509,13 @@ function InspectContent() {
         const saved = Array.isArray(data?.columnOrder) && data.columnOrder.every((x: unknown) => typeof x === 'string')
           ? (data.columnOrder as string[])
           : null;
-        setColumnOrder(normalizeInspectColumnOrder(mergeColumnOrder(cols, saved)));
+        // Saved orders are user-chosen — apply verbatim (modulo merging in any new API columns).
+        // Only normalize the default order (when nothing has been saved yet) so distance/loadsize/trailermode
+        // sit beside vineyard_name out of the box.
+        const merged = saved && saved.length > 0
+          ? mergeColumnOrder(cols, saved)
+          : normalizeInspectColumnOrder(getDefaultColumnOrder(cols));
+        setColumnOrder(merged);
         const hidden = Array.isArray(data?.hiddenColumns) && data.hiddenColumns.every((x: unknown) => typeof x === 'string')
           ? new Set(data.hiddenColumns as string[])
           : new Set<string>();
@@ -478,37 +524,51 @@ function InspectContent() {
       .catch(() => setColumnOrder(normalizeInspectColumnOrder(getDefaultColumnOrder(cols))));
   }, [apiColumns.length, apiColumns]);
 
+  /** Latched once data first arrives; prevents the saved-sort init effect from ever re-firing
+   *  and clobbering the user's dropdown / saved-load state on later refetches. */
+  const sortInitDoneRef = useRef(false);
+
   useEffect(() => {
-    if (apiColumns.length === 0 || sortColumnsInitialized.current) return;
-    sortColumnsInitialized.current = true;
+    if (apiColumns.length === 0) return;
+    if (sortInitDoneRef.current) return;
+    sortInitDoneRef.current = true;
+
     const locate = locateJobIdParam?.trim();
     if (locate && apiColumns.includes('actual_start_time')) {
       setSortColumns(['actual_start_time', '', '']);
       return;
     }
+    const ac = new AbortController();
     const q = new URLSearchParams({ type: SORT_SETTING_TYPE, name: SORT_SETTING_NAME }).toString();
-    fetch(`/api/settings?${q}`, { cache: 'no-store' })
+    fetch(`/api/settings?${q}`, { cache: 'no-store', signal: ac.signal })
       .then((r) => r.json())
       .then((data) => {
+        if (ac.signal.aborted) return;
         if (data?.settingvalue) {
           try {
             const arr = JSON.parse(data.settingvalue) as unknown[];
             if (Array.isArray(arr) && arr.every((x) => typeof x === 'string')) {
               const cols = new Set(apiColumns);
               const valid = arr.filter((c): c is string => typeof c === 'string' && cols.has(c));
-              setSortColumns([
-                valid[0] ?? '',
-                valid[1] ?? '',
-                valid[2] ?? '',
-              ]);
+              setSortColumns([valid[0] ?? '', valid[1] ?? '', valid[2] ?? '']);
               return;
             }
           } catch {}
         }
-        setSortColumns(['', '', '']);
+        // No usable saved value — leave state empty so appendInspectSortParams falls back to actual_start_time.
       })
-      .catch(() => setSortColumns(['', '', '']));
-  }, [apiColumns.length, apiColumns, locateJobIdParam]);
+      .catch(() => {
+        if (ac.signal.aborted) return;
+      });
+    return () => ac.abort();
+    // Only `apiColumns.length` and `locateJobIdParam` — the body itself guards with the
+    // ref so it runs exactly once per mount (or once after a locate URL change cleared the ref).
+  }, [apiColumns.length, locateJobIdParam, apiColumns]);
+
+  /** When the locate URL param actually changes (Recent jobs / Summary link), allow sort to be re-initialized. */
+  useEffect(() => {
+    sortInitDoneRef.current = false;
+  }, [locateJobIdParam]);
 
   useEffect(() => {
     const type = 'System';
@@ -546,20 +606,53 @@ function InspectContent() {
     [allColumns, hiddenColumns],
   );
 
-  const saveColumnConfig = (order: string[], hidden: Set<string>) => {
+  /** Sort dropdowns offer real DB columns only — virtual G1..G5 are computed client-side and not sortable. */
+  const sortableColumns = useMemo(
+    () => allColumns.filter((c) => !GPS_STEP_VIRTUAL_COLUMN_SET.has(c)),
+    [allColumns],
+  );
+
+  /** Save status for column order/visibility — mirrors the sort Save button so UI feedback is consistent. */
+  const [columnSaveStatus, setColumnSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
+  const columnSaveResetTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const saveColumnConfig = useCallback((order: string[], hidden: Set<string>) => {
     const orderToSave = order.length ? order : allColumns;
     if (!orderToSave.length) return;
+    const payload = {
+      table: COLUMN_ORDER_TABLE,
+      columnOrder: orderToSave,
+      hiddenColumns: Array.from(hidden),
+    };
+    if (columnSaveResetTimer.current) {
+      clearTimeout(columnSaveResetTimer.current);
+      columnSaveResetTimer.current = null;
+    }
+    setColumnSaveStatus('saving');
     fetch('/api/column-order', {
       method: 'PUT',
       cache: 'no-store',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        table: COLUMN_ORDER_TABLE,
-        columnOrder: orderToSave,
-        hiddenColumns: Array.from(hidden),
-      }),
-    }).catch(() => {});
-  };
+      body: JSON.stringify(payload),
+    })
+      .then(async (r) => {
+        const body = await r.json().catch(() => ({}));
+        if (r.ok) {
+          setColumnSaveStatus('saved');
+        } else {
+          const details = { status: r.status, statusText: r.statusText, url: r.url, payload, responseBody: body };
+          console.error('[Inspect save columns] FAILED:', JSON.stringify(details, null, 2));
+          setColumnSaveStatus('error');
+        }
+      })
+      .catch((err) => {
+        console.error('[Inspect save columns] FETCH ERROR:', err);
+        setColumnSaveStatus('error');
+      })
+      .finally(() => {
+        columnSaveResetTimer.current = setTimeout(() => setColumnSaveStatus('idle'), 2000);
+      });
+  }, [allColumns]);
 
   const toggleColumnVisibility = (col: string) => {
     const next = new Set(hiddenColumns);
@@ -611,12 +704,22 @@ function InspectContent() {
     setDropTargetCol(null);
   };
 
-  useEffect(() => {
-    fetch('/api/gpsmappings')
-      .then((r) => r.json())
-      .then((data) => setGpsMappings(data?.rows ?? []))
-      .catch(() => setGpsMappings([]));
+  const loadGpsMappings = useCallback(async () => {
+    setGpsMappingsLoading(true);
+    try {
+      const r = await fetch(`/api/gpsmappings?_=${Date.now()}`, { cache: 'no-store' });
+      const data = (await r.json().catch(() => ({}))) as { rows?: { type?: string; vwname?: string; gpsname?: string }[] };
+      setGpsMappings(Array.isArray(data?.rows) ? (data.rows as { type: string; vwname: string; gpsname: string }[]) : []);
+    } catch {
+      setGpsMappings([]);
+    } finally {
+      setGpsMappingsLoading(false);
+    }
   }, []);
+
+  useEffect(() => {
+    void loadGpsMappings();
+  }, [loadGpsMappings]);
 
   const appendInspectSortParams = useCallback((p: URLSearchParams) => {
     const c1 = sortColumns[0]?.trim() || 'actual_start_time';
@@ -1025,6 +1128,48 @@ function InspectContent() {
     return [...set].filter(Boolean);
   }, [relevantMappings, vineyardTrim, wineryTrim]);
 
+  /** GPS grid: tint rows whose `fence_name` matches mapped vineyard (green) or winery (blue) names. */
+  const inspectGpsFenceLcSets = useMemo(() => {
+    const vineyard = new Set<string>();
+    const winery = new Set<string>();
+    for (const m of relevantMappings) {
+      const t = (m.type ?? '').trim();
+      const vw = (m.vwname ?? '').trim();
+      const gps = (m.gpsname ?? '').trim();
+      if (t === 'Vineyard') {
+        if (vw) vineyard.add(vw.toLowerCase());
+        if (gps) vineyard.add(gps.toLowerCase());
+      } else if (t === 'Winery') {
+        if (vw) winery.add(vw.toLowerCase());
+        if (gps) winery.add(gps.toLowerCase());
+      }
+    }
+    if (vineyardTrim && !relevantMappings.some((m) => (m.type ?? '').trim() === 'Vineyard')) {
+      vineyard.add(vineyardTrim.toLowerCase());
+    }
+    if (wineryTrim && !relevantMappings.some((m) => (m.type ?? '').trim() === 'Winery')) {
+      winery.add(wineryTrim.toLowerCase());
+    }
+    return { vineyard, winery } as const;
+  }, [relevantMappings, vineyardTrim, wineryTrim]);
+
+  const gpsTrackingFenceRowClass = useCallback(
+    (row: Row) => {
+      const raw = row.fence_name ?? (row as { Fence_Name?: unknown }).Fence_Name;
+      if (raw == null || raw === '') return '';
+      const lc = String(raw).trim().toLowerCase();
+      if (!lc) return '';
+      if (inspectGpsFenceLcSets.vineyard.has(lc)) {
+        return 'bg-green-50/95 hover:bg-green-100/95 dark:bg-green-950/45 dark:hover:bg-green-900/50';
+      }
+      if (inspectGpsFenceLcSets.winery.has(lc)) {
+        return 'bg-blue-50/95 hover:bg-blue-100/95 dark:bg-blue-950/45 dark:hover:bg-blue-900/50';
+      }
+      return '';
+    },
+    [inspectGpsFenceLcSets],
+  );
+
   /** Extract YYYY-MM-DD from job's actual_start_time (or similar timestamp) for tagging. */
   const jobDateForTagging = useMemo(() => {
     const raw = selectedRow?.actual_start_time ?? selectedRow?.actual_end_time ?? selectedRow?.planned_start_time;
@@ -1115,6 +1260,30 @@ function InspectContent() {
       setPinJobSaving(false);
     }
   }, [selectedRow, pinJobNoteDraft]);
+
+  const submitUnpinJobFromRecent = useCallback(async () => {
+    const jobId = selectedRow?.job_id != null && selectedRow.job_id !== '' ? String(selectedRow.job_id).trim() : '';
+    if (!jobId) return;
+    setPinJobSaving(true);
+    setPinJobError(null);
+    try {
+      const r = await fetch('/api/inspect-history', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ job_id: jobId, note: null }),
+      });
+      const data = (await r.json().catch(() => ({}))) as { error?: string };
+      if (!r.ok) {
+        setPinJobError(typeof data?.error === 'string' ? data.error : `Failed (${r.status})`);
+        return;
+      }
+      setPinJobModalOpen(false);
+      setPinJobNoteDraft('');
+      window.dispatchEvent(new Event('geodata-inspect-history-changed'));
+    } finally {
+      setPinJobSaving(false);
+    }
+  }, [selectedRow]);
 
   useEffect(() => {
     if (!pinJobModalOpen) return;
@@ -1273,6 +1442,143 @@ function InspectContent() {
     return rows;
   }, [relevantMappings, vineyardTrim, wineryTrim]);
 
+  /**
+   * One row per Winery mapping (no dedupe). `pairWinery` matches tbl_distances.delivery_winery (job vWork name when set).
+   */
+  const inspectPairMatrixWineryColumns = useMemo(() => {
+    const wRows = mappingTableRows.filter((r) => r.type === 'Winery');
+    if (wRows.length === 0) {
+      if (!wineryTrim) return [] as { id: string; header: string; pairWinery: string }[];
+      return [{ id: 'winery-direct', header: wineryTrim, pairWinery: wineryTrim.trim() }];
+    }
+    return wRows.map((row, i) => {
+      const orig = row.original !== '—' ? row.original.trim() : '';
+      const res = row.result !== '—' ? row.result.trim() : '';
+      const toUse = row.toUse !== '—' ? row.toUse.trim() : '';
+      const header =
+        res && toUse && res !== toUse
+          ? `${res} → ${toUse}`
+          : res || toUse || orig || `Winery ${i + 1}`;
+      const pairWinery = (wineryTrim || toUse || res || orig).trim();
+      return { id: `winery-row-${i}`, header, pairWinery };
+    });
+  }, [mappingTableRows, wineryTrim]);
+
+  /**
+   * One column per Vineyard row in Mapping (no dedupe — duplicate GPS targets stay separate columns).
+   * `pairVineyard` is the string matched against tbl_distances.vineyard_name (job vWork name when set).
+   */
+  const inspectPairMatrixVineyardColumns = useMemo(() => {
+    const vRows = mappingTableRows.filter((r) => r.type === 'Vineyard');
+    if (vRows.length === 0) {
+      if (!vineyardTrim) return [] as { id: string; header: string; pairVineyard: string }[];
+      return [{ id: 'vineyard-direct', header: vineyardTrim, pairVineyard: vineyardTrim.trim() }];
+    }
+    return vRows.map((row, i) => {
+      const orig = row.original !== '—' ? row.original.trim() : '';
+      const res = row.result !== '—' ? row.result.trim() : '';
+      const toUse = row.toUse !== '—' ? row.toUse.trim() : '';
+      const header =
+        res && toUse && res !== toUse
+          ? `${res} → ${toUse}`
+          : res || toUse || orig || `Vineyard ${i + 1}`;
+      const pairVineyard = (vineyardTrim || toUse || res || orig).trim();
+      return { id: `vineyard-col-${i}`, header, pairVineyard };
+    });
+  }, [mappingTableRows, vineyardTrim]);
+
+  const inspectPairMatrixVineyardPairKeys = useMemo(
+    () => [...new Set(inspectPairMatrixVineyardColumns.map((c) => c.pairVineyard).filter(Boolean))],
+    [inspectPairMatrixVineyardColumns],
+  );
+
+  const inspectPairMatrixWineryPairKeys = useMemo(
+    () => [...new Set(inspectPairMatrixWineryColumns.map((r) => r.pairWinery).filter(Boolean))],
+    [inspectPairMatrixWineryColumns],
+  );
+
+  const [pairDistMatrixByKey, setPairDistMatrixByKey] = useState<
+    Record<string, { distance_m: number | null; duration_min: number | null; manual_override: boolean }>
+  >({});
+  const [pairDistMatrixLoading, setPairDistMatrixLoading] = useState(false);
+  const [pairDistMatrixErr, setPairDistMatrixErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!selectedRow || inspectPairMatrixWineryPairKeys.length === 0 || inspectPairMatrixVineyardPairKeys.length === 0) {
+      setPairDistMatrixByKey({});
+      setPairDistMatrixErr(null);
+      setPairDistMatrixLoading(false);
+      return;
+    }
+    const pairs = inspectPairMatrixWineryPairKeys.flatMap((w) =>
+      inspectPairMatrixVineyardPairKeys.map((v) => ({ winery: w, vineyard: v })),
+    );
+    if (pairs.length > 400) {
+      setPairDistMatrixErr('Too many winery×vineyard combinations (max 400).');
+      setPairDistMatrixByKey({});
+      setPairDistMatrixLoading(false);
+      return;
+    }
+    const ac = new AbortController();
+    setPairDistMatrixLoading(true);
+    setPairDistMatrixErr(null);
+    fetch('/api/inspect/pair-distances-matrix', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pairs }),
+      signal: ac.signal,
+    })
+      .then(async (r) => {
+        const data = (await r.json().catch(() => ({}))) as {
+          error?: string;
+          pairs?: Array<{
+            winery?: string;
+            vineyard?: string;
+            distance_m?: unknown;
+            duration_min?: unknown;
+            manual_override?: unknown;
+          }>;
+        };
+        if (!r.ok) {
+          throw new Error(typeof data?.error === 'string' ? data.error : r.statusText);
+        }
+        const list = Array.isArray(data.pairs) ? data.pairs : [];
+        const next: Record<string, { distance_m: number | null; duration_min: number | null; manual_override: boolean }> =
+          {};
+        for (const p of list) {
+          if (!p || typeof p !== 'object') continue;
+          const w = typeof p.winery === 'string' ? p.winery : '';
+          const v = typeof p.vineyard === 'string' ? p.vineyard : '';
+          if (!w || !v) continue;
+          const dm = p.distance_m;
+          const dur = p.duration_min;
+          next[`${w}\x1f${v}`] = {
+            distance_m:
+              dm == null || dm === ''
+                ? null
+                : typeof dm === 'number'
+                  ? dm
+                  : Number(dm),
+            duration_min:
+              dur == null || dur === ''
+                ? null
+                : typeof dur === 'number'
+                  ? dur
+                  : Number(dur),
+            manual_override: p.manual_override === true || p.manual_override === 1,
+          };
+        }
+        setPairDistMatrixByKey(next);
+      })
+      .catch((e: unknown) => {
+        if (e instanceof Error && e.name === 'AbortError') return;
+        setPairDistMatrixErr(e instanceof Error ? e.message : String(e));
+        setPairDistMatrixByKey({});
+      })
+      .finally(() => setPairDistMatrixLoading(false));
+    return () => ac.abort();
+  }, [selectedRow?.job_id, inspectPairMatrixWineryPairKeys, inspectPairMatrixVineyardPairKeys]);
+
   const [sortSaveStatus, setSortSaveStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const saveSortColumns = (cols: [string, string, string]) => {
     const valid = cols.filter(Boolean);
@@ -1334,7 +1640,19 @@ function InspectContent() {
   }, []);
 
   const TRACKING_DATE_COLS = new Set(['position_time', 'position_time_nz']);
-  const TRACKING_DISPLAY_COLUMNS = ['device_name', 'fence_name', 'geofence_type', 'position_time_nz', 'position_time', 'lat', 'lon'] as const;
+  /** GPS grid columns; `fence_plus` is filled client-side after “Tag Fence+ rows” (not from tbl_tracking). */
+  const TRACKING_GRID_COLUMNS = ['device_name', 'fence_name', 'geofence_id', 'fence_plus', 'geofence_type', 'position_time_nz', 'position_time', 'lat', 'lon'] as const;
+
+  const trackingGridColLabel = useCallback((col: string) => {
+    if (col === 'fence_plus') return 'Fence+';
+    return formatColumnLabel(col);
+  }, []);
+
+  useEffect(() => {
+    setFencePlusById({});
+    setFencePlusMeta(null);
+    setFencePlusErr(null);
+  }, [trackingRows]);
 
   /** Haversine distance in meters between two WGS84 (lat, lon) points. Returns null if either point is invalid. */
   const haversineMeters = useCallback((lat1: number, lon1: number, lat2: number, lon2: number): number | null => {
@@ -1349,8 +1667,6 @@ function InspectContent() {
     return R * c;
   }, []);
   const sortedTrackingRows = useMemo(() => {
-    const cols = trackingSortCol ? [trackingSortCol] : [];
-    if (cols.length === 0) return trackingRows;
     const out = [...trackingRows];
     const compareTracking = (a: unknown, b: unknown, col: string): number => {
       const va = a == null ? '' : a;
@@ -1367,11 +1683,72 @@ function InspectContent() {
       return String(va).localeCompare(String(vb));
     };
     out.sort((r1, r2) => {
-      const c = compareTracking(r1[trackingSortCol], r2[trackingSortCol], trackingSortCol);
+      let c = 0;
+      if (trackingSortCol === 'fence_plus') {
+        const id1 = r1.id != null ? String(r1.id) : '';
+        const id2 = r2.id != null ? String(r2.id) : '';
+        const fp1 = fencePlusById[id1] ?? '';
+        const fp2 = fencePlusById[id2] ?? '';
+        c = String(fp1).localeCompare(String(fp2));
+      } else {
+        c = compareTracking(r1[trackingSortCol], r2[trackingSortCol], trackingSortCol);
+      }
       return trackingSortDir === 'asc' ? c : -c;
     });
     return out;
-  }, [trackingRows, trackingSortCol, trackingSortDir]);
+  }, [trackingRows, trackingSortCol, trackingSortDir, fencePlusById]);
+
+  const runTagFencePlusRows = useCallback(async () => {
+    if (!deviceForTracking || !vineyardTrim) {
+      setFencePlusErr('Need worker (device) and job vineyard_name.');
+      return;
+    }
+    const ids = sortedTrackingRows
+      .map((r) => {
+        const raw = r.id ?? (r as { ID?: unknown }).ID;
+        if (raw == null) return NaN;
+        const n = typeof raw === 'number' ? raw : parseInt(String(raw), 10);
+        return Number.isFinite(n) ? n : NaN;
+      })
+      .filter((n) => Number.isFinite(n) && n > 0);
+    if (ids.length === 0) {
+      setFencePlusErr('No tbl_tracking.id on loaded rows — refresh GPS data.');
+      return;
+    }
+    setFencePlusLoading(true);
+    setFencePlusErr(null);
+    try {
+      const res = await fetch('/api/inspect/fence-plus-tags', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          device: deviceForTracking,
+          vineyardName: vineyardTrim,
+          trackingIds: ids,
+        }),
+      });
+      const data = (await res.json()) as {
+        error?: string;
+        tags?: Record<string, string | null>;
+        bufferMeters?: number;
+        fenceNames?: string[];
+      };
+      if (!res.ok) {
+        setFencePlusErr(data.error ?? res.statusText);
+        return;
+      }
+      if (data.tags && typeof data.tags === 'object') {
+        setFencePlusById(data.tags);
+      }
+      if (data.bufferMeters != null && Array.isArray(data.fenceNames)) {
+        setFencePlusMeta({ bufferMeters: data.bufferMeters, fenceNames: data.fenceNames });
+      }
+    } catch (e) {
+      setFencePlusErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setFencePlusLoading(false);
+    }
+  }, [deviceForTracking, vineyardTrim, sortedTrackingRows]);
 
   const columnWidths = useMemo(
     () => computeColumnWidths(columns, sortedRows, formatCell, formatColumnLabel),
@@ -1579,10 +1956,7 @@ function InspectContent() {
           {errorDetail?.code && <p className="mt-1 text-xs">Code: {errorDetail.code}</p>}
         </div>
       )}
-      {hasCompletedInitialFetch && !error && rows.length === 0 && (
-        <p className="text-zinc-600">{listRefreshing ? 'Updating…' : 'No rows.'}</p>
-      )}
-      {hasCompletedInitialFetch && !error && rows.length > 0 && (
+      {hasCompletedInitialFetch && !error && (
         <>
           <div className="mb-2 flex flex-wrap items-center gap-2 rounded-lg border border-zinc-200 bg-white px-3 py-2 dark:border-zinc-700 dark:bg-zinc-900">
             <div className="flex flex-wrap items-center gap-x-1.5 gap-y-1">
@@ -1595,7 +1969,7 @@ function InspectContent() {
                 title="Primary sort (SQL ORDER BY)"
               >
                 <option value="">—</option>
-                {allColumns.map((c) => (
+                {sortableColumns.map((c) => (
                   <option key={c} value={c}>
                     {formatColumnLabel(c)}
                   </option>
@@ -1609,7 +1983,7 @@ function InspectContent() {
                 title="Secondary sort (SQL)"
               >
                 <option value="">—</option>
-                {allColumns.map((c) => (
+                {sortableColumns.map((c) => (
                   <option key={c} value={c}>
                     {formatColumnLabel(c)}
                   </option>
@@ -1623,7 +1997,7 @@ function InspectContent() {
                 title="Tertiary sort (SQL)"
               >
                 <option value="">—</option>
-                {allColumns.map((c) => (
+                {sortableColumns.map((c) => (
                   <option key={c} value={c}>
                     {formatColumnLabel(c)}
                   </option>
@@ -1633,9 +2007,19 @@ function InspectContent() {
                 type="button"
                 onClick={() => saveSortColumns(sortColumns)}
                 disabled={sortSaveStatus === 'saving'}
+                title="Save Sort 1/2/3 picks (this button only saves the SORT — see Save Cols for column order/visibility)"
                 className="ml-1 rounded border border-zinc-200 bg-transparent px-1.5 py-0.5 text-[11px] text-zinc-500 hover:bg-zinc-100 disabled:opacity-60 dark:border-zinc-600 dark:hover:bg-zinc-800"
               >
-                {sortSaveStatus === 'saving' ? '…' : sortSaveStatus === 'saved' ? 'Saved' : sortSaveStatus === 'error' ? 'Error' : 'Save'}
+                {sortSaveStatus === 'saving' ? '…' : sortSaveStatus === 'saved' ? 'Saved' : sortSaveStatus === 'error' ? 'Error' : 'Save Sort'}
+              </button>
+              <button
+                type="button"
+                onClick={() => saveColumnConfig(allColumns, hiddenColumns)}
+                disabled={columnSaveStatus === 'saving' || allColumns.length === 0}
+                title="Save the current column ORDER and SHOW/HIDE state. Drag-reorder also auto-saves; this is the explicit button."
+                className="rounded border border-zinc-200 bg-transparent px-1.5 py-0.5 text-[11px] text-zinc-500 hover:bg-zinc-100 disabled:opacity-60 dark:border-zinc-600 dark:hover:bg-zinc-800"
+              >
+                {columnSaveStatus === 'saving' ? '…' : columnSaveStatus === 'saved' ? 'Saved' : columnSaveStatus === 'error' ? 'Error' : 'Save Cols'}
               </button>
               <div className="relative">
                 <button
@@ -1652,10 +2036,19 @@ function InspectContent() {
                       onClick={() => setShowColumnConfig(false)}
                       aria-hidden="true"
                     />
-                    <div className="absolute left-0 top-full z-50 mt-1 min-w-[220px] rounded-lg border border-zinc-200 bg-white p-3 shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
+                    <div className="absolute left-0 top-full z-50 mt-1 min-w-[260px] rounded-lg border border-zinc-200 bg-white p-3 shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
                       <div className="mb-2 flex items-center justify-between gap-2">
                         <span className="text-xs font-medium text-zinc-500">Show/hide columns</span>
-                        <div className="flex gap-2">
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => saveColumnConfig(allColumns, hiddenColumns)}
+                            disabled={columnSaveStatus === 'saving' || allColumns.length === 0}
+                            className="rounded border border-zinc-200 bg-transparent px-1.5 py-0.5 text-[11px] text-zinc-600 hover:bg-zinc-100 disabled:opacity-60 dark:border-zinc-600 dark:hover:bg-zinc-800"
+                            title="Save the current column ORDER and SHOW/HIDE state"
+                          >
+                            {columnSaveStatus === 'saving' ? '…' : columnSaveStatus === 'saved' ? 'Saved' : columnSaveStatus === 'error' ? 'Error' : 'Save'}
+                          </button>
                           <button type="button" onClick={showAllColumns} className="text-xs text-blue-600 hover:underline dark:text-blue-400">
                             Show all
                           </button>
@@ -1673,7 +2066,11 @@ function InspectContent() {
                               onChange={() => toggleColumnVisibility(col)}
                               className="rounded"
                             />
-                            <span className="text-sm">{formatColumnLabel(col)}</span>
+                            <span className="text-sm">
+                              {GPS_STEP_VIRTUAL_COLUMN_SET.has(col)
+                                ? `${col.toUpperCase()} — step_${col.slice(1)}_gps_completed_at present (Y/N)`
+                                : formatColumnLabel(col)}
+                            </span>
                           </label>
                         ))}
                       </div>
@@ -1737,13 +2134,25 @@ function InspectContent() {
                             ? 'Load Size'
                             : col === 'distance'
                                 ? 'Distance'
+                            : GPS_STEP_VIRTUAL_COLUMN_SET.has(col)
+                                ? col.toUpperCase()
                             : formatColumnLabel(col)}
                     </th>
                   ))}
                 </tr>
               </thead>
               <tbody>
-                {sortedRows.map((row, i) => (
+                {sortedRows.length === 0 ? (
+                  <tr>
+                    <td
+                      colSpan={Math.max(1, columns.length)}
+                      className="px-3 py-10 text-center text-sm text-zinc-500 dark:text-zinc-400"
+                    >
+                      {listRefreshing ? 'Updating…' : 'No rows match the current filters. Adjust filters above or clear them.'}
+                    </td>
+                  </tr>
+                ) : (
+                  sortedRows.map((row, i) => (
                   <tr
                     key={i}
                     ref={i === selectedRowIndex ? selectedRowRef : undefined}
@@ -1756,13 +2165,37 @@ function InspectContent() {
                     }}
                     className={`cursor-pointer border-b border-zinc-100 dark:border-zinc-800 hover:bg-zinc-50 dark:hover:bg-zinc-800/50 ${selectedRowIndex === i ? 'bg-blue-100 dark:bg-blue-900/40' : ''}`}
                   >
-                    {columns.map((col) => (
-                      <td key={col} className="whitespace-nowrap px-3 py-2 text-zinc-700 dark:text-zinc-300">
-                        {col === 'distance' ? formatDistanceCell(row[col]) : formatCell(row[col])}
-                      </td>
-                    ))}
+                    {columns.map((col) => {
+                      if (GPS_STEP_VIRTUAL_COLUMN_SET.has(col)) {
+                        const stepN = parseInt(col.slice(1), 10);
+                        const has = readInspectStepGps(row, stepN) !== null;
+                        return (
+                          <td
+                            key={col}
+                            className="whitespace-nowrap px-1.5 py-2 text-center"
+                            title={`step_${stepN}_gps_completed_at ${has ? 'has data' : 'is empty'}`}
+                          >
+                            <span
+                              className={`inline-flex h-5 w-5 items-center justify-center rounded text-[11px] font-bold ${
+                                has
+                                  ? 'bg-green-100 text-green-700 dark:bg-green-900/40 dark:text-green-300'
+                                  : 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300'
+                              }`}
+                            >
+                              {has ? 'Y' : 'N'}
+                            </span>
+                          </td>
+                        );
+                      }
+                      return (
+                        <td key={col} className="whitespace-nowrap px-3 py-2 text-zinc-700 dark:text-zinc-300">
+                          {col === 'distance' ? formatDistanceCell(row[col]) : formatCell(row[col])}
+                        </td>
+                      );
+                    })}
                   </tr>
-                ))}
+                  ))
+                )}
               </tbody>
             </table>
           </div>
@@ -1832,7 +2265,21 @@ function InspectContent() {
               </div>
             )}
             <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
-              <h2 className="text-sm font-semibold text-zinc-700 dark:text-zinc-300">Step details</h2>
+              <div className="flex min-w-0 max-w-full flex-wrap items-baseline gap-x-2 gap-y-1">
+                <h2 className="shrink-0 text-sm font-semibold text-zinc-700 dark:text-zinc-300">
+                  Step details
+                </h2>
+                {selectedRow && (
+                  <span
+                    className="min-w-0 truncate text-sm font-normal text-zinc-600 dark:text-zinc-400"
+                    title={`${deliveryWinery} - ${vineyardName}`}
+                  >
+                    {deliveryWinery}
+                    {' - '}
+                    {vineyardName}
+                  </span>
+                )}
+              </div>
               <div className="flex flex-wrap items-center gap-2">
                 <button
                   type="button"
@@ -1843,7 +2290,7 @@ function InspectContent() {
                   }}
                   disabled={!selectedRow}
                   className="rounded border border-zinc-300 bg-white px-3 py-1.5 text-sm font-medium text-zinc-800 shadow-sm hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100 dark:hover:bg-zinc-700 dark:disabled:opacity-50"
-                  title="Put this job at the top of Query → Recent jobs, with an optional reminder note."
+                  title="Pin this job in Query → Recent jobs until it is explicitly unpinned."
                 >
                   Pin job
                 </button>
@@ -1924,18 +2371,10 @@ function InspectContent() {
                       ? String(step1CarryFromLastJobRaw).trim()
                       : '';
                   const orideValue = stepOverrides[orideKey] ?? '';
-                  /** Final = oride if set, else existing actual/completed logic. */
-                  let finalValue: unknown = orideValue ? orideValue : (selectedRow?.[actualTimeKey] ?? selectedRow?.[completedKey]);
-                  if (n === 5 && selectedRow && !orideValue) {
-                    const vworkStep5 = selectedRow.step_5_completed_at ?? selectedRow.Step_5_completed_at;
-                    if (gpsStepValue != null && gpsStepValue !== '' && vworkStep5 != null && vworkStep5 !== '') {
-                      const gpsNorm = normalizeForCompare(gpsStepValue);
-                      const vworkNorm = normalizeForCompare(vworkStep5);
-                      if (gpsNorm != null && vworkNorm != null && gpsNorm >= vworkNorm) {
-                        finalValue = vworkStep5;
-                      }
-                    }
-                  }
+                  /** Final = oride if set, else DB actual time (merge from steps), else VWork completed. */
+                  const finalValue: unknown = orideValue
+                    ? orideValue
+                    : (selectedRow?.[actualTimeKey] ?? selectedRow?.[completedKey]);
                   const finalDisplay = finalValue != null && finalValue !== '' ? formatCell(finalValue) : '—';
                   const vworkClickable = selectedRow && (selectedRow[completedKey] != null && selectedRow[completedKey] !== '');
                   const gpsClickable = gpsStepValue != null && gpsStepValue !== '';
@@ -2068,110 +2507,221 @@ function InspectContent() {
                   </tr>
                 );})}
               </tbody>
-              <tfoot>
-                <tr>
-                  <td colSpan={4} className="px-2 py-1.5" />
-                  <td className="align-top px-2 py-1.5" colSpan={2}>
-                    <div className="mb-3 flex flex-col gap-2 rounded border border-zinc-200 bg-zinc-50/80 px-2 py-2 dark:border-zinc-600 dark:bg-zinc-800/40">
-                      <label className="flex cursor-pointer items-center gap-2 text-sm text-zinc-800 dark:text-zinc-200">
-                        <input
-                          type="checkbox"
-                          checked={excludedFromSummaries}
-                          onChange={(e) => setExcludedFromSummaries(e.target.checked)}
-                          className="rounded border-zinc-300 dark:border-zinc-600"
-                        />
-                        <span>Exclude from summaries</span>
-                      </label>
-                      <div>
-                        <label className="mb-1 block text-xs font-medium text-zinc-500">Exclude notes (optional)</label>
-                        <textarea
-                          value={excludednotes}
-                          onChange={(e) => setExcludednotes(e.target.value.slice(0, 250))}
-                          placeholder="Why this job is excluded from daily/season rollups…"
-                          rows={2}
-                          maxLength={250}
-                          className="w-full min-w-[12rem] rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800"
-                        />
-                      </div>
-                    </div>
-                    <div className="flex items-end gap-2">
-                      <div className="min-w-0 flex-1">
-                        <label className="mb-1 block text-xs font-medium text-zinc-500">Comment (what you changed)</label>
-                        <textarea
-                          value={steporidecomment}
-                          onChange={(e) => setSteporidecomment(e.target.value)}
-                          placeholder="Optional note about manual overrides…"
-                          rows={2}
-                          className="w-full min-w-[12rem] rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800"
-                        />
-                      </div>
-                      <button
-                        type="button"
-                        disabled={!selectedRow?.job_id || saveOverridesStatus === 'saving'}
-                        onClick={async () => {
-                          if (!selectedRow?.job_id) return;
-                          setSaveOverridesStatus('saving');
-                          try {
-                            const res = await fetch('/api/vworkjobs/step-overrides', {
-                              method: 'POST',
-                              headers: { 'Content-Type': 'application/json' },
-                              body: JSON.stringify({
-                                job_id: String(selectedRow.job_id),
-                                step1oride: stepOverrides.step1oride || null,
-                                step2oride: stepOverrides.step2oride || null,
-                                step3oride: stepOverrides.step3oride || null,
-                                step4oride: stepOverrides.step4oride || null,
-                                step5oride: stepOverrides.step5oride || null,
-                                steporidecomment: steporidecomment || null,
-                                excluded: excludedFromSummaries ? 1 : 0,
-                                excludednotes: excludednotes.trim() ? excludednotes.trim().slice(0, 250) : null,
-                              }),
-                            });
-                            const data = await res.json().catch(() => ({}));
-                            if (!res.ok) {
-                              throw new Error(
-                                typeof data?.error === 'string' ? data.error : res.statusText,
-                              );
-                            }
-                            // step-overrides already sets step_N_actual_time / step_N_via for ORIDE. Do not run
-                            // derived-steps write-back here: it clears actuals/GPS-derived fields first and can
-                            // fight the save; use "Refetch steps" when you need GPS re-derivation.
-                            const s = data?.saved as Record<string, unknown> | undefined;
-                            if (s && typeof s === 'object') {
-                              const str = (k: string) =>
-                                s[k] != null && String(s[k]).trim() !== '' ? String(s[k]).trim().slice(0, 19) : '';
-                              setStepOverrides({
-                                step1oride: str('step1oride'),
-                                step2oride: str('step2oride'),
-                                step3oride: str('step3oride'),
-                                step4oride: str('step4oride'),
-                                step5oride: str('step5oride'),
-                              });
-                              const c = s.steporidecomment;
-                              setSteporidecomment(c != null && String(c).trim() !== '' ? String(c) : '');
-                              setExcludedFromSummaries(Number(s.excluded) === 1);
-                              const en = s.excludednotes;
-                              setExcludednotes(en != null && String(en) !== '' ? String(en).slice(0, 250) : '');
-                            }
-                            await refreshJobRowFromApi(selectedRow.job_id);
-                            setSaveOverridesStatus('saved');
-                          } catch (e) {
-                            setSaveOverridesStatus('error');
-                            console.error('[Save step overrides]', e);
-                          } finally {
-                            setTimeout(() => setSaveOverridesStatus('idle'), 2000);
-                          }
-                        }}
-                        className="shrink-0 rounded bg-green-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-green-700 disabled:opacity-50 dark:bg-green-700 dark:hover:bg-green-600"
-                      >
-                        {saveOverridesStatus === 'saving' ? 'Saving…' : saveOverridesStatus === 'saved' ? 'Saved ✓' : saveOverridesStatus === 'error' ? 'Save failed' : 'Save'}
-                      </button>
-                    </div>
-                  </td>
-                  <td className="px-2 py-1.5" />
-                </tr>
-              </tfoot>
             </table>
+            <div className="mt-4 flex flex-col gap-4 lg:flex-row lg:items-start lg:gap-6">
+              <div className="min-w-0 flex-1 space-y-2">
+                <div className="flex flex-wrap items-baseline gap-2">
+                  <h3 className="text-xs font-semibold uppercase tracking-wide text-zinc-600 dark:text-zinc-400">
+                    Pair distances (tbl_distances)
+                  </h3>
+                  <span className="text-xs text-zinc-500 dark:text-zinc-500">
+                    Rows: one per winery mapping · Columns: one per vineyard mapping. Lookups use job vWork winery /
+                    vineyard when set (same keys as tbl_distances / Admin Distances). Effective km / min; manual overrides
+                    apply.
+                  </span>
+                </div>
+                {pairDistMatrixErr && (
+                  <p className="text-sm text-amber-700 dark:text-amber-300">{pairDistMatrixErr}</p>
+                )}
+                {inspectPairMatrixWineryColumns.length > 0 && inspectPairMatrixVineyardColumns.length > 0 ? (
+                  <div className="overflow-x-auto rounded border border-zinc-200 dark:border-zinc-700">
+                    <table className="min-w-[16rem] border-collapse text-left text-xs">
+                      <thead>
+                        <tr className="border-b border-zinc-200 bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-800/80">
+                          <th className="sticky left-0 z-10 border-r border-zinc-200 bg-zinc-50 px-2 py-1.5 font-medium text-zinc-600 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-400">
+                            Winery \ Vineyard
+                          </th>
+                          {inspectPairMatrixVineyardColumns.map((col) => (
+                            <th
+                              key={col.id}
+                              className="max-w-[10rem] px-2 py-1.5 font-medium text-zinc-600 dark:text-zinc-400"
+                              title={`${col.header}${col.pairVineyard !== col.header ? ` · pair: ${col.pairVineyard}` : ''}`}
+                            >
+                              <span className="line-clamp-3 break-words">{col.header}</span>
+                            </th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {pairDistMatrixLoading && Object.keys(pairDistMatrixByKey).length === 0 ? (
+                          <tr>
+                            <td
+                              colSpan={inspectPairMatrixVineyardColumns.length + 1}
+                              className="px-2 py-3 text-zinc-500 dark:text-zinc-400"
+                            >
+                              Loading distances…
+                            </td>
+                          </tr>
+                        ) : (
+                          inspectPairMatrixWineryColumns.map((wrow) => (
+                            <tr key={wrow.id} className="border-b border-zinc-100 dark:border-zinc-800">
+                              <th
+                                className="sticky left-0 z-10 max-w-[11rem] border-r border-zinc-200 bg-white px-2 py-1.5 text-left font-medium text-zinc-800 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200"
+                                title={`${wrow.header}${wrow.pairWinery !== wrow.header ? ` · pair: ${wrow.pairWinery}` : ''}`}
+                              >
+                                <span className="line-clamp-4 break-words">{wrow.header}</span>
+                              </th>
+                              {inspectPairMatrixVineyardColumns.map((col) => {
+                                const w = wrow.pairWinery;
+                                const v = col.pairVineyard;
+                                const cell = pairDistMatrixByKey[`${w}\x1f${v}`];
+                                const dm = cell?.distance_m;
+                                const dur = cell?.duration_min;
+                                const hasData =
+                                  cell != null &&
+                                  ((dm != null && Number.isFinite(dm)) || (dur != null && Number.isFinite(dur)));
+                                const km =
+                                  dm != null && Number.isFinite(dm) ? (dm / 1000).toFixed(1) : null;
+                                const minStr =
+                                  dur != null && Number.isFinite(dur)
+                                    ? dur % 1 === 0
+                                      ? `${Math.round(dur)} min`
+                                      : `${dur.toFixed(1)} min`
+                                    : null;
+                                const jobPair =
+                                  wineryTrim &&
+                                  vineyardTrim &&
+                                  w.trim().toLowerCase() === wineryTrim.toLowerCase() &&
+                                  v.trim().toLowerCase() === vineyardTrim.toLowerCase();
+                                return (
+                                  <td
+                                    key={`${wrow.id}-${col.id}`}
+                                    className={`max-w-[9rem] px-2 py-1.5 align-top leading-snug ${
+                                      jobPair
+                                        ? 'bg-amber-50 font-medium text-zinc-900 dark:bg-amber-950/40 dark:text-zinc-100'
+                                        : hasData
+                                          ? 'text-zinc-800 dark:text-zinc-200'
+                                          : 'text-zinc-400 dark:text-zinc-500'
+                                    }`}
+                                    title={
+                                      cell?.manual_override
+                                        ? 'Includes tbl_distances_manual override'
+                                        : undefined
+                                    }
+                                  >
+                                    {!hasData ? (
+                                      '—'
+                                    ) : (
+                                      <span className="flex flex-col gap-0.5">
+                                        {km != null && <span>{km} km</span>}
+                                        {minStr != null && <span className="tabular-nums">{minStr}</span>}
+                                        {cell?.manual_override ? (
+                                          <span className="text-[10px] font-normal text-zinc-500 dark:text-zinc-400">
+                                            manual
+                                          </span>
+                                        ) : null}
+                                      </span>
+                                    )}
+                                  </td>
+                                );
+                              })}
+                            </tr>
+                          ))
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                ) : (
+                  <p className="text-sm text-zinc-500 dark:text-zinc-400">
+                    Select a job with winery and vineyard names to show pair distances (aligned with Mapping candidates).
+                  </p>
+                )}
+              </div>
+              <div className="w-full shrink-0 space-y-3 lg:w-[min(22rem,100%)]">
+                <div className="flex flex-col gap-2 rounded border border-zinc-200 bg-zinc-50/80 px-2 py-2 dark:border-zinc-600 dark:bg-zinc-800/40">
+                  <label className="flex cursor-pointer items-center gap-2 text-sm text-zinc-800 dark:text-zinc-200">
+                    <input
+                      type="checkbox"
+                      checked={excludedFromSummaries}
+                      onChange={(e) => setExcludedFromSummaries(e.target.checked)}
+                      className="rounded border-zinc-300 dark:border-zinc-600"
+                    />
+                    <span>Exclude from summaries</span>
+                  </label>
+                  <div>
+                    <label className="mb-1 block text-xs font-medium text-zinc-500">Exclude notes (optional)</label>
+                    <textarea
+                      value={excludednotes}
+                      onChange={(e) => setExcludednotes(e.target.value.slice(0, 250))}
+                      placeholder="Why this job is excluded from daily/season rollups…"
+                      rows={2}
+                      maxLength={250}
+                      className="w-full min-w-[12rem] rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+                    />
+                  </div>
+                </div>
+                <div className="flex items-end gap-2">
+                  <div className="min-w-0 flex-1">
+                    <label className="mb-1 block text-xs font-medium text-zinc-500">Comment (what you changed)</label>
+                    <textarea
+                      value={steporidecomment}
+                      onChange={(e) => setSteporidecomment(e.target.value)}
+                      placeholder="Optional note about manual overrides…"
+                      rows={2}
+                      className="w-full min-w-[12rem] rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+                    />
+                  </div>
+                  <button
+                    type="button"
+                    disabled={!selectedRow?.job_id || saveOverridesStatus === 'saving'}
+                    onClick={async () => {
+                      if (!selectedRow?.job_id) return;
+                      setSaveOverridesStatus('saving');
+                      try {
+                        const res = await fetch('/api/vworkjobs/step-overrides', {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({
+                            job_id: String(selectedRow.job_id),
+                            step1oride: stepOverrides.step1oride || null,
+                            step2oride: stepOverrides.step2oride || null,
+                            step3oride: stepOverrides.step3oride || null,
+                            step4oride: stepOverrides.step4oride || null,
+                            step5oride: stepOverrides.step5oride || null,
+                            steporidecomment: steporidecomment || null,
+                            excluded: excludedFromSummaries ? 1 : 0,
+                            excludednotes: excludednotes.trim() ? excludednotes.trim().slice(0, 250) : null,
+                          }),
+                        });
+                        const data = await res.json().catch(() => ({}));
+                        if (!res.ok) {
+                          throw new Error(
+                            typeof data?.error === 'string' ? data.error : res.statusText,
+                          );
+                        }
+                        const s = data?.saved as Record<string, unknown> | undefined;
+                        if (s && typeof s === 'object') {
+                          const str = (k: string) =>
+                            s[k] != null && String(s[k]).trim() !== '' ? String(s[k]).trim().slice(0, 19) : '';
+                          setStepOverrides({
+                            step1oride: str('step1oride'),
+                            step2oride: str('step2oride'),
+                            step3oride: str('step3oride'),
+                            step4oride: str('step4oride'),
+                            step5oride: str('step5oride'),
+                          });
+                          const c = s.steporidecomment;
+                          setSteporidecomment(c != null && String(c).trim() !== '' ? String(c) : '');
+                          setExcludedFromSummaries(Number(s.excluded) === 1);
+                          const en = s.excludednotes;
+                          setExcludednotes(en != null && String(en) !== '' ? String(en).slice(0, 250) : '');
+                        }
+                        await refreshJobRowFromApi(selectedRow.job_id);
+                        setSaveOverridesStatus('saved');
+                      } catch (e) {
+                        setSaveOverridesStatus('error');
+                        console.error('[Save step overrides]', e);
+                      } finally {
+                        setTimeout(() => setSaveOverridesStatus('idle'), 2000);
+                      }
+                    }}
+                    className="shrink-0 rounded bg-green-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-green-700 disabled:opacity-50 dark:bg-green-700 dark:hover:bg-green-600"
+                  >
+                    {saveOverridesStatus === 'saving' ? 'Saving…' : saveOverridesStatus === 'saved' ? 'Saved ✓' : saveOverridesStatus === 'error' ? 'Save failed' : 'Save'}
+                  </button>
+                </div>
+              </div>
+            </div>
             <div className="mt-4 rounded border border-zinc-200 bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-800/50">
               <div className="flex flex-wrap items-center justify-between gap-2 border-b border-zinc-200 px-3 py-2 dark:border-zinc-700">
                 <span className="text-sm font-medium text-zinc-700 dark:text-zinc-300">Steps debug</span>
@@ -2246,6 +2796,20 @@ function InspectContent() {
             </button>
             {showMappingSection && (
               <div className="border-t border-zinc-200 p-4 dark:border-zinc-700">
+                <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                  <p className="text-xs text-zinc-500 dark:text-zinc-400">
+                    Mappings load once when Inspect opens; use Refetch after edits in Admin → GPS mappings.
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => void loadGpsMappings()}
+                    disabled={gpsMappingsLoading}
+                    className="shrink-0 rounded border border-zinc-300 bg-white px-3 py-1.5 text-sm font-medium text-zinc-800 shadow-sm hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100 dark:hover:bg-zinc-700 dark:disabled:opacity-50"
+                    title="Reload tbl_gpsmappings from the server (bypasses browser cache)."
+                  >
+                    {gpsMappingsLoading ? 'Loading…' : 'Refetch mappings'}
+                  </button>
+                </div>
                 <table className="min-w-[20rem] text-left text-sm">
                   <thead>
                     <tr className="border-b border-zinc-200 dark:border-zinc-700">
@@ -2427,8 +2991,8 @@ function InspectContent() {
                           onChange={(e) => setTrackingSortCol(e.target.value)}
                           className="rounded border border-zinc-300 bg-white px-2 py-1 text-sm dark:border-zinc-600 dark:bg-zinc-800"
                         >
-                          {TRACKING_DISPLAY_COLUMNS.map((col) => (
-                            <option key={col} value={col}>{formatColumnLabel(col)}</option>
+                          {TRACKING_GRID_COLUMNS.map((col) => (
+                            <option key={col} value={col}>{trackingGridColLabel(col)}</option>
                           ))}
                         </select>
                         <select
@@ -2440,14 +3004,44 @@ function InspectContent() {
                           <option value="desc">Descending</option>
                         </select>
                       </label>
+                      <button
+                        type="button"
+                        onClick={() => void runTagFencePlusRows()}
+                        disabled={
+                          fencePlusLoading ||
+                          !deviceForTracking ||
+                          !vineyardTrim ||
+                          sortedTrackingRows.length === 0
+                        }
+                        className="rounded border border-violet-300 bg-violet-50 px-2 py-1 text-sm font-medium text-violet-900 hover:bg-violet-100 disabled:opacity-50 dark:border-violet-600 dark:bg-violet-950/40 dark:text-violet-100 dark:hover:bg-violet-900/50"
+                        title="Per-row: job vineyard Steps+ buffer (Settings buffer m). No duration filter. Does not change step logic."
+                      >
+                        {fencePlusLoading ? 'Tagging…' : 'Tag Fence+ rows'}
+                      </button>
                     </div>
+                    {fencePlusErr != null && fencePlusErr !== '' && (
+                      <p className="mb-2 text-sm text-red-600 dark:text-red-400">{fencePlusErr}</p>
+                    )}
+                    {fencePlusMeta != null && (
+                      <p className="mb-2 text-xs text-zinc-500">
+                        Fence+ uses buffer {fencePlusMeta.bufferMeters} m; fence names: {fencePlusMeta.fenceNames.join(', ')}
+                      </p>
+                    )}
                     <div className="max-h-[1200px] min-h-[600px] overflow-auto rounded border border-zinc-200 dark:border-zinc-700">
                       <table className="min-w-full text-left text-sm">
                         <thead className="sticky top-0 z-10 bg-zinc-100 dark:bg-zinc-800">
                           <tr>
-                            {TRACKING_DISPLAY_COLUMNS.map((col) => (
-                              <th key={col} className="whitespace-nowrap px-2 py-1.5 font-medium text-zinc-700 dark:text-zinc-300">
-                                {formatColumnLabel(col)}
+                            {TRACKING_GRID_COLUMNS.map((col) => (
+                              <th
+                                key={col}
+                                className="whitespace-nowrap px-2 py-1.5 font-medium text-zinc-700 dark:text-zinc-300"
+                                title={
+                                  col === 'fence_plus'
+                                    ? 'Point inside ST_Buffer(job vineyard fence(s), Steps+ buffer m) — same geometry as Steps+; per point, no min duration.'
+                                    : undefined
+                                }
+                              >
+                                {trackingGridColLabel(col)}
                               </th>
                             ))}
                             <th className="whitespace-nowrap px-2 py-1.5 font-medium text-zinc-700 dark:text-zinc-300">
@@ -2455,6 +3049,12 @@ function InspectContent() {
                             </th>
                             <th className="whitespace-nowrap px-2 py-1.5 font-medium text-zinc-700 dark:text-zinc-300">
                               Map
+                            </th>
+                            <th
+                              className="whitespace-nowrap px-2 py-1.5 text-right font-medium text-zinc-700 dark:text-zinc-300"
+                              title="tbl_tracking primary key"
+                            >
+                              tbl_tracking.id
                             </th>
                           </tr>
                         </thead>
@@ -2469,13 +3069,29 @@ function InspectContent() {
                             const distanceM = prev && Number.isFinite(prevLat) && Number.isFinite(prevLon) && hasCoords
                               ? haversineMeters(prevLat, prevLon, lat, lon)
                               : null;
+                            const rowKey = row.id != null && String(row.id).trim() !== '' ? `t-${String(row.id)}` : `i-${i}`;
                             return (
-                            <tr key={i} className="border-t border-zinc-100 dark:border-zinc-800">
-                              {TRACKING_DISPLAY_COLUMNS.map((col) => (
-                                <td key={col} className="whitespace-nowrap px-2 py-1.5 text-zinc-600 dark:text-zinc-400">
-                                  {formatGpsCell(row[col])}
-                                </td>
-                              ))}
+                            <tr key={rowKey} className={`border-t border-zinc-100 dark:border-zinc-800 ${gpsTrackingFenceRowClass(row)}`}>
+                              {TRACKING_GRID_COLUMNS.map((col) => {
+                                if (col === 'fence_plus') {
+                                  const rid = row.id != null ? String(row.id) : '';
+                                  const fp = rid !== '' ? fencePlusById[rid] : null;
+                                  return (
+                                    <td
+                                      key={col}
+                                      className="max-w-[16rem] truncate px-2 py-1.5 text-zinc-600 dark:text-zinc-400"
+                                      title={fp != null && fp !== '' ? fp : undefined}
+                                    >
+                                      {fp != null && fp !== '' ? fp : '—'}
+                                    </td>
+                                  );
+                                }
+                                return (
+                                  <td key={col} className="whitespace-nowrap px-2 py-1.5 text-zinc-600 dark:text-zinc-400">
+                                    {formatGpsCell((row as Record<string, unknown>)[col])}
+                                  </td>
+                                );
+                              })}
                               <td className="whitespace-nowrap px-2 py-1.5 text-zinc-600 dark:text-zinc-400 tabular-nums">
                                 {distanceM != null ? `${Math.round(distanceM)}` : '—'}
                               </td>
@@ -2492,6 +3108,13 @@ function InspectContent() {
                                 ) : (
                                   <span className="text-zinc-400">—</span>
                                 )}
+                              </td>
+                              <td className="whitespace-nowrap px-2 py-1.5 text-right tabular-nums text-zinc-600 dark:text-zinc-400">
+                                {row.id != null && String(row.id).trim() !== ''
+                                  ? String(row.id)
+                                  : (row as { ID?: unknown }).ID != null && String((row as { ID: unknown }).ID).trim() !== ''
+                                    ? String((row as { ID: unknown }).ID)
+                                    : '—'}
                               </td>
                             </tr>
                             );
@@ -2541,8 +3164,8 @@ function InspectContent() {
                           onChange={(e) => setTrackingSortCol(e.target.value)}
                           className="rounded border border-zinc-300 bg-white px-2 py-1 text-sm dark:border-zinc-600 dark:bg-zinc-800"
                         >
-                          {TRACKING_DISPLAY_COLUMNS.map((col) => (
-                            <option key={col} value={col}>{formatColumnLabel(col)}</option>
+                          {TRACKING_GRID_COLUMNS.map((col) => (
+                            <option key={col} value={col}>{trackingGridColLabel(col)}</option>
                           ))}
                         </select>
                         <select
@@ -2567,7 +3190,7 @@ function InspectContent() {
                 const esc = (s: string) => `'${String(s).replace(/'/g, "''")}'`;
                 let where = `t.device_name=${esc(deviceForTracking)} AND t.position_time_nz>${esc(after)}`;
                 if (before) where += ` AND t.position_time_nz<${esc(before)}`;
-                return `SELECT t.id, t.device_name, g.fence_name, t.geofence_type, t.position_time_nz, t.position_time, t.lat, t.lon FROM tbl_tracking t LEFT JOIN tbl_geofences g ON g.fence_id = t.geofence_id WHERE ${where} ORDER BY t.position_time_nz ASC LIMIT 500`;
+                return `SELECT t.id, t.device_name, t.geofence_id, g.fence_name, t.geofence_type, t.position_time_nz, t.position_time, t.lat, t.lon FROM tbl_tracking t LEFT JOIN tbl_geofences g ON g.fence_id = t.geofence_id WHERE ${where} ORDER BY t.position_time_nz ASC LIMIT 500`;
               })()}
               </pre>
             )}
@@ -2597,10 +3220,10 @@ function InspectContent() {
             onClick={(e) => e.stopPropagation()}
           >
             <h3 id="pin-job-title" className="text-base font-semibold text-zinc-900 dark:text-zinc-100">
-              Pin job to Recent jobs
+              Pin job
             </h3>
             <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
-              This job moves to the top of the sidebar <span className="font-medium text-zinc-800 dark:text-zinc-200">Query → Recent jobs</span>. Add a short note if you want a reminder when you come back to it.
+              Adds a bookmark under <span className="font-medium text-zinc-800 dark:text-zinc-200">Query → Recent jobs → Pinned</span>. Pins stay in the list when you open the job again; each pin keeps its own note. Use Unpin to remove every pin for this job.
             </p>
             {selectedRow?.job_id != null && selectedRow.job_id !== '' ? (
               <p className="mt-2 font-mono text-xs text-zinc-500 dark:text-zinc-400">Job {String(selectedRow.job_id)}</p>
@@ -2620,7 +3243,16 @@ function InspectContent() {
             />
             <p className="mt-0.5 text-right text-[10px] text-zinc-400">{pinJobNoteDraft.length}/500</p>
             {pinJobError ? <p className="mt-2 text-sm text-red-600 dark:text-red-400">{pinJobError}</p> : null}
-            <div className="mt-4 flex justify-end gap-2">
+            <div className="mt-4 flex flex-wrap justify-end gap-2">
+              <button
+                type="button"
+                disabled={pinJobSaving || !selectedRow}
+                onClick={() => void submitUnpinJobFromRecent()}
+                className="mr-auto rounded border border-amber-300 bg-white px-3 py-1.5 text-sm font-medium text-amber-700 hover:bg-amber-50 disabled:opacity-50 dark:border-amber-700 dark:bg-zinc-900 dark:text-amber-200 dark:hover:bg-amber-950/30"
+                title="Remove all pinned bookmarks for this job from the sidebar."
+              >
+                Unpin
+              </button>
               <button
                 type="button"
                 disabled={pinJobSaving}

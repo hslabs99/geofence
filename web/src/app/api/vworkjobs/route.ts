@@ -184,10 +184,13 @@ export async function GET(request: Request) {
       for (const col of RAW_TIMESTAMP_COLS) {
         const rawKey = `${col}_raw`;
         const rawVal = out[rawKey];
-        if (typeof rawVal === 'string') {
-          out[col] = rawVal;
-          delete out[rawKey];
-        }
+        if (typeof rawVal === 'string') out[col] = rawVal;
+        // Always drop the *_raw key from the wire payload — even when null —
+        // so client `Object.keys(rows[0])` is stable across rows. Otherwise
+        // the visible column set drifts based on which row is first, which
+        // breaks any client memo keyed on the column shape (e.g. saved-sort
+        // re-init on Inspect).
+        delete out[rawKey];
       }
       return out;
     });

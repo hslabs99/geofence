@@ -90,7 +90,7 @@ export async function GET(request: Request) {
 
     const limitPlaceholder = params.length - 1;
     const offsetPlaceholder = params.length;
-    const sql = `SELECT t.device_name, g.fence_name, t.geofence_type, to_char(t.position_time_nz, 'YYYY-MM-DD HH24:MI:SS') AS position_time_nz, to_char(t.position_time, 'YYYY-MM-DD HH24:MI:SS') AS position_time, t.lat, t.lon FROM tbl_tracking t LEFT JOIN tbl_geofences g ON g.fence_id = t.geofence_id WHERE ${whereClause} ORDER BY t.position_time_nz ASC LIMIT $${limitPlaceholder} OFFSET $${offsetPlaceholder}`;
+    const sql = `SELECT t.id, t.device_name, t.geofence_id, g.fence_name, t.geofence_type, to_char(t.position_time_nz, 'YYYY-MM-DD HH24:MI:SS') AS position_time_nz, to_char(t.position_time, 'YYYY-MM-DD HH24:MI:SS') AS position_time, t.lat, t.lon FROM tbl_tracking t LEFT JOIN tbl_geofences g ON g.fence_id = t.geofence_id WHERE ${whereClause} ORDER BY t.position_time_nz ASC LIMIT $${limitPlaceholder} OFFSET $${offsetPlaceholder}`;
 
     const rows = await query(sql, params);
 
@@ -101,7 +101,7 @@ export async function GET(request: Request) {
     const fencePart = fenceNames.length > 0
       ? ` AND g.fence_name IN (${fenceNames.map((n) => esc(n)).join(', ')})`
       : '';
-    const sqlCopyPaste = `SELECT t.device_name, g.fence_name, t.geofence_type, to_char(t.position_time_nz, 'YYYY-MM-DD HH24:MI:SS') AS position_time_nz, to_char(t.position_time, 'YYYY-MM-DD HH24:MI:SS') AS position_time, t.lat, t.lon FROM tbl_tracking t LEFT JOIN tbl_geofences g ON g.fence_id = t.geofence_id WHERE t.device_name = ${esc(device.trim())} AND ${timePart}${fencePart}${geofenceTypeCondition} ORDER BY t.position_time_nz ASC LIMIT ${limit} OFFSET ${offset}`;
+    const sqlCopyPaste = `SELECT t.id, t.device_name, t.geofence_id, g.fence_name, t.geofence_type, to_char(t.position_time_nz, 'YYYY-MM-DD HH24:MI:SS') AS position_time_nz, to_char(t.position_time, 'YYYY-MM-DD HH24:MI:SS') AS position_time, t.lat, t.lon FROM tbl_tracking t LEFT JOIN tbl_geofences g ON g.fence_id = t.geofence_id WHERE t.device_name = ${esc(device.trim())} AND ${timePart}${fencePart}${geofenceTypeCondition} ORDER BY t.position_time_nz ASC LIMIT ${limit} OFFSET ${offset}`;
 
     return NextResponse.json({ rows: jsonSafe(rows), sql, sqlCopyPaste, total });
   } catch (err) {

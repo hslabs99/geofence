@@ -151,7 +151,7 @@ export default function DistancesPage() {
     [rows, reportFormat],
   );
   const isCompactFormat = reportFormat === 'customer_template';
-  const tableColSpan = isCompactFormat ? 4 : 6;
+  const tableColSpan = isCompactFormat ? 4 : 7;
   const loadedWithKmCount = useMemo(() => rows.filter(jobHasReportableDistanceKm).length, [rows]);
   const showDebug = viewMode !== 'client';
 
@@ -326,7 +326,7 @@ export default function DistancesPage() {
       ) : (
         <div className="max-h-[72vh] overflow-auto rounded-lg border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900">
           <table
-            className={`w-full text-left text-xs ${isCompactFormat ? 'min-w-[26rem]' : 'min-w-[42rem]'}`}
+            className={`w-full text-left text-xs ${isCompactFormat ? 'min-w-[26rem]' : 'min-w-[50rem]'}`}
           >
             <thead
               className={`${THEAD_TH} sticky top-0 z-10 bg-zinc-100 shadow-[0_1px_0_0_rgba(0,0,0,0.1)] dark:bg-zinc-800 dark:shadow-[0_1px_0_0_rgba(255,255,255,0.08)]`}
@@ -342,6 +342,9 @@ export default function DistancesPage() {
                   <>
                     <th className="border-r border-zinc-200 px-2 py-2 text-xs font-medium text-zinc-500 dark:border-zinc-700 dark:text-zinc-400">
                       Winery
+                    </th>
+                    <th className="border-r border-zinc-200 px-2 py-2 text-xs font-medium text-zinc-500 dark:border-zinc-700 dark:text-zinc-400">
+                      Vineyard
                     </th>
                     <th className="border-r border-zinc-200 px-2 py-2 text-xs font-medium text-zinc-500 dark:border-zinc-700 dark:text-zinc-400">
                       Truck
@@ -425,6 +428,9 @@ export default function DistancesPage() {
                           {r.winery}
                         </td>
                         <td className="min-w-[8rem] whitespace-nowrap border-r border-zinc-200 px-2 py-1.5 text-zinc-800 dark:border-zinc-700 dark:text-zinc-200">
+                          {r.vineyard}
+                        </td>
+                        <td className="min-w-[8rem] whitespace-nowrap border-r border-zinc-200 px-2 py-1.5 text-zinc-800 dark:border-zinc-700 dark:text-zinc-200">
                           {r.truck}
                         </td>
                         <td className="whitespace-nowrap border-r border-zinc-200 px-2 py-1.5 text-right tabular-nums text-zinc-500 dark:border-zinc-700 dark:text-zinc-400">
@@ -457,6 +463,7 @@ export default function DistancesPage() {
                       : r.scope === 'winery'
                         ? r.label
                         : r.winery;
+                  const vine = '—';
                   const tr =
                     r.scope === 'truck'
                       ? r.label
@@ -476,6 +483,9 @@ export default function DistancesPage() {
                       </td>
                       <td className="whitespace-nowrap border-r border-zinc-200 px-2 py-1.5 text-zinc-700 dark:border-zinc-700 dark:text-zinc-300">
                         {w}
+                      </td>
+                      <td className="min-w-[8rem] whitespace-nowrap border-r border-zinc-200 px-2 py-1.5 text-zinc-700 dark:border-zinc-700 dark:text-zinc-300">
+                        {vine}
                       </td>
                       <td className="min-w-[8rem] border-r border-zinc-200 px-2 py-1.5 text-zinc-800 dark:border-zinc-700 dark:text-zinc-200">
                         {tr}

@@ -1,6 +1,6 @@
 /**
- * Build per-step VWork / GPS / Manual / Final values to match Query → Inspect “Step details”
- * (same column precedence and step-5 final rule). Uses case-insensitive column lookup on raw job rows.
+ * Build per-step VWork / GPS / Manual / Final values to match Query → Inspect “Step details”.
+ * Final = manual (oride) if set, else `step_N_actual_time`, else VWork `step_N_completed_at` — same as DB after steps write-back.
  */
 
 import { dateToLiteral } from '@/lib/utils';
@@ -22,7 +22,7 @@ function col(row: Record<string, unknown>, logical: string): unknown {
   return undefined;
 }
 
-/** Normalize timestamp to YYYY-MM-DD HH:mm:ss for comparison (Inspect step-5 rule). */
+/** Normalize timestamp to YYYY-MM-DD HH:mm:ss for comparison (e.g. minutes-between). */
 function normalizeForCompare(v: unknown): string | null {
   if (v == null || v === '') return null;
   const raw = cellToTimestampString(v);
@@ -96,24 +96,7 @@ export function buildInspectStyleStepsFromJobRow(row: Record<string, unknown>): 
       col(row, `step_${n}_actual_time`) ?? row[`Step_${n}_actual_time`] ?? row[`Step_${n}_Actual_Time`];
     const actualStr = asTrimmedSlice(actualRaw, 32);
 
-    let finalStr: string | null;
-    if (manualStr) {
-      finalStr = manualStr;
-    } else {
-      finalStr = actualStr ?? vworkStr;
-      if (n === 5 && !manualStr) {
-        const vworkStep5 =
-          col(row, 'step_5_completed_at') ?? row['Step_5_completed_at'] ?? row['Step_5_Completed_At'];
-        const gpsStepVal = gpsStr;
-        if (gpsStepVal && vworkStep5 != null && String(vworkStep5).trim() !== '') {
-          const gpsNorm = normalizeForCompare(gpsStepVal);
-          const vworkNorm = normalizeForCompare(vworkStep5);
-          if (gpsNorm != null && vworkNorm != null && gpsNorm >= vworkNorm) {
-            finalStr = asTrimmedSlice(vworkStep5, 32);
-          }
-        }
-      }
-    }
+    const finalStr: string | null = manualStr ? manualStr : actualStr ?? vworkStr;
 
     const viaRaw = col(row, `step_${n}_via`) ?? row[`Step_${n}_Via`];
     const viaStr = viaRaw != null && String(viaRaw).trim() !== '' ? String(viaRaw).trim() : null;

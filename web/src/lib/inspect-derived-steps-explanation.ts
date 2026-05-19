@@ -3,6 +3,8 @@
  */
 
 import type { CleanupRulesReport } from '@/lib/derived-steps';
+import { normalizeTimestampString } from '@/lib/normalize-timestamp-string';
+import { formatDateDdMmHhMm, formatDateNZ } from '@/lib/utils';
 
 export type InspectExplanationItem = {
   id: string;
@@ -15,6 +17,70 @@ export type InspectExplanationItem = {
 function str(v: unknown): string {
   if (v == null) return '';
   return String(v).trim();
+}
+
+/** DB/API timestamp → dd/mm hh:mm for Inspect lines (pattern-only; no Date math). */
+function formatGpsWindowForInspect(raw: string): string {
+  const s = str(raw);
+  if (!s) return '—';
+  if (/^\d{1,2}\/\d{1,2}\/\d{2,4}/.test(s)) {
+    const n = formatDateDdMmHhMm(s);
+    return n !== '—' ? n : s.slice(0, 16);
+  }
+  const narrow = formatDateDdMmHhMm(s);
+  if (narrow !== '—') return narrow;
+  const nz = formatDateNZ(s.slice(0, 19));
+  return nz && nz !== s.slice(0, 19) ? nz : s.slice(0, 19);
+}
+
+/** Lines for polygon fail: job window + actual tbl_tracking bounds used on the lookup + optional guardrail. */
+function buildVineyardPolygonFailWindowLines(api: Record<string, unknown>, step: 'step2' | 'step3'): string[] {
+  const lines: string[] = [];
+  const dbg = api.debug && typeof api.debug === 'object' ? (api.debug as Record<string, unknown>) : null;
+  const vineyard = dbg?.vineyard && typeof dbg.vineyard === 'object' ? (dbg.vineyard as Record<string, unknown>) : null;
+  const cell = vineyard?.[step] && typeof vineyard[step] === 'object' ? (vineyard[step] as Record<string, unknown>) : null;
+
+  if (dbg) {
+    const pa = str(dbg.positionAfter);
+    const pb = dbg.positionBefore != null && str(dbg.positionBefore) !== '' ? str(dbg.positionBefore) : '';
+    lines.push(
+      `Inspect / API tracking window (job): position_time_nz strictly after ${formatGpsWindowForInspect(pa)}` +
+        (pb ? ` and strictly before ${formatGpsWindowForInspect(pb)}.` : ' (no positionBefore — open-ended on job window).'),
+    );
+  }
+
+  if (cell) {
+    const lo = str(cell.positionAfter);
+    const hi = cell.positionBefore != null && str(cell.positionBefore) !== '' ? str(cell.positionBefore) : '';
+    const kind = step === 'step2' ? 'ENTER' : 'EXIT';
+    lines.push(
+      `Polygon ${step === 'step2' ? 'Step 2' : 'Step 3'} tbl_tracking query: first Vineyard ${kind} with ` +
+        `position_time_nz > ${formatGpsWindowForInspect(lo)}` +
+        (hi ? ` AND position_time_nz < ${formatGpsWindowForInspect(hi)} (both exclusive).` : ' (no exclusive upper on this query).'),
+    );
+    const ids = Array.isArray(cell.fenceIds) ? (cell.fenceIds as unknown[]).map((x) => String(x)).filter(Boolean) : [];
+    if (ids.length > 0) {
+      lines.push(`Mapped vineyard geofence_id list (ANY): [${ids.join(', ')}].`);
+    }
+    const tp = str(cell.tracePlain);
+    if (tp) lines.push(`Ordered context: ${tp}`);
+  } else {
+    lines.push(
+      `No debug.vineyard.${step} on this payload — refetch steps so the API returns full debug (fence ids + bounds).`,
+    );
+  }
+
+  const vf = dbg?.vineyardGpsOrderingFloor && typeof dbg.vineyardGpsOrderingFloor === 'object' ? (dbg.vineyardGpsOrderingFloor as Record<string, unknown>) : null;
+  const p1 = vineyard?.part1FetchGuardrail && typeof vineyard.part1FetchGuardrail === 'object' ? (vineyard.part1FetchGuardrail as Record<string, unknown>) : null;
+  if (step === 'step2') {
+    const summaryPoly = str(p1?.summaryLineStep2Polygon);
+    if (summaryPoly) {
+      lines.push(`Part 1 fetch → guardrails (polygon step 2): ${summaryPoly}`);
+    } else if (vf && str(vf.summaryLine)) {
+      lines.push(`Vineyard GPS ordering floor (for steps 2/3/5): ${str(vf.summaryLine)}`);
+    }
+  }
+  return lines;
 }
 
 function buildLastJobEndStep1LimiterItem(api: Record<string, unknown>): InspectExplanationItem | null {
@@ -231,6 +297,31 @@ function viaLabel(v: unknown): string {
   return s || '—';
 }
 
+/** Prefer debug.vineyard.resolvedFenceNames so each mapped fence shows geofence_id next to the name. */
+function buildMappedVineyardSearchLine(api: Record<string, unknown>, nameList: string[]): string {
+  const dbg = api.debug && typeof api.debug === 'object' ? (api.debug as Record<string, unknown>) : null;
+  const v = dbg?.vineyard && typeof dbg.vineyard === 'object' ? (dbg.vineyard as Record<string, unknown>) : null;
+  const resolved = v?.resolvedFenceNames;
+  if (Array.isArray(resolved) && resolved.length > 0) {
+    const parts: string[] = [];
+    for (const item of resolved) {
+      if (item == null || typeof item !== 'object') continue;
+      const o = item as Record<string, unknown>;
+      const fid = o.fence_id;
+      const fn = str(o.fence_name);
+      const idStr = fid != null && String(fid).trim() !== '' ? String(fid) : '—';
+      parts.push(fn ? `${fn} (geofence_id ${idStr})` : `(geofence_id ${idStr})`);
+    }
+    if (parts.length > 0) {
+      return `Mapped vineyard search set (VWork + tbl_gpsmappings → tbl_geofences): ${parts.join('; ')}.`;
+    }
+  }
+  if (nameList.length > 0) {
+    return `Mapped vineyard search set (names; resolve to geofence_id in tbl_geofences): ${nameList.join('; ')}.`;
+  }
+  return 'Mapped vineyard search set: (not in snapshot — refetch with newer API for names).';
+}
+
 function fmtMinSec(sec: unknown): string {
   const n = typeof sec === 'number' ? sec : parseInt(String(sec ?? ''), 10);
   if (!Number.isFinite(n) || n <= 0) return '—';
@@ -273,6 +364,7 @@ export function buildInspectDerivedStepsExplanation(api: Record<string, unknown>
     detail: [
       'Uses tbl_tracking for the Inspect window (start less / end plus), vineyard & winery fence mappings, guardrails, then optional Steps+ (buffer around vineyard polygons).',
       'Headlines are the quick read; open a row for why.',
+      'Explanation order is narrative: Step 1 (fence union, morning EXIT, GPS1 vs polygon G2 bracket, vineyard ordering floor), then Step 2 polygon + ENTER window, Step 3 polygon + EXIT window, Step 4 winery ENTER (strict fetch + relaxed audit when anchor raises the floor), winery Step 5 EXIT window, Vine+, cleanup, final rollup. The raw API debug object still follows server computation order.',
     ],
   });
 
@@ -281,7 +373,11 @@ export function buildInspectDerivedStepsExplanation(api: Record<string, unknown>
 
   const acid = buildAcidTestStep1Item(api);
   if (acid) out.push(acid);
-  pushCleanupRulesAudit(out, api);
+
+  pushStep1MorningFenceUnion(out, api);
+  pushStep1MorningExitAudit(out, api);
+  pushGpsStep1GuardrailAudit(out, api);
+  pushVineyardGpsOrderingFloorAudit(out, api);
 
   const initial = api.initialPass as Record<string, unknown> | undefined;
   const sPlus = api.stepsPlusReport as Record<string, unknown> | undefined;
@@ -296,13 +392,16 @@ export function buildInspectDerivedStepsExplanation(api: Record<string, unknown>
     const step2SearchList = Array.isArray(initial.step2PolygonSearchFenceNames)
       ? (initial.step2PolygonSearchFenceNames as unknown[]).map((x) => str(x)).filter(Boolean)
       : [];
-    const step2SearchLine =
-      step2SearchList.length > 0
-        ? `Mapped vineyard search set (VWork + tbl_gpsmappings → tbl_geofences): ${step2SearchList.join('; ')}.`
-        : 'Mapped vineyard search set: (not in snapshot — refetch with newer API for names).';
+    const step2SearchLine = buildMappedVineyardSearchLine(api, step2SearchList);
 
     if (has(poly2)) {
-      const fenceBit = step2Fence ? ` · ${step2Fence}` : '';
+      const fenceBit = step2Fence
+        ? ` · ${step2Fence}${
+            step2Gid != null && (typeof step2Gid === 'number' || typeof step2Gid === 'string')
+              ? ` (geofence_id ${String(step2Gid)})`
+              : ''
+          }`
+        : '';
       const gidDetail =
         step2Gid != null && (typeof step2Gid === 'number' || typeof step2Gid === 'string')
           ? `tbl_tracking.geofence_id on winning row: ${String(step2Gid)}.`
@@ -312,7 +411,11 @@ export function buildInspectDerivedStepsExplanation(api: Record<string, unknown>
         headline: `Step 2 · Polygon OK${fenceBit} · arrive ${str(poly2).slice(0, 19)}`,
         detail: [
           step2Fence
-            ? `Winning ENTER: geofence “${step2Fence}” (one of several mapped names for this vineyard).`
+            ? `Winning ENTER: geofence “${step2Fence}”${
+                step2Gid != null && (typeof step2Gid === 'number' || typeof step2Gid === 'string')
+                  ? ` (geofence_id ${String(step2Gid)})`
+                  : ''
+              } (one of several mapped names for this vineyard).`
             : 'Winning ENTER: fence name not in snapshot (older API).',
           ...(gidDetail ? [gidDetail] : []),
           step2SearchLine,
@@ -324,12 +427,14 @@ export function buildInspectDerivedStepsExplanation(api: Record<string, unknown>
         id: 'poly2-fail',
         headline: `Step 2 · Polygon failed · no vineyard ENTER for “${vName}”`,
         detail: [
-          'No tbl_tracking ENTER row whose geofence_id maps to this job’s vineyard fences.',
+          'No tbl_tracking ENTER row whose geofence_id maps to this job’s vineyard fences (after guardrails / window).',
           step2SearchLine,
           `Via after first pass: ${viaLabel(initial.step2Via)}.`,
+          ...buildVineyardPolygonFailWindowLines(api, 'step2'),
         ],
       });
     }
+    pushVineyardStepLookupTraceForStep(out, api, 'step2');
 
     if (has(poly3)) {
       out.push({
@@ -344,16 +449,23 @@ export function buildInspectDerivedStepsExplanation(api: Record<string, unknown>
         detail: [
           'No tbl_tracking EXIT on mapped vineyard fence ids after the arrive time (or none in window).',
           `Via: ${viaLabel(initial.step3Via)}.`,
+          ...buildVineyardPolygonFailWindowLines(api, 'step3'),
         ],
       });
     }
+    pushVineyardStepLookupTraceForStep(out, api, 'step3');
   } else {
     out.push({
       id: 'poly-snapshot-missing',
       headline: 'Step 2–3 · Polygon snapshot missing (older API)',
       detail: ['Refetch after deploy to get initialPass, or read Step_N_GPS on the job row.'],
     });
+    pushVineyardStepLookupTraceForStep(out, api, 'step2');
+    pushVineyardStepLookupTraceForStep(out, api, 'step3');
   }
+
+  pushWineryStep4EnterTrace(out, api);
+  pushStep5GpsWindowAudit(out, api);
 
   if (!sPlus) {
     out.push({
@@ -361,7 +473,8 @@ export function buildInspectDerivedStepsExplanation(api: Record<string, unknown>
       headline: 'Vine+ · Report missing (older API)',
       detail: ['Server did not return stepsPlusReport; VineFence+ / VineFenceV+ may still be in Via.'],
     });
-    return finishFinal(out, api);
+    appendStepsClosingAudit(out, api);
+    return out;
   }
 
   if (sPlus.eligible === false) {
@@ -382,7 +495,8 @@ export function buildInspectDerivedStepsExplanation(api: Record<string, unknown>
             ? ['Call derived-steps with writeBack so Steps+ runs.']
             : undefined,
     });
-    return finishFinal(out, api);
+    appendStepsClosingAudit(out, api);
+    return out;
   }
 
   const minSec = sPlus.minDurationSeconds;
@@ -493,7 +607,55 @@ export function buildInspectDerivedStepsExplanation(api: Record<string, unknown>
     });
   }
 
-  return finishFinal(out, api);
+  appendStepsClosingAudit(out, api);
+  return out;
+}
+
+/** After step fetch narrative: Part 3b cleanup, then final step 1–5 rollup. */
+function appendStepsClosingAudit(out: InspectExplanationItem[], api: Record<string, unknown>): void {
+  pushCleanupRulesAudit(out, api);
+  pushFinalStepsHeadlineSummary(out, api);
+}
+
+/** One-line-per-step summary from merged API payload. */
+function pushFinalStepsHeadlineSummary(out: InspectExplanationItem[], api: Record<string, unknown>): void {
+  const lines: string[] = [];
+  for (let n = 1; n <= 5; n++) {
+    const g = api[`step${n}Gps` as keyof typeof api];
+    const v = api[`step${n}Via` as keyof typeof api];
+    const a = api[`step${n}` as keyof typeof api];
+    const src = has(g) ? `GPS ${str(g).slice(0, 19)}` : has(a) ? `final ${str(a).slice(0, 19)}` : '—';
+    lines.push(`Step ${n}: ${src} · via ${viaLabel(v)}`);
+  }
+  out.push({
+    id: 'final',
+    headline: 'Final · steps 1–5 (after buffer pass)',
+    detail: lines,
+  });
+}
+
+/** Inspect → Steps debug → Explanation: Step 1 morning EXIT fence_id union (this job ∪ previous job winery when chained). */
+function pushStep1MorningFenceUnion(out: InspectExplanationItem[], api: Record<string, unknown>): void {
+  const dbg = api.debug && typeof api.debug === 'object' ? (api.debug as Record<string, unknown>) : null;
+  const winery = dbg?.winery && typeof dbg.winery === 'object' ? (dbg.winery as Record<string, unknown>) : null;
+  const u = winery?.step1MorningFenceUnion;
+  if (u == null || typeof u !== 'object') return;
+  const r = u as Record<string, unknown>;
+  const unioned = r.unionedPreviousWinery === true;
+  const prevDw = str(r.previousDeliveryWinery);
+  const prevId = str(r.previousJobId);
+  const mergedCount = r.mergedFenceIdCount;
+  out.push({
+    id: 'step1-morning-fence-union',
+    headline: unioned
+      ? `Step 1 · Morning EXIT · fence_ids include previous job winery (${prevDw || '—'})`
+      : 'Step 1 · Morning EXIT · fence_ids · this job delivery winery only',
+    detail: [
+      typeof mergedCount === 'number' ? `Merged geofence id count: ${mergedCount}` : '',
+      prevId ? `Previous same-day job id: ${prevId}` : '',
+      prevDw ? `Previous delivery_winery: ${prevDw}` : '',
+    ].filter(Boolean),
+  });
 }
 
 /** Inspect → Steps debug → Explanation: morning winery EXIT (step 1) bounds + re-enter NOT EXISTS rule. */
@@ -549,6 +711,53 @@ function pushStep1MorningExitAudit(out: InspectExplanationItem[], api: Record<st
   out.push({ id: 'step1-morning-exit', headline, detail });
 }
 
+/** Inspect → Steps debug → GPS step 1 guardrail (anchor vs GPS2 at bracket check). */
+function pushGpsStep1GuardrailAudit(out: InspectExplanationItem[], api: Record<string, unknown>): void {
+  const dbg = api.debug && typeof api.debug === 'object' ? (api.debug as Record<string, unknown>) : null;
+  const g = dbg?.gpsStep1Guardrail;
+  if (g == null || typeof g !== 'object') {
+    out.push({
+      id: 'gps-step1-guardrail-missing',
+      headline: 'Step 1 · GPS guardrail audit · not in response',
+      detail: ['Refetch after deploy — API should return debug.gpsStep1Guardrail.'],
+    });
+    return;
+  }
+  const r = g as Record<string, unknown>;
+  const oc = str(r.anchorBracketOutcome).replace(/_/g, ' ');
+  const droppedJob = r.droppedGps1AtOrAfterVworkJobEnd === true;
+  const droppedBracket = r.droppedGps1ByAfterAnchorBracket === true;
+  const headline =
+    droppedJob || droppedBracket
+      ? `Step 1 · GPS guardrail · dropped · ${oc}`
+      : `Step 1 · GPS guardrail · ${oc}`;
+  const detail: string[] = [];
+  detail.push(`VWork job end (step 1–2 ceiling): ${str(r.vworkJobEndForStep12Ceiling).slice(0, 19) || '—'}.`);
+  detail.push(
+    `Dropped at/after job end: ${droppedJob ? 'yes' : 'no'} · candidate before that check: ${str(r.gps1BeforeJobEndCheck).slice(0, 19) || '—'} (tracking id ${str(r.gps1TrackingIdBeforeJobEndCheck) || '—'}).`
+  );
+  detail.push(`Job start anchor (step1oride ?? VWork step 1): ${str(r.jobStartAnchor).slice(0, 19) || '—'}.`);
+  detail.push(`Bracket evaluated: ${r.anchorBracketEvaluated === true ? 'yes' : 'no'}.`);
+  detail.push(
+    `GPS1 at bracket: ${str(r.gps1AtAnchorBracket).slice(0, 19) || '—'} (id ${str(r.gps1TrackingIdAtAnchorBracket) || '—'}).`
+  );
+  detail.push(
+    `GPS2 polygon at bracket (unchanged by tentative): ${str(r.gps2AtAnchorBracketCheck).slice(0, 19) || '—'} (id ${str(r.gps2TrackingIdAtAnchorBracketCheck) || '—'}).`
+  );
+  detail.push(`Tracking floor for tentative G2 (strict >): ${str(r.step1BracketTrackingFloor).slice(0, 19) || '—'}.`);
+  detail.push(`Tentative merged enter (Steps+ only, bracket): ${str(r.tentativeVineyardEnterFromOptions).slice(0, 19) || '—'}.`);
+  detail.push(`Tentative G2 qualified (after anchor+floor): ${str(r.tentativeG2QualifiedForBracket).slice(0, 19) || '—'}.`);
+  detail.push(`Bracket used tentative G2: ${r.bracketUsedTentativeG2 === true ? 'yes' : 'no'}.`);
+  detail.push(`G2 effective for strict GPS1<G2: ${str(r.g2EffectiveForAnchorBracket).slice(0, 19) || '—'}.`);
+  detail.push(`GPS1 strictly after anchor: ${r.gps1StrictlyAfterAnchor === true ? 'yes' : r.gps1StrictlyAfterAnchor === false ? 'no' : '—'}.`);
+  detail.push(
+    `Keep condition (G2eff exists and GPS1<G2eff strict): ${r.keepG1AfterAnchorConditionMet === true ? 'yes' : r.keepG1AfterAnchorConditionMet === false ? 'no' : '—'}.`
+  );
+  detail.push(`Dropped by after-anchor bracket: ${droppedBracket ? 'yes' : 'no'}.`);
+  if (str(r.summaryLine)) detail.push(str(r.summaryLine));
+  out.push({ id: 'gps-step1-guardrail', headline, detail });
+}
+
 /** Inspect → Steps debug → Explanation: Part 1 (X,Y) window + Part 2 accept for GPS step 5. */
 function pushStep5GpsWindowAudit(out: InspectExplanationItem[], api: Record<string, unknown>): void {
   const dbg = api.debug && typeof api.debug === 'object' ? (api.debug as Record<string, unknown>) : null;
@@ -581,7 +790,8 @@ function pushStep5GpsWindowAudit(out: InspectExplanationItem[], api: Record<stri
   detail.push(`Job end for step-5 cap (step_5_completed_at ?? actual_end_time): ${str(w.jobEndForStep5Rule).slice(0, 19) || '—'}.`);
   detail.push(`positionBefore from derived-steps options: ${str(w.positionBeforeFromOptions).slice(0, 19) || '—'}.`);
   detail.push(`Step5ExtendWineryExit (minutes): ${str(w.step5ExtendWineryExitMinutes)}.`);
-  detail.push(`jobEnd + extend (input to min): ${str(w.jobEndPlusExtend).slice(0, 19) || '—'}.`);
+  detail.push(`Step5 extend anchor max(tap, GPS4): ${str(w.step5ExtendAnchor).slice(0, 19) || '—'}.`);
+  detail.push(`anchor + extend (input to min): ${str(w.jobEndPlusExtend).slice(0, 19) || '—'}.`);
   detail.push(`upperExclusiveSource: ${str(w.upperExclusiveSource).replace(/_/g, ' ') || '—'}.`);
   detail.push(`step5ExitQueryRan: ${w.step5ExitQueryRan === true ? 'yes' : 'no'}.`);
   if (dec) {
@@ -589,27 +799,332 @@ function pushStep5GpsWindowAudit(out: InspectExplanationItem[], api: Record<stri
     detail.push(str(dec.summaryLine));
     detail.push(`Fetch candidate after guardrails: ${str(dec.fetchCandidateTime).slice(0, 19) || '—'} (tracking id ${str(dec.fetchCandidateTrackingId) || '—'}).`);
     detail.push(`VWork job end: ${str(dec.vworkStep5).slice(0, 19) || '—'}.`);
-    detail.push(`Accept-after-job-end exclusive upper (job end + extend): ${str(dec.acceptAfterJobEndExclusiveUpper).slice(0, 19) || '—'}.`);
+    detail.push(`Step5 extend anchor max(tap, GPS4): ${str(dec.step5ExtendAnchor).slice(0, 19) || '—'}.`);
+    detail.push(`Accept-after-job-end exclusive upper (max(tap, GPS4) + extend): ${str(dec.acceptAfterJobEndExclusiveUpper).slice(0, 19) || '—'}.`);
     detail.push(`step5GpsAccepted: ${dec.step5GpsAccepted === true ? 'yes' : 'no'} · outcome: ${str(dec.outcome).replace(/_/g, ' ') || '—'}.`);
   }
   out.push({ id: 'step5-gps-window', headline, detail });
 }
 
-function finishFinal(out: InspectExplanationItem[], api: Record<string, unknown>): InspectExplanationItem[] {
-  pushStep1MorningExitAudit(out, api);
-  pushStep5GpsWindowAudit(out, api);
-  const lines: string[] = [];
-  for (let n = 1; n <= 5; n++) {
-    const g = api[`step${n}Gps` as keyof typeof api];
-    const v = api[`step${n}Via` as keyof typeof api];
-    const a = api[`step${n}` as keyof typeof api];
-    const src = has(g) ? `GPS ${str(g).slice(0, 19)}` : has(a) ? `final ${str(a).slice(0, 19)}` : '—';
-    lines.push(`Step ${n}: ${src} · via ${viaLabel(v)}`);
+function pushVineyardGpsOrderingFloorAudit(out: InspectExplanationItem[], api: Record<string, unknown>): void {
+  const dbg = api.debug && typeof api.debug === 'object' ? (api.debug as Record<string, unknown>) : null;
+  const vf = dbg?.vineyardGpsOrderingFloor;
+  if (vf == null || typeof vf !== 'object') return;
+  const r = vf as Record<string, unknown>;
+  const detail: string[] = [];
+  if (str(r.summaryLine)) detail.push(str(r.summaryLine));
+  detail.push(`Rule: ${str(r.rule).replace(/_/g, ' ')}.`);
+  detail.push(
+    `Parts: step1oride=${str(r.orideNorm).slice(0, 19) || '—'} · GPS1(after bracket)=${str(r.gps1NormAfterBracket).slice(0, 19) || '—'} · tap=${str(r.tapOnlyNorm).slice(0, 19) || '—'} · floor=${str(r.floorFor235).slice(0, 19) || '—'}.`
+  );
+  out.push({
+    id: 'vineyard-ordering-floor',
+    headline: 'Vineyard GPS ordering · guardrail floor (steps 2–3–5)',
+    detail,
+  });
+}
+
+function formatVineyardTraceRowVerdict(
+  row: Record<string, unknown>,
+  idx: number,
+  winnerIdx: number,
+  winnerRow: Record<string, unknown>,
+  key: 'step2' | 'step3',
+  part1: Record<string, unknown> | null,
+  vf: Record<string, unknown> | null
+): string {
+  const id = row.id != null ? String(row.id) : '—';
+  const gid = row.geofence_id != null ? String(row.geofence_id) : '—';
+  const fn = str(row.fence_name) || '—';
+  const tnz = str(row.position_time_nz).slice(0, 19) || '—';
+  const base = `  id=${id} · geofence_id=${gid} · ${fn} · position_time_nz=${tnz}`;
+
+  if (idx !== winnerIdx) {
+    const wid = winnerRow.id != null ? String(winnerRow.id) : '—';
+    const wtnz = str(winnerRow.position_time_nz).slice(0, 19) || '—';
+    const kind = key === 'step2' ? 'ENTER' : 'EXIT';
+    return `${base} → FAIL · not LIMIT 1 · same WHERE, ORDER BY position_time_nz ASC — earliest matching ${kind} is id=${wid} at ${wtnz}; this row is never returned by LIMIT 1.`;
+  }
+
+  const floorRaw = part1?.orderingFloorExclusive;
+  const floor = floorRaw != null ? str(floorRaw).slice(0, 19) : '';
+  const floorRule = str(vf?.rule).replace(/_/g, ' ');
+  const clearedFloor =
+    key === 'step2'
+      ? part1?.clearedByOrderingFloorStep2 === true
+      : part1?.clearedByOrderingFloorStep3 === true;
+  const clearedJob = part1?.clearedVworkJobEndStep2And3 === true;
+  const clearedCeilingOnly = part1?.clearedStep3OnlyJobEndCeiling === true;
+  const dups = part1?.duplicateTrackingIdClears as unknown;
+  const dupKey = key === 'step2' ? 'step2' : 'step3';
+  const dupClear = Array.isArray(dups) && dups.some((x) => String(x) === dupKey);
+
+  const removalReasons: string[] = [];
+  if (clearedFloor && floor) {
+    const tn = normalizeTimestampString(tnz) ?? tnz;
+    const fl = normalizeTimestampString(floor) ?? floor;
+    const strictlyAfter = tn > fl;
+    if (!strictlyAfter) {
+      removalReasons.push(
+        `ordering floor: Part 1 requires position_time_nz > ${floor}${floorRule ? ` (${floorRule})` : ''}; this LIMIT 1 row at ${tnz} is not strictly after that floor`
+      );
+    } else {
+      removalReasons.push(
+        `ordering floor: Part 1 cleared this step for floor ${floor}${floorRule ? ` (${floorRule})` : ''} — listed time ${tnz} sorts strictly after that floor; compare preclear / merged candidate time in API debug`
+      );
+    }
+  }
+  if (clearedJob) {
+    removalReasons.push('VWork job end (vineyard ENTER time ≥ job end clears steps 2 and 3 together)');
+  }
+  if (key === 'step3' && clearedCeilingOnly && !clearedJob) {
+    removalReasons.push('step 3 ceiling only (vineyard EXIT at/after job end + step-3 buffer)');
+  }
+  if (dupClear) {
+    removalReasons.push('duplicate tbl_tracking.id (same id already kept on an earlier step in 1→5 merge order)');
+  }
+
+  if (removalReasons.length > 0) {
+    return `${base} → FAIL · LIMIT 1 row (earliest match) but Part 1 removed it: ${removalReasons.join('; ')}.`;
+  }
+  return `${base} → SUCCESS · LIMIT 1 row (earliest match) and Part 1 guardrails kept it (ordering floor, job end / step-3 ceiling, duplicate-id).`;
+}
+
+function formatStep4AuditRowVerdict(
+  row: Record<string, unknown>,
+  fetchLowerExclusive: string,
+  step1LegDisplay: string
+): string {
+  const id = row.id != null ? String(row.id) : '—';
+  const gid = row.geofence_id != null ? String(row.geofence_id) : '—';
+  const fn = str(row.fence_name) || '—';
+  const tnz = str(row.position_time_nz).slice(0, 19) || '—';
+  const base = `  id=${id} · geofence_id=${gid} · ${fn} · position_time_nz=${tnz}`;
+  const fl = fetchLowerExclusive.trim() !== '' ? (normalizeTimestampString(fetchLowerExclusive) ?? fetchLowerExclusive) : '';
+  const tn = tnz.trim() !== '' ? (normalizeTimestampString(tnz) ?? tnz) : '';
+  if (!fl || !tn) {
+    return `${base} → (could not compare to fetch lower — missing normalized time)`;
+  }
+  if (tn <= fl) {
+    return `${base} → SKIP (Part 1) · not strictly after fetchLowerExclusive ${fl} — SQL requires position_time_nz > max(step1 leg, step2, step3); step1 leg = anchor ?? GPS morning EXIT = ${step1LegDisplay}. This ENTER is on/before that bound (often an early winery re-entry before the contractual job start when anchor is later).`;
+  }
+  return `${base} → ELIGIBLE · strictly after fetchLowerExclusive ${fl}; earliest such row in this ordered list is what Part 1 LIMIT 1 returns for the strict query.`;
+}
+
+function formatStep4StrictRowVerdict(
+  row: Record<string, unknown>,
+  idx: number,
+  winnerIdx: number,
+  winnerRow: Record<string, unknown>,
+  part1: Record<string, unknown> | null
+): string {
+  const id = row.id != null ? String(row.id) : '—';
+  const gid = row.geofence_id != null ? String(row.geofence_id) : '—';
+  const fn = str(row.fence_name) || '—';
+  const tnz = str(row.position_time_nz).slice(0, 19) || '—';
+  const base = `  id=${id} · geofence_id=${gid} · ${fn} · position_time_nz=${tnz}`;
+
+  if (idx !== winnerIdx) {
+    const wid = winnerRow.id != null ? String(winnerRow.id) : '—';
+    const wtnz = str(winnerRow.position_time_nz).slice(0, 19) || '—';
+    return `${base} → FAIL · not LIMIT 1 · same strict winery ENTER WHERE, ORDER BY position_time_nz ASC — earliest match is id=${wid} at ${wtnz}; this row is never returned by LIMIT 1.`;
+  }
+
+  const floorRaw = part1?.step4OrderingFloorExclusive;
+  const floor = floorRaw != null ? str(floorRaw).slice(0, 19) : '';
+  const clearedFloor = part1?.clearedByStep4OrderingFloor === true;
+  const dups = part1?.duplicateTrackingIdClears as unknown;
+  const dupClear = Array.isArray(dups) && dups.some((x) => String(x) === 'step4');
+
+  const removalReasons: string[] = [];
+  if (clearedFloor && floor) {
+    const tn = normalizeTimestampString(tnz) ?? tnz;
+    const fl = normalizeTimestampString(floor) ?? floor;
+    const strictlyAfter = tn > fl;
+    if (!strictlyAfter) {
+      removalReasons.push(
+        `Part 1 guardrail: GPS step 4 winery ENTER must be strictly after max(vineyard ordering floor, step2, step3) = ${floor}; this LIMIT 1 row at ${tnz} is not strictly after that instant.`
+      );
+    } else {
+      removalReasons.push(
+        `Part 1 cleared step 4 for ordering floor ${floor} — listed time ${tnz} sorts strictly after that floor; compare preclearStep4 in API debug.`
+      );
+    }
+  }
+  if (dupClear) {
+    removalReasons.push(
+      'duplicate tbl_tracking.id — same id already used by an earlier step in guardrail pass order (steps 1→5).'
+    );
+  }
+
+  if (removalReasons.length > 0) {
+    return `${base} → FAIL · LIMIT 1 row (earliest strict match) but Part 1 removed it: ${removalReasons.join('; ')}.`;
+  }
+  return `${base} → SUCCESS · LIMIT 1 row (earliest strict match) and Part 1 guardrails kept it.`;
+}
+
+/** Winery step 4 ENTER: relaxed-lower audit (anchor gap) + strict Part 1 ordered rows — mirrors vineyard step 2/3 traces. */
+function pushWineryStep4EnterTrace(out: InspectExplanationItem[], api: Record<string, unknown>): void {
+  const dbg = api.debug && typeof api.debug === 'object' ? (api.debug as Record<string, unknown>) : null;
+  const winery = dbg?.winery && typeof dbg.winery === 'object' ? (dbg.winery as Record<string, unknown>) : null;
+  const vineyard = dbg?.vineyard && typeof dbg.vineyard === 'object' ? (dbg.vineyard as Record<string, unknown>) : null;
+  const cell = winery?.step4;
+  const bd = winery?.step4FetchLowerBreakdown;
+  if (cell == null || typeof cell !== 'object') {
+    out.push({
+      id: 'step4-trace-missing',
+      headline: 'Step 4 · Winery ENTER trace · not in response',
+      detail: [
+        'Refetch steps after deploy — the API should return debug.winery.step4 (ordered rows + trace) and debug.winery.step4FetchLowerBreakdown.',
+      ],
+    });
+    return;
+  }
+  const cellObj = cell as Record<string, unknown>;
+  const part1 =
+    vineyard?.part1FetchGuardrail && typeof vineyard.part1FetchGuardrail === 'object'
+      ? (vineyard.part1FetchGuardrail as Record<string, unknown>)
+      : null;
+  const detail: string[] = [];
+  if (bd != null && typeof bd === 'object') {
+    const b = bd as Record<string, unknown>;
+    detail.push(
+      `Lower bound breakdown: step1 leg (= anchor ?? GPS morning winery EXIT) = ${str(b.step1LegUsedForFetch).slice(0, 19) || '—'} · anchor = ${str(b.anchor).slice(0, 19) || '—'} · GPS morning EXIT = ${str(b.gpsMorningExit).slice(0, 19) || '—'}.`
+    );
+    detail.push(
+      `Strict Part 1 fetch lowerExclusive (max of step1 leg, ${b.bothVineyardGpsStepsMissing === true ? 'positionAfter when both vineyard GPS steps missing' : 'step2, step3'}): ${str(b.fetchLowerExclusive).slice(0, 19) || '—'}.`
+    );
+    detail.push(`Relaxed audit lower (max(positionAfter, step2, step3) only): ${str(b.auditRelaxedLowerExclusive).slice(0, 19) || '—'}.`);
+    detail.push(
+      b.bothVineyardGpsStepsMissing === true
+        ? 'Both vineyard GPS steps were missing for this pass — fetch lower also merges positionAfter with the step1 leg.'
+        : 'When relaxed lower is strictly before strict fetch lower, tbl_tracking can show winery ENTER rows between them; Part 1 ignores those for step 4 because the step1 leg (anchor when set, else GPS morning EXIT) is later than an early re-entry.'
+    );
+  }
+  const tp = cellObj.tracePlain;
+  if (typeof tp === 'string' && tp.trim()) detail.push(tp.trim());
+
+  const fetchLowerForAudit =
+    bd != null && typeof bd === 'object'
+      ? str((bd as Record<string, unknown>).fetchLowerExclusive).slice(0, 19) || ''
+      : str(cellObj.positionAfter).slice(0, 19) || '';
+  const step1LegForAudit =
+    bd != null && typeof bd === 'object'
+      ? str((bd as Record<string, unknown>).step1LegUsedForFetch).slice(0, 19) || '—'
+      : '—';
+
+  const auditRowsRaw = cellObj.auditMatchingRowsOrdered;
+  const auditCap = str(cellObj.auditMatchingRowsCaption);
+  if (Array.isArray(auditRowsRaw) && auditRowsRaw.length > 0) {
+    detail.push(
+      auditCap ||
+        'Audit: winery ENTER rows after relaxed lower (includes rows excluded from Part 1 by step1 leg alone):'
+    );
+    for (let i = 0; i < auditRowsRaw.length; i++) {
+      const r = auditRowsRaw[i];
+      if (r == null || typeof r !== 'object') continue;
+      detail.push(formatStep4AuditRowVerdict(r as Record<string, unknown>, fetchLowerForAudit, step1LegForAudit));
+    }
+    if (cellObj.auditMatchingRowsTruncated === true) {
+      detail.push('  … (audit list capped for payload size.)');
+    }
+  }
+
+  const cap = str(cellObj.matchingRowsCaption);
+  const rowsRaw = cellObj.matchingRowsOrdered;
+  const truncated = cellObj.matchingRowsTruncated === true;
+  if (Array.isArray(rowsRaw) && rowsRaw.length > 0) {
+    detail.push(
+      cap ||
+        'Part 1 fetch: rows matching strict WHERE (same as LIMIT 1), ordered by position_time_nz ASC; guardrails may still clear the winner:'
+    );
+    const winnerIdx = 0;
+    const w0 = rowsRaw[winnerIdx];
+    const winnerRow = w0 != null && typeof w0 === 'object' ? (w0 as Record<string, unknown>) : {};
+    for (let idx = 0; idx < rowsRaw.length; idx++) {
+      const r = rowsRaw[idx];
+      if (r == null || typeof r !== 'object') continue;
+      detail.push(formatStep4StrictRowVerdict(r as Record<string, unknown>, idx, winnerIdx, winnerRow, part1));
+    }
+    if (truncated) {
+      detail.push('  … (more rows exist — list capped for Inspect payload size.)');
+    }
+  } else   if (Array.isArray(rowsRaw) && rowsRaw.length === 0) {
+    detail.push(
+      'Part 1 fetch: no winery ENTER on mapped delivery_winery fences strictly inside the lower/upper window (0 rows before LIMIT 1).'
+    );
+  } else if (!Array.isArray(rowsRaw)) {
+    detail.push('Part 1 ordered row list not in this payload (older API — refetch after deploy).');
+  }
+
+  if (detail.length === 0) {
+    detail.push('Expand raw API debug → debug.winery.step4 for fence ids, bounds, and ordered rows.');
+  }
+
+  out.push({
+    id: 'winery-step4-enter-trace',
+    headline: 'Step 4 · Winery ENTER · tbl_tracking (audit + Part 1 fetch)',
+    detail,
+  });
+}
+
+/** One vineyard polygon trace (step2 ENTER or step3 EXIT) — call immediately after that step’s polygon headline block. */
+function pushVineyardStepLookupTraceForStep(
+  out: InspectExplanationItem[],
+  api: Record<string, unknown>,
+  key: 'step2' | 'step3'
+): void {
+  const dbg = api.debug && typeof api.debug === 'object' ? (api.debug as Record<string, unknown>) : null;
+  const v = dbg?.vineyard && typeof dbg.vineyard === 'object' ? (dbg.vineyard as Record<string, unknown>) : null;
+  if (!v) return;
+  const headlines: Record<string, string> = {
+    step2: 'Step 2 · Vineyard ENTER · tbl_tracking window (ordered)',
+    step3: 'Step 3 · Vineyard EXIT · tbl_tracking window (ordered)',
+  };
+  const cell = v[key];
+  if (cell == null || typeof cell !== 'object') return;
+  const cellObj = cell as Record<string, unknown>;
+  const tp = cellObj.tracePlain;
+  if (typeof tp !== 'string' || !tp.trim()) return;
+  const detail: string[] = [tp.trim()];
+  const cap = str(cellObj.matchingRowsCaption);
+  const rowsRaw = cellObj.matchingRowsOrdered;
+  const truncated = cellObj.matchingRowsTruncated === true;
+  const part1 =
+    v.part1FetchGuardrail && typeof v.part1FetchGuardrail === 'object'
+      ? (v.part1FetchGuardrail as Record<string, unknown>)
+      : null;
+  const vf =
+    dbg?.vineyardGpsOrderingFloor != null && typeof dbg.vineyardGpsOrderingFloor === 'object'
+      ? (dbg.vineyardGpsOrderingFloor as Record<string, unknown>)
+      : null;
+  if (Array.isArray(rowsRaw) && rowsRaw.length > 0) {
+    detail.push(
+      cap ||
+        'Matching tbl_tracking rows (same WHERE as LIMIT 1 for this step; ordered by time; guardrails may still exclude later):'
+    );
+    const winnerIdx = 0;
+    const w0 = rowsRaw[winnerIdx];
+    const winnerRow = w0 != null && typeof w0 === 'object' ? (w0 as Record<string, unknown>) : {};
+    for (let idx = 0; idx < rowsRaw.length; idx++) {
+      const r = rowsRaw[idx];
+      if (r == null || typeof r !== 'object') continue;
+      const o = r as Record<string, unknown>;
+      detail.push(formatVineyardTraceRowVerdict(o, idx, winnerIdx, winnerRow, key, part1, vf));
+    }
+    if (truncated) {
+      detail.push('  … (more rows exist in this window — list capped for Inspect payload size.)');
+    }
+  } else if (Array.isArray(rowsRaw) && rowsRaw.length === 0) {
+    detail.push(
+      key === 'step2'
+        ? 'Matching tbl_tracking rows: none in this window for the same WHERE (0 ENTER rows before LIMIT 1).'
+        : 'Matching tbl_tracking rows: none in this window for the same WHERE (0 EXIT rows before LIMIT 1).'
+    );
   }
   out.push({
-    id: 'final',
-    headline: 'Final · steps 1–5 (after buffer pass)',
-    detail: lines,
+    id: `vineyard-${key}-trace`,
+    headline: headlines[key] ?? key,
+    detail,
   });
-  return out;
 }

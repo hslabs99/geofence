@@ -480,7 +480,7 @@ export default function SettingsPage() {
             <label className="block">
               <span className="text-sm font-medium text-zinc-700 dark:text-zinc-300">Step 5 extend for winery exit (minutes)</span>
               <p className="mt-0.5 text-xs text-zinc-500">
-                Derived GPS step 5 (Job Completed): search winery EXIT up to this many minutes after VWork job completion when the driver tapped complete before physically leaving the winery fence (that EXIT can also be the next job start).
+                Derived GPS step 5 (Job Completed): search winery EXIT up to this many minutes after max(VWork job completion, GPS winery ENTER step 4) — so if tap is early but return-to-winery on GPS is later, the window still reaches the real EXIT (tapped complete before leaving; EXIT may align with the next job start).
               </p>
               <div className="mt-2 flex items-center gap-2">
                 <input
@@ -676,6 +676,151 @@ export default function SettingsPage() {
               </div>
             </label>
           </div>
+          <SettingsInspector />
+        </div>
+      )}
+    </div>
+  );
+}
+
+type InspectorRow = { settingvalue: string | null; ctid: string };
+
+/** Read-only inspector: lists EVERY row in tbl_settings for a given (type, name) so duplicate /
+ *  stale rows can be spotted. Includes a "Repair (collapse to newest)" button that PUTs the
+ *  newest value back — PUT now wraps DELETE+INSERT in a transaction, so this collapses any
+ *  duplicates into a single row. */
+function SettingsInspector() {
+  const [typeIn, setTypeIn] = useState('System');
+  const [nameIn, setNameIn] = useState('Inspectsort');
+  const [rows, setRows] = useState<InspectorRow[] | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [repairStatus, setRepairStatus] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
+
+  const load = async () => {
+    setLoading(true);
+    setErr(null);
+    try {
+      const q = new URLSearchParams({ type: typeIn.trim(), name: nameIn.trim(), all: '1' }).toString();
+      const r = await fetch(`/api/settings?${q}`, { cache: 'no-store' });
+      const data = (await r.json().catch(() => ({}))) as { rows?: InspectorRow[]; error?: string };
+      if (!r.ok) throw new Error(data?.error ?? r.statusText);
+      setRows(Array.isArray(data.rows) ? data.rows : []);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+      setRows(null);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const repair = async () => {
+    if (!rows || rows.length === 0) return;
+    const newest = rows[0]?.settingvalue ?? null;
+    setRepairStatus('saving');
+    try {
+      const r = await fetch('/api/settings', {
+        method: 'PUT',
+        cache: 'no-store',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          type: typeIn.trim(),
+          settingname: nameIn.trim(),
+          settingvalue: newest,
+        }),
+      });
+      if (!r.ok) throw new Error(r.statusText);
+      setRepairStatus('saved');
+      await load();
+    } catch (e) {
+      console.error('[Settings repair] FAILED:', e);
+      setRepairStatus('error');
+    } finally {
+      setTimeout(() => setRepairStatus('idle'), 2000);
+    }
+  };
+
+  return (
+    <div className="rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900">
+      <div className="mb-2 text-sm font-medium text-zinc-700 dark:text-zinc-300">
+        Settings inspector (read-only)
+      </div>
+      <p className="mb-2 text-xs text-zinc-500">
+        Lists every row in tbl_settings for the given <code>type</code> / <code>settingname</code>.
+        Multiple rows = duplicates; the GET API returns the newest (ctid DESC). Click Repair to
+        collapse duplicates into a single row.
+      </p>
+      <div className="mb-2 flex flex-wrap items-center gap-2">
+        <input
+          type="text"
+          value={typeIn}
+          onChange={(e) => setTypeIn(e.target.value)}
+          placeholder="type"
+          className="w-28 rounded border border-zinc-300 bg-white px-2 py-1 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+        />
+        <input
+          type="text"
+          value={nameIn}
+          onChange={(e) => setNameIn(e.target.value)}
+          placeholder="settingname"
+          className="w-44 rounded border border-zinc-300 bg-white px-2 py-1 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+        />
+        <button
+          type="button"
+          onClick={load}
+          disabled={loading}
+          className="rounded bg-zinc-200 px-3 py-1 text-sm font-medium hover:bg-zinc-300 disabled:opacity-50 dark:bg-zinc-700 dark:hover:bg-zinc-600"
+        >
+          {loading ? 'Loading…' : 'Load'}
+        </button>
+        {rows && rows.length > 1 && (
+          <button
+            type="button"
+            onClick={repair}
+            disabled={repairStatus === 'saving'}
+            className="rounded bg-amber-200 px-3 py-1 text-sm font-medium hover:bg-amber-300 disabled:opacity-50 dark:bg-amber-800 dark:hover:bg-amber-700"
+            title="Delete duplicates and keep the newest value (writes via DELETE+INSERT)"
+          >
+            {repairStatus === 'saving'
+              ? 'Repairing…'
+              : repairStatus === 'saved'
+                ? 'Repaired'
+                : repairStatus === 'error'
+                  ? 'Repair failed'
+                  : `Repair (collapse ${rows.length} → 1)`}
+          </button>
+        )}
+      </div>
+      {err && <p className="text-sm text-red-600 dark:text-red-400">{err}</p>}
+      {rows && rows.length === 0 && (
+        <p className="text-sm text-zinc-500">No rows found for that key.</p>
+      )}
+      {rows && rows.length > 0 && (
+        <div className="overflow-auto rounded border border-zinc-200 dark:border-zinc-700">
+          <table className="w-full text-left text-xs">
+            <thead className="bg-zinc-50 dark:bg-zinc-800">
+              <tr>
+                <th className="px-2 py-1 font-medium text-zinc-600 dark:text-zinc-300">#</th>
+                <th className="px-2 py-1 font-medium text-zinc-600 dark:text-zinc-300">ctid</th>
+                <th className="px-2 py-1 font-medium text-zinc-600 dark:text-zinc-300">settingvalue</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r, i) => (
+                <tr
+                  key={r.ctid}
+                  className={`border-t border-zinc-200 dark:border-zinc-700 ${i === 0 ? 'bg-emerald-50 dark:bg-emerald-950/40' : ''}`}
+                  title={i === 0 ? 'Newest row (returned by GET)' : 'Older duplicate'}
+                >
+                  <td className="px-2 py-1 font-mono text-zinc-500">{i === 0 ? 'new' : i}</td>
+                  <td className="px-2 py-1 font-mono text-zinc-500">{r.ctid}</td>
+                  <td className="px-2 py-1 font-mono break-all text-zinc-700 dark:text-zinc-300">
+                    {r.settingvalue == null ? <em className="text-zinc-400">null</em> : r.settingvalue}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
       )}
     </div>

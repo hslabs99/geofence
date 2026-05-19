@@ -12,8 +12,9 @@ export {
 } from '@/lib/step5-winery-exit-extend-setting-names';
 
 /**
- * Minutes after VWork job end (`step_5_completed_at` / `actual_end_time`) to search for and accept winery EXIT
- * as GPS step 5 when the driver tapped “job complete” before physically leaving (see `decideFinalSteps` / Part 1 fetch).
+ * Minutes after max(VWork tap, GPS winery ENTER step 4) to search for and accept winery EXIT as GPS step 5
+ * when the driver tapped “job complete” before physically leaving, or tapped before GPS shows return to winery
+ * (see `decideFinalSteps` / Part 1 fetch).
  */
 export async function getStep5ExtendWineryExitMinutes(): Promise<number> {
   const rows = await query<{ settingvalue: string | null }>(

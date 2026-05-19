@@ -2,11 +2,9 @@ import { NextResponse } from 'next/server';
 import { query, execute } from '@/lib/db';
 import { addMinutesToTimestampAsNZ } from '@/lib/fetch-steps';
 import {
-  aggregateStepsPlusBufferedSegments,
   deriveGpsLayerAfterVineFencePlus,
   deriveGpsStepsForJob,
   finalizeDerivedSteps,
-  getVineyardFenceIdsForVworkName,
   type JobForDerivedSteps,
   normalizeTimestampString,
   vineyardBufferWidensPolygonEnter,
@@ -16,8 +14,7 @@ import {
 import { getJobEndCeilingBufferMinutes } from '@/lib/job-end-ceiling-buffer-setting';
 import { getStep5ExtendWineryExitMinutes } from '@/lib/step5-winery-exit-extend-setting';
 import { getStep1FromPreviousJobLimitMinutes } from '@/lib/step1-from-previous-job-limit-setting';
-import { runStepsPlusQuery } from '@/lib/steps-plus-query';
-import { getStepsPlusSettings } from '@/lib/steps-plus-settings';
+import { tryStepsPlusSnapshotForVineyardJob, type StepsPlusSnapshotAttempt } from '@/lib/steps-plus-merge-snapshot';
 import {
   applyStep1LastJobEndIfEligible,
   type Step1LastJobEndResult,
@@ -308,6 +305,27 @@ export async function GET(request: Request) {
       }
     }
 
+    const vineyardSnapName = job.vineyard_name ? String(job.vineyard_name).trim() : '';
+    const vworkEndRawSnap =
+      pick('step_5_completed_at', 'Step_5_Completed_At') ?? pick('actual_end_time', 'Actual_End_Time');
+    const vworkEndSnap =
+      vworkEndRawSnap != null && String(vworkEndRawSnap).trim() !== ''
+        ? normalizeTimestampString(vworkEndRawSnap as string | Date)
+        : null;
+    let stepsPlusSnapshotAttempt: StepsPlusSnapshotAttempt | null = null;
+    if (writeBack && vineyardSnapName) {
+      stepsPlusSnapshotAttempt = await tryStepsPlusSnapshotForVineyardJob({
+        device: deviceForTracking,
+        positionAfter: effectivePositionAfter,
+        positionBefore: effectivePositionBefore,
+        vineyardName: vineyardSnapName,
+        jobEndCeilingBufferMinutes,
+        vworkEnd: vworkEndSnap,
+      });
+    }
+    const tentativeVineyardEnterForStep1Bracket =
+      stepsPlusSnapshotAttempt?.ok === true ? stepsPlusSnapshotAttempt.snapshot.mergedEnter : null;
+
     let result = await deriveGpsStepsForJob(job, {
       windowMinutes,
       device: deviceForTracking,
@@ -315,6 +333,7 @@ export async function GET(request: Request) {
       positionBefore: effectivePositionBefore,
       jobEndCeilingBufferMinutes,
       step5ExtendWineryExitMinutes,
+      tentativeVineyardEnterForStep1Bracket,
     });
 
     /** Snapshot before Steps+ (VineFence+/VineFenceV+) so Inspect can show polygon vs buffer in plain English. */
@@ -384,176 +403,147 @@ export async function GET(request: Request) {
         fenceNames: [...fenceNames],
       };
       if (fenceNames.length > 0) {
-        const { bufferMeters: stepsPlusBufferM, minDurationSeconds: stepsPlusMinSec } =
-          await getStepsPlusSettings();
-        const stepsPlusEnd =
-          effectivePositionBefore ?? addMinutesToTimestampAsNZ(effectivePositionAfter, 24 * 60);
-        const stepsPlusRows = await runStepsPlusQuery(
-          deviceForTracking,
-          effectivePositionAfter,
-          stepsPlusEnd,
-          fenceNames,
-          stepsPlusBufferM
-        );
-        const stays = stepsPlusRows.filter((r) => Number(r.duration_seconds) >= stepsPlusMinSec);
-        const rawDurNums = stepsPlusRows
-          .map((r) => Number(r.duration_seconds))
-          .filter((n) => Number.isFinite(n));
-        const maxRawSegmentDurationSeconds =
-          rawDurNums.length === 0 ? null : Math.max(...rawDurNums);
-        const vworkEndRaw = pick('step_5_completed_at', 'Step_5_Completed_At') ?? pick('actual_end_time', 'Actual_End_Time');
-        const vworkEnd =
-          vworkEndRaw != null && String(vworkEndRaw).trim() !== ''
-            ? normalizeTimestampString(vworkEndRaw as string | Date)
-            : null;
-        const exitCeil =
-          vworkEnd == null
-            ? null
-            : normalizeTimestampString(addMinutesToTimestampAsNZ(vworkEnd, jobEndCeilingBufferMinutes)) ?? vworkEnd;
-        const staysInJob =
-          vworkEnd == null
-            ? stays
-            : stays.filter((r) => {
-                const ent = normalizeTimestampString(r.enter_time);
-                const ext = normalizeTimestampString(r.exit_time);
-                return (
-                  ent != null &&
-                  ext != null &&
-                  exitCeil != null &&
-                  ent < vworkEnd &&
-                  ext < exitCeil
-                );
-              });
-        Object.assign(stepsPlusReport, {
-          bufferMeters: stepsPlusBufferM,
-          minDurationSeconds: stepsPlusMinSec,
-          stepsPlusEnd,
-          rawSegmentCount: stepsPlusRows.length,
-          afterMinDurationCount: stays.length,
-          staysInJobCount: staysInJob.length,
-          /** Every buffered segment duration (seconds), same order as Steps+ SQL. For “too short” diagnosis. */
-          rawSegmentDurationsSeconds: rawDurNums,
-          /** Longest single segment before min-duration filter. */
-          maxRawSegmentDurationSeconds: maxRawSegmentDurationSeconds,
-          vworkEnd: vworkEnd ?? null,
-          exitCeilForStayFilter: exitCeil ?? null,
-          polygonHadBothStepsGps: result.step2Gps != null && result.step3Gps != null,
-        });
-        if (staysInJob.length < 1) {
-          const outcome =
-            stepsPlusRows.length === 0
-              ? 'no_buffered_stays_found'
-              : stays.length === 0
-                ? 'all_segments_below_min_duration'
-                : 'no_stay_in_job_window';
+        const att = stepsPlusSnapshotAttempt;
+        if (!att) {
           Object.assign(stepsPlusReport, {
-            outcome,
-            detail:
-              outcome === 'no_buffered_stays_found'
-                ? 'No lat/lon points formed a contiguous inside-buffer segment in the window, or fence geometries did not match tbl_geofences names.'
-                : outcome === 'all_segments_below_min_duration'
-                  ? 'Points were inside the buffer but every run was shorter than the minimum duration setting.'
-                  : 'Segments existed but none met enter-before-job-end and exit-before-ceiling (job end + job end ceiling buffer).',
+            outcome: 'steps_plus_snapshot_unavailable',
+            detail: 'Internal: fence names resolved but Steps+ snapshot was not precomputed.',
           });
-        }
-        if (staysInJob.length >= 1) {
-          const hadBothPolygonGps = result.step2Gps != null && result.step3Gps != null;
-          const vineyardFenceIds = await getVineyardFenceIdsForVworkName(vineyardName);
-          const merged = await aggregateStepsPlusBufferedSegments(
-            staysInJob,
-            deviceForTracking,
-            effectivePositionAfter,
+        } else {
+          const meta = att.ok ? att.snapshot : att;
+          const stepsPlusRows = meta.stepsPlusRows;
+          const stays = meta.stays;
+          const staysInJob = meta.staysInJob;
+          const stepsPlusEnd = meta.stepsPlusEnd;
+          const stepsPlusBufferM = meta.bufferMeters;
+          const stepsPlusMinSec = meta.minDurationSeconds;
+          const rawDurNums = meta.rawSegmentDurationsSeconds;
+          const maxRawSegmentDurationSeconds = meta.maxRawSegmentDurationSeconds;
+          const exitCeil = meta.exitCeilForStayFilter;
+          const vworkEnd = meta.vworkEnd;
+
+          Object.assign(stepsPlusReport, {
+            bufferMeters: stepsPlusBufferM,
+            minDurationSeconds: stepsPlusMinSec,
             stepsPlusEnd,
-            vineyardFenceIds
-          );
-          let bufferVia: StepVia = 'VineFence+';
-          let applyBuffer = !hadBothPolygonGps;
-          if (hadBothPolygonGps) {
-            applyBuffer = vineyardBufferWidensPolygonEnter(
-              merged.enter,
-              result.step2Gps!,
-              result.step3Gps!
-            );
-            bufferVia = 'VineFenceV+';
-          }
-          Object.assign(stepsPlusReport, {
-            mergedEnter: merged.enter,
-            mergedExit: merged.exit,
-            usedGpsStarMerge: merged.usedGpsStarMerge,
-            hadBothPolygonGps,
-            applyBuffer,
-            bufferVia,
+            rawSegmentCount: stepsPlusRows.length,
+            afterMinDurationCount: stays.length,
+            staysInJobCount: staysInJob.length,
+            rawSegmentDurationsSeconds: rawDurNums,
+            maxRawSegmentDurationSeconds,
+            vworkEnd: vworkEnd ?? null,
+            exitCeilForStayFilter: exitCeil ?? null,
+            polygonHadBothStepsGps: result.step2Gps != null && result.step3Gps != null,
           });
-          const step2ForBuffer: { value: string; trackingId: number | null } = {
-            value: merged.enter,
-            trackingId: null,
-          };
-          const step3ForBuffer: { value: string; trackingId: number | null } =
-            hadBothPolygonGps && applyBuffer
-              ? { value: result.step3Gps!, trackingId: result.step3TrackingId }
-              : { value: merged.exit, trackingId: null };
-          if (!applyBuffer && hadBothPolygonGps) {
+
+          if (!att.ok) {
+            const outcome =
+              att.fail === 'no_rows'
+                ? 'no_buffered_stays_found'
+                : att.fail === 'no_stays_in_job'
+                  ? 'no_stay_in_job_window'
+                  : 'all_segments_below_min_duration';
             Object.assign(stepsPlusReport, {
-              outcome: 'buffer_skipped_polygon_complete_vinefencev_not_wider',
+              outcome,
               detail:
-                'Both polygon vineyard steps existed; buffered enter was not enough earlier than polygon enter for VineFenceV+ (see VINE_FENCE_V_PLUS_MIN_ENTER_DELTA_MINUTES and queue rules).',
+                att.fail === 'no_rows'
+                  ? 'No lat/lon points formed a contiguous inside-buffer segment in the window, or fence geometries did not match tbl_geofences names.'
+                  : att.fail === 'no_stays_in_job'
+                    ? 'Segments existed but none met enter-before-job-end and exit-before-ceiling (job end + job end ceiling buffer).'
+                    : 'Points were inside the buffer but merge produced no valid enter/exit window.',
             });
           }
-          if (applyBuffer) {
-            const preBufferResult = result;
-            const derivedAfterPlus = await deriveGpsLayerAfterVineFencePlus(
-              job,
-              {
-                windowMinutes,
-                device: deviceForTracking,
-                positionAfter: effectivePositionAfter,
-                positionBefore: effectivePositionBefore,
-                jobEndCeilingBufferMinutes,
-                step5ExtendWineryExitMinutes,
-              },
-              {
-                step1:
-                  result.step1Gps != null
-                    ? { value: result.step1Gps, trackingId: result.step1TrackingId }
-                    : null,
-                step2: step2ForBuffer,
-                step3: step3ForBuffer,
-              },
-              result.debug
-            );
-            const fin = finalizeDerivedSteps(
-              {
-                ...derivedAfterPlus,
-                step2Via: bufferVia,
-                step3Via: hadBothPolygonGps ? 'GPS' : bufferVia,
-              },
-              job
-            );
-            const bufferGpsOk = fin.step2Gps != null && fin.step3Gps != null;
-            if (!bufferGpsOk) {
-              result = { ...preBufferResult, debug: result.debug };
+
+          if (att.ok && att.snapshot.staysInJob.length >= 1) {
+            const mergedEnter = att.snapshot.mergedEnter;
+            const mergedExit = att.snapshot.mergedExit;
+            const usedGpsStarMerge = att.snapshot.usedGpsStarMerge;
+            const hadBothPolygonGps = result.step2Gps != null && result.step3Gps != null;
+            let bufferVia: StepVia = 'VineFence+';
+            let applyBuffer = !hadBothPolygonGps;
+            if (hadBothPolygonGps) {
+              applyBuffer = vineyardBufferWidensPolygonEnter(
+                mergedEnter,
+                result.step2Gps!,
+                result.step3Gps!
+              );
+              bufferVia = 'VineFenceV+';
+            }
+            Object.assign(stepsPlusReport, {
+              mergedEnter,
+              mergedExit,
+              usedGpsStarMerge,
+              hadBothPolygonGps,
+              applyBuffer,
+              bufferVia,
+            });
+            const step2ForBuffer: { value: string; trackingId: number | null } = {
+              value: mergedEnter,
+              trackingId: null,
+            };
+            const step3ForBuffer: { value: string; trackingId: number | null } =
+              hadBothPolygonGps && applyBuffer
+                ? { value: result.step3Gps!, trackingId: result.step3TrackingId }
+                : { value: mergedExit, trackingId: null };
+            if (!applyBuffer && hadBothPolygonGps) {
               Object.assign(stepsPlusReport, {
-                outcome: 'buffer_pipeline_guardrails_failed',
+                outcome: 'buffer_skipped_polygon_complete_vinefencev_not_wider',
                 detail:
-                  'Buffered enter/exit were merged but re-derived GPS layer failed guardrails (step 2/3 GPS cleared). Previous polygon pass kept.',
+                  'Both polygon vineyard steps existed; buffered enter was not enough earlier than polygon enter for VineFenceV+ (see VINE_FENCE_V_PLUS_MIN_ENTER_DELTA_MINUTES and queue rules).',
               });
-            } else {
-              stepsPlusGpsStarMerge = merged.usedGpsStarMerge;
-              result = { ...fin, debug: result.debug };
-              Object.assign(stepsPlusReport, {
-                outcome:
-                  hadBothPolygonGps && bufferVia === 'VineFenceV+' ? 'applied_vinefence_v_plus' : 'applied_vinefence_plus',
-              });
-              if (hadBothPolygonGps && bufferVia === 'VineFenceV+') {
-                const deltaMin = vineyardEnterMinutesEarlierThanPolygon(
-                  merged.enter,
-                  preBufferResult.step2Gps!
-                );
-                vineFenceVPlusCalcnote =
-                  deltaMin > 0
-                    ? `VineFenceV+(${deltaMin} min enter earlier):`
-                    : 'VineFenceV+:';
-                Object.assign(stepsPlusReport, { vineFenceVPlusDeltaMinutes: deltaMin });
+            }
+            if (applyBuffer) {
+              const preBufferResult = result;
+              const derivedAfterPlus = await deriveGpsLayerAfterVineFencePlus(
+                job,
+                {
+                  windowMinutes,
+                  device: deviceForTracking,
+                  positionAfter: effectivePositionAfter,
+                  positionBefore: effectivePositionBefore,
+                  jobEndCeilingBufferMinutes,
+                  step5ExtendWineryExitMinutes,
+                  tentativeVineyardEnterForStep1Bracket,
+                },
+                {
+                  step1:
+                    result.step1Gps != null
+                      ? { value: result.step1Gps, trackingId: result.step1TrackingId }
+                      : null,
+                  step2: step2ForBuffer,
+                  step3: step3ForBuffer,
+                },
+                result.debug
+              );
+              const fin = finalizeDerivedSteps(
+                {
+                  ...derivedAfterPlus,
+                  step2Via: bufferVia,
+                  step3Via: hadBothPolygonGps ? 'GPS' : bufferVia,
+                },
+                job
+              );
+              const bufferGpsOk = fin.step2Gps != null && fin.step3Gps != null;
+              if (!bufferGpsOk) {
+                result = { ...preBufferResult, debug: result.debug };
+                Object.assign(stepsPlusReport, {
+                  outcome: 'buffer_pipeline_guardrails_failed',
+                  detail:
+                    'Buffered enter/exit were merged but re-derived GPS layer failed guardrails (step 2/3 GPS cleared). Previous polygon pass kept.',
+                });
+              } else {
+                stepsPlusGpsStarMerge = usedGpsStarMerge;
+                result = { ...fin, debug: result.debug };
+                Object.assign(stepsPlusReport, {
+                  outcome:
+                    hadBothPolygonGps && bufferVia === 'VineFenceV+' ? 'applied_vinefence_v_plus' : 'applied_vinefence_plus',
+                });
+                if (hadBothPolygonGps && bufferVia === 'VineFenceV+') {
+                  const deltaMin = vineyardEnterMinutesEarlierThanPolygon(mergedEnter, preBufferResult.step2Gps!);
+                  vineFenceVPlusCalcnote =
+                    deltaMin > 0 ? `VineFenceV+(${deltaMin} min enter earlier):` : 'VineFenceV+:';
+                  Object.assign(stepsPlusReport, { vineFenceVPlusDeltaMinutes: deltaMin });
+                }
               }
             }
           }

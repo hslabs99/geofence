@@ -855,6 +855,104 @@ function summaryExportQuadCells(q: { total: number; max: number; min: number; av
   return [q.total, q.max, q.min, q.av];
 }
 
+function summaryExportClientPairCells(q: { total: number; max: number; min: number; av: number }): number[] {
+  return [q.total, q.av];
+}
+
+type SummaryExportMinsQuad = { total: number; max: number; min: number; av: number };
+
+function summaryExportDayMetricCells(
+  r: {
+    mins_2: SummaryExportMinsQuad;
+    mins_3: SummaryExportMinsQuad;
+    mins_4: SummaryExportMinsQuad;
+    mins_5: SummaryExportMinsQuad;
+    travel: SummaryExportMinsQuad;
+    total: SummaryExportMinsQuad;
+  },
+  clientMode: boolean,
+): number[] {
+  if (clientMode) {
+    return [
+      ...summaryExportClientPairCells(r.travel),
+      ...summaryExportClientPairCells(r.mins_3),
+      ...summaryExportClientPairCells(r.mins_5),
+      ...summaryExportClientPairCells(r.total),
+    ];
+  }
+  return [
+    ...summaryExportQuadCells(r.mins_2),
+    ...summaryExportQuadCells(r.mins_3),
+    ...summaryExportQuadCells(r.mins_4),
+    ...summaryExportQuadCells(r.mins_5),
+    ...summaryExportQuadCells(r.travel),
+    ...summaryExportQuadCells(r.mins_3),
+    ...summaryExportQuadCells(r.mins_5),
+    ...summaryExportQuadCells(r.total),
+  ];
+}
+
+function summaryExportDayHeader(clientMode: boolean, splitByOverUnder: boolean): string[] {
+  const quadHeaders = (prefix: string) => [`${prefix}_total`, `${prefix}_max`, `${prefix}_min`, `${prefix}_av`];
+  const clientPairHeaders = (prefix: string) => [`${prefix}_total`, `${prefix}_av`];
+  const metricHeaders = clientMode
+    ? [
+        ...clientPairHeaders('travel'),
+        ...clientPairHeaders('inVineyard'),
+        ...clientPairHeaders('inWinery'),
+        ...clientPairHeaders('grandTotal'),
+      ]
+    : [
+        ...quadHeaders('step2_toVine'),
+        ...quadHeaders('step3_inVine'),
+        ...quadHeaders('step4_toWine'),
+        ...quadHeaders('step5_inWinery'),
+        ...quadHeaders('travel'),
+        ...quadHeaders('inVineyard'),
+        ...quadHeaders('inWinery'),
+        ...quadHeaders('grandTotal'),
+      ];
+  return [
+    'date',
+    ...(splitByOverUnder ? ['rowType'] : []),
+    'jobs',
+    'vyards',
+    ...(clientMode ? [] : ['kmsRoundTrip']),
+    ...metricHeaders,
+  ];
+}
+
+function formatJobViaForExport(viaVal: unknown): string {
+  const viaStr = formatCell(viaVal);
+  if (viaStr === '—') return '';
+  const viaLower = viaStr.toLowerCase();
+  if (viaLower === 'vinefence+') return 'GPS+';
+  if (viaLower === 'vinefencev+') return 'GPS+V';
+  return viaStr;
+}
+
+function summaryExportJobLeadCell(
+  row: Row,
+  key: (typeof BY_JOB_LEAD_COLUMNS)[number]['key'],
+  filterTemplate: string,
+  naLabelByTemplate: Record<string, string>,
+): string | number {
+  if (key === 'limits_breached') return String(row.limits_breached ?? '-');
+  if (key === 'distance') {
+    const km = distanceRoundTripKmFromRow(row);
+    return km == null ? '' : km;
+  }
+  if (key === 'Customer') return formatCell(row['Customer'] ?? row['customer']);
+  if (key === 'vineyard_group') {
+    return formatVineyardGroupForSummary(
+      row.vineyard_group,
+      filterTemplate.trim() || (row.template != null ? String(row.template).trim() : ''),
+      naLabelByTemplate,
+    );
+  }
+  return formatCell(row[key]);
+}
+
 /** Rollup layout control — used in the Season Summary tab header (wide select). */
 function SeasonRollupLayoutSelect({
   splitMode,
@@ -886,20 +984,20 @@ function SeasonRollupLayoutSelect({
   );
 }
 
-async function downloadSummaryXlsx(
-  rows: (string | number | null | undefined)[][],
-  sheetName: string,
-  filename: string,
-): Promise<void> {
-  const XLSX = await import('xlsx');
-  const ws = XLSX.utils.aoa_to_sheet(rows);
-  const wb = XLSX.utils.book_new();
-  const safeSheet = sheetName.replace(/[\[\]*\/\\?:]/g, '').slice(0, 31) || 'Sheet1';
-  XLSX.utils.book_append_sheet(wb, ws, safeSheet);
-  const out = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
-  const blob = new Blob([out], {
-    type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-  });
+function summaryCsvEscapeCell(v: string | number | null | undefined): string {
+  if (v == null || v === '') return '';
+  const s = String(v);
+  if (/[",\r\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+  return s;
+}
+
+function summaryAoaToCsv(rows: (string | number | null | undefined)[][]): string {
+  return rows.map((row) => row.map(summaryCsvEscapeCell).join(',')).join('\r\n');
+}
+
+function downloadSummaryCsv(rows: (string | number | null | undefined)[][], filename: string): void {
+  const csv = summaryAoaToCsv(rows);
+  const blob = new Blob(['\ufeff', csv], { type: 'text/csv;charset=utf-8;' });
   const a = document.createElement('a');
   const url = URL.createObjectURL(blob);
   a.href = url;
@@ -1053,7 +1151,7 @@ function SummaryPageInner() {
   /** Show/hide the Time Limits table (can get in the way). */
   const [showLimitsTable, setShowLimitsTable] = useState(true);
   const [jobsPage, setJobsPage] = useState(0);
-  const [jobsPageSize, setJobsPageSize] = useState(500);
+  const [jobsPageSize, setJobsPageSize] = useState(200);
   const [totalJobsFromApi, setTotalJobsFromApi] = useState(0);
   /** SQL debug from /api/vworkjobs (customer + template only; subsidiary filters are client-side). */
   const [jobsQueryDebug, setJobsQueryDebug] = useState<{
@@ -1334,15 +1432,6 @@ function SummaryPageInner() {
     sortColumns,
     jobsPage,
   ]);
-
-  const distinctTruckIds = useMemo(() => {
-    const set = new Set<string>();
-    for (const row of rows) {
-      const v = row.truck_id;
-      if (v != null && String(v).trim() !== '') set.add(String(v).trim());
-    }
-    return Array.from(set).sort();
-  }, [rows]);
 
   /** Distinct workers in the loaded job set (customer + template); subsidiary filters do not shrink this list. */
   const distinctWorkers = useMemo(() => {
@@ -2739,7 +2828,7 @@ function SummaryPageInner() {
         ]);
       }
     }
-    await downloadSummaryXlsx(aoa, 'Time Limits', `summary-limits_${cust}_${tmpl}_${day}.xlsx`);
+    await downloadSummaryCsv(aoa, `summary-limits_${cust}_${tmpl}_${day}.csv`);
   }, [timeLimitRowsForTableVisible, timeLimitRowActualById, effectiveCustomer, filterTemplate, naLabelByTemplate, viewMode]);
 
   const runExportSeasonDataXlsx = useCallback(async () => {
@@ -2834,8 +2923,132 @@ function SummaryPageInner() {
         ]);
       }
     }
-    await downloadSummaryXlsx(aoa, 'Season Data', `summary-season_${cust}_${tmpl}_${day}.xlsx`);
+    await downloadSummaryCsv(aoa, `summary-season_${cust}_${tmpl}_${day}.csv`);
   }, [seasonRollupRows, effectiveCustomer, filterTemplate, viewMode]);
+
+  const runExportDailyDataXlsx = useCallback(async () => {
+    const day = new Date().toISOString().slice(0, 10);
+    const cust = sanitizeSummaryExportFilenamePart(effectiveCustomer);
+    const tmpl = sanitizeSummaryExportFilenamePart(filterTemplate);
+    const clientMode = viewMode === 'client';
+    const header = summaryExportDayHeader(clientMode, splitByOverUnder);
+    const aoa: (string | number | null | undefined)[][] = [header];
+    for (const r of rowsByDay) {
+      const rowType = (r as { rowType?: string }).rowType;
+      const jobs = (r as RollupQuads).jobs ?? [];
+      aoa.push([
+        r.date,
+        ...(splitByOverUnder ? [rowType ?? ''] : []),
+        r.rollupJobCount,
+        uniqueVineyardCount(jobs),
+        ...(clientMode ? [] : [roundTripKms(jobs)]),
+        ...summaryExportDayMetricCells(r, clientMode),
+      ]);
+    }
+    for (const set of byDayFooterSets) {
+      const s = set.stats;
+      aoa.push([
+        'Total / Av',
+        ...(splitByOverUnder ? [set.rowType ?? ''] : []),
+        set.jobCount,
+        set.vyardsTotal,
+        ...(clientMode ? [] : [set.kmsTotal]),
+        ...summaryExportDayMetricCells(
+          {
+            mins_2: s.mins_2,
+            mins_3: s.mins_3,
+            mins_4: s.mins_4,
+            mins_5: s.mins_5,
+            travel: s.travel,
+            total: s.total,
+          },
+          clientMode,
+        ),
+      ]);
+    }
+    await downloadSummaryCsv(aoa, `summary-daily_${cust}_${tmpl}_${day}.csv`);
+  }, [rowsByDay, byDayFooterSets, effectiveCustomer, filterTemplate, viewMode, splitByOverUnder]);
+
+  const runExportJobsDataXlsx = useCallback(async () => {
+    const day = new Date().toISOString().slice(0, 10);
+    const cust = sanitizeSummaryExportFilenamePart(effectiveCustomer);
+    const tmpl = sanitizeSummaryExportFilenamePart(filterTemplate);
+    const clientMode = viewMode === 'client';
+    const header = clientMode
+      ? [
+          ...BY_JOB_LEAD_COLUMNS.map((c) => c.key),
+          'start_time',
+          'travel',
+          'in_vineyard',
+          'in_winery',
+          'total',
+        ]
+      : [
+          ...BY_JOB_LEAD_COLUMNS.map((c) => c.key),
+          'step_1_time',
+          'step_1_via',
+          'mins_2',
+          'step_2_time',
+          'step_2_via',
+          'mins_3',
+          'step_3_time',
+          'step_3_via',
+          'mins_4',
+          'step_4_time',
+          'step_4_via',
+          'mins_5',
+          'step_5_time',
+          'step_5_via',
+          'travel',
+          'in_vineyard',
+          'in_winery',
+          'total',
+        ];
+    const aoa: (string | number | null | undefined)[][] = [header];
+    const tmplTrim = filterTemplate.trim();
+    for (const row of sortedRows) {
+      const lead = BY_JOB_LEAD_COLUMNS.map(({ key }) =>
+        summaryExportJobLeadCell(row, key, tmplTrim, naLabelByTemplate),
+      );
+      const travel = travelMins(row);
+      const inVineyard = minsBetween(row, 2, 3);
+      const inWinery = minsBetween(row, 4, 5);
+      const total = totalMins(row);
+      if (clientMode) {
+        const startVal =
+          row.actual_start_time ?? row.step_1_actual_time ?? row.step_1_gps_completed_at ?? row.step_1_completed_at;
+        aoa.push([
+          ...lead,
+          formatDateDDMM(startVal),
+          travel ?? '',
+          inVineyard ?? '',
+          inWinery ?? '',
+          total ?? '',
+        ]);
+      } else {
+        const stepCells: (string | number)[] = [];
+        for (const n of STEP_NUMS) {
+          const actualVal = row[`step_${n}_actual_time`] ?? row[`step_${n}_gps_completed_at`] ?? row[`step_${n}_completed_at`];
+          const viaVal = row[`step_${n}_via`];
+          if (n >= 2) {
+            const mins = minsBetween(row, n - 1, n);
+            stepCells.push(mins ?? '');
+          }
+          stepCells.push(formatDateDDMM(actualVal));
+          stepCells.push(formatJobViaForExport(viaVal));
+        }
+        aoa.push([
+          ...lead,
+          ...stepCells,
+          travel ?? '',
+          inVineyard ?? '',
+          inWinery ?? '',
+          total ?? '',
+        ]);
+      }
+    }
+    await downloadSummaryCsv(aoa, `summary-jobs_${cust}_${tmpl}_${day}.csv`);
+  }, [sortedRows, effectiveCustomer, filterTemplate, viewMode, naLabelByTemplate]);
 
   /** Jobs API runs only with both set so payloads stay scoped to one customer + template. */
   const canLoadJobs = effectiveCustomer.trim() !== '' && filterTemplate.trim() !== '';
@@ -3207,23 +3420,7 @@ function SummaryPageInner() {
                 <div className="flex min-w-0 flex-col gap-2">
                   <div>
                     <div className="grid grid-cols-[5rem_1fr] items-center gap-1.5">
-                      <label className="text-[11px] font-medium text-zinc-500">Truck</label>
-                      <select
-                        value={filterTruckId}
-                        onChange={(e) => setFilterTruckId(e.target.value)}
-                        disabled={!canLoadJobs}
-                        className="w-full rounded border border-zinc-300 bg-white px-2 py-0.5 text-[11px] disabled:cursor-not-allowed disabled:opacity-70 dark:border-zinc-600 dark:bg-zinc-800"
-                      >
-                        <option value="">— All —</option>
-                        {distinctTruckIds.map((id) => (
-                          <option key={id} value={id}>{id}</option>
-                        ))}
-                      </select>
-                    </div>
-                  </div>
-                  <div>
-                    <div className="grid grid-cols-[5rem_1fr] items-center gap-1.5">
-                      <label className="text-[11px] font-medium text-zinc-500">Worker</label>
+                      <label className="text-[11px] font-medium text-zinc-500">Truck/Worker</label>
                       <select
                         value={filterWorker}
                         onChange={(e) => setFilterWorker(e.target.value)}
@@ -4476,6 +4673,28 @@ function SummaryPageInner() {
                     >
                       Export Season Data
                     </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      className="block w-full px-3 py-2 text-left text-sm text-zinc-800 hover:bg-zinc-100 dark:text-zinc-200 dark:hover:bg-zinc-800"
+                      onClick={() => {
+                        setSummaryExportMenuOpen(false);
+                        void runExportDailyDataXlsx();
+                      }}
+                    >
+                      Export Daily Data
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      className="block w-full px-3 py-2 text-left text-sm text-zinc-800 hover:bg-zinc-100 dark:text-zinc-200 dark:hover:bg-zinc-800"
+                      onClick={() => {
+                        setSummaryExportMenuOpen(false);
+                        void runExportJobsDataXlsx();
+                      }}
+                    >
+                      Export Jobs Data
+                    </button>
                   </div>
                 )}
               </div>
@@ -5133,7 +5352,7 @@ function SummaryPageInner() {
                         }}
                         className="h-7 rounded border border-zinc-300 bg-white px-2 text-xs dark:border-zinc-600 dark:bg-zinc-800"
                       >
-                        {[100, 250, 500, 1000, 2000].map((v) => (
+                        {[100, 200, 250, 500, 1000, 2000].map((v) => (
                           <option key={v} value={v}>
                             {v}
                           </option>
