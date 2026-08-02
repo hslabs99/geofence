@@ -19,12 +19,13 @@ export default function AuthGuard({ children }: { children: React.ReactNode }) {
 
     const session = readStoredUserType();
     const onLogin = pathname === '/login';
+    const onDbSwitch = pathname === '/db-switch';
 
     if (onLogin && session) {
       router.replace('/');
       return;
     }
-    if (!onLogin && !session) {
+    if (!onLogin && !onDbSwitch && !session) {
       window.location.replace('/login');
       return;
     }

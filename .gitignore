@@ -11,7 +11,7 @@ build/
 .env
 .env.*
 !.env.local.example
-!.env.local.example
+.celgps-db-target.local
 
 # IDE / OS
 .DS_Store

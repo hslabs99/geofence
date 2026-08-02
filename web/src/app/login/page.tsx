@@ -1,6 +1,7 @@
 'use client';
 
 import { useState } from 'react';
+import Link from 'next/link';
 import { GEODATA_USER_STORAGE_KEY } from '@/contexts/ViewModeContext';
 import ImagePageHeader from '@/components/ImagePageHeader';
 
@@ -102,6 +103,13 @@ export default function LoginPage() {
               {error && (
                 <p className="text-sm text-red-600 dark:text-red-400">{error}</p>
               )}
+              <p className="text-xs text-zinc-500">
+                Cloud SQL stopped?{' '}
+                <Link href="/db-switch" className="font-medium text-zinc-700 underline dark:text-zinc-300">
+                  Emergency switch to Supabase
+                </Link>{' '}
+                (no login required).
+              </p>
               <button
                 type="submit"
                 disabled={loading}

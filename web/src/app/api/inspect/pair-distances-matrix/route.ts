@@ -125,6 +125,9 @@ export async function POST(request: Request) {
       );
     }
     console.error('[pair-distances-matrix]', e);
-    return NextResponse.json({ error: msg }, { status: 500 });
+    const friendly = /max clients reached|EMAXCONNSESSION/i.test(msg)
+      ? 'Database connection pool full (Supabase session limit). Wait a few seconds and retry, or restart the dev server.'
+      : msg;
+    return NextResponse.json({ error: friendly }, { status: 500 });
   }
 }

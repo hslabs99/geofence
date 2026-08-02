@@ -7,6 +7,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { GEODATA_USER_STORAGE_KEY, useViewMode } from '@/contexts/ViewModeContext';
 import { useSummaryHistory } from '@/contexts/SummaryHistoryContext';
 import { listSummaryHistory } from '@/lib/summary-history-storage';
+import { GEODATA_DB_CONNECTION_CHANGED } from '@/lib/db-connection-events';
 
 type InspectHistoryEntry = {
   id: number;
@@ -20,6 +21,18 @@ type InspectHistoryEntry = {
 };
 
 const GEODATA_INSPECT_HISTORY_CHANGED = 'geodata-inspect-history-changed';
+
+type DbConnectionBanner = {
+  ok: boolean;
+  connected: boolean;
+  target: 'cloudsql' | 'supabase' | null;
+  database: string | null;
+  host: string | null;
+  label: string | null;
+  error?: string | null;
+  connectError?: string | null;
+  connectMs?: number | null;
+};
 
 function buildInspectUrl(entry: InspectHistoryEntry): string {
   const params = new URLSearchParams();
@@ -153,6 +166,51 @@ export default function Sidebar() {
   const recentViewsRef = useRef<HTMLDivElement>(null);
   const recentViewsFlyoutRef = useRef<HTMLDivElement>(null);
   const inspectFlyoutRef = useRef<HTMLDivElement>(null);
+  const [dbConnection, setDbConnection] = useState<DbConnectionBanner | null>(null);
+
+  const fetchDbConnection = useCallback(() => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 12000);
+    fetch('/api/db/connection-info', { cache: 'no-store', signal: controller.signal })
+      .then((r) => r.json())
+      .then((data) => {
+        setDbConnection({
+          ok: data?.ok === true,
+          connected: data?.connected === true,
+          target: data?.target === 'supabase' ? 'supabase' : data?.target === 'cloudsql' ? 'cloudsql' : null,
+          database: typeof data?.database === 'string' ? data.database : null,
+          host: typeof data?.host === 'string' ? data.host : null,
+          label: typeof data?.label === 'string' ? data.label : null,
+          error: typeof data?.error === 'string' ? data.error : null,
+          connectError: typeof data?.connectError === 'string' ? data.connectError : null,
+          connectMs: typeof data?.connectMs === 'number' ? data.connectMs : null,
+        });
+      })
+      .catch(() => {
+        setDbConnection({
+          ok: false,
+          connected: false,
+          target: null,
+          database: null,
+          host: null,
+          label: null,
+          error: 'Connection check timed out',
+        });
+      })
+      .finally(() => clearTimeout(timer));
+  }, []);
+
+  useEffect(() => {
+    fetchDbConnection();
+  }, [fetchDbConnection]);
+
+  useEffect(() => {
+    const onDbChanged = () => fetchDbConnection();
+    window.addEventListener(GEODATA_DB_CONNECTION_CHANGED, onDbChanged);
+    return () => {
+      window.removeEventListener(GEODATA_DB_CONNECTION_CHANGED, onDbChanged);
+    };
+  }, [fetchDbConnection]);
 
   const fetchInspectHistory = useCallback(() => {
     fetch('/api/inspect-history')
@@ -212,6 +270,37 @@ export default function Sidebar() {
   return (
     <aside className="flex min-h-screen w-56 shrink-0 flex-col border-r border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-900">
       <nav className="flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto overflow-x-hidden p-3">
+        {dbConnection && (
+          <div
+            className={`mb-1 rounded border px-2.5 py-2 text-xs ${
+              !dbConnection.connected
+                ? 'border-red-400 bg-red-50 text-red-950 dark:border-red-800 dark:bg-red-950/40 dark:text-red-100'
+                : dbConnection.target === 'supabase'
+                  ? 'border-emerald-300 bg-emerald-50 text-emerald-950 dark:border-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-100'
+                  : dbConnection.target === 'cloudsql'
+                    ? 'border-blue-300 bg-blue-50 text-blue-950 dark:border-blue-800 dark:bg-blue-950/40 dark:text-blue-100'
+                    : 'border-zinc-300 bg-zinc-50 text-zinc-800 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-200'
+            }`}
+            title={dbConnection.connectError ?? dbConnection.error ?? undefined}
+          >
+            <div className="text-[10px] font-semibold uppercase tracking-wider opacity-75">
+              {dbConnection.connected ? 'Connected DB' : 'DB unreachable'}
+            </div>
+            <div className="truncate font-mono text-sm font-bold leading-tight">
+              {dbConnection.database ?? '—'}
+            </div>
+            <div className="mt-0.5 truncate leading-tight opacity-90">
+              {dbConnection.label ?? 'Unknown host'}
+              {dbConnection.host ? ` · ${dbConnection.host}` : ''}
+              {dbConnection.connectMs != null ? ` (${dbConnection.connectMs}ms)` : ''}
+            </div>
+            {!dbConnection.connected && (
+              <Link href="/db-switch" className="mt-1 inline-block font-medium underline">
+                Switch to Supabase
+              </Link>
+            )}
+          </div>
+        )}
         <Link
           href="/"
           className={`rounded px-3 py-2 text-sm font-medium ${
@@ -544,6 +633,14 @@ export default function Sidebar() {
               }`}
             >
               API GPS Import
+            </Link>
+            <Link
+              href="/admin/celgps-migration"
+              className={`rounded px-3 py-2 text-sm ${
+                pathname === '/admin/celgps-migration' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
+              }`}
+            >
+              DB Migration
             </Link>
           </>
         )}

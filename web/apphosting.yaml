@@ -2,32 +2,24 @@
 # Set app root to "web" when creating the backend if repo root is parent.
 # https://firebase.google.com/docs/app-hosting/configure
 #
-# Database: connect via Cloud SQL public IP (no Unix socket).
-# Set secret CLOUD_SQL_PUBLIC_IP to your instance's public IP:
-#   firebase apphosting:secrets:set CLOUD_SQL_PUBLIC_IP
-# Get the IP from: Cloud Console → SQL → your instance → Overview → Public IP.
+# Database (Supabase): set in Firebase Console → App Hosting → Environment
+#   DATABASE_URL
+#   CELGPS_DATABASE_URL
+#   CELGPS_DB_TARGET=supabase
+#   CELGPS_SUPABASE_PASSWORD (optional if URLs are set)
+# Do NOT also bind those from Secret Manager here — avoids two conflicting sources.
+# TrackSolid remains Secret Manager (already working in prod).
 
 runConfig:
   cpu: 1
   memoryMiB: 512
 
 env:
-  - variable: PGHOST
-    secret: CLOUD_SQL_PUBLIC_IP
+  # Safety net if Console env is missing; Console values override yaml when both exist.
+  - variable: CELGPS_DB_TARGET
+    value: "supabase"
     availability: [RUNTIME]
-  - variable: PGPORT
-    value: "5432"
-    availability: [RUNTIME]
-  - variable: PGDATABASE
-    value: geodata
-    availability: [RUNTIME]
-  - variable: PGUSER
-    value: geofence
-    availability: [RUNTIME]
-  - variable: PGPASSWORD
-    secret: PG_PASSWORD
-    availability: [RUNTIME]
-  # TrackSolid API (Import GPS data > Fetch devices). Set via: firebase apphosting:secrets:set TRACKSOLID_*
+  # TrackSolid API. Set via: firebase apphosting:secrets:set TRACKSOLID_*
   - variable: TRACKSOLID_APP_KEY
     secret: TRACKSOLID_APP_KEY
     availability: [RUNTIME]
