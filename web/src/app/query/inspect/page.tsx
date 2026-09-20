@@ -23,6 +23,49 @@ const SORT_SETTING_NAME = 'Inspectsort';
  */
 const GPS_STEP_VIRTUAL_COLUMNS = ['g1', 'g2', 'g3', 'g4', 'g5'] as const;
 const GPS_STEP_VIRTUAL_COLUMN_SET = new Set<string>(GPS_STEP_VIRTUAL_COLUMNS);
+/** /api/vworkjobs hard cap — export pages up to this size. */
+const INSPECT_XLSX_FETCH_MAX = 20000;
+/** Always include original Step 1 snapshots in the XLSX, even if hidden on the grid. */
+const INSPECT_XLSX_ALWAYS_COLUMNS = ['step_1_safe', 'step1supersafe'] as const;
+
+function inspectGridColumnHeader(col: string): string {
+  if (col === 'trailermode') return 'TT';
+  if (col === 'loadsize') return 'Load Size';
+  if (col === 'distance') return 'Distance';
+  if (col === 'step_1_safe') return 'Step 1 Safe';
+  if (col === 'step1supersafe') return 'Step 1 Super Safe';
+  if (GPS_STEP_VIRTUAL_COLUMN_SET.has(col)) return col.toUpperCase();
+  return formatColumnLabel(col);
+}
+
+function inspectXlsxColumnKeys(allColumns: string[]): string[] {
+  const always: string[] = [...INSPECT_XLSX_ALWAYS_COLUMNS];
+  const out = allColumns.filter((c) => !always.includes(c));
+  const after = out.findIndex((c) => c === 'step_1_completed_at');
+  if (after >= 0) {
+    out.splice(after + 1, 0, ...always);
+  } else {
+    out.push(...always);
+  }
+  return out;
+}
+
+function inspectGridCellForExport(row: Row, col: string): string | number {
+  if (GPS_STEP_VIRTUAL_COLUMN_SET.has(col)) {
+    const stepN = parseInt(col.slice(1), 10);
+    return readInspectStepGps(row, stepN) !== null ? 'Y' : 'N';
+  }
+  const v = row[col];
+  if (v == null || v === '') return '';
+  if (col === 'distance') {
+    const n = typeof v === 'number' ? v : Number(v);
+    return Number.isFinite(n) ? Math.round(n * 100) / 100 : '';
+  }
+  if (isIsoDateString(v)) return formatDateNZ(v);
+  if (typeof v === 'number' && Number.isFinite(v)) return v;
+  if (typeof v === 'boolean') return v ? 'true' : 'false';
+  return String(v);
+}
 
 /** API columns kept on row data (so right-pane logic still works) but never shown as a grid column. */
 const HIDDEN_API_COLUMNS = new Set<string>(['truck_id']);
@@ -274,6 +317,8 @@ function InspectContent() {
   const [showColumnConfig, setShowColumnConfig] = useState(false);
   /** Row counts, pagination summary, full API query string + debug — hidden by default (saves space). */
   const [showListInfoApiDebug, setShowListInfoApiDebug] = useState(false);
+  const [xlsxExporting, setXlsxExporting] = useState(false);
+  const [xlsxExportError, setXlsxExportError] = useState<string | null>(null);
   const columnOrderInitialized = useRef(false);
   const [selectedRowIndex, setSelectedRowIndex] = useState(0);
   const selectedRowRef = useRef<HTMLTableRowElement>(null);
@@ -1625,6 +1670,52 @@ function InspectContent() {
     return String(v);
   }, []);
 
+  const exportInspectXlsx = useCallback(async () => {
+    if (allColumns.length === 0) return;
+    setXlsxExportError(null);
+    setXlsxExporting(true);
+    try {
+      let exportRows = sortedRows;
+      if (totalJobsFromApi > sortedRows.length) {
+        const p = buildInspectApiParams({ resolveJobId: null });
+        p.set('limit', String(INSPECT_XLSX_FETCH_MAX));
+        p.set('offset', '0');
+        const res = await fetch(`/api/vworkjobs?${p.toString()}`, { cache: 'no-store' });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          throw new Error(typeof data?.error === 'string' ? data.error : res.statusText);
+        }
+        exportRows = Array.isArray(data.rows) ? (data.rows as Row[]) : [];
+      }
+      const exportCols = inspectXlsxColumnKeys(allColumns);
+      const aoa: (string | number)[][] = [
+        exportCols.map(inspectGridColumnHeader),
+        ...exportRows.map((row) => exportCols.map((col) => inspectGridCellForExport(row, col))),
+      ];
+      const XLSX = await import('xlsx');
+      const ws = XLSX.utils.aoa_to_sheet(aoa);
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, 'Inspect');
+      const out = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
+      const blob = new Blob([out], {
+        type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      const day = new Date().toISOString().slice(0, 10);
+      a.download = `inspect-jobs-${day}.xlsx`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      setXlsxExportError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setXlsxExporting(false);
+    }
+  }, [allColumns, sortedRows, totalJobsFromApi, buildInspectApiParams]);
+
   const formatDistanceCell = useCallback((v: unknown): string => {
     if (v == null || v === '') return '—';
     const n = typeof v === 'number' ? v : Number(v);
@@ -2089,7 +2180,21 @@ function InspectContent() {
               </span>
             )}
           </div>
-          <div className="mb-1 flex justify-end">
+          <div className="mb-1 flex flex-wrap items-center justify-end gap-2">
+            {xlsxExportError && (
+              <span className="max-w-md text-right text-[11px] text-red-700 dark:text-red-400" title={xlsxExportError}>
+                Download failed: {xlsxExportError}
+              </span>
+            )}
+            <button
+              type="button"
+              onClick={() => void exportInspectXlsx()}
+              disabled={xlsxExporting || allColumns.length === 0 || sortedRows.length === 0}
+              title="Download every column and all matching rows as .xlsx, including Step 1 Safe and Step 1 Super Safe (original start times)"
+              className="rounded border border-zinc-300 bg-white px-2 py-0.5 text-[11px] font-medium text-zinc-700 hover:bg-zinc-100 disabled:opacity-50 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-200 dark:hover:bg-zinc-700"
+            >
+              {xlsxExporting ? 'Downloading…' : 'Download XLSX'}
+            </button>
             <button
               type="button"
               onClick={clearAllFilters}
@@ -2108,10 +2213,10 @@ function InspectContent() {
                   <col key={col} style={{ width: columnWidths[col], minWidth: columnWidths[col] }} />
                 ))}
               </colgroup>
-              <thead>
-                <tr className="border-b border-zinc-200 bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-900/95">
+              <thead className="sticky top-0 z-20 bg-zinc-50 shadow-[0_1px_0_0_rgba(0,0,0,0.1)] dark:bg-zinc-900 dark:shadow-[0_1px_0_0_rgba(255,255,255,0.1)]">
+                <tr className="border-b border-zinc-200 bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-900">
                   {columns.map((col) => (
-                    <th key={`f-${col}`} className="align-top px-1.5 py-1.5 font-normal">
+                    <th key={`f-${col}`} className="align-top bg-zinc-50 px-1.5 py-1.5 font-normal dark:bg-zinc-900">
                       {renderColumnFilter(col)}
                     </th>
                   ))}
@@ -2129,15 +2234,7 @@ function InspectContent() {
                       className={`cursor-grab select-none whitespace-nowrap bg-zinc-100 px-3 py-2 font-medium text-zinc-900 hover:bg-zinc-200 dark:bg-zinc-800 dark:text-zinc-100 dark:hover:bg-zinc-700 ${dropTargetCol === col ? 'bg-blue-200 dark:bg-blue-800' : ''} ${dragCol === col ? 'opacity-60' : ''}`}
                       title="Drag to reorder"
                     >
-                      {col === 'trailermode'
-                        ? 'TT'
-                        : col === 'loadsize'
-                            ? 'Load Size'
-                            : col === 'distance'
-                                ? 'Distance'
-                            : GPS_STEP_VIRTUAL_COLUMN_SET.has(col)
-                                ? col.toUpperCase()
-                            : formatColumnLabel(col)}
+                      {inspectGridColumnHeader(col)}
                     </th>
                   ))}
                 </tr>
@@ -3030,12 +3127,12 @@ function InspectContent() {
                     )}
                     <div className="max-h-[1200px] min-h-[600px] overflow-auto rounded border border-zinc-200 dark:border-zinc-700">
                       <table className="min-w-full text-left text-sm">
-                        <thead className="sticky top-0 z-10 bg-zinc-100 dark:bg-zinc-800">
+                        <thead className="sticky top-0 z-20 bg-zinc-100 shadow-[0_1px_0_0_rgba(0,0,0,0.1)] dark:bg-zinc-800 dark:shadow-[0_1px_0_0_rgba(255,255,255,0.1)]">
                           <tr>
                             {TRACKING_GRID_COLUMNS.map((col) => (
                               <th
                                 key={col}
-                                className="whitespace-nowrap px-2 py-1.5 font-medium text-zinc-700 dark:text-zinc-300"
+                                className="whitespace-nowrap bg-zinc-100 px-2 py-1.5 font-medium text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300"
                                 title={
                                   col === 'fence_plus'
                                     ? 'Point inside ST_Buffer(job vineyard fence(s), Steps+ buffer m) — same geometry as Steps+; per point, no min duration.'
@@ -3045,14 +3142,14 @@ function InspectContent() {
                                 {trackingGridColLabel(col)}
                               </th>
                             ))}
-                            <th className="whitespace-nowrap px-2 py-1.5 font-medium text-zinc-700 dark:text-zinc-300">
+                            <th className="whitespace-nowrap bg-zinc-100 px-2 py-1.5 font-medium text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300">
                               Distance (m)
                             </th>
-                            <th className="whitespace-nowrap px-2 py-1.5 font-medium text-zinc-700 dark:text-zinc-300">
+                            <th className="whitespace-nowrap bg-zinc-100 px-2 py-1.5 font-medium text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300">
                               Map
                             </th>
                             <th
-                              className="whitespace-nowrap px-2 py-1.5 text-right font-medium text-zinc-700 dark:text-zinc-300"
+                              className="whitespace-nowrap bg-zinc-100 px-2 py-1.5 text-right font-medium text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300"
                               title="tbl_tracking primary key"
                             >
                               tbl_tracking.id

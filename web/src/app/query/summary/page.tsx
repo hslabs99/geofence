@@ -227,6 +227,21 @@ function formatDateDDMM(v: unknown, includeTime = true): string {
   return `${dd}/${mm} ${h!.padStart(2, '0')}:${min.padStart(2, '0')}`;
 }
 
+/** Final step clock (actual, else GPS, else VWork completed). Used for billed minutes. */
+function finalStepTime(row: Row, step: number): unknown {
+  return row[`step_${step}_actual_time`] ?? row[`step_${step}_gps_completed_at`] ?? row[`step_${step}_completed_at`];
+}
+
+/** Job start for client view / export: final step 1, not VWork actual_start_time. */
+function jobFinalStartTime(row: Row): unknown {
+  return finalStepTime(row, 1) ?? row.actual_start_time;
+}
+
+/** Job end for client view / export: final step 5, not VWork actual_end_time. */
+function jobFinalEndTime(row: Row): unknown {
+  return finalStepTime(row, 5) ?? row.actual_end_time;
+}
+
 /** Minutes between two timestamps (step_x - step_x-1). Returns null if either missing. */
 function minsBetween(row: Row, stepPrev: number, stepCur: number): number | null {
   const prevKey = `step_${stepPrev}_actual_time`;
@@ -2980,6 +2995,7 @@ function SummaryPageInner() {
       ? [
           ...BY_JOB_LEAD_COLUMNS.map((c) => c.key),
           'start_time',
+          'end_time',
           'travel',
           'in_vineyard',
           'in_winery',
@@ -3017,11 +3033,10 @@ function SummaryPageInner() {
       const inWinery = minsBetween(row, 4, 5);
       const total = totalMins(row);
       if (clientMode) {
-        const startVal =
-          row.actual_start_time ?? row.step_1_actual_time ?? row.step_1_gps_completed_at ?? row.step_1_completed_at;
         aoa.push([
           ...lead,
-          formatDateDDMM(startVal),
+          formatDateDDMM(jobFinalStartTime(row)),
+          formatDateDDMM(jobFinalEndTime(row)),
           travel ?? '',
           inVineyard ?? '',
           inWinery ?? '',
@@ -5411,7 +5426,7 @@ function SummaryPageInner() {
                   <th
                     // Top limit header row must account for Step 1 (Time/Via) columns in admin mode,
                     // otherwise the per-column limit inputs/stats shift left.
-                    colSpan={BY_JOB_LEAD_COLUMNS.length + (jobClientView ? 1 : 2)}
+                    colSpan={BY_JOB_LEAD_COLUMNS.length + 2}
                     className="border-r border-zinc-200 px-2 py-0.5 text-[11px] font-medium text-zinc-500 dark:border-zinc-700"
                     title={
                       timeLimitRows.length > 0
@@ -5511,12 +5526,20 @@ function SummaryPageInner() {
                     );
                   })}
                   {jobClientView && (
+                    <>
                     <th
                       onClick={() => handleSort('step_1_actual_time')}
                       className={`cursor-pointer select-none whitespace-nowrap border-b border-r border-zinc-200 px-3 py-2 font-medium text-zinc-900 hover:bg-zinc-200 dark:border-zinc-700 dark:text-zinc-100 dark:hover:bg-zinc-700 ${sortKey === 'step_1_actual_time' ? 'bg-zinc-200 dark:bg-zinc-700' : ''}`}
                     >
                       Start Time {sortKey === 'step_1_actual_time' ? (sortDir === 'asc' ? '↑' : '↓') : ''}
                     </th>
+                    <th
+                      onClick={() => handleSort('step_5_actual_time')}
+                      className={`cursor-pointer select-none whitespace-nowrap border-b border-r border-zinc-200 px-3 py-2 font-medium text-zinc-900 hover:bg-zinc-200 dark:border-zinc-700 dark:text-zinc-100 dark:hover:bg-zinc-700 ${sortKey === 'step_5_actual_time' ? 'bg-zinc-200 dark:bg-zinc-700' : ''}`}
+                    >
+                      End Time {sortKey === 'step_5_actual_time' ? (sortDir === 'asc' ? '↑' : '↓') : ''}
+                    </th>
+                    </>
                   )}
                   {!jobClientView && (
                     <>
@@ -5617,7 +5640,7 @@ function SummaryPageInner() {
               <tbody>
                 {sortedRows.length === 0 ? (
                   <tr>
-                    <td colSpan={jobClientView ? BY_JOB_LEAD_COLUMNS.length + 1 : allColumns.length} className="px-3 py-6 text-center text-zinc-500">
+                    <td colSpan={jobClientView ? BY_JOB_LEAD_COLUMNS.length + 2 : allColumns.length} className="px-3 py-6 text-center text-zinc-500">
                       No rows {filterActualFrom || filterActualTo || effectiveCustomer || filterTemplate || filterTruckId || filterWorker.trim() || filterTrailermode ? '(try relaxing filters)' : ''}.
                     </td>
                   </tr>
@@ -5720,9 +5743,14 @@ function SummaryPageInner() {
                       );
                       })}
                       {jobClientView && (
+                        <>
                         <td className="whitespace-nowrap px-2 py-1.5 text-zinc-600 dark:text-zinc-400">
-                          {formatDateDDMM(row.actual_start_time ?? row.step_1_actual_time ?? row.step_1_gps_completed_at ?? row.step_1_completed_at)}
+                          {formatDateDDMM(jobFinalStartTime(row))}
                         </td>
+                        <td className="whitespace-nowrap px-2 py-1.5 text-zinc-600 dark:text-zinc-400">
+                          {formatDateDDMM(jobFinalEndTime(row))}
+                        </td>
+                        </>
                       )}
                       {!jobClientView && (() => {
                         const limitsRow = getMatchingLimitsRow(row);

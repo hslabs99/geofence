@@ -6,7 +6,7 @@ import { dateToLiteral } from '@/lib/utils';
 /** Raw timestamp columns in tbl_vworkjobs: SELECT as to_char so API returns exact DB digits. */
 const RAW_TIMESTAMP_COLS = [
   'actual_start_time', 'actual_end_time', 'planned_start_time',
-  'step_1_completed_at', 'step_1_safe', 'step_2_completed_at', 'step_3_completed_at', 'step_4_completed_at', 'step_5_completed_at',
+  'step_1_completed_at', 'step_1_safe', 'step1supersafe', 'step_2_completed_at', 'step_3_completed_at', 'step_4_completed_at', 'step_5_completed_at',
   'step_1_gps_completed_at', 'step_2_gps_completed_at', 'step_3_gps_completed_at', 'step_4_gps_completed_at', 'step_5_gps_completed_at',
   'step_1_actual_time', 'step_2_actual_time', 'step_3_actual_time', 'step_4_actual_time', 'step_5_actual_time',
   'step1oride', 'step2oride', 'step3oride', 'step4oride', 'step5oride',
