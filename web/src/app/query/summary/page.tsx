@@ -22,6 +22,7 @@ import {
   SUMMARY_COLUMN_COLOR_SETTINGS_TYPE,
   type SummaryColumnColorKey,
 } from '@/lib/summary-column-color-setting-names';
+import { buildChecksumCustomReportAoa } from '@/lib/summary-job-checksums';
 
 /** Center all header cell labels horizontally and vertically within summary thead blocks */
 const SUMMARY_THEAD_TH_ALIGNMENT = '[&_th]:align-middle [&_th]:text-center';
@@ -946,6 +947,48 @@ function formatJobViaForExport(viaVal: unknown): string {
   return viaStr;
 }
 
+const SUMMARY_EXPORT_ADMIN_JOB_METRIC_HEADERS = [
+  'step_1_time',
+  'step_1_via',
+  'mins_2',
+  'step_2_time',
+  'step_2_via',
+  'mins_3',
+  'step_3_time',
+  'step_3_via',
+  'mins_4',
+  'step_4_time',
+  'step_4_via',
+  'mins_5',
+  'step_5_time',
+  'step_5_via',
+  'travel',
+  'in_vineyard',
+  'in_winery',
+  'total',
+] as const;
+
+function summaryExportAdminJobMetricCells(row: Row): (string | number)[] {
+  const stepCells: (string | number)[] = [];
+  for (const n of STEP_NUMS) {
+    const actualVal = row[`step_${n}_actual_time`] ?? row[`step_${n}_gps_completed_at`] ?? row[`step_${n}_completed_at`];
+    const viaVal = row[`step_${n}_via`];
+    if (n >= 2) {
+      const mins = minsBetween(row, n - 1, n);
+      stepCells.push(mins ?? '');
+    }
+    stepCells.push(formatDateDDMM(actualVal));
+    stepCells.push(formatJobViaForExport(viaVal));
+  }
+  return [
+    ...stepCells,
+    travelMins(row) ?? '',
+    minsBetween(row, 2, 3) ?? '',
+    minsBetween(row, 4, 5) ?? '',
+    totalMins(row) ?? '',
+  ];
+}
+
 function summaryExportJobLeadCell(
   row: Row,
   key: (typeof BY_JOB_LEAD_COLUMNS)[number]['key'],
@@ -1099,6 +1142,8 @@ function SummaryPageInner() {
   const vineyardPickerPanelRef = useRef<HTMLDivElement | null>(null);
   const [summaryExportMenuOpen, setSummaryExportMenuOpen] = useState(false);
   const summaryExportMenuRef = useRef<HTMLDivElement | null>(null);
+  const [checksumExportBusy, setChecksumExportBusy] = useState(false);
+  const [checksumExportError, setChecksumExportError] = useState<string | null>(null);
   /** All vineyard_name values for the customer (from filter-options), independent of vineyard filter — avoids “stuck” list after reload. */
   const [vineyardOptionsAll, setVineyardOptionsAll] = useState<string[]>([]);
   /** Distinct templates for the customer (filter-options) so the Template dropdown works before jobs are loaded. */
@@ -2284,17 +2329,25 @@ function SummaryPageInner() {
     return out;
   }, [rowsWithLimits, sortKey, sortDir, sortColumns]);
 
+  /**
+   * Client never sees Inspect-excluded jobs (billing view). Admin By Job still lists them (ghosted).
+   */
+  const byJobListedRows = useMemo(
+    () => (viewMode === 'client' ? sortedRows.filter(includedInRollup) : sortedRows),
+    [sortedRows, viewMode],
+  );
+
   /** By Job table shows one page; season/daily use full sortedRows via filteredRows. */
   const sortedRowsPage = useMemo(() => {
-    if (summaryTab !== 'by_job') return sortedRows;
+    if (summaryTab !== 'by_job') return byJobListedRows;
     const start = jobsPage * jobsPageSize;
-    return sortedRows.slice(start, start + jobsPageSize);
-  }, [sortedRows, summaryTab, jobsPage, jobsPageSize]);
+    return byJobListedRows.slice(start, start + jobsPageSize);
+  }, [byJobListedRows, summaryTab, jobsPage, jobsPageSize]);
 
   const jobsTotalPages = useMemo(() => {
     if (jobsPageSize <= 0) return 1;
-    return Math.max(1, Math.ceil(sortedRows.length / jobsPageSize));
-  }, [sortedRows.length, jobsPageSize]);
+    return Math.max(1, Math.ceil(byJobListedRows.length / jobsPageSize));
+  }, [byJobListedRows.length, jobsPageSize]);
 
   useEffect(() => {
     setJobsPage((p) => Math.max(0, Math.min(p, jobsTotalPages - 1)));
@@ -3001,71 +3054,57 @@ function SummaryPageInner() {
           'in_winery',
           'total',
         ]
-      : [
-          ...BY_JOB_LEAD_COLUMNS.map((c) => c.key),
-          'step_1_time',
-          'step_1_via',
-          'mins_2',
-          'step_2_time',
-          'step_2_via',
-          'mins_3',
-          'step_3_time',
-          'step_3_via',
-          'mins_4',
-          'step_4_time',
-          'step_4_via',
-          'mins_5',
-          'step_5_time',
-          'step_5_via',
-          'travel',
-          'in_vineyard',
-          'in_winery',
-          'total',
-        ];
+      : [...BY_JOB_LEAD_COLUMNS.map((c) => c.key), ...SUMMARY_EXPORT_ADMIN_JOB_METRIC_HEADERS];
     const aoa: (string | number | null | undefined)[][] = [header];
     const tmplTrim = filterTemplate.trim();
-    for (const row of sortedRows) {
+    const exportRows = clientMode ? sortedRows.filter(includedInRollup) : sortedRows;
+    for (const row of exportRows) {
       const lead = BY_JOB_LEAD_COLUMNS.map(({ key }) =>
         summaryExportJobLeadCell(row, key, tmplTrim, naLabelByTemplate),
       );
-      const travel = travelMins(row);
-      const inVineyard = minsBetween(row, 2, 3);
-      const inWinery = minsBetween(row, 4, 5);
-      const total = totalMins(row);
       if (clientMode) {
         aoa.push([
           ...lead,
           formatDateDDMM(jobFinalStartTime(row)),
           formatDateDDMM(jobFinalEndTime(row)),
-          travel ?? '',
-          inVineyard ?? '',
-          inWinery ?? '',
-          total ?? '',
+          travelMins(row) ?? '',
+          minsBetween(row, 2, 3) ?? '',
+          minsBetween(row, 4, 5) ?? '',
+          totalMins(row) ?? '',
         ]);
       } else {
-        const stepCells: (string | number)[] = [];
-        for (const n of STEP_NUMS) {
-          const actualVal = row[`step_${n}_actual_time`] ?? row[`step_${n}_gps_completed_at`] ?? row[`step_${n}_completed_at`];
-          const viaVal = row[`step_${n}_via`];
-          if (n >= 2) {
-            const mins = minsBetween(row, n - 1, n);
-            stepCells.push(mins ?? '');
-          }
-          stepCells.push(formatDateDDMM(actualVal));
-          stepCells.push(formatJobViaForExport(viaVal));
-        }
-        aoa.push([
-          ...lead,
-          ...stepCells,
-          travel ?? '',
-          inVineyard ?? '',
-          inWinery ?? '',
-          total ?? '',
-        ]);
+        aoa.push([...lead, ...summaryExportAdminJobMetricCells(row)]);
       }
     }
     await downloadSummaryCsv(aoa, `summary-jobs_${cust}_${tmpl}_${day}.csv`);
   }, [sortedRows, effectiveCustomer, filterTemplate, viewMode, naLabelByTemplate]);
+
+  const runExportJobsDataChecksumsXlsx = useCallback(async () => {
+    if (viewMode === 'client') return;
+    const customer = effectiveCustomer.trim();
+    if (!customer) {
+      setChecksumExportError('Select a customer in the sidebar to run Job Data with Check Sums.');
+      return;
+    }
+    setChecksumExportError(null);
+    setChecksumExportBusy(true);
+    try {
+      const params = new URLSearchParams();
+      params.set('customer', customer);
+      const res = await fetch(`/api/vworkjobs?${params}`, { cache: 'no-store' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data?.error ?? res.statusText);
+      const jobs = Array.isArray(data.rows) ? data.rows : [];
+      const aoa = buildChecksumCustomReportAoa(jobs);
+      const day = new Date().toISOString().slice(0, 10);
+      const cust = sanitizeSummaryExportFilenamePart(customer);
+      await downloadSummaryCsv(aoa, `summary-jobs-checksums_${cust}_${day}.csv`);
+    } catch (e) {
+      setChecksumExportError(e instanceof Error ? e.message : 'Checksum report failed.');
+    } finally {
+      setChecksumExportBusy(false);
+    }
+  }, [viewMode, effectiveCustomer]);
 
   /** Jobs API runs only with both set so payloads stay scoped to one customer + template. */
   const canLoadJobs = effectiveCustomer.trim() !== '' && filterTemplate.trim() !== '';
@@ -3297,6 +3336,21 @@ function SummaryPageInner() {
                   />
                   Show all filters
                 </label>
+                {viewMode !== 'client' && (
+                  <button
+                    type="button"
+                    disabled={!effectiveCustomer.trim() || checksumExportBusy}
+                    title={
+                      !effectiveCustomer.trim()
+                        ? 'Select a customer in the sidebar'
+                        : 'Whole-customer checksum: VWork vs actual step 1/5, overlaps, and gaps under 30 minutes. Template is not required.'
+                    }
+                    onClick={() => void runExportJobsDataChecksumsXlsx()}
+                    className="rounded border border-zinc-300 bg-white px-2.5 py-0.5 text-[11px] font-medium text-zinc-800 hover:bg-zinc-50 disabled:cursor-not-allowed disabled:opacity-60 dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100 dark:hover:bg-zinc-700"
+                  >
+                    {checksumExportBusy ? 'Building checksum…' : 'Job Data with Check Sums'}
+                  </button>
+                )}
               </div>
             </div>
 
@@ -4567,6 +4621,17 @@ function SummaryPageInner() {
           {!canLoadJobs && (
             <p className="mb-4 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-zinc-800 dark:border-amber-900/40 dark:bg-amber-950/25 dark:text-zinc-200">
               Select a <strong className="font-semibold">customer</strong> in the sidebar and a <strong className="font-semibold">template</strong> to load jobs and rollups. Winery, vineyard, date and other filters apply after data has loaded.
+              {viewMode !== 'client' && effectiveCustomer.trim() ? (
+                <>
+                  {' '}
+                  <strong className="font-semibold">Job Data with Check Sums</strong> can run now for this customer (all templates).
+                </>
+              ) : null}
+            </p>
+          )}
+          {checksumExportError && viewMode !== 'client' && (
+            <p className="mb-3 rounded-lg border border-red-200 bg-red-50 px-4 py-2 text-sm text-red-800 dark:border-red-900/40 dark:bg-red-950/30 dark:text-red-200">
+              {checksumExportError}
             </p>
           )}
           {canLoadJobs && !loading && (
@@ -4666,7 +4731,7 @@ function SummaryPageInner() {
                 {summaryExportMenuOpen && (
                   <div
                     role="menu"
-                    className="absolute left-0 top-full z-50 mt-0.5 min-w-[13rem] rounded-md border border-zinc-200 bg-white py-1 shadow-lg dark:border-zinc-600 dark:bg-zinc-900"
+                    className="absolute left-0 top-full z-50 mt-0.5 min-w-[16rem] rounded-md border border-zinc-200 bg-white py-1 shadow-lg dark:border-zinc-600 dark:bg-zinc-900"
                   >
                     <button
                       type="button"
@@ -4712,6 +4777,21 @@ function SummaryPageInner() {
                     >
                       Export Jobs Data
                     </button>
+                    {viewMode !== 'client' && (
+                      <button
+                        type="button"
+                        role="menuitem"
+                        disabled={!effectiveCustomer.trim() || checksumExportBusy}
+                        className="block w-full px-3 py-2 text-left text-sm text-zinc-800 hover:bg-zinc-100 disabled:cursor-not-allowed disabled:opacity-60 dark:text-zinc-200 dark:hover:bg-zinc-800"
+                        onClick={() => {
+                          if (!effectiveCustomer.trim() || checksumExportBusy) return;
+                          setSummaryExportMenuOpen(false);
+                          void runExportJobsDataChecksumsXlsx();
+                        }}
+                      >
+                        {checksumExportBusy ? 'Building checksum…' : 'Job Data with Check Sums'}
+                      </button>
+                    )}
                   </div>
                 )}
               </div>
@@ -5365,7 +5445,7 @@ function SummaryPageInner() {
           {summaryTab === 'by_job' && (
           <div ref={byJobTableScrollRef} className="w-full min-w-0">
             {(() => {
-              const n = sortedRows.length;
+              const n = byJobListedRows.length;
               if (n <= jobsPageSize) return null;
               const start = n === 0 ? 0 : jobsPage * jobsPageSize + 1;
               const end = Math.min((jobsPage + 1) * jobsPageSize, n);
@@ -5638,7 +5718,7 @@ function SummaryPageInner() {
                 )}
               </thead>
               <tbody>
-                {sortedRows.length === 0 ? (
+                {byJobListedRows.length === 0 ? (
                   <tr>
                     <td colSpan={jobClientView ? BY_JOB_LEAD_COLUMNS.length + 2 : allColumns.length} className="px-3 py-6 text-center text-zinc-500">
                       No rows {filterActualFrom || filterActualTo || effectiveCustomer || filterTemplate || filterTruckId || filterWorker.trim() || filterTrailermode ? '(try relaxing filters)' : ''}.
@@ -5987,7 +6067,7 @@ function SummaryPageInner() {
             <span>
               {summaryTab === 'by_job'
                 ? (() => {
-                    const n = sortedRows.length;
+                    const n = byJobListedRows.length;
                     const start = n === 0 ? 0 : jobsPage * jobsPageSize + 1;
                     const end = Math.min((jobsPage + 1) * jobsPageSize, n);
                     return n > jobsPageSize
@@ -6000,7 +6080,7 @@ function SummaryPageInner() {
                     ? `${formatIntNz(vineyardSummaryList.length)} vineyard${vineyardSummaryList.length !== 1 ? 's' : ''} · Jobs (rollups): ${formatIntNz(rollupJobsCount)}${rollupJobsCount !== filteredRows.length ? ` · ${formatIntNz(filteredRows.length)} loaded` : ''}${filteredRows.length !== totalJobsFromApi ? ` (client filter ${formatIntNz(filteredRows.length)} vs API ${formatIntNz(totalJobsFromApi)})` : ''}`
                     : `Total harvest days: ${formatIntNz(summaryHarvestDayCount)} · Jobs (rollups): ${formatIntNz(rollupJobsCount)}${rollupJobsCount !== filteredRows.length ? ` · ${formatIntNz(filteredRows.length)} loaded` : ''}${filteredRows.length !== totalJobsFromApi ? ` (client filter ${formatIntNz(filteredRows.length)} vs API ${formatIntNz(totalJobsFromApi)})` : ''}`}
             </span>
-            {summaryTab === 'by_job' && sortedRows.length > jobsPageSize && (
+            {summaryTab === 'by_job' && byJobListedRows.length > jobsPageSize && (
               <span className="flex items-center gap-2">
                 <button
                   type="button"
