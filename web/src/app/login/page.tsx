@@ -35,7 +35,8 @@ export default function LoginPage() {
         );
       }
       // Full page load so layout/context remount and read session (no manual refresh needed)
-      window.location.href = userType === 'Client' ? '/query/summary' : '/';
+      window.location.href =
+        userType === 'Client' ? '/query/summary' : userType === 'Driver' ? '/driver/home' : '/';
       return;
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Network error');
@@ -103,6 +104,13 @@ export default function LoginPage() {
               {error && (
                 <p className="text-sm text-red-600 dark:text-red-400">{error}</p>
               )}
+              <p className="text-xs text-zinc-500">
+                Drivers sign in at{' '}
+                <Link href="/driver" className="font-medium text-zinc-700 underline dark:text-zinc-300">
+                  /driver
+                </Link>
+                .
+              </p>
               <p className="text-xs text-zinc-500">
                 Cloud SQL stopped?{' '}
                 <Link href="/db-switch" className="font-medium text-zinc-700 underline dark:text-zinc-300">

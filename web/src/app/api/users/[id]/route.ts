@@ -2,6 +2,8 @@ import { NextResponse } from 'next/server';
 import { query, execute } from '@/lib/db';
 import { dateToLiteral } from '@/lib/utils';
 import bcrypt from 'bcryptjs';
+import { ensureDriverUserSchema } from '@/lib/ensure-driver-user';
+import { normalizeUserType, userTypeForStorage } from '@/lib/user-types';
 
 function jsonSafe<T>(obj: T): T {
   if (obj === null || obj === undefined) return obj;
@@ -18,18 +20,7 @@ function jsonSafe<T>(obj: T): T {
   return obj;
 }
 
-const CANONICAL_USER_TYPES = ['Super Admin', 'Admin', 'Client'] as const;
-type CanonicalUserType = (typeof CANONICAL_USER_TYPES)[number];
-
-function normalizeUserType(raw: string | null | undefined): CanonicalUserType {
-  const s = (raw ?? '').trim();
-  if (/super\s*admin/i.test(s)) return 'Super Admin';
-  if (/^admin$/i.test(s)) return 'Admin';
-  if (/^client$/i.test(s)) return 'Client';
-  return 'Admin';
-}
-
-/** Read user_type from row; driver may return different key casing (user_type, User_Type, userType, etc.). */
+/** Read user_type from row; pg may return different key casing (user_type, User_Type, userType, etc.). */
 function getRawUserType(row: Record<string, unknown>): string | null | undefined {
   const keys = ['user_type', 'User_Type', 'userType', 'UserType', 'usertype'];
   for (const k of keys) {
@@ -71,7 +62,7 @@ export async function PUT(
     const { id } = await params;
     const userid = id;
     const body = await request.json();
-    const { email, password, firstname, surname, phone, userType, customer } = body as {
+    const { email, password, firstname, surname, phone, userType, customer, truckRego } = body as {
       email?: string;
       password?: string;
       firstname?: string | null;
@@ -79,19 +70,24 @@ export async function PUT(
       phone?: string | null;
       userType?: string | null;
       customer?: string | null;
+      truckRego?: string | null;
     };
+    await ensureDriverUserSchema();
     const data: Record<string, unknown> = {};
     if (email !== undefined) data.email = String(email).trim().toLowerCase();
     if (firstname !== undefined) data.firstname = firstname?.trim() || null;
     if (surname !== undefined) data.surname = surname?.trim() || null;
     if (phone !== undefined) data.phone = phone?.trim() || null;
     if (userType !== undefined) {
-      data.user_type = userType?.trim() || 'Admin';
+      data.user_type = userTypeForStorage(userType);
       data.customer = data.user_type === 'Client' ? (customer?.trim() ?? null) : null;
+      data.truck_rego = data.user_type === 'Driver' ? (truckRego?.trim() || null) : null;
     }
-    if (customer !== undefined && data.user_type === undefined) {
+    if ((customer !== undefined || truckRego !== undefined) && data.user_type === undefined) {
       const existing = await query<{ user_type: string }>('SELECT user_type FROM tbl_users WHERE userid = $1', [userid]);
-      if (existing[0]?.user_type === 'Client') data.customer = customer?.trim() || null;
+      const existingType = normalizeUserType(existing[0]?.user_type);
+      if (customer !== undefined && existingType === 'Client') data.customer = customer?.trim() || null;
+      if (truckRego !== undefined && existingType === 'Driver') data.truck_rego = truckRego?.trim() || null;
     }
     if (password !== undefined && password !== '' && typeof password === 'string' && password.length >= 6) {
       data.password = await bcrypt.hash(password, 10);

@@ -8,6 +8,7 @@ import { GEODATA_USER_STORAGE_KEY, useViewMode } from '@/contexts/ViewModeContex
 import { useSummaryHistory } from '@/contexts/SummaryHistoryContext';
 import { listSummaryHistory } from '@/lib/summary-history-storage';
 import { GEODATA_DB_CONNECTION_CHANGED } from '@/lib/db-connection-events';
+import LocationServiceStatus from '@/components/LocationServiceStatus';
 
 type InspectHistoryEntry = {
   id: number;
@@ -255,9 +256,10 @@ export default function Sidebar() {
   }, [historyOpen, recentViewsOpen]);
 
   function handleSignOut() {
+    const dest = userType === 'Driver' ? '/driver' : '/login';
     if (typeof localStorage !== 'undefined') localStorage.removeItem(GEODATA_USER_STORAGE_KEY);
     refreshUser();
-    router.push('/login');
+    router.push(dest);
   }
 
   useEffect(() => {
@@ -301,6 +303,7 @@ export default function Sidebar() {
             )}
           </div>
         )}
+        {viewMode !== 'driver' && (
         <Link
           href="/"
           className={`rounded px-3 py-2 text-sm font-medium ${
@@ -309,11 +312,12 @@ export default function Sidebar() {
         >
           Home
         </Link>
+        )}
         {allowedViewModes.length > 0 && (
         <div className="mt-2 px-1">
           <div className="mb-1 text-xs font-medium text-zinc-500 dark:text-zinc-400">View</div>
           <div className="flex flex-col gap-1">
-            {(['super', 'admin', 'client'] as const)
+            {(['super', 'admin', 'client', 'driver'] as const)
               .filter((mode) => allowedViewModes.includes(mode))
               .map((mode) => (
               <div key={mode}>
@@ -326,7 +330,7 @@ export default function Sidebar() {
                     className="border-zinc-300 text-blue-600 dark:border-zinc-600"
                   />
                   <span className={viewMode === mode ? 'font-medium text-zinc-900 dark:text-zinc-100' : 'text-zinc-600 dark:text-zinc-400'}>
-                    {mode === 'super' ? 'Super' : mode === 'admin' ? 'Admin' : 'Client'}
+                    {mode === 'super' ? 'Super' : mode === 'admin' ? 'Admin' : mode === 'driver' ? 'Driver' : 'Client'}
                   </span>
                 </label>
               </div>
@@ -363,7 +367,16 @@ export default function Sidebar() {
         </div>
         )}
         <div className="my-1 border-t border-zinc-200 dark:border-zinc-700" />
-        {viewMode === 'client' ? (
+        {viewMode === 'driver' ? (
+          <Link
+            href="/query/driver-visibility"
+            className={`rounded px-3 py-2 text-sm ${
+              pathname === '/query/driver-visibility' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
+            }`}
+          >
+            Driver Visibility
+          </Link>
+        ) : viewMode === 'client' ? (
           <Link
             href="/query/summary"
             className={`rounded px-3 py-2 text-sm ${
@@ -526,6 +539,14 @@ export default function Sidebar() {
             >
               Vwork
             </Link>
+            <Link
+              href="/query/driver-visibility"
+              className={`rounded px-3 py-2 text-sm ${
+                pathname === '/query/driver-visibility' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
+              }`}
+            >
+              Driver Visibility
+            </Link>
             <div className="my-1 border-t border-zinc-200 dark:border-zinc-700" />
             <div className="mt-2 rounded-md border-l-4 border-amber-500 bg-amber-50 px-3 py-1.5 text-xs font-bold uppercase tracking-wider text-amber-800 dark:border-amber-400 dark:bg-amber-950/50 dark:text-amber-200">
               Admin
@@ -537,6 +558,14 @@ export default function Sidebar() {
               }`}
             >
               Users
+            </Link>
+            <Link
+              href="/admin/current-locations"
+              className={`rounded px-3 py-2 text-sm ${
+                pathname === '/admin/current-locations' ? 'bg-zinc-200 text-zinc-900 dark:bg-zinc-700 dark:text-zinc-100' : 'text-zinc-600 hover:bg-zinc-100 dark:text-zinc-400 dark:hover:bg-zinc-800'
+              }`}
+            >
+              Service management
             </Link>
             <Link
               href="/admin/autoruns"
@@ -647,6 +676,7 @@ export default function Sidebar() {
       </nav>
       {userType && (
         <div className="shrink-0 border-t border-zinc-200 p-3 dark:border-zinc-700">
+          <LocationServiceStatus variant="staff" />
           <button
             type="button"
             onClick={handleSignOut}

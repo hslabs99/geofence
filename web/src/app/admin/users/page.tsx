@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useState } from 'react';
 
-const USER_TYPES = ['Super Admin', 'Admin', 'Client'] as const;
+const USER_TYPES = ['Super Admin', 'Admin', 'Client', 'Driver'] as const;
 type UserType = (typeof USER_TYPES)[number];
 
 type User = {
@@ -14,6 +14,7 @@ type User = {
   userType?: string | null;
   user_type?: string | null; // API may return snake_case from DB
   customer?: string | null;
+  truck_rego?: string | null;
   createdAt?: string;
   updatedAt?: string;
 };
@@ -28,6 +29,7 @@ const emptyForm = () => ({
   phone: '',
   userType: 'Admin' as UserType,
   customer: '',
+  truckRego: '',
 });
 
 export default function UsersPage() {
@@ -85,6 +87,7 @@ export default function UsersPage() {
       phone: u.phone ?? '',
       userType,
       customer: u.customer ?? '',
+      truckRego: u.truck_rego ?? '',
     });
     setModal({ mode: 'edit', user: u });
   }, []);
@@ -105,6 +108,7 @@ export default function UsersPage() {
       phone: form.phone.trim() || '',
       userType: form.userType,
       customer: form.userType === 'Client' ? form.customer.trim() : '',
+      truckRego: form.userType === 'Driver' ? form.truckRego.trim() : '',
     };
     if (!editing) {
       if (!form.password || form.password.length < 6) {
@@ -165,9 +169,10 @@ export default function UsersPage() {
           <table className="min-w-full text-left text-sm">
             <thead>
               <tr className="border-b border-zinc-200 bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-800">
-                <th className="px-3 py-2 font-medium text-zinc-900 dark:text-zinc-100">Email</th>
+                <th className="px-3 py-2 font-medium text-zinc-900 dark:text-zinc-100">Email / driver ID</th>
                 <th className="px-3 py-2 font-medium text-zinc-900 dark:text-zinc-100">Type</th>
                 <th className="px-3 py-2 font-medium text-zinc-900 dark:text-zinc-100">Customer</th>
+                <th className="px-3 py-2 font-medium text-zinc-900 dark:text-zinc-100">Truck rego</th>
                 <th className="px-3 py-2 font-medium text-zinc-900 dark:text-zinc-100">First name</th>
                 <th className="px-3 py-2 font-medium text-zinc-900 dark:text-zinc-100">Surname</th>
                 <th className="px-3 py-2 font-medium text-zinc-900 dark:text-zinc-100">Phone</th>
@@ -180,6 +185,7 @@ export default function UsersPage() {
                   <td className="whitespace-nowrap px-3 py-2 text-zinc-700 dark:text-zinc-300">{u.email}</td>
                   <td className="whitespace-nowrap px-3 py-2 text-zinc-700 dark:text-zinc-300">{u.userType ?? u.user_type ?? '—'}</td>
                   <td className="whitespace-nowrap px-3 py-2 text-zinc-700 dark:text-zinc-300">{u.customer ?? '—'}</td>
+                  <td className="whitespace-nowrap px-3 py-2 text-zinc-700 dark:text-zinc-300">{u.truck_rego ?? '—'}</td>
                   <td className="whitespace-nowrap px-3 py-2 text-zinc-700 dark:text-zinc-300">{u.firstname ?? '—'}</td>
                   <td className="whitespace-nowrap px-3 py-2 text-zinc-700 dark:text-zinc-300">{u.surname ?? '—'}</td>
                   <td className="whitespace-nowrap px-3 py-2 text-zinc-700 dark:text-zinc-300">{u.phone ?? '—'}</td>
@@ -224,9 +230,11 @@ export default function UsersPage() {
                 <p className="text-sm text-red-600 dark:text-red-400">{submitError}</p>
               )}
               <div>
-                <label className="mb-1 block text-xs font-medium text-zinc-500">Email *</label>
+                <label className="mb-1 block text-xs font-medium text-zinc-500">
+                  {form.userType === 'Driver' ? 'Driver ID *' : 'Email *'}
+                </label>
                 <input
-                  type="email"
+                  type={form.userType === 'Driver' ? 'text' : 'email'}
                   value={form.email}
                   onChange={(e) => setForm((f) => ({ ...f, email: e.target.value }))}
                   required
@@ -278,14 +286,21 @@ export default function UsersPage() {
               </div>
               <div>
                 <label className="mb-1 block text-xs font-medium text-zinc-500">User type</label>
-                <div className="flex gap-4">
+                <div className="flex flex-wrap gap-4">
                   {USER_TYPES.map((t) => (
                     <label key={t} className="flex items-center gap-1.5 text-sm">
                       <input
                         type="radio"
                         name="userType"
                         checked={form.userType === t}
-                        onChange={() => setForm((f) => ({ ...f, userType: t, customer: t === 'Client' ? f.customer : '' }))}
+                        onChange={() =>
+                          setForm((f) => ({
+                            ...f,
+                            userType: t,
+                            customer: t === 'Client' ? f.customer : '',
+                            truckRego: t === 'Driver' ? f.truckRego : '',
+                          }))
+                        }
                         className="rounded border-zinc-300 text-blue-600 dark:border-zinc-600"
                       />
                       {t}
@@ -293,6 +308,17 @@ export default function UsersPage() {
                   ))}
                 </div>
               </div>
+              {form.userType === 'Driver' && (
+                <div>
+                  <label className="mb-1 block text-xs font-medium text-zinc-500">Truck rego</label>
+                  <input
+                    type="text"
+                    value={form.truckRego}
+                    onChange={(e) => setForm((f) => ({ ...f, truckRego: e.target.value }))}
+                    className="w-full rounded border border-zinc-300 px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800 dark:text-zinc-100"
+                  />
+                </div>
+              )}
               {form.userType === 'Client' && (
                 <div>
                   <div className="mb-1 flex items-center justify-between">

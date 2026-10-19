@@ -3,6 +3,7 @@ import { join } from 'path';
 import { loadEnvConfig } from '@next/env';
 import { dateToLiteralUTC } from './utils';
 import { query, execute } from './db';
+import { recordTracksolidCall } from './tracksolid-call-budget';
 
 const projectDir = process.cwd();
 loadEnvConfig(projectDir);
@@ -37,6 +38,10 @@ function getTokenCacheKey(baseUrl: string): string {
   const entries = Object.entries(TRACKSOLID_ENDPOINTS) as [string, string][];
   const found = entries.find(([, url]) => url === baseUrl);
   return found ? found[0] : 'default';
+}
+
+export function tracksolidNodeKey(endpoint?: string | null): string {
+  return getTokenCacheKey(getBaseUrl(endpoint));
 }
 
 const FULL_REDACT_KEYS = new Set(['sign', 'user_pwd_md5', 'access_token']);
@@ -164,41 +169,61 @@ async function post(
   const sign = signParams(params, config.appSecret);
   const formParams: Record<string, string> = { ...params, sign };
   const body = new URLSearchParams(formParams).toString();
-  const res = await fetch(baseUrl, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body,
-  });
-  const raw = await res.text();
-  let data: { code?: number; message?: string; result?: unknown };
+  let code = -1;
+  let ok = false;
   try {
-    data = JSON.parse(raw) as { code?: number; message?: string; result?: unknown };
-  } catch {
-    data = { code: -1, message: 'Response was not JSON' };
+    const res = await fetch(baseUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body,
+    });
+    const raw = await res.text();
+    let data: { code?: number; message?: string; result?: unknown };
+    try {
+      data = JSON.parse(raw) as { code?: number; message?: string; result?: unknown };
+    } catch {
+      data = { code: -1, message: 'Response was not JSON' };
+    }
+    code = data.code ?? -1;
+    ok = code === 0;
+    const debug = buildDebug(baseUrl, context.method, formParams, body.length, res.status, raw, data);
+    if (code !== 0) {
+      throw new TracksolidApiError(
+        `Tracksolid ${context.method}: code=${code} message=${data.message ?? 'unknown'}`,
+        debug,
+        code
+      );
+    }
+    return {
+      code,
+      message: data.message,
+      result: data.result,
+      _raw: raw,
+      _status: res.status,
+      _debug: debug,
+    };
+  } finally {
+    try {
+      await recordTracksolidCall({
+        endpointKey: getTokenCacheKey(baseUrl),
+        method: context.method,
+        ok,
+      });
+    } catch (err) {
+      console.error('[tracksolid] call count failed', err);
+    }
   }
-  const code = data.code ?? -1;
-  const debug = buildDebug(baseUrl, context.method, formParams, body.length, res.status, raw, data);
-  if (code !== 0) {
-    throw new TracksolidApiError(
-      `Tracksolid ${context.method}: code=${code} message=${data.message ?? 'unknown'}`,
-      debug,
-      code
-    );
-  }
-  return {
-    code,
-    message: data.message,
-    result: data.result,
-    _raw: raw,
-    _status: res.status,
-    _debug: debug,
-  };
 }
 
-const TOKEN_EXPIRES_IN_SEC = 500;
-const TOKEN_REUSE_BUFFER_SEC = 60;
+/** Ask TrackSolid for a 2-hour token. Polls reuse it until shortly before this expiry. */
+const TOKEN_EXPIRES_IN_SEC = 7200;
+const TOKEN_REUSE_BUFFER_SEC = 120;
 
-const tokenCache = new Map<string, { token: string; expiresAt: number }>();
+type CachedToken = { token: string; expiresAt: number; requestedAt: number | null; requestCount: number };
+
+const tokenCache = new Map<string, CachedToken>();
+const tokenRequestInFlight = new Map<string, Promise<{ token: string; debug: TracksolidDebug }>>();
+const tokenUse = new Map<string, { at: number; mode: 'reused' | 'requested'; error: string | null }>();
 
 /** Clear cached token so the next request gets a fresh one. Call when token is expired or you rotated credentials. */
 export async function clearTokenCache(endpoint?: string | null): Promise<void> {
@@ -221,7 +246,20 @@ export async function clearTokenCache(endpoint?: string | null): Promise<void> {
   }
 }
 
-async function getTokenFromDb(cacheKey: string): Promise<{ token: string; expiresAt: number } | null> {
+function localClock(ms: number): string {
+  const now = new Date(ms);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+}
+
+function readExpiresInSec(result: Record<string, unknown> | undefined): number {
+  const raw = result?.expiresIn ?? result?.expires_in;
+  const n = typeof raw === 'number' ? raw : typeof raw === 'string' ? Number(raw) : NaN;
+  if (!Number.isFinite(n)) return TOKEN_EXPIRES_IN_SEC;
+  return Math.min(7200, Math.max(60, Math.round(n)));
+}
+
+async function getTokenFromDb(cacheKey: string): Promise<CachedToken | null> {
   try {
     const rows = await query<{ settingvalue: string | null }>(
       'SELECT settingvalue FROM tbl_settings WHERE type = $1 AND settingname = $2 LIMIT 1',
@@ -229,17 +267,27 @@ async function getTokenFromDb(cacheKey: string): Promise<{ token: string; expire
     );
     const row = rows[0];
     if (!row?.settingvalue) return null;
-    const data = JSON.parse(row.settingvalue) as { token?: string; expiresAt?: number };
-    if (typeof data?.token === 'string' && typeof data?.expiresAt === 'number') return data as { token: string; expiresAt: number };
-    return null;
+    const data = JSON.parse(row.settingvalue) as {
+      token?: string;
+      expiresAt?: number;
+      requestedAt?: number;
+      requestCount?: number;
+    };
+    if (typeof data?.token !== 'string' || typeof data?.expiresAt !== 'number') return null;
+    return {
+      token: data.token,
+      expiresAt: data.expiresAt,
+      requestedAt: typeof data.requestedAt === 'number' ? data.requestedAt : null,
+      requestCount: typeof data.requestCount === 'number' && data.requestCount > 0 ? data.requestCount : 1,
+    };
   } catch {
     return null;
   }
 }
 
-async function setTokenInDb(cacheKey: string, token: string, expiresAt: number): Promise<void> {
+async function setTokenInDb(cacheKey: string, cached: CachedToken): Promise<void> {
   try {
-    const value = JSON.stringify({ token, expiresAt });
+    const value = JSON.stringify(cached);
     await execute(
       `INSERT INTO tbl_settings (type, settingname, settingvalue) VALUES ($1, $2, $3)
        ON CONFLICT (type, settingname) DO UPDATE SET settingvalue = EXCLUDED.settingvalue`,
@@ -247,6 +295,112 @@ async function setTokenInDb(cacheKey: string, token: string, expiresAt: number):
     );
   } catch {
     // ignore DB errors; in-memory cache still works
+  }
+}
+
+export type TracksolidTokenStatus = {
+  endpoint: string;
+  token: string | null;
+  valid: boolean;
+  requestedAt: string | null;
+  expiresAt: string | null;
+  expiresAtMs: number | null;
+  secondsRemaining: number | null;
+  requestCount: number;
+  lastUse: 'reused' | 'requested' | null;
+  lastUseAt: string | null;
+  lastError: string | null;
+};
+
+/** Read the stored token. Does not call TrackSolid. */
+export async function getTracksolidTokenStatus(endpoint?: string | null): Promise<TracksolidTokenStatus> {
+  const baseUrl = getBaseUrl(endpoint);
+  const cacheKey = getTokenCacheKey(baseUrl);
+  let cached = tokenCache.get(baseUrl);
+  if (!cached) {
+    const fromDb = await getTokenFromDb(cacheKey);
+    if (fromDb) {
+      cached = fromDb;
+      tokenCache.set(baseUrl, fromDb);
+    }
+  }
+  const use = tokenUse.get(baseUrl);
+  const now = Date.now();
+  const secondsRemaining = cached ? Math.max(0, Math.ceil((cached.expiresAt - now) / 1000)) : null;
+  const endpointKey = getTokenCacheKey(baseUrl);
+  return {
+    endpoint: endpointKey,
+    token: cached?.token ?? null,
+    valid: !!cached && cached.expiresAt > now + TOKEN_REUSE_BUFFER_SEC * 1000,
+    requestedAt: cached?.requestedAt != null ? localClock(cached.requestedAt) : null,
+    expiresAt: cached ? localClock(cached.expiresAt) : null,
+    expiresAtMs: cached?.expiresAt ?? null,
+    secondsRemaining,
+    requestCount: cached?.requestCount ?? 0,
+    lastUse: use?.mode ?? null,
+    lastUseAt: use ? localClock(use.at) : null,
+    lastError: use?.error ?? null,
+  };
+}
+
+async function loadCachedToken(baseUrl: string, cacheKey: string): Promise<CachedToken | null> {
+  let cached = tokenCache.get(baseUrl) ?? null;
+  if (!cached) {
+    cached = await getTokenFromDb(cacheKey);
+    if (cached) tokenCache.set(baseUrl, cached);
+  }
+  return cached;
+}
+
+async function requestAccessToken(
+  baseUrl: string,
+  cacheKey: string,
+): Promise<{ token: string; debug: TracksolidDebug }> {
+  const previous = await loadCachedToken(baseUrl, cacheKey);
+  const config = getConfig();
+  const params = {
+    ...commonParams(config),
+    method: 'jimi.oauth.token.get',
+    user_id: config.account,
+    user_pwd_md5: config.passwordMd5,
+    expires_in: String(TOKEN_EXPIRES_IN_SEC),
+  };
+  try {
+    const out = await post(params, config, { method: 'jimi.oauth.token.get' }, baseUrl);
+    const result = out.result as Record<string, unknown> | undefined;
+    const token =
+      typeof result?.access_token === 'string'
+        ? result.access_token
+        : typeof result?.accessToken === 'string'
+          ? result.accessToken
+          : null;
+    if (!token) {
+      const debug: TracksolidDebug = buildDebug(
+        baseUrl,
+        'jimi.oauth.token.get',
+        { ...params, sign: signParams(params, config.appSecret) },
+        new URLSearchParams({ ...params, sign: signParams(params, config.appSecret) }).toString().length,
+        out._status,
+        out._raw,
+        { code: out.code, message: out.message, result: out.result }
+      );
+      throw new TracksolidApiError('Tracksolid token: no access_token in result.', debug);
+    }
+    const now = Date.now();
+    const cached: CachedToken = {
+      token,
+      expiresAt: now + readExpiresInSec(result) * 1000,
+      requestedAt: now,
+      requestCount: (previous?.requestCount ?? 0) + 1,
+    };
+    tokenCache.set(baseUrl, cached);
+    tokenUse.set(baseUrl, { at: now, mode: 'requested', error: null });
+    await setTokenInDb(cacheKey, cached);
+    return { token, debug: out._debug };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    tokenUse.set(baseUrl, { at: Date.now(), mode: 'requested', error: message });
+    throw err;
   }
 }
 
@@ -260,13 +414,9 @@ export async function getAccessToken(
   const minExpires = now + TOKEN_REUSE_BUFFER_SEC * 1000;
 
   if (!options?.skipCache) {
-    let cached = tokenCache.get(baseUrl);
-    if (!cached) {
-      const fromDb = await getTokenFromDb(cacheKey);
-      cached = fromDb ?? undefined;
-      if (cached) tokenCache.set(baseUrl, cached);
-    }
+    const cached = await loadCachedToken(baseUrl, cacheKey);
     if (cached && cached.expiresAt > minExpires) {
+      tokenUse.set(baseUrl, { at: now, mode: 'reused', error: null });
       const debug: TracksolidDebug = buildDebug(
         baseUrl,
         'jimi.oauth.token.get',
@@ -280,50 +430,23 @@ export async function getAccessToken(
     }
   }
 
-  const config = getConfig();
-  const params = {
-    ...commonParams(config),
-    method: 'jimi.oauth.token.get',
-    user_id: config.account,
-    user_pwd_md5: config.passwordMd5,
-    expires_in: String(TOKEN_EXPIRES_IN_SEC),
-  };
-  const out = await post(params, config, { method: 'jimi.oauth.token.get' }, baseUrl);
-  const result = out.result as Record<string, unknown> | undefined;
-  const token =
-    typeof result?.access_token === 'string'
-      ? result.access_token
-      : typeof result?.accessToken === 'string'
-        ? result.accessToken
-        : null;
-  if (!token) {
-    const debug: TracksolidDebug = buildDebug(
-      baseUrl,
-      'jimi.oauth.token.get',
-      { ...params, sign: signParams(params, config.appSecret) },
-      new URLSearchParams({ ...params, sign: signParams(params, config.appSecret) }).toString().length,
-      out._status,
-      out._raw,
-      { code: out.code, message: out.message, result: out.result }
-    );
-    throw new TracksolidApiError('Tracksolid token: no access_token in result.', debug);
+  const inFlight = tokenRequestInFlight.get(baseUrl);
+  if (inFlight) return inFlight;
+
+  const pending = requestAccessToken(baseUrl, cacheKey);
+  tokenRequestInFlight.set(baseUrl, pending);
+  try {
+    return await pending;
+  } finally {
+    tokenRequestInFlight.delete(baseUrl);
   }
-  const serverExpiresIn =
-    typeof result?.expiresIn === 'number'
-      ? result.expiresIn
-      : typeof result?.expires_in === 'number'
-        ? result.expires_in
-        : TOKEN_EXPIRES_IN_SEC;
-  const expiresInSec = Math.min(Math.max(60, serverExpiresIn), 7200);
-  const expiresAt = now + expiresInSec * 1000;
-  tokenCache.set(baseUrl, { token, expiresAt });
-  await setTokenInDb(cacheKey, token, expiresAt);
-  return { token, debug: out._debug };
 }
 
 export interface DeviceItem {
   imei: string;
   deviceName?: string;
+  deviceGroup?: string;
+  deviceGroupId?: string;
 }
 
 export async function listDevices(
@@ -341,12 +464,25 @@ export async function listDevices(
   const out = await post(params, config, { method: 'jimi.user.device.list' }, baseUrl);
   const raw = out.result;
   const list = Array.isArray(raw)
-    ? (raw as Array<{ imei?: string; deviceName?: string }>)
-    : (raw as { deviceList?: Array<{ imei?: string; deviceName?: string }> } | undefined)?.deviceList ?? [];
+    ? (raw as Array<Record<string, unknown>>)
+    : ((raw as { deviceList?: Array<Record<string, unknown>> } | undefined)?.deviceList ?? []);
   return {
-    devices: list.map((d) => ({ imei: d.imei ?? '', deviceName: d.deviceName })),
+    devices: list.map((d) => ({
+      imei: d.imei != null ? String(d.imei) : '',
+      deviceName: d.deviceName != null ? String(d.deviceName) : undefined,
+      deviceGroup: pickDeviceString(d, ['deviceGroup', 'device_group', 'groupName', 'group_name']),
+      deviceGroupId: pickDeviceString(d, ['deviceGroupId', 'device_group_id', 'group_id']),
+    })),
     debug: out._debug,
   };
+}
+
+function pickDeviceString(row: Record<string, unknown>, keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = row[key];
+    if (value != null && String(value).trim() !== '') return String(value).trim();
+  }
+  return undefined;
 }
 
 /**
@@ -391,6 +527,60 @@ export async function getTrackForDevice(
       };
     }),
     debug: out._debug,
+  };
+}
+
+/** Latest fix for one or more IMEIs. Method jimi.device.location.get (TrackSolid 3.2). gpsTime is the API string, unparsed. */
+export interface CurrentLocationFix {
+  imei: string;
+  deviceName: string;
+  gpsTime: string;
+  lat: number | null;
+  lng: number | null;
+  location: string | null;
+  fencename: string | null;
+}
+
+export async function getCurrentLocations(
+  accessToken: string,
+  imeis: string[],
+  endpoint?: string | null
+): Promise<{ fixes: CurrentLocationFix[]; debug: TracksolidDebug }> {
+  const config = getConfig();
+  const baseUrl = getBaseUrl(endpoint);
+  const params: Record<string, string> = {
+    ...commonParams(config),
+    method: 'jimi.device.location.get',
+    access_token: accessToken,
+    imeis: imeis.join(','),
+  };
+  const out = await post(params, config, { method: 'jimi.device.location.get' }, baseUrl);
+  const raw = out.result;
+  const list = Array.isArray(raw)
+    ? (raw as Array<Record<string, unknown>>)
+    : ((raw as { list?: unknown; rows?: unknown } | undefined)?.list as Array<Record<string, unknown>> | undefined) ??
+      ((raw as { rows?: unknown } | undefined)?.rows as Array<Record<string, unknown>> | undefined) ??
+      [];
+  return {
+    fixes: (Array.isArray(list) ? list : []).map(parseCurrentLocationFix),
+    debug: out._debug,
+  };
+}
+
+function parseCurrentLocationFix(row: Record<string, unknown>): CurrentLocationFix {
+  const latRaw = row.lat ?? row.latitude;
+  const lngRaw = row.lng ?? row.longitude;
+  const lat = latRaw == null || latRaw === '' ? null : Number(latRaw);
+  const lng = lngRaw == null || lngRaw === '' ? null : Number(lngRaw);
+  const gps = row.gpsTime ?? row.gps_time ?? row.gpstime ?? '';
+  return {
+    imei: row.imei != null ? String(row.imei) : row.IMEI != null ? String(row.IMEI) : '',
+    deviceName: row.deviceName != null ? String(row.deviceName) : '',
+    gpsTime: gps == null ? '' : String(gps),
+    lat: lat != null && Number.isFinite(lat) ? lat : null,
+    lng: lng != null && Number.isFinite(lng) ? lng : null,
+    location: pickDeviceString(row, ['locDesc', 'location', 'address']) ?? null,
+    fencename: pickDeviceString(row, ['fenceName', 'fence_name', 'fencename', 'geofenceName', 'geoFenceName']) ?? null,
   };
 }
 

@@ -2,16 +2,16 @@
 
 import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
 import { usePathname } from 'next/navigation';
+import { USER_TYPE_LABELS, type UserTypeLabel } from '@/lib/user-types';
 
-/** Super and Admin both use admin view in Summary; Client uses client view. */
-export type ViewMode = 'super' | 'admin' | 'client';
+/** Super and Admin use staff views; Client and Driver are locked to their own screen. */
+export type ViewMode = 'super' | 'admin' | 'client' | 'driver';
 
-/** User type from tbl_users; determines which view modes are allowed. */
-export type UserTypeLabel = 'Super Admin' | 'Admin' | 'Client';
+export type { UserTypeLabel };
 
 const STORAGE_KEY = 'geodata_user';
 
-const VALID_USER_TYPES: UserTypeLabel[] = ['Super Admin', 'Admin', 'Client'];
+const VALID_USER_TYPES: readonly UserTypeLabel[] = USER_TYPE_LABELS;
 
 /** Parse `geodata_user` from localStorage; null if missing or invalid. */
 export function readStoredUserType(): UserTypeLabel | null {
@@ -30,14 +30,16 @@ export function readStoredUserType(): UserTypeLabel | null {
 function userTypeToViewMode(t: UserTypeLabel): ViewMode {
   if (t === 'Super Admin') return 'super';
   if (t === 'Admin') return 'admin';
+  if (t === 'Driver') return 'driver';
   return 'client';
 }
 
-/** Allowed view modes for each user type (rights go down: super can pick all, client only client). */
+/** Allowed view modes for each user type (rights go down: super can pick all, driver only driver). */
 function allowedViewModesForUserType(t: UserTypeLabel | null): ViewMode[] {
   if (!t) return [];
-  if (t === 'Super Admin') return ['super', 'admin', 'client'];
-  if (t === 'Admin') return ['admin', 'client'];
+  if (t === 'Super Admin') return ['super', 'admin', 'client', 'driver'];
+  if (t === 'Admin') return ['admin', 'client', 'driver'];
+  if (t === 'Driver') return ['driver'];
   return ['client'];
 }
 

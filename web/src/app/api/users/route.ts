@@ -1,7 +1,9 @@
 import { NextResponse } from 'next/server';
-import { query, execute } from '@/lib/db';
+import { query } from '@/lib/db';
 import { dateToLiteral } from '@/lib/utils';
 import bcrypt from 'bcryptjs';
+import { ensureDriverUserSchema } from '@/lib/ensure-driver-user';
+import { normalizeUserType, userTypeForStorage } from '@/lib/user-types';
 
 function jsonSafe<T>(obj: T): T {
   if (obj === null || obj === undefined) return obj;
@@ -18,18 +20,7 @@ function jsonSafe<T>(obj: T): T {
   return obj;
 }
 
-const CANONICAL_USER_TYPES = ['Super Admin', 'Admin', 'Client'] as const;
-type CanonicalUserType = (typeof CANONICAL_USER_TYPES)[number];
-
-function normalizeUserType(raw: string | null | undefined): CanonicalUserType {
-  const s = (raw ?? '').trim();
-  if (/super\s*admin/i.test(s)) return 'Super Admin';
-  if (/^admin$/i.test(s)) return 'Admin';
-  if (/^client$/i.test(s)) return 'Client';
-  return 'Admin';
-}
-
-/** Read user_type from row; driver may return different key casing (user_type, User_Type, userType, etc.). */
+/** Read user_type from row; pg may return different key casing (user_type, User_Type, userType, etc.). */
 function getRawUserType(row: Record<string, unknown>): string | null | undefined {
   const keys = ['user_type', 'User_Type', 'userType', 'UserType', 'usertype'];
   for (const k of keys) {
@@ -48,6 +39,7 @@ function mapUserRow(row: Record<string, unknown>): Record<string, unknown> & { u
 
 export async function GET() {
   try {
+    await ensureDriverUserSchema();
     const users = await query(
       'SELECT * FROM tbl_users ORDER BY userid ASC'
     );
@@ -62,7 +54,7 @@ export async function GET() {
 export async function POST(request: Request) {
   try {
     const body = await request.json();
-    const { email, password, firstname, surname, phone, userType, customer } = body as {
+    const { email, password, firstname, surname, phone, userType, customer, truckRego } = body as {
       email?: string;
       password?: string;
       firstname?: string | null;
@@ -70,6 +62,7 @@ export async function POST(request: Request) {
       phone?: string | null;
       userType?: string | null;
       customer?: string | null;
+      truckRego?: string | null;
     };
     if (!email || typeof email !== 'string' || !email.trim()) {
       return NextResponse.json({ error: 'email required' }, { status: 400 });
@@ -77,14 +70,16 @@ export async function POST(request: Request) {
     if (!password || typeof password !== 'string' || password.length < 6) {
       return NextResponse.json({ error: 'password required, min 6 chars' }, { status: 400 });
     }
-    const uType = userType?.trim() || 'Admin';
+    await ensureDriverUserSchema();
+    const uType = userTypeForStorage(userType);
     const cust = uType === 'Client' ? (customer?.trim() || null) : null;
+    const rego = uType === 'Driver' ? (truckRego?.trim() || null) : null;
     const hashed = await bcrypt.hash(password, 10);
     const rows = await query(
-      `INSERT INTO tbl_users (email, password, firstname, surname, phone, user_type, customer)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
+      `INSERT INTO tbl_users (email, password, firstname, surname, phone, user_type, customer, truck_rego)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        RETURNING *`,
-      [email.trim().toLowerCase(), hashed, firstname?.trim() || null, surname?.trim() || null, phone?.trim() || null, uType, cust]
+      [email.trim().toLowerCase(), hashed, firstname?.trim() || null, surname?.trim() || null, phone?.trim() || null, uType, cust, rego]
     );
     const user = rows[0];
     if (!user) return NextResponse.json({ error: 'Insert failed' }, { status: 500 });

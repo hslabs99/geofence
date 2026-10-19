@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { query } from '@/lib/db';
 import bcrypt from 'bcryptjs';
+import { normalizeUserType, type UserTypeLabel } from '@/lib/user-types';
 
 /** Any email + this password → Super Admin, no DB. Non-production only unless ALLOW_GEODATA_UNIVERSAL_LOGIN=1. */
 const UNIVERSAL_LOGIN_PASSWORD = 'CelCel';
@@ -49,20 +50,14 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Invalid email or password' }, { status: 401 });
     }
 
-    const rawType = (user.user_type ?? '').trim();
-    const userType =
-      /super\s*admin/i.test(rawType) ? 'Super Admin'
-      : /^admin$/i.test(rawType) ? 'Admin'
-      : /^client$/i.test(rawType) ? 'Client'
-      : rawType || 'Admin';
-
+    const userType: UserTypeLabel = normalizeUserType(user.user_type);
     const customer = userType === 'Client' ? ((user.customer ?? '').trim() || null) : null;
 
     return NextResponse.json({
       ok: true,
       user: {
         email: user.email,
-        userType: userType as 'Super Admin' | 'Admin' | 'Client',
+        userType,
         firstname: user.firstname,
         surname: user.surname,
         ...(customer != null && { customer }),
