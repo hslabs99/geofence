@@ -1,7 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
-import { useLocationAge } from '@/components/driver/useLocationAge';
+import { useEffect, useState, type ReactNode } from 'react';
 
 const POLL_MS = 30_000;
 
@@ -14,7 +13,7 @@ export type ApproachReading = {
   meters?: number | null;
   inside?: boolean;
   beenInside?: boolean;
-  proximity?: 'green' | 'red' | null;
+  proximity?: 'yellow' | 'red' | null;
   crossedAt?: string | null;
   limitMeters?: number;
   gpstimeNz?: string | null;
@@ -63,20 +62,32 @@ export function useJobApproach(jobId: number, done: number) {
 }
 
 /** Metres from the latest stored truck fix to the vineyard or winery fence edge. */
-export default function ApproachMeters({ reading, loading }: { reading: ApproachReading | null; loading: boolean }) {
-  const gpsAge = useLocationAge(reading?.gpstimeNz);
+export default function ApproachMeters({
+  reading,
+  loading,
+  corner,
+}: {
+  reading: ApproachReading | null;
+  loading: boolean;
+  corner?: ReactNode;
+}) {
   const watching = reading?.active !== false && (reading != null || loading);
-  if (!watching) return null;
+  if (!watching) {
+    return corner ? <div className="mx-4 mb-2 flex justify-end">{corner}</div> : null;
+  }
 
   const leaving = reading?.step === 3;
   const place = reading?.target === 'winery' ? 'winery' : 'vineyard';
   const meters = typeof reading?.meters === 'number' ? reading.meters.toLocaleString('en-NZ') : null;
 
   return (
-    <div className="mx-4 mb-3 rounded-2xl bg-white px-4 py-3 shadow-[0_1px_2px_rgba(16,24,40,0.06)]">
-      <p className="text-xs font-medium uppercase tracking-wide text-[#667085]">
-        {leaving ? 'From the vineyard fence' : `To the ${place} fence`}
-      </p>
+    <div className="mx-4 mb-2 rounded-2xl bg-white px-4 py-2.5 shadow-[0_1px_2px_rgba(16,24,40,0.06)]">
+      <div className="flex items-center justify-between gap-3">
+        <p className="min-w-0 text-xs font-medium uppercase tracking-wide text-[#667085]">
+          {leaving ? 'From the vineyard fence' : `To the ${place} fence`}
+        </p>
+        {corner}
+      </div>
       {loading ? (
         <p className="mt-1 text-base text-[#667085]">Checking the latest location…</p>
       ) : reading?.error ? (
@@ -99,12 +110,6 @@ export default function ApproachMeters({ reading, loading }: { reading: Approach
             : leaving
               ? `Outside the edge of ${reading?.fence || place}.`
               : `Remaining to the edge of ${reading?.fence || place}.`}
-        </p>
-      )}
-      {reading?.fetchedAt && <p className="mt-2 text-xs text-[#475467]">Fetched {reading.fetchedAt} NZ</p>}
-      {reading?.gpstimeNz && (
-        <p className="mt-0.5 text-xs text-[#475467]">
-          GPS {reading.gpstimeNz} NZ{gpsAge != null ? ` (${gpsAge}s)` : ''}
         </p>
       )}
     </div>

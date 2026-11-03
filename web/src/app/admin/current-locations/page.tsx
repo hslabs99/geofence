@@ -1,6 +1,8 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import DriverDiversionSetup from '@/components/admin/DriverDiversionSetup';
+import { VworkApiPanel } from '@/components/admin/VworkApiPanel';
 import { VworkFeedPanel } from '@/components/admin/VworkFeedPanel';
 
 type Row = {
@@ -194,7 +196,7 @@ export default function CurrentLocationsAdminPage() {
   const [alertEmails, setAlertEmails] = useState('');
   const [checkerSeconds, setCheckerSeconds] = useState('60');
   const [emailNotice, setEmailNotice] = useState<string | null>(null);
-  const [tab, setTab] = useState<'service' | 'rows' | 'summary' | 'log' | 'vwork'>('service');
+  const [tab, setTab] = useState<'service' | 'rows' | 'summary' | 'log' | 'vwork-api' | 'vwork'>('service');
   const [confirmEmpty, setConfirmEmpty] = useState(false);
   const [tick, setTick] = useState(0);
   const [locationSort, setLocationSort] = useState<LocationColumn>('polltime');
@@ -341,6 +343,7 @@ export default function CurrentLocationsAdminPage() {
             ['rows', 'Location data'],
             ['summary', 'Poll summary'],
             ['log', 'Poll log'],
+            ['vwork-api', 'VWork API'],
             ['vwork', 'VWork feed'],
           ] as const
         ).map(([id, label]) => (
@@ -491,6 +494,8 @@ export default function CurrentLocationsAdminPage() {
           Save
         </button>
       </div>
+
+      <DriverDiversionSetup />
 
       <div className="mt-3 flex flex-wrap items-end gap-3 rounded-lg border border-zinc-200 bg-white p-3 dark:border-zinc-700 dark:bg-zinc-900">
         <label className="text-sm text-zinc-700 dark:text-zinc-200">
@@ -847,6 +852,8 @@ export default function CurrentLocationsAdminPage() {
         </table>
       </div>
       )}
+
+      {tab === 'vwork-api' && <VworkApiPanel />}
 
       {tab === 'vwork' && <VworkFeedPanel />}
 

@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server';
+import { enqueueVworkFeedJobs } from '@/lib/vwork-feed-queue';
 import { checkVworkJobFeed, insertVworkFeedTestRows, listVworkJobFeed } from '@/lib/vwork-job-feed';
 
 /** GET: recent rows in vwork_job_feed. */
@@ -18,15 +19,17 @@ export async function POST(request: Request) {
     const action = (body.action ?? 'check').trim();
     if (action === 'test') {
       const seeded = await insertVworkFeedTestRows();
+      const queue = await enqueueVworkFeedJobs();
       const list = await listVworkJobFeed(80);
-      return NextResponse.json({ ok: true, ...seeded, ...list });
+      return NextResponse.json({ ok: true, ...seeded, queue, ...list });
     }
     if (action !== 'check') {
       return NextResponse.json({ error: 'action must be check or test' }, { status: 400 });
     }
     const result = await checkVworkJobFeed(Number(body.lookbackDays ?? 14));
+    const queue = await enqueueVworkFeedJobs();
     const list = await listVworkJobFeed(80);
-    return NextResponse.json({ ok: true, ...result, ...list });
+    return NextResponse.json({ ok: true, ...result, queue, ...list });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     const status = message.includes('VWORK_API_KEY') ? 400 : 500;

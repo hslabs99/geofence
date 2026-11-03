@@ -9,7 +9,7 @@ export type GateProximity = {
   meters: number | null;
   inside: boolean;
   beenInside: boolean;
-  proximity: 'green' | 'red' | null;
+  proximity: 'yellow' | 'red' | null;
   /** New Zealand GPS time of the fence crossing, when the marker is red. */
   crossedAt: string | null;
   limitMeters: number;
@@ -95,7 +95,7 @@ function readingFromFixes(step: 2 | 3 | 4, target: 'vineyard' | 'winery', fence:
   const meters = latest?.meters == null ? null : Number(latest.meters);
   const inside = meters === 0;
   const beenInside = fixes.some((fix) => fix.meters === 0);
-  let proximity: 'green' | 'red' | null = null;
+  let proximity: 'yellow' | 'red' | null = null;
   let crossedAt: string | null = null;
 
   if (meters != null && (step === 2 || step === 4)) {
@@ -105,18 +105,16 @@ function readingFromFixes(step: 2 | 3 | 4, target: 'vineyard' | 'winery', fence:
       const entryIndex = entry ? fixes.indexOf(entry) + 1 : 0;
       crossedAt = fixes[entryIndex]?.gpstime_nz ?? latest?.gpstime_nz ?? null;
     } else if (meters <= limitMeters) {
-      proximity = 'green';
+      proximity = 'yellow';
     }
   }
 
+  // Leaving the vineyard has no approach warning. The first fix outside is already the tap.
   if (meters != null && step === 3 && beenInside && !inside) {
+    proximity = 'red';
     const lastInside = fixes.reduce((found, fix, index) => (fix.meters === 0 ? index : found), -1);
     const left = fixes[lastInside + 1];
-    if (meters <= limitMeters) proximity = 'green';
-    else {
-      proximity = 'red';
-      crossedAt = left?.gpstime_nz ?? latest?.gpstime_nz ?? null;
-    }
+    crossedAt = left?.gpstime_nz ?? latest?.gpstime_nz ?? null;
   }
 
   return {

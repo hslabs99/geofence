@@ -1,7 +1,8 @@
 import { NextResponse } from 'next/server';
 import { query } from '@/lib/db';
+import { clearDriverJobLog } from '@/lib/driver-job-log';
 import { ensureTblDriverJobsSchema } from '@/lib/ensure-tbl-driver-jobs-schema';
-import { DRIVER_JOB_COLUMNS, type DriverJob } from '@/lib/driver-jobs';
+import { DRIVER_JOB_COLUMNS, phoneLocalStamp, type DriverJob } from '@/lib/driver-jobs';
 
 /** POST: clear step click times so the job can be tested again. */
 export async function POST(_request: Request, { params }: { params: Promise<{ id: string }> }) {
@@ -29,6 +30,7 @@ export async function POST(_request: Request, { params }: { params: Promise<{ id
     );
     const row = rows[0];
     if (!row) return NextResponse.json({ error: 'Job not found' }, { status: 404 });
+    await clearDriverJobLog(jobId, phoneLocalStamp());
     return NextResponse.json({ row });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS tbl_driver_jobs (
   step_5_click        timestamp without time zone,
   step_2_manual       boolean,
   step_3_manual       boolean,
-  step_4_manual       boolean
+  step_4_manual       boolean,
+  log_cleared_at      timestamp without time zone
 );
 
 CREATE INDEX IF NOT EXISTS idx_tbl_driver_jobs_job_id

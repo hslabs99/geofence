@@ -20,6 +20,8 @@ env:
     value: "supabase"
     availability: [RUNTIME]
   # TrackSolid API. Set via: firebase apphosting:secrets:set TRACKSOLID_*
+  # VWork jobs API: set VWORK_API_KEY and VWORK_API_BASE in the App Hosting environment.
+  # Leave the key as replace-me until a live poll is wanted. The poll reads those at runtime.
   - variable: TRACKSOLID_APP_KEY
     secret: TRACKSOLID_APP_KEY
     availability: [RUNTIME]

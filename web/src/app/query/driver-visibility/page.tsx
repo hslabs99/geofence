@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import StaffOnlyGate from '@/components/StaffOnlyGate';
 import DriverAppPreview from '@/components/driver/DriverAppPreview';
+import RealTimeJobs from '@/components/driver/RealTimeJobs';
 
 type DriverJobRow = {
   id: number;
@@ -52,7 +53,7 @@ function DriverVisibilityPageContent() {
   const [editingId, setEditingId] = useState<number | null>(null);
   const [saving, setSaving] = useState(false);
   const [addError, setAddError] = useState<string | null>(null);
-  const [tab, setTab] = useState<'visibility' | 'app'>('visibility');
+  const [tab, setTab] = useState<'queue' | 'live' | 'app'>('queue');
 
   useEffect(() => {
     const params = new URLSearchParams();
@@ -196,14 +197,15 @@ function DriverVisibilityPageContent() {
       <div className="mb-4">
         <h1 className="text-2xl font-semibold text-zinc-900 dark:text-zinc-100">Driver Visibility</h1>
         <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
-          Driver visibility lists and edits jobs. The driver app tab opens the same phone app used at /driver, as the driver you select.
+          Job Queue lists and edits jobs. Real Time Jobs shows each open job on the same step track the driver sees. The driver app tab opens the same phone app used at /driver, as the driver you select.
         </p>
       </div>
 
       <div className="mb-4 flex gap-2 border-b border-zinc-200 dark:border-zinc-700">
         {(
           [
-            ['visibility', 'Driver visibility'],
+            ['queue', 'Job Queue'],
+            ['live', 'Real Time Jobs'],
             ['app', 'Driver app'],
           ] as const
         ).map(([id, label]) => (
@@ -224,7 +226,9 @@ function DriverVisibilityPageContent() {
 
       {tab === 'app' && <DriverAppPreview />}
 
-      {tab === 'visibility' && (
+      {tab === 'live' && <RealTimeJobs />}
+
+      {tab === 'queue' && (
       <>
       {error && (
         <div className="mb-4 rounded bg-red-100 p-3 text-red-800 dark:bg-red-900/30 dark:text-red-200">{error}</div>

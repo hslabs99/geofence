@@ -27,6 +27,7 @@ type FeedResponse = {
   inserted?: number;
   truncated?: boolean;
   lookbackDays?: number;
+  queue?: { queued?: number; skippedClosed?: number };
   error?: string;
 };
 
@@ -76,10 +77,11 @@ export function VworkFeedPanel() {
       setTotal(data.total ?? 0);
       setConfigured(data.configured === true);
       const added = data.inserted ?? 0;
+      const queued = data.queue?.queued ?? 0;
       setSummary(
         action === 'test'
-          ? `Added ${added} test jobs for Mike, registration ABC123.`
-          : `Checked jobs updated in the last ${data.lookbackDays ?? lookbackDays} days. Fetched ${data.fetched ?? 0}, already in VWork jobs ${data.alreadyInVworkJobs ?? 0}, already in this feed ${data.alreadyInFeed ?? 0}, added ${added}.${data.truncated ? ' The page limit was reached before the list finished.' : ''}`,
+          ? `Added ${added} test jobs for Mike, registration ABC123. Queued ${queued} in the job queue.`
+          : `Checked jobs updated in the last ${data.lookbackDays ?? lookbackDays} days. Fetched ${data.fetched ?? 0}, already in VWork jobs ${data.alreadyInVworkJobs ?? 0}, already in this feed ${data.alreadyInFeed ?? 0}, added ${added}. Queued ${queued} in the job queue.${data.truncated ? ' The page limit was reached before the list finished.' : ''}`,
       );
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -91,7 +93,7 @@ export function VworkFeedPanel() {
   return (
     <div className="mt-4">
       <p className="max-w-3xl text-sm text-zinc-600 dark:text-zinc-400">
-        Checks the VWork jobs API for jobs updated in the last few days. A job is added here only when its id is not already in VWork jobs and not already in this feed. Planned times are stored as the API sent them.
+        Checks the VWork jobs API for jobs updated in the last few days. A job is added here only when its id is not already in VWork jobs and not already in this feed. Open jobs are then added to the Driver Visibility job queue. Planned times are stored as the API sent them.
       </p>
       {!configured && (
         <p className="mt-3 text-sm text-amber-800 dark:text-amber-200">

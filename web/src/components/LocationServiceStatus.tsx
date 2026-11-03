@@ -37,7 +37,7 @@ function field(label: string, value: string | null | undefined) {
   );
 }
 
-function RowCard({ title, row, empty }: { title: string; row: Row | null; empty: string }) {
+function RowCard({ title, row, empty, hideTimes = false }: { title: string; row: Row | null; empty: string; hideTimes?: boolean }) {
   const gpsAge = useLocationAge(row?.gpstime_nz);
   return (
     <div className="rounded-xl bg-white/80 px-3 py-2 text-[#1c2430]">
@@ -45,8 +45,8 @@ function RowCard({ title, row, empty }: { title: string; row: Row | null; empty:
       {row ? (
         <>
           <p className="mt-1 text-base font-semibold">{row.truck_id || '—'}</p>
-          {field('Fetched', row.polltime ? `${row.polltime} NZ` : null)}
-          {field('GPS', row.gpstime_nz ? `${row.gpstime_nz} NZ${gpsAge != null ? ` (${gpsAge}s)` : ''}` : null)}
+          {hideTimes ? null : field('Fetched', row.polltime ? `${row.polltime} NZ` : null)}
+          {hideTimes ? null : field('GPS', row.gpstime_nz ? `${row.gpstime_nz} NZ${gpsAge != null ? ` (${gpsAge}s)` : ''}` : null)}
           {field('Where', row.location)}
           {field('Coordinates', row.coordinates)}
           {field('Fence', row.fencename)}
@@ -70,7 +70,7 @@ function reading(status: Status | null, truckId: string | null): string {
   return 'A newer poll has a row for another truck. This truck was not in that poll.';
 }
 
-export default function LocationServiceStatus({ variant }: { variant: 'phone' | 'staff' }) {
+export default function LocationServiceStatus({ variant, inline = false }: { variant: 'phone' | 'staff'; inline?: boolean }) {
   const routePath = usePathname();
   const driverNav = useDriverNavOptional();
   const pathname = driverNav?.pathname ?? routePath;
@@ -78,11 +78,17 @@ export default function LocationServiceStatus({ variant }: { variant: 'phone' | 
   const [open, setOpen] = useState(false);
   const [truckId, setTruckId] = useState<string | null>(null);
   const [pollMs, setPollMs] = useState(variant === 'phone' ? 30_000 : 10_000);
+  const [cycleStart, setCycleStart] = useState<number | null>(null);
+  const [now, setNow] = useState(() => Date.now());
+  const gpsStamp = status?.truck?.gpstime_nz || status?.latest?.gpstime_nz || null;
+  const gpsAge = useLocationAge(variant === 'phone' ? gpsStamp : null);
 
   const hidden = variant === 'phone' && pathname === '/driver';
+  const onJob = /^\/driver\/job\//.test(pathname);
+  const idle = hidden || (variant === 'phone' && onJob && !inline);
 
   useEffect(() => {
-    if (hidden) return;
+    if (idle) return;
     let cancelled = false;
     async function resolveTruck() {
       if (variant !== 'phone') {
@@ -122,10 +128,10 @@ export default function LocationServiceStatus({ variant }: { variant: 'phone' | 
     return () => {
       cancelled = true;
     };
-  }, [driverNav?.truckRego, hidden, pathname, variant]);
+  }, [driverNav?.truckRego, idle, pathname, variant]);
 
   useEffect(() => {
-    if (hidden) return;
+    if (idle) return;
     let cancelled = false;
     async function load() {
       try {
@@ -135,8 +141,11 @@ export default function LocationServiceStatus({ variant }: { variant: 'phone' | 
         if (!res.ok) throw new Error(data?.error ?? res.statusText);
         if (!cancelled) {
           setStatus(data);
-          if (variant === 'phone' && typeof data?.driverAppPollSeconds === 'number' && data.driverAppPollSeconds >= 5) {
-            setPollMs(data.driverAppPollSeconds * 1000);
+          if (variant === 'phone') {
+            setCycleStart(Date.now());
+            if (typeof data?.driverAppPollSeconds === 'number' && data.driverAppPollSeconds >= 5) {
+              setPollMs(data.driverAppPollSeconds * 1000);
+            }
           }
         }
       } catch {
@@ -149,24 +158,46 @@ export default function LocationServiceStatus({ variant }: { variant: 'phone' | 
       cancelled = true;
       clearInterval(id);
     };
-  }, [hidden, pollMs, truckId, variant]);
+  }, [idle, pollMs, truckId, variant]);
 
-  if (hidden) return null;
+  useEffect(() => {
+    if (idle || variant !== 'phone' || status?.running !== true) return;
+    const id = setInterval(() => setNow(Date.now()), 100);
+    return () => clearInterval(id);
+  }, [idle, status?.running, variant]);
+
+  if (idle) return null;
 
   const running = status?.running === true;
-  const label = running ? 'Service running' : 'Service stopped';
+  const label = variant === 'phone' ? (running ? 'GPS polling' : 'GPS stopped') : running ? 'Service running' : 'Service stopped';
   const dot = running ? 'bg-[#12b76a]' : 'bg-[#f04438]';
+  const spanMs = Math.max(5000, pollMs);
+  const fill = running && cycleStart != null ? Math.max(0, Math.min(1, 1 - (now - cycleStart) / spanMs)) : 0;
+  const remainSec = Math.max(0, Math.ceil((fill * spanMs) / 1000));
+
+  const gpsClock = gpsStamp?.match(/(\d{2}:\d{2}:\d{2})/)?.[1] ?? null;
+  const gpsCaption = gpsClock ? `${gpsClock}${gpsAge != null ? ` · ${gpsAge}s` : ''}` : 'No GPS';
 
   const button =
     variant === 'phone' ? (
-      <button
-        type="button"
-        onClick={() => setOpen(true)}
-        className="inline-flex h-9 items-center gap-2 rounded-full bg-white px-3 text-sm font-semibold text-[#1c2430] shadow-[0_1px_2px_rgba(16,24,40,0.08)]"
-      >
-        <span className={`h-2.5 w-2.5 rounded-full ${dot}`} />
-        {label}
-      </button>
+      <div className="flex w-[6.5rem] shrink-0 flex-col">
+        <button
+          type="button"
+          onClick={() => setOpen(true)}
+          title={running ? `Next location check in ${remainSec}s` : 'GPS polling is stopped'}
+          aria-label={running ? 'GPS polling' : 'GPS stopped'}
+          className="relative h-[1.125rem] w-full overflow-hidden bg-[#e4e7ec]"
+        >
+          {running ? (
+            <span className="absolute inset-y-0 right-0 bg-[#c9efd6]" style={{ width: `${fill * 100}%` }} />
+          ) : (
+            <span className="absolute inset-0 bg-[#fecdca]" />
+          )}
+        </button>
+        <p className="mt-0.5 truncate text-right text-[9px] font-medium leading-none tabular-nums text-[#667085]" title={gpsStamp ?? undefined}>
+          {gpsCaption}
+        </p>
+      </div>
     ) : (
       <button
         type="button"
@@ -202,19 +233,21 @@ export default function LocationServiceStatus({ variant }: { variant: 'phone' | 
         <p className={variant === 'phone' ? 'text-sm text-[#475467]' : ''}>{reading(status, truckId)}</p>
         <p className={variant === 'phone' ? 'text-sm text-[#475467]' : 'text-xs text-zinc-500'}>
           {status?.lastPolltime ? `Last poll ${status.lastPolltime}` : 'No poll yet'}
-          {status ? ` · every ${status.intervalSeconds} sec` : ''}
+          {variant === 'phone' ? ` · checks every ${Math.round(spanMs / 1000)} sec` : status ? ` · every ${status.intervalSeconds} sec` : ''}
         </p>
         {variant === 'phone' && (
           <RowCard
             title={truckId ? `This truck · ${truckId}` : 'This truck'}
             row={status?.truck ?? null}
             empty={truckId ? 'No location row for this truck.' : 'No truck is set on this login.'}
+            hideTimes
           />
         )}
         <RowCard
           title="Any truck"
           row={status?.latest ?? null}
           empty="No location rows yet."
+          hideTimes={variant === 'phone'}
         />
       </div>
     </div>
@@ -223,7 +256,7 @@ export default function LocationServiceStatus({ variant }: { variant: 'phone' | 
   if (variant === 'phone') {
     return (
       <>
-        <div className="flex justify-end px-3 pt-[max(0.4rem,env(safe-area-inset-top))]">{button}</div>
+        {inline ? button : <div className="flex justify-end px-3 pt-[max(0.4rem,env(safe-area-inset-top))]">{button}</div>}
         {panel}
       </>
     );

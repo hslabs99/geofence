@@ -1,6 +1,8 @@
 import { NextResponse } from 'next/server';
 import { query } from '@/lib/db';
 import { ensureTblDriverJobsSchema } from '@/lib/ensure-tbl-driver-jobs-schema';
+import { expectedDurationLabel, openJobDiversion, stopJobDiversion } from '@/lib/driver-diversions';
+import { recordDriverClick } from '@/lib/driver-job-log';
 import { readStepProximity } from '@/lib/gate-proximity';
 import {
   DRIVER_GATES,
@@ -28,7 +30,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       return NextResponse.json({ error: 'Job not found' }, { status: 404 });
     }
 
-    const body = (await request.json()) as { step?: unknown; at?: unknown; confirmed?: unknown };
+    const body = (await request.json()) as { step?: unknown; at?: unknown; confirmed?: unknown; endDiversion?: unknown };
     const step = Number(body.step);
     const at = typeof body.at === 'string' ? body.at.trim() : '';
     if (!DRIVER_GATES.some((gate) => gate.step === step)) {
@@ -48,6 +50,23 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     const next = completedGateCount(current) + 1;
     if (step !== next || next > DRIVER_GATES.length) {
       return NextResponse.json({ error: 'That gate is not the next step' }, { status: 409 });
+    }
+
+    if (step >= 2 && step <= 5) {
+      const open = await openJobDiversion(jobId);
+      if (open && body.endDiversion !== true) {
+        const gateTitle = DRIVER_GATES.find((gate) => gate.step === step)?.title ?? 'the next step';
+        const expected = expectedDurationLabel(open.expected_duration);
+        const expectedBit = expected === '—' ? '' : ` Expected ${expected}.`;
+        return NextResponse.json({
+          needsConfirm: true,
+          kind: 'diversion',
+          message: `${open.type_name} is still running.${expectedBit} End it before ${gateTitle}?`,
+        });
+      }
+      if (open && body.endDiversion === true) {
+        await stopJobDiversion(jobId, at, step);
+      }
     }
 
     const gateStep = step === 2 || step === 3 || step === 4 ? step : null;
@@ -73,6 +92,17 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     );
     const row = rows[0];
     if (!row) return NextResponse.json({ error: 'That gate is not the next step' }, { status: 409 });
+    try {
+      await recordDriverClick({
+        driverJobId: jobId,
+        at,
+        step,
+        outcome: warning ? 'caution_accept' : 'auto_accept',
+        detail: warning,
+      });
+    } catch {
+      // The gate click is already stored. The log can be rebuilt from it.
+    }
     return NextResponse.json({ row });
   } catch (err) {
     const code = (err as { code?: string }).code;

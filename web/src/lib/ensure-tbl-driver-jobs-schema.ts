@@ -66,6 +66,7 @@ export async function ensureTblDriverJobsSchema(): Promise<void> {
   await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS step_2_manual boolean`);
   await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS step_3_manual boolean`);
   await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS step_4_manual boolean`);
+  await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS log_cleared_at timestamp without time zone`);
 
   driverJobsEnsured = true;
 }

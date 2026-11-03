@@ -1,0 +1,436 @@
+'use client';
+
+import { useEffect, useMemo, useState } from 'react';
+import DriverJobLog from '@/components/driver/DriverJobLog';
+import GateTrack, { type TruckMeters } from '@/components/driver/GateTrack';
+import { locationAgeSeconds } from '@/components/driver/useLocationAge';
+import {
+  DRIVER_GATES,
+  completedGateCount,
+  gateManual,
+  truckStage,
+  wineryArrivalEta,
+  type DriverJob,
+} from '@/lib/driver-jobs';
+import type { LiveDriverJob, LivePlace } from '@/lib/live-driver-jobs';
+
+const POLL_MS = 30_000;
+
+const selectCls =
+  'w-full max-w-[16rem] rounded border border-zinc-300 bg-white px-2 py-1 text-xs dark:border-zinc-600 dark:bg-zinc-800';
+
+const MODES = [
+  { id: 'to-winery', title: 'To winery', match: (done: number) => done === 3 },
+  { id: 'unloading', title: 'Unloading', match: (done: number) => done === 4 },
+  { id: 'loading', title: 'Loading', match: (done: number) => done === 2 },
+  { id: 'to-vineyard', title: 'To vineyard', match: (done: number) => done === 1 },
+] as const;
+
+function jobMode(done: number): string | null {
+  return MODES.find((mode) => mode.match(done))?.title ?? null;
+}
+
+/** Share of the fence-to-fence journey already behind the truck. */
+function journeyShare(total: number | null, remaining: number | null): number | null {
+  if (total == null || remaining == null || total <= 0) return null;
+  return Math.min(100, Math.max(0, Math.round((1 - remaining / total) * 100)));
+}
+
+function minuteLabel(seconds: number | null): string | null {
+  if (seconds == null) return null;
+  const mins = Math.max(0, Math.round(seconds / 60));
+  return mins === 1 ? '1 min' : `${mins} min`;
+}
+
+/** Minutes still to go, from the time already spent on the share already covered. */
+function etaMinutesLeft(legStart: string | null | undefined, percent: number | null, now: Date): number | null {
+  if (percent == null || percent < 5 || percent >= 100) return null;
+  const elapsed = locationAgeSeconds(legStart, now);
+  if (elapsed == null || elapsed < 60) return null;
+  const remainingSec = (elapsed * (100 - percent)) / percent;
+  if (!Number.isFinite(remainingSec)) return null;
+  return Math.max(0, Math.round(remainingSec / 60));
+}
+
+/** Rough arrival clock from the time already spent on the share already covered. */
+function progressEta(legStart: string | null | undefined, percent: number | null, now: Date): string | null {
+  const mins = etaMinutesLeft(legStart, percent, now);
+  if (mins == null) return null;
+  const eta = new Date(now.getTime() + mins * 60 * 1000);
+  const clock = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Pacific/Auckland',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  }).format(eta);
+  const day = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Pacific/Auckland',
+    day: '2-digit',
+    month: '2-digit',
+  }).format(eta);
+  const today = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Pacific/Auckland',
+    day: '2-digit',
+    month: '2-digit',
+  }).format(now);
+  return day === today ? clock : `${day} ${clock}`;
+}
+
+function textOf(value: string | null | undefined): string {
+  const s = value == null ? '' : String(value).trim();
+  return s || '—';
+}
+
+function distinct(rows: LiveDriverJob[], key: 'driver' | 'winery_name' | 'vineyard_name'): string[] {
+  const seen = new Set<string>();
+  for (const row of rows) {
+    const value = row[key]?.trim();
+    if (value) seen.add(value);
+  }
+  return [...seen].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+}
+
+function metersOrInfinity(meters: number | null): number {
+  return meters == null ? Number.POSITIVE_INFINITY : meters;
+}
+
+/** Coming-in trucks first, then at the winery, at the vineyard, then outbound. */
+function stageRank(done: number): number {
+  if (done === 3) return 0;
+  if (done === 4) return 1;
+  if (done === 2) return 2;
+  if (done === 1) return 3;
+  return 4;
+}
+
+function compareJobs(a: LiveDriverJob, b: LiveDriverJob): number {
+  const doneA = completedGateCount(a);
+  const doneB = completedGateCount(b);
+  const rank = stageRank(doneA) - stageRank(doneB);
+  if (rank !== 0) return rank;
+  if (doneA === 3) {
+    const delta = metersOrInfinity(a.place.wineryMeters) - metersOrInfinity(b.place.wineryMeters);
+    if (delta !== 0) return delta;
+  }
+  if (doneA === 1) {
+    const delta = metersOrInfinity(a.place.vineyardMeters) - metersOrInfinity(b.place.vineyardMeters);
+    if (delta !== 0) return delta;
+  }
+  return a.job_id.localeCompare(b.job_id, undefined, { sensitivity: 'base' });
+}
+
+function manualLabels(job: DriverJob): string[] {
+  return DRIVER_GATES.filter((gate) => gateManual(job, gate.step)).map((gate) => `step ${gate.step} ${gate.title}`);
+}
+
+function travelMeters(job: DriverJob, place: LivePlace): TruckMeters | null {
+  const done = completedGateCount(job);
+  if (done === 1) return { meters: place.vineyardMeters, inside: place.vineyardInside };
+  if (done === 3) return { meters: place.wineryMeters, inside: place.wineryInside };
+  return null;
+}
+
+function expectedLabel(value: string | null): string {
+  if (value === '60+') return 'more than 60 min';
+  if (value === '15' || value === '30' || value === '45' || value === '60') return `${value} min`;
+  return '—';
+}
+
+function formatClock(seconds: number): string {
+  const s = Math.max(0, seconds);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  const pad = (n: number) => String(n).padStart(2, '0');
+  if (h > 0) return `${h}:${pad(m)}:${pad(sec)}`;
+  return `${pad(m)}:${pad(sec)}`;
+}
+
+function JobRow({ job }: { job: LiveDriverJob }) {
+  const done = completedGateCount(job);
+  const stage = truckStage(done);
+  const manual = manualLabels(job);
+  const status = jobMode(done) ?? (stage ? stage.label.replace('\n', ' ') : 'Open');
+  const [openDetail, setOpenDetail] = useState(false);
+  const [logOpen, setLogOpen] = useState(false);
+  const [elapsed, setElapsed] = useState('00:00');
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  const running = job.diversion;
+  const now = new Date(nowMs);
+  const travelling = done === 1 || done === 3;
+  const remaining = done === 1 ? job.place.vineyardMeters : done === 3 ? job.place.wineryMeters : null;
+  const total = job.place.journeyMeters;
+  const share = travelling ? journeyShare(total, remaining) : null;
+  const legStart = done === 1 ? job.step_1_click : done === 2 ? job.step_2_click : done === 3 ? job.step_3_click : done === 4 ? job.step_4_click : null;
+  const travelledMin = minuteLabel(locationAgeSeconds(legStart, now));
+  const etaMins = travelling ? etaMinutesLeft(legStart, share, now) : null;
+  const liveEta = travelling ? progressEta(legStart, share, now) : null;
+  const fallbackEta = !liveEta && done === 3 ? wineryArrivalEta(job) : null;
+  const travelled =
+    total != null && remaining != null ? Math.min(total, Math.max(0, total - remaining)) : null;
+  const place = done === 1 || done === 2 ? job.vineyard_name : job.winery_name;
+  const leg =
+    done === 1 ? 'Step 1 → 2' : done === 2 ? 'Step 2' : done === 3 ? 'Step 3 → 4' : done === 4 ? 'Step 4' : 'Step';
+  const mapHref = job.place.lat != null && job.place.lng != null ? `https://www.google.com/maps?q=${job.place.lat},${job.place.lng}` : null;
+
+  useEffect(() => {
+    if (!running) return;
+    const tick = () => setElapsed(formatClock(locationAgeSeconds(running.startedAt) ?? 0));
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [running]);
+
+  useEffect(() => {
+    const id = setInterval(() => setNowMs(Date.now()), 30_000);
+    return () => clearInterval(id);
+  }, []);
+
+  return (
+    <article className="overflow-hidden rounded-lg border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900">
+      <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-1 px-3 py-2">
+        <div className="min-w-0">
+          <p className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
+            {textOf(job.truck_id)}
+            <span className="ml-2 font-normal text-zinc-600 dark:text-zinc-300">{textOf(job.driver)}</span>
+          </p>
+          <p className="mt-0.5 text-xs text-zinc-600 dark:text-zinc-400">
+            <span className="font-mono text-zinc-800 dark:text-zinc-200">{textOf(job.job_id)}</span>
+            {' · '}
+            {textOf(job.vineyard_name)} → {textOf(job.winery_name)}
+          </p>
+        </div>
+        <div className="text-right text-xs">
+          <p className="flex items-center justify-end gap-3">
+            <button type="button" onClick={() => setLogOpen(true)} className="font-semibold text-[#175cd3] hover:underline">
+              Job log
+            </button>
+            {mapHref ? (
+              <a href={mapHref} target="_blank" rel="noopener noreferrer" className="font-semibold text-[#175cd3] hover:underline">
+                Map
+              </a>
+            ) : (
+              <span className="text-zinc-400">Map</span>
+            )}
+          </p>
+          {liveEta && (
+            <p className="mt-1 font-semibold text-[#1f9d55]" title="Rough estimate from the share of the journey already covered">
+              {done === 1 ? 'Vineyard' : 'Winery'} ETA {liveEta}
+            </p>
+          )}
+          {fallbackEta && <p className="mt-1 font-semibold text-[#1f9d55]">Winery ETA {fallbackEta}</p>}
+          <p className={manual.length ? 'font-semibold text-[#b54708]' : 'text-zinc-500 dark:text-zinc-400'}>
+            {manual.length ? `Manual override: ${manual.join(', ')}` : 'No manual override'}
+          </p>
+          <p className="text-zinc-500 dark:text-zinc-400">{job.place.gpstimeNz ? `GPS ${job.place.gpstimeNz} NZ` : 'No GPS fix'}</p>
+          {running && (
+            <button
+              type="button"
+              onClick={() => setOpenDetail((value) => !value)}
+              className="mt-1 rounded-full bg-[#b54708] px-2.5 py-1 text-left text-[11px] font-semibold text-white"
+            >
+              Diversion · {running.typeName} · {elapsed}
+            </button>
+          )}
+        </div>
+      </div>
+      {running && openDetail && (
+        <div className="border-t border-zinc-200 px-3 py-2 text-xs text-zinc-700 dark:border-zinc-700 dark:text-zinc-200">
+          <p>Running for {elapsed}. Expected {expectedLabel(running.expectedDuration)}.</p>
+          <p className="mt-1 tabular-nums">Started {running.startedAt}</p>
+          {running.note ? <p className="mt-1">{running.note}</p> : <p className="mt-1 text-zinc-500">No note.</p>}
+        </div>
+      )}
+      <div className="flex items-stretch bg-[#f3f5f7]">
+        <div className="flex w-[14.5rem] shrink-0 flex-col justify-center gap-1 border-r border-[#e4e7ec] px-3 py-3">
+          <p className="text-left text-xs font-semibold text-[#175cd3]">{status}</p>
+          <p className="text-xs font-semibold text-zinc-800">{leg}</p>
+          <p className="truncate text-[11px] text-zinc-600" title={place ?? ''}>{textOf(place)}</p>
+          {travelling ? (
+            <>
+              <p className="text-[11px] tabular-nums text-zinc-800">
+                {travelled != null && total != null
+                  ? `${travelled.toLocaleString('en-NZ')} of ${total.toLocaleString('en-NZ')} m`
+                  : 'Metres not available'}
+              </p>
+              <p className="text-[11px] text-zinc-600">{travelledMin ? `Travelling ${travelledMin}` : 'Travelling —'}</p>
+              <p className="text-[11px] font-semibold text-[#1f9d55]" title="Rough estimate from the share of the journey already covered">
+                {etaMins != null ? `${etaMins === 1 ? '1 min' : `${etaMins} min`} to ETA` : 'ETA —'}
+              </p>
+            </>
+          ) : (
+            <p className="text-[11px] text-zinc-600">
+              {done === 2 ? 'Loading' : done === 4 ? 'Unloading' : 'On this step'} {travelledMin ?? '—'}
+            </p>
+          )}
+        </div>
+        <div className="min-w-0 flex-1">
+      <GateTrack
+        job={job}
+        travelMeters={travelMeters(job, job.place)}
+        placeNames={{ vineyard: job.vineyard_name, winery: job.winery_name }}
+        journey={{
+          meters: job.place.journeyMeters,
+          active: done === 1 ? 'out' : done === 3 ? 'back' : null,
+          remaining,
+          eta: liveEta,
+        }}
+      />
+        </div>
+      </div>
+      {logOpen && (
+        <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/45 p-4" role="dialog" aria-modal="true">
+          <div className="flex max-h-[80vh] w-full max-w-lg flex-col overflow-hidden rounded-2xl bg-white shadow-xl">
+            <div className="flex items-center justify-between border-b border-zinc-200 px-4 py-3">
+              <p className="text-sm font-semibold text-zinc-900">Job log · {textOf(job.job_id)}</p>
+              <button type="button" onClick={() => setLogOpen(false)} className="text-sm font-semibold text-[#175cd3]">
+                Close
+              </button>
+            </div>
+            <div className="min-h-0 flex-1 overflow-auto bg-[#f4f7f8]">
+              <DriverJobLog jobId={job.id} />
+            </div>
+          </div>
+        </div>
+      )}
+    </article>
+  );
+}
+
+export default function RealTimeJobs() {
+  const [rows, setRows] = useState<LiveDriverJob[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [pollMs, setPollMs] = useState(POLL_MS);
+  const [filterDriver, setFilterDriver] = useState('');
+  const [filterWinery, setFilterWinery] = useState('');
+  const [filterVineyard, setFilterVineyard] = useState('');
+  const [filterStatus, setFilterStatus] = useState('');
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function load() {
+      try {
+        const res = await fetch('/api/driver-jobs/live', { cache: 'no-store' });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data?.error ?? res.statusText);
+        if (cancelled) return;
+        setRows(Array.isArray(data?.rows) ? (data.rows as LiveDriverJob[]) : []);
+        setError(null);
+        const seconds = data?.driverAppPollSeconds;
+        if (typeof seconds === 'number' && seconds >= 5) setPollMs(seconds * 1000);
+      } catch (err) {
+        if (!cancelled) setError(err instanceof Error ? err.message : String(err));
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    }
+
+    void load();
+    const timer = setInterval(() => void load(), pollMs);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [pollMs]);
+
+  const drivers = useMemo(() => distinct(rows, 'driver'), [rows]);
+  const wineries = useMemo(() => distinct(rows, 'winery_name'), [rows]);
+  const vineyards = useMemo(() => distinct(rows, 'vineyard_name'), [rows]);
+
+  const visible = useMemo(() => {
+    return rows
+      .filter((row) => {
+        if (filterDriver && row.driver?.trim() !== filterDriver) return false;
+        if (filterWinery && row.winery_name?.trim() !== filterWinery) return false;
+        if (filterVineyard && row.vineyard_name?.trim() !== filterVineyard) return false;
+        if (filterStatus && jobMode(completedGateCount(row)) !== filterStatus) return false;
+        return true;
+      })
+      .sort(compareJobs);
+  }, [rows, filterDriver, filterWinery, filterVineyard, filterStatus]);
+
+  return (
+    <div>
+      <p className="mb-3 text-sm text-zinc-600 dark:text-zinc-400">
+        Open jobs only: the driver has passed step 1 and has not passed step 5. Each row is the same gate track the driver sees.
+        Green is a GPS tap, amber is a manual override, and the dashed time on Arrive winery is the ETA from the trip out.
+        The metres under the line are the estimated journey between the fences. While a truck is en route, that also shows
+        how far through the journey it is, the metres still to go, and a rough ETA from the share already covered.
+        Filter by mode together with a vineyard or winery to see what is about to arrive. Trucks coming in are listed first.
+      </p>
+
+      <div className="mb-4 rounded-lg border border-zinc-200 bg-white p-3 dark:border-zinc-700 dark:bg-zinc-900">
+        <h2 className="mb-2 text-xs font-semibold uppercase tracking-wide text-zinc-500 dark:text-zinc-400">Filters</h2>
+        <div className="flex flex-wrap items-end gap-3">
+          <div>
+            <label className="mb-0.5 block text-[11px] font-medium text-zinc-500 dark:text-zinc-400">Driver</label>
+            <select value={filterDriver} onChange={(e) => setFilterDriver(e.target.value)} className={selectCls}>
+              <option value="">All</option>
+              {drivers.map((name) => (
+                <option key={name} value={name}>
+                  {name}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className="mb-0.5 block text-[11px] font-medium text-zinc-500 dark:text-zinc-400">Winery</label>
+            <select value={filterWinery} onChange={(e) => setFilterWinery(e.target.value)} className={selectCls}>
+              <option value="">All</option>
+              {wineries.map((name) => (
+                <option key={name} value={name}>
+                  {name}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className="mb-0.5 block text-[11px] font-medium text-zinc-500 dark:text-zinc-400">Mode</label>
+            <select value={filterStatus} onChange={(e) => setFilterStatus(e.target.value)} className={selectCls}>
+              <option value="">All</option>
+              {MODES.map((mode) => (
+                <option key={mode.id} value={mode.title}>
+                  {mode.title}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className="mb-0.5 block text-[11px] font-medium text-zinc-500 dark:text-zinc-400">Vineyard</label>
+            <select value={filterVineyard} onChange={(e) => setFilterVineyard(e.target.value)} className={selectCls}>
+              <option value="">All</option>
+              {vineyards.map((name) => (
+                <option key={name} value={name}>
+                  {name}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+      </div>
+
+      {error && (
+        <div className="mb-4 rounded bg-red-100 p-3 text-red-800 dark:bg-red-900/30 dark:text-red-200">{error}</div>
+      )}
+
+      {loading ? (
+        <p className="text-zinc-600 dark:text-zinc-400">Loading open jobs…</p>
+      ) : visible.length === 0 ? (
+        <p className="text-sm text-zinc-500 dark:text-zinc-400">No open jobs. A job appears here after the driver starts it, and leaves when the job ends.</p>
+      ) : (
+        <div className="flex flex-col gap-3">
+          {visible.map((job) => (
+            <JobRow key={job.id} job={job} />
+          ))}
+        </div>
+      )}
+
+      <p className="mt-3 text-xs text-zinc-500 dark:text-zinc-400">
+        {loading ? '…' : `${visible.length} open job${visible.length === 1 ? '' : 's'}`}
+        {` · refreshes every ${Math.round(pollMs / 1000)}s`}
+      </p>
+    </div>
+  );
+}
