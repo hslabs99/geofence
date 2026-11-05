@@ -11,6 +11,7 @@ export async function ensureDriverUserSchema(): Promise<void> {
   if (driverUserEnsured) return;
 
   await execute(`ALTER TABLE tbl_users ADD COLUMN IF NOT EXISTS truck_rego text`);
+  await execute(`ALTER TABLE tbl_users ADD COLUMN IF NOT EXISTS imei text`);
 
   const existing = await query<{ userid: string }>(
     `SELECT userid

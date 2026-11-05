@@ -87,14 +87,14 @@ export async function driverJobWriteFromBody(
   if (!jobId) return { ok: false, error: 'Job ID is required' };
   const device = await resolveDevice(blank(body.imei));
   if (!device.ok) return device;
+  const winery = blank(body.winery_name ?? body.wineryName ?? body.winery);
+  const vineyard = blank(body.vineyard_name ?? body.vineyardName ?? body.vineyard);
   const fences = await canonicalFenceNames([
-    { label: 'Winery', value: blank(body.winery_name ?? body.wineryName ?? body.winery) },
-    { label: 'Vineyard', value: blank(body.vineyard_name ?? body.vineyardName ?? body.vineyard) },
     { label: 'Winery geofence', value: blank(body.winery_geo_fence ?? body.wineryGeoFence) },
     { label: 'Vineyard geofence', value: blank(body.vineyard_geo_fence ?? body.vineyardGeoFence) },
   ]);
   if (!fences.ok) return fences;
-  const [winery, vineyard, wineryFence, vineyardFence] = fences.values;
+  const [wineryFence, vineyardFence] = fences.values;
   return {
     ok: true,
     job: {

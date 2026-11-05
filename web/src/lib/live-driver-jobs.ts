@@ -3,7 +3,8 @@ import { ensureDriverDiversionsSchema } from '@/lib/driver-diversions';
 import { ensureCurrentLocationsSchema, fillCurrentLocationGpsTimeNz } from '@/lib/ensure-current-locations-schema';
 import { ensureTblDriverJobsSchema } from '@/lib/ensure-tbl-driver-jobs-schema';
 import { loadCurrentLocationSettings } from '@/lib/current-location-poll';
-import { DRIVER_JOB_COLUMNS, type DriverJob } from '@/lib/driver-jobs';
+import { fenceProximity, loadDepartureFixes, vineyardDeparture } from '@/lib/gate-proximity';
+import { completedGateCount, DRIVER_JOB_COLUMNS, type DriverJob } from '@/lib/driver-jobs';
 
 export type LivePlace = {
   vineyardMeters: number | null;
@@ -19,6 +20,14 @@ export type LivePlace = {
   lng: number | null;
   /** Shortest metres between the winery fence and the vineyard fence. */
   journeyMeters: number | null;
+  /** Next checkpoint the driver can tap. */
+  checkpointStep: 2 | 3 | 4 | null;
+  /** Same yellow/red marker as the driver button. Yellow is soft, red is hard. */
+  checkpointAlert: 'yellow' | 'red' | null;
+  /** GPS time of a vineyard exit. Empty when the red mark is only a reminder to tap. */
+  checkpointCrossedAt: string | null;
+  /** Gate 3 red because the truck is heading to the winery without a fence exit. */
+  checkpointRemind: boolean;
 };
 
 export type LiveDiversion = {
@@ -59,16 +68,13 @@ function flagOf(value: unknown): boolean | null {
   return null;
 }
 
-/**
- * Jobs the driver has started and not ended, with metres from the latest truck fix
- * to the vineyard fence and the winery fence.
- */
 export async function loadLiveDriverJobs(): Promise<{ rows: LiveDriverJob[]; driverAppPollSeconds: number }> {
   await ensureTblDriverJobsSchema();
   await ensureDriverDiversionsSchema();
   await ensureCurrentLocationsSchema();
   await fillCurrentLocationGpsTimeNz();
-  const driverAppPollSeconds = (await loadCurrentLocationSettings()).driverAppPollSeconds;
+  const settings = await loadCurrentLocationSettings();
+  const driverAppPollSeconds = settings.driverAppPollSeconds;
 
   const sqlRows = await query<LiveSqlRow>(
     `WITH open_jobs AS (
@@ -76,8 +82,6 @@ export async function loadLiveDriverJobs(): Promise<{ rows: LiveDriverJob[]; dri
               btrim(coalesce(nullif(btrim(coalesce(vineyard_geo_fence, '')), ''), vineyard_name, '')) AS vineyard_fence,
               btrim(coalesce(nullif(btrim(coalesce(winery_geo_fence, '')), ''), winery_name, '')) AS winery_fence
        FROM tbl_driver_jobs
-       WHERE step_1_click IS NOT NULL
-         AND step_5_click IS NULL
      ),
      located AS (
        SELECT j.id,
@@ -168,7 +172,11 @@ export async function loadLiveDriverJobs(): Promise<{ rows: LiveDriverJob[]; dri
       vineyard_name: row.vineyard_name,
       winery_geo_fence: row.winery_geo_fence,
       vineyard_geo_fence: row.vineyard_geo_fence,
+      step_0_click: row.step_0_click,
       step_1_click: row.step_1_click,
+      truck_rego: row.truck_rego,
+      trailer_rego: row.trailer_rego,
+      confirmed_driver: row.confirmed_driver,
       step_2_click: row.step_2_click,
       step_3_click: row.step_3_click,
       step_4_click: row.step_4_click,
@@ -186,11 +194,47 @@ export async function loadLiveDriverJobs(): Promise<{ rows: LiveDriverJob[]; dri
         lat: coordOf(row.lat),
         lng: coordOf(row.lng),
         journeyMeters: metersOf(row.journey_meters),
+        checkpointStep: null,
+        checkpointAlert: null,
+        checkpointCrossedAt: null,
+        checkpointRemind: false,
       },
       diversion: null,
     };
     return job;
   });
+
+  const departing = rows.filter((job) => completedGateCount(job) === 2);
+  const tracks = await loadDepartureFixes(
+    departing.map((job) => ({
+      id: job.id,
+      imei: job.imei?.trim() || '',
+      truck: job.truck_id?.trim() || '',
+      since: job.step_1_click?.trim() || '',
+      vineyardFence: (job.vineyard_geo_fence || job.vineyard_name || '').trim(),
+      wineryFence: (job.winery_geo_fence || job.winery_name || '').trim(),
+    })),
+  );
+  for (const job of rows) {
+    const done = completedGateCount(job);
+    const step = done === 1 ? 2 : done === 2 ? 3 : done === 3 ? 4 : null;
+    job.place.checkpointStep = step;
+    if (!step) continue;
+    if (step === 3) {
+      const depart = vineyardDeparture({
+        step2Manual: job.step_2_manual === true,
+        step2At: job.step_2_click?.trim() ?? '',
+        limitMeters: settings.confirmAwayMeters,
+        fixes: tracks.get(job.id) ?? [],
+      });
+      job.place.checkpointAlert = depart.proximity;
+      job.place.checkpointCrossedAt = depart.crossedAt;
+      job.place.checkpointRemind = depart.remind;
+      continue;
+    }
+    const meters = step === 4 ? job.place.wineryMeters : job.place.vineyardMeters;
+    job.place.checkpointAlert = fenceProximity(step, meters, false, settings.confirmAwayMeters);
+  }
 
   const ids = rows.map((row) => row.id);
   if (ids.length > 0) {

@@ -1,4 +1,7 @@
-import { DRIVER_GATES, completedGateCount, gateClock, gateManual, minutesBetween, truckStage, wineryArrivalEta, type DriverJob, type TruckLoad } from '@/lib/driver-jobs';
+'use client';
+
+import { useLocationAge } from '@/components/driver/useLocationAge';
+import { DRIVER_GATES, completedGateCount, gateClock, gateManual, minutesBetween, secondsBetween, truckStage, wineryArrivalEta, type DriverJob, type TruckLoad } from '@/lib/driver-jobs';
 
 function TruckIcon({ load }: { load: TruckLoad }) {
   return (
@@ -80,7 +83,7 @@ function JourneyOnBar({
 }
 
 /** Portrait gate strip: done gates show the tap time, the truck sits on the way to the next gate. */
-export default function GateTrack({
+function PhoneGateTrack({
   job,
   travelMeters,
   placeNames,
@@ -199,4 +202,326 @@ export default function GateTrack({
       </div>
     </div>
   );
+}
+
+/** Same yellow/red marker the driver button shows. */
+export type CheckpointMark = {
+  step: 2 | 3 | 4;
+  alert: 'yellow' | 'red' | null;
+} | null;
+
+const LIVE_COLS = '3.25rem minmax(0,1fr) auto minmax(0,1fr) auto';
+const POD_COLS = 'minmax(0,3.25rem) 5.2rem minmax(0,3.25rem)';
+/** Border plus padding that insets the place circles, so the road meets their rims. */
+const POD_INSET = 6;
+const CIRCLE_CENTER = POD_INSET + 18;
+/** Gate 1 is 3.25rem wide and its circle is 2.25rem, so 8px reaches the rim and stops short of the time. */
+const RIM_REACH = 8;
+
+function snappedShare(percent: number | null): number {
+  if (percent == null) return 0;
+  return Math.min(100, Math.max(0, Math.round(percent / 20) * 20));
+}
+
+function formatDuration(seconds: number): string {
+  const s = Math.max(0, seconds);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  const pad = (n: number) => String(n).padStart(2, '0');
+  if (h > 0) return `${h}:${pad(m)}:${pad(sec)}`;
+  return `${pad(m)}:${pad(sec)}`;
+}
+
+function LiveHeading({ step }: { step: number }) {
+  const gate = DRIVER_GATES[step - 1];
+  return (
+    <div className="min-w-0 overflow-hidden px-0.5 text-center">
+      <div className="text-[9px] font-semibold uppercase tracking-wide text-[#9aa3ad]">Gate {gate.step}</div>
+      <div className="mt-0.5 min-h-[2.35em] text-[10px] leading-tight text-[#6d7580]">{gate.title}</div>
+    </div>
+  );
+}
+
+function LiveGateDot({
+  job,
+  step,
+  alert,
+  eta,
+}: {
+  job: DriverJob;
+  step: number;
+  alert: 'yellow' | 'red' | null;
+  eta: string | null;
+}) {
+  const gate = DRIVER_GATES[step - 1];
+  const done = completedGateCount(job);
+  const complete = step <= done;
+  const manual = complete && gateManual(job, step);
+  const estimate = !complete && step === 4 && eta ? (eta.match(/(\d{2}:\d{2})$/)?.[1] ?? eta) : null;
+  const stamp = job[gate.key];
+  const face =
+    manual
+      ? 'bg-[#b54708] text-[11px] font-semibold text-white shadow-sm'
+      : complete
+        ? 'bg-[#1f9d55] text-[11px] font-semibold text-white shadow-sm'
+        : alert === 'red'
+          ? 'border-2 border-[#f04438] bg-[#fef3f2] text-[11px] font-semibold text-[#b42318]'
+          : alert === 'yellow'
+            ? 'border-2 border-[#e0a100] bg-[#fffaeb] text-[11px] font-semibold text-[#b54708]'
+            : estimate
+              ? 'border-2 border-dashed border-[#1f9d55] bg-[#f7f8fa] text-[10px] font-semibold text-[#1f9d55]'
+              : 'border-2 border-dashed border-[#c5ccd6] bg-[#f7f8fa] text-[11px] font-medium text-[#b0b7c3]';
+  return (
+    <div className="relative z-[2] flex flex-col items-center">
+      <div className={`flex h-9 w-9 items-center justify-center rounded-full ${face}`}>
+        {complete ? gateClock(stamp) : estimate ?? '--:--'}
+      </div>
+      {alert === 'yellow' || alert === 'red' ? (
+        <span className={`mt-1 text-[8px] font-bold uppercase leading-none ${alert === 'red' ? 'text-[#b42318]' : 'text-[#b54708]'}`}>
+          {alert === 'red' ? 'Hard' : 'Soft'}
+        </span>
+      ) : manual ? (
+        <span className="mt-1 text-center text-[8px] font-bold uppercase leading-tight text-[#b54708]">
+          Manual
+          <br />
+          no GPS
+        </span>
+      ) : (
+        <span className="mt-1 block h-[8px]" />
+      )}
+    </div>
+  );
+}
+
+/** Running while step 3 is open. Frozen at step 3 minus step 2 once the truck has left. */
+function VineyardStay({ job }: { job: DriverJob }) {
+  const open = !job.step_3_click?.trim();
+  const live = useLocationAge(open ? job.step_2_click : null);
+  if (!job.step_2_click?.trim()) return null;
+  const seconds = open ? live : secondsBetween(job.step_2_click, job.step_3_click);
+  if (seconds == null) return null;
+  return (
+    <div className="mt-1 text-center" aria-label={open ? 'Time in the vineyard' : 'Time spent in the vineyard'}>
+      <span className="block text-[12px] font-bold tabular-nums leading-none text-[#1f9d55]">{formatDuration(seconds)}</span>
+      <span className="mt-0.5 block text-[8px] font-bold uppercase leading-none tracking-wide text-[#1f9d55]">
+        {open ? 'in vineyard' : 'vineyard'}
+      </span>
+    </div>
+  );
+}
+
+function RoadLeg({
+  connect,
+  truck,
+  load,
+  percent,
+  meters,
+  remaining,
+  eta,
+  minutes,
+}: {
+  /** Outbound line starts at the gate 1 rim. The return road runs between the two places. */
+  connect: 'from-previous' | 'between';
+  truck: boolean;
+  load: TruckLoad;
+  percent: number | null;
+  meters: number | null;
+  remaining: number | null;
+  eta: string | null;
+  minutes: number | null;
+}) {
+  const snapped = snappedShare(truck ? percent : null);
+  const reach = connect === 'from-previous' ? RIM_REACH : 0;
+  const truckLeft =
+    connect === 'from-previous'
+      ? `calc(${snapped}% - ${(1 - snapped / 100) * reach}px)`
+      : `${snapped}%`;
+  return (
+    <div className="relative min-h-[5.8rem]">
+      <div
+        className="absolute h-[2px] bg-[#d5dbe3]"
+        style={
+          connect === 'from-previous'
+            ? { top: CIRCLE_CENTER - 1, left: -reach, right: 0 }
+            : { top: CIRCLE_CENTER - 1, left: 0, right: 0 }
+        }
+      />
+      {minutes != null && (
+        <div className="absolute left-1/2 z-[1] -translate-x-1/2 -translate-y-1/2 text-center" style={{ top: CIRCLE_CENTER }}>
+          <span className="block rounded bg-[#f3f5f7] px-0.5 text-[12px] font-bold leading-none tabular-nums text-[#1f9d55]">{minutes}</span>
+          <span className="mt-1.5 block text-[8px] font-bold uppercase leading-none tracking-wide text-[#1f9d55]">min</span>
+        </div>
+      )}
+      {meters != null && (
+        <div
+          className="absolute inset-x-0 z-[1] text-center"
+          style={{ top: 42 }}
+          title="Estimated metres between the fences. The percentage compares metres still to go with that journey. The truck steps along this road in 20% increments."
+        >
+          <span className="block whitespace-nowrap text-[11px] font-bold leading-none tabular-nums text-[#344054]">
+            {meters.toLocaleString('en-NZ')} m
+          </span>
+          {percent != null ? (
+            <span className="mt-0.5 block whitespace-nowrap text-[9px] font-bold leading-none text-[#175cd3]">
+              {percent}%{remaining != null ? ` · ${remaining.toLocaleString('en-NZ')} m left` : ''}
+            </span>
+          ) : null}
+          {eta ? <span className="mt-0.5 block whitespace-nowrap text-[9px] font-semibold leading-none text-[#1f9d55]">ETA {eta}</span> : null}
+        </div>
+      )}
+      {truck && (
+        <div className="absolute z-[2] flex w-[4.6rem] -translate-x-1/2 flex-col items-center" style={{ top: 2, left: truckLeft }}>
+          <TruckIcon load={load} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Staff live track. The two long gaps are the roads.
+ * Steps 2 and 3 sit inside the vineyard. Steps 4 and 5 sit inside the winery.
+ * The truck does not travel inside either place.
+ */
+function LiveGateTrack({
+  job,
+  placeNames,
+  journey,
+  checkpoint,
+}: {
+  job: DriverJob;
+  placeNames?: { vineyard?: string | null; winery?: string | null } | null;
+  journey?: JourneyMeters | null;
+  checkpoint?: CheckpointMark;
+}) {
+  const done = completedGateCount(job);
+  const stage = truckStage(done);
+  const eta = done === 3 ? wineryArrivalEta(job) : null;
+  const alertFor = (step: 2 | 3 | 4) => (checkpoint?.step === step ? checkpoint.alert : null);
+  const outPercent = journey?.active === 'out' ? journeyPercent(journey.meters ?? 0, journey.remaining) : null;
+  const backPercent = journey?.active === 'back' ? journeyPercent(journey.meters ?? 0, journey.remaining) : null;
+  const journeyMeters = journey?.meters ?? null;
+  const outMinutes = done > 1 ? minutesBetween(job.step_1_click, job.step_2_click) : null;
+  const backMinutes = done > 3 ? minutesBetween(job.step_3_click, job.step_4_click) : null;
+  const unloadMinutes = done > 4 ? minutesBetween(job.step_4_click, job.step_5_click) : null;
+  const load = stage?.load ?? 'empty';
+
+  return (
+    <div className="bg-[#f3f5f7] px-1 pb-2 pt-2">
+      <div className="grid items-end" style={{ gridTemplateColumns: LIVE_COLS }}>
+        <LiveHeading step={1} />
+        <div />
+        <div className="rounded-full border-2 border-transparent px-1.5">
+          <div className="grid" style={{ gridTemplateColumns: POD_COLS }}>
+            <LiveHeading step={2} />
+            <div />
+            <LiveHeading step={3} />
+          </div>
+          {placeNames ? (
+            <div className="truncate text-center text-[11px] font-semibold leading-tight text-[#1c2430]" title={placeNames.vineyard ?? ''}>
+              {placeNames.vineyard?.trim() || '—'}
+            </div>
+          ) : null}
+        </div>
+        <div />
+        <div className="rounded-full border-2 border-transparent px-1.5">
+          <div className="grid" style={{ gridTemplateColumns: POD_COLS }}>
+            <LiveHeading step={4} />
+            <div />
+            <LiveHeading step={5} />
+          </div>
+          {placeNames ? (
+            <div className="truncate text-center text-[11px] font-semibold leading-tight text-[#1c2430]" title={placeNames.winery ?? ''}>
+              {placeNames.winery?.trim() || '—'}
+            </div>
+          ) : null}
+        </div>
+      </div>
+      <div className="relative mt-1 grid items-start" style={{ gridTemplateColumns: LIVE_COLS }}>
+        <div style={{ paddingTop: POD_INSET }}>
+          <LiveGateDot job={job} step={1} alert={null} eta={eta} />
+        </div>
+        <RoadLeg
+          connect="from-previous"
+          truck={done === 1}
+          load={load}
+          percent={outPercent}
+          meters={journeyMeters}
+          remaining={journey?.active === 'out' ? journey.remaining : null}
+          eta={journey?.active === 'out' ? journey.eta : null}
+          minutes={outMinutes}
+        />
+        <div
+          className="relative z-[1] rounded-full border-2 border-[#3f6212] bg-[#eef6e8] px-1.5 py-1"
+          title="Inside the vineyard. The truck waits here between arriving and leaving."
+        >
+          <div className="grid items-start" style={{ gridTemplateColumns: POD_COLS }}>
+            <LiveGateDot job={job} step={2} alert={alertFor(2)} eta={eta} />
+            <div className="flex flex-col items-center">
+              {done === 2 && (
+                <div style={{ marginTop: -4 }}>
+                  <TruckIcon load={load} />
+                </div>
+              )}
+              <VineyardStay job={job} />
+            </div>
+            <LiveGateDot job={job} step={3} alert={alertFor(3)} eta={eta} />
+          </div>
+        </div>
+        <RoadLeg
+          connect="between"
+          truck={done === 3}
+          load={load}
+          percent={backPercent}
+          meters={journeyMeters}
+          remaining={journey?.active === 'back' ? journey.remaining : null}
+          eta={journey?.active === 'back' ? journey.eta : null}
+          minutes={backMinutes}
+        />
+        <div
+          className="relative z-[1] rounded-full border-2 border-[#3f6212] bg-[#eef6e8] px-1.5 py-1"
+          title="Inside the winery. The truck waits here between arriving and the end of the job."
+        >
+          <div className="grid items-start" style={{ gridTemplateColumns: POD_COLS }}>
+            <LiveGateDot job={job} step={4} alert={alertFor(4)} eta={eta} />
+            <div className="flex flex-col items-center">
+              {done === 4 && (
+                <div style={{ marginTop: -4 }}>
+                  <TruckIcon load={load} />
+                  <span className="mt-0.5 block whitespace-pre-line text-center text-[9px] font-bold leading-tight text-[#1f9d55]">
+                    Unloading
+                  </span>
+                </div>
+              )}
+              {unloadMinutes != null && (
+                <div className="mt-1 text-center">
+                  <span className="block text-[12px] font-bold leading-none tabular-nums text-[#1f9d55]">{unloadMinutes}</span>
+                  <span className="mt-1.5 block text-[8px] font-bold uppercase leading-none tracking-wide text-[#1f9d55]">min</span>
+                </div>
+              )}
+            </div>
+            <LiveGateDot job={job} step={5} alert={null} eta={eta} />
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** Driver phone keeps the even gate strip. The live board stretches the two roads and pods the vineyard. */
+export default function GateTrack({
+  live,
+  ...props
+}: {
+  job: DriverJob;
+  travelMeters?: TruckMeters | null;
+  placeNames?: { vineyard?: string | null; winery?: string | null } | null;
+  journey?: JourneyMeters | null;
+  /** Staff listing. Draws the road / vineyard wheel and moves the truck along the active road. */
+  live?: boolean;
+  checkpoint?: CheckpointMark;
+}) {
+  if (live) return <LiveGateTrack job={props.job} placeNames={props.placeNames} journey={props.journey} checkpoint={props.checkpoint} />;
+  return <PhoneGateTrack job={props.job} travelMeters={props.travelMeters} placeNames={props.placeNames} journey={props.journey} />;
 }

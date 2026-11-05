@@ -9,6 +9,8 @@ import {
   vworkApiPollStatus,
   type VworkApiSettings,
 } from '@/lib/vwork-api-poll';
+import { syncVworkDrivers } from '@/lib/vwork-driver-sync';
+import { linkQueuedJobsToVwork } from '@/lib/vwork-job-steps';
 
 async function snapshot() {
   await loadVworkApiSettings();
@@ -51,7 +53,12 @@ export async function POST(request: Request) {
       const saved = await saveVworkApiSettings(settings);
       return NextResponse.json({ ok: true, ...(await snapshot()), settings: saved });
     }
-    return NextResponse.json({ error: 'action must be start, stop, once, or settings' }, { status: 400 });
+    if (action === 'sync-drivers') {
+      await linkQueuedJobsToVwork();
+      const drivers = await syncVworkDrivers();
+      return NextResponse.json({ ok: true, drivers, ...(await snapshot()) });
+    }
+    return NextResponse.json({ error: 'action must be start, stop, once, settings, or sync-drivers' }, { status: 400 });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return NextResponse.json({ error: message }, { status: 500 });

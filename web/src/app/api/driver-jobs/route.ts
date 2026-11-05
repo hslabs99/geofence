@@ -15,6 +15,38 @@ function rowsToSortedDistinct(rows: { val: string | null }[]): string[] {
   return [...seen].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
 }
 
+export type DriverUserOption = { value: string; label: string };
+
+/** Drivers from tbl_users (user_type = driver). Value is the name stored on the job. */
+function driverUsersFromRows(
+  rows: { name: string | null; email: string | null; truck_rego: string | null }[],
+): DriverUserOption[] {
+  const named = rows
+    .map((row) => {
+      const name = (row.name ?? '').trim();
+      const email = (row.email ?? '').trim();
+      const value = name || email;
+      const truck = (row.truck_rego ?? '').trim();
+      return value ? { value, email, truck } : null;
+    })
+    .filter((row): row is { value: string; email: string; truck: string } => row != null);
+
+  const nameCount = new Map<string, number>();
+  for (const row of named) nameCount.set(row.value, (nameCount.get(row.value) ?? 0) + 1);
+
+  const seen = new Set<string>();
+  const options: DriverUserOption[] = [];
+  for (const row of named) {
+    const shared = (nameCount.get(row.value) ?? 0) > 1 && row.email && row.email !== row.value;
+    const value = shared ? `${row.value} (${row.email})` : row.value;
+    if (seen.has(value)) continue;
+    seen.add(value);
+    const label = row.truck ? `${value} · ${row.truck}` : value;
+    options.push({ value, label });
+  }
+  return options.sort((a, b) => a.label.localeCompare(b.label, undefined, { sensitivity: 'base' }));
+}
+
 /** GET: Driver Visibility jobs, optionally filtered by driver, winery, or vineyard. */
 export async function GET(request: Request) {
   try {
@@ -40,7 +72,7 @@ export async function GET(request: Request) {
     }
     const whereClause = conditions.length ? ` WHERE ${conditions.join(' AND ')}` : '';
 
-    const [rows, driverRows, wineryRows, vineyardRows, fenceRows] = await Promise.all([
+    const [rows, driverRows, wineryRows, vineyardRows, fenceRows, userDriverRows] = await Promise.all([
       query<DriverJobRow>(
         `SELECT ${DRIVER_JOB_COLUMNS}
          FROM tbl_driver_jobs
@@ -72,12 +104,22 @@ export async function GET(request: Request) {
          WHERE fence_name IS NOT NULL AND btrim(fence_name) <> ''
          ORDER BY lower(btrim(fence_name)), btrim(fence_name)`,
       ),
+      query<{ name: string | null; email: string | null; truck_rego: string | null }>(
+        `SELECT
+           NULLIF(btrim(concat_ws(' ', NULLIF(btrim(firstname), ''), NULLIF(btrim(surname), ''))), '') AS name,
+           NULLIF(btrim(email), '') AS email,
+           NULLIF(btrim(truck_rego), '') AS truck_rego
+         FROM tbl_users
+         WHERE LOWER(btrim(COALESCE(user_type, ''))) = 'driver'
+         ORDER BY 1, 2`,
+      ),
     ]);
 
     return NextResponse.json({
       rows,
       total: rows.length,
       drivers: rowsToSortedDistinct(driverRows),
+      driverUsers: driverUsersFromRows(userDriverRows),
       wineries: rowsToSortedDistinct(wineryRows),
       vineyards: rowsToSortedDistinct(vineyardRows),
       fenceNames: rowsToSortedDistinct(fenceRows),

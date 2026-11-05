@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from 'react';
 
 type FeedRow = {
+  account: string | null;
   job_id: string;
   customer: string | null;
   template: string | null;
@@ -93,13 +94,13 @@ export function VworkFeedPanel() {
   return (
     <div className="mt-4">
       <p className="max-w-3xl text-sm text-zinc-600 dark:text-zinc-400">
-        Checks the VWork jobs API for jobs updated in the last few days. A job is added here only when its id is not already in VWork jobs and not already in this feed. Open jobs are then added to the Driver Visibility job queue. Planned times are stored as the API sent them.
+        Checks the Delegat and Others VWork accounts for jobs updated in the last few days. A job is added here only when its id is not already in VWork jobs and not already in this feed for that account. Open jobs are then added to the Driver Visibility job queue. Planned times are stored as the API sent them.
       </p>
       {!configured && (
         <p className="mt-3 text-sm text-amber-800 dark:text-amber-200">
           {keyState === 'placeholder'
-            ? 'VWORK_API_KEY is still the placeholder in the environment. Live checks stay off until it is replaced.'
-            : 'VWORK_API_KEY is not set. Live checks stay off until it is added.'}
+            ? 'The VWork keys are still placeholders. Live checks stay off until VWORK_API_KEY_DELEGAT or VWORK_API_KEY_OTHERS is replaced.'
+            : 'VWORK_API_KEY_DELEGAT and VWORK_API_KEY_OTHERS are not set. Live checks stay off until one is added.'}
         </p>
       )}
       {error && (
@@ -142,7 +143,7 @@ export function VworkFeedPanel() {
         <table className="min-w-full text-left text-xs">
           <thead className="bg-zinc-100 dark:bg-zinc-800">
             <tr>
-              {['Job', 'Customer', 'Worker', 'Status', 'Planned start', 'Vineyard', 'Winery', 'Registration', 'Fetched'].map((heading) => (
+              {['Account', 'Job', 'Customer', 'Worker', 'Status', 'Planned start', 'Vineyard', 'Winery', 'Registration', 'Fetched'].map((heading) => (
                 <th key={heading} className="px-2 py-2 font-medium text-zinc-500">{heading}</th>
               ))}
             </tr>
@@ -150,11 +151,12 @@ export function VworkFeedPanel() {
           <tbody>
             {rows.length === 0 ? (
               <tr>
-                <td colSpan={9} className="px-2 py-4 text-zinc-500">No new jobs in the feed yet.</td>
+                <td colSpan={10} className="px-2 py-4 text-zinc-500">No new jobs in the feed yet.</td>
               </tr>
             ) : (
               rows.map((row) => (
-                <tr key={row.job_id} className="border-t border-zinc-100 dark:border-zinc-800">
+                <tr key={`${row.account ?? ''}-${row.job_id}`} className="border-t border-zinc-100 dark:border-zinc-800">
+                  <td className="px-2 py-1.5">{row.account || '—'}</td>
                   <td className="px-2 py-1.5 font-mono">{row.job_id}</td>
                   <td className="px-2 py-1.5">{row.customer || '—'}</td>
                   <td className="px-2 py-1.5">{row.worker || '—'}</td>

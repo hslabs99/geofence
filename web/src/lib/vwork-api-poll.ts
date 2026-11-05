@@ -1,7 +1,8 @@
 import { execute, getClient, query } from '@/lib/db';
 import { checkVworkJobFeed } from '@/lib/vwork-job-feed';
 import { enqueueVworkFeedJobs, type VworkFeedQueueResult } from '@/lib/vwork-feed-queue';
-import { vworkApiConfigured, vworkApiKeyState } from '@/lib/vwork-api';
+import { vworkAccountStatus, vworkApiConfigured, vworkApiKeyState, type VworkAccountStatus } from '@/lib/vwork-api';
+import type { VworkFeedAccountResult } from '@/lib/vwork-job-feed';
 
 const LOGTYPE = 'vwork_api_poll';
 const SETTINGS_TYPE = 'VworkApiPoll';
@@ -132,14 +133,18 @@ async function writeLog(stage: string, details: Record<string, unknown>): Promis
 
 function summaryText(input: {
   configured: boolean;
-  fetched: number | null;
-  inserted: number | null;
+  accounts: VworkFeedAccountResult[];
   queue: VworkFeedQueueResult;
-  truncated: boolean;
 }): string {
-  const live = input.configured
-    ? `Fetched ${input.fetched ?? 0}, added ${input.inserted ?? 0} to the feed${input.truncated ? ' (page limit reached)' : ''}`
-    : 'Live fetch skipped because VWORK_API_KEY is not ready';
+  const waiting = vworkAccountStatus()
+    .filter((account) => account.state !== 'ready')
+    .map((account) => `${account.label}: key ${account.state}`);
+  const pulled = input.accounts.map((account) =>
+    account.error
+      ? `${account.label}: ${account.error}`
+      : `${account.label}: fetched ${account.fetched}, added ${account.inserted}${account.truncated ? ' (page limit reached)' : ''}`,
+  );
+  const live = input.configured || waiting.length > 0 ? [...pulled, ...waiting].join('. ') : 'No VWork API key is ready';
   const more = input.queue.remaining > 0 ? `, ${input.queue.remaining} still waiting` : '';
   return `${live}. Queued ${input.queue.queued}, skipped ${input.queue.skippedClosed} closed${more}.`;
 }
@@ -153,26 +158,23 @@ export async function pollVworkApiOnce(): Promise<{ summary: string; queued: num
   s.lastPolltime = at;
   try {
     const configured = vworkApiConfigured();
-    let fetched: number | null = null;
-    let inserted: number | null = null;
-    let truncated = false;
-    if (configured) {
-      const feed = await checkVworkJobFeed(s.settings.lookbackDays);
-      fetched = feed.fetched;
-      inserted = feed.inserted;
-      truncated = feed.truncated;
-    }
+    const feedAccounts: VworkFeedAccountResult[] = configured ? (await checkVworkJobFeed(s.settings.lookbackDays)).accounts : [];
     const queue = await enqueueVworkFeedJobs();
-    const summary = summaryText({ configured, fetched, inserted, queue, truncated });
+    const summary = summaryText({ configured, accounts: feedAccounts, queue });
+    const accountErrors = feedAccounts.filter((account) => account.error);
     s.lastSummary = summary;
-    s.lastError = null;
+    s.lastError =
+      accountErrors.length > 0 && accountErrors.length === feedAccounts.length
+        ? accountErrors.map((account) => `${account.label}: ${account.error}`).join('; ')
+        : null;
     await writeLog(configured ? 'ok' : 'waiting-key', {
       at,
       keyState: vworkApiKeyState(),
+      accounts: vworkAccountStatus(),
       lookbackDays: s.settings.lookbackDays,
-      fetched,
-      inserted,
-      truncated,
+      fetched: feedAccounts.reduce((sum, account) => sum + account.fetched, 0),
+      inserted: feedAccounts.reduce((sum, account) => sum + account.inserted, 0),
+      accountResults: feedAccounts,
       queued: queue.queued,
       skippedClosed: queue.skippedClosed,
       remaining: queue.remaining,
@@ -230,6 +232,7 @@ export function vworkApiPollStatus(): {
   intervalMs: number;
   settings: VworkApiSettings;
   keyState: 'missing' | 'placeholder' | 'ready';
+  accounts: VworkAccountStatus[];
   configured: boolean;
   lastPolltime: string | null;
   lastSummary: string | null;
@@ -244,6 +247,7 @@ export function vworkApiPollStatus(): {
     intervalMs: s.settings.pollIntervalSeconds * 1000,
     settings: s.settings,
     keyState: vworkApiKeyState(),
+    accounts: vworkAccountStatus(),
     configured: vworkApiConfigured(),
     lastPolltime: s.lastPolltime,
     lastSummary: s.lastSummary,

@@ -4,6 +4,8 @@ import { ensureTblDriverJobsSchema } from '@/lib/ensure-tbl-driver-jobs-schema';
 import { expectedDurationLabel, openJobDiversion, stopJobDiversion } from '@/lib/driver-diversions';
 import { recordDriverClick } from '@/lib/driver-job-log';
 import { readStepProximity } from '@/lib/gate-proximity';
+import { staffActorFromBody } from '@/lib/job-actor';
+import { pushDriverGateToVwork } from '@/lib/vwork-job-steps';
 import {
   DRIVER_GATES,
   DRIVER_JOB_COLUMNS,
@@ -30,7 +32,17 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       return NextResponse.json({ error: 'Job not found' }, { status: 404 });
     }
 
-    const body = (await request.json()) as { step?: unknown; at?: unknown; confirmed?: unknown; endDiversion?: unknown };
+    const body = (await request.json()) as {
+      step?: unknown;
+      at?: unknown;
+      confirmed?: unknown;
+      endDiversion?: unknown;
+      control?: unknown;
+    };
+    const actor = body.control === true ? await staffActorFromBody(body) : null;
+    if (body.control === true && !actor) {
+      return NextResponse.json({ error: 'Only an admin can control this job.' }, { status: 403 });
+    }
     const step = Number(body.step);
     const at = typeof body.at === 'string' ? body.at.trim() : '';
     if (!DRIVER_GATES.some((gate) => gate.step === step)) {
@@ -50,6 +62,9 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     const next = completedGateCount(current) + 1;
     if (step !== next || next > DRIVER_GATES.length) {
       return NextResponse.json({ error: 'That gate is not the next step' }, { status: 409 });
+    }
+    if (step === 1 && !current.step_0_click?.trim()) {
+      return NextResponse.json({ error: 'Confirm job details before starting the job.' }, { status: 409 });
     }
 
     if (step >= 2 && step <= 5) {
@@ -99,11 +114,13 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
         step,
         outcome: warning ? 'caution_accept' : 'auto_accept',
         detail: warning,
+        actor,
       });
     } catch {
       // The gate click is already stored. The log can be rebuilt from it.
     }
-    return NextResponse.json({ row });
+    const vwork = await pushDriverGateToVwork(jobId, step, at);
+    return NextResponse.json({ row, vwork });
   } catch (err) {
     const code = (err as { code?: string }).code;
     if (code === '22007' || code === '22008') {

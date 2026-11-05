@@ -8,11 +8,18 @@ import { DriverLink } from '@/components/driver/driver-nav';
 import DriverDiversionControl from '@/components/driver/DriverDiversionControl';
 import DriverJobLog from '@/components/driver/DriverJobLog';
 import GateTrack from '@/components/driver/GateTrack';
-import { DRIVER_GATES, completedGateCount, gateClock, gateManual, phoneLocalStamp, wineryArrivalEta, type DriverJob } from '@/lib/driver-jobs';
+import { DRIVER_GATES, completedGateCount, gateClock, gateManual, jobDetailsConfirmed, phoneLocalStamp, wineryArrivalEta, type DriverJob } from '@/lib/driver-jobs';
+import { staffActorPayload } from '@/lib/staff-session';
 
-function ProximityMark({ kind }: { kind: 'yellow' | 'red' }) {
+export type DriverScreenMode = 'control' | 'watch' | null;
+
+function ProximityMark({ kind, reminded }: { kind: 'yellow' | 'red'; reminded?: boolean }) {
   const color = kind === 'yellow' ? '#e0a100' : '#f04438';
-  const title = kind === 'yellow' ? 'Close to the fence. Tap as you cross.' : 'Tap now. The fence crossing has already happened.';
+  const title = kind === 'yellow'
+    ? 'Close to the fence. Tap as you cross.'
+    : reminded
+      ? 'Tap depart. You are heading back to the winery.'
+      : 'Tap now. The fence crossing has already happened.';
   const pin =
     'M12 0C7.6 0 4 3.4 4 7.6 4 12.8 12 22 12 22s8-9.2 8-14.4C20 3.4 16.4 0 12 0zm0 10.6a3 3 0 1 1 0-6 3 3 0 0 1 0 6z';
   return (
@@ -37,7 +44,7 @@ function ProximityMark({ kind }: { kind: 'yellow' | 'red' }) {
 function FenceLine({ label, name, jobId }: { label: string; name: string | null; jobId: number }) {
   const fence = name?.trim() ?? '';
   const mapHref = fence
-    ? `/map?job=${jobId}&fence=${encodeURIComponent(fence)}`
+    ? `/driver/map?job=${jobId}&fence=${encodeURIComponent(fence)}`
     : null;
   return (
     <div className="flex items-center justify-between gap-3 border-t border-[#eaecf0] py-3 first:border-t-0">
@@ -46,9 +53,9 @@ function FenceLine({ label, name, jobId }: { label: string; name: string | null;
         <p className="mt-0.5 truncate text-base text-[#1c2430]">{fence || '—'}</p>
       </div>
       {mapHref ? (
-        <DriverLink to={mapHref} className="shrink-0 text-base font-semibold text-[#175cd3]">
+        <a href={mapHref} target="_blank" rel="noopener noreferrer" className="shrink-0 text-base font-semibold text-[#175cd3]">
           View on Map
-        </DriverLink>
+        </a>
       ) : null}
     </div>
   );
@@ -68,10 +75,107 @@ function JobDetails({ job }: { job: DriverJob }) {
   );
 }
 
-export default function DriverJobScreen({ id: idProp }: { id?: string }) {
+type SuggestedPlates = { truckRego: string; trailerRego: string };
+
+function ConfirmJobDetails({
+  job,
+  plates,
+  watch,
+  saving,
+  onConfirm,
+}: {
+  job: DriverJob;
+  plates: SuggestedPlates | null;
+  watch: boolean;
+  saving: boolean;
+  onConfirm: (values: { driverName: string; truckRego: string; trailerRego: string }) => void;
+}) {
+  const confirmed = jobDetailsConfirmed(job);
+  const [driverName, setDriverName] = useState('');
+  const [truckRego, setTruckRego] = useState(plates?.truckRego ?? job.truck_rego?.trim() ?? '');
+  const [trailerRego, setTrailerRego] = useState(plates?.trailerRego ?? job.trailer_rego?.trim() ?? '');
+  const ready = driverName.trim() !== '' && truckRego.trim() !== '';
+
+  if (confirmed) {
+    const summary = [job.confirmed_driver, job.truck_rego, job.trailer_rego]
+      .map((value) => value?.trim() || '')
+      .filter(Boolean)
+      .join(' · ');
+    return (
+      <div className="rounded-2xl bg-[#e4e7ec] px-4 py-3">
+        <p className="text-base font-medium text-[#667085]">Step 0 · Confirm job details · {gateClock(job.step_0_click)}</p>
+        {summary ? <p className="mt-1 truncate text-sm font-semibold text-[#1c2430]">{summary}</p> : null}
+      </div>
+    );
+  }
+
+  return (
+    <form
+      className="rounded-2xl bg-white px-4 py-4 shadow-[0_1px_2px_rgba(16,24,40,0.06)]"
+      onSubmit={(event) => {
+        event.preventDefault();
+        if (!ready || watch || saving) return;
+        onConfirm({
+          driverName: driverName.trim(),
+          truckRego: truckRego.trim(),
+          trailerRego: trailerRego.trim(),
+        });
+      }}
+    >
+      <p className="text-lg font-semibold text-[#1c2430]">Step 0 · Confirm job details</p>
+      <p className="mt-1 text-sm leading-snug text-[#667085]">
+        Enter your name for this job. Check the truck and trailer registrations.
+      </p>
+      <label className="mt-3 block text-xs font-medium uppercase tracking-wide text-[#667085]">
+        Driver name
+        <input
+          value={driverName}
+          onChange={(event) => setDriverName(event.target.value)}
+          disabled={watch || saving}
+          autoComplete="name"
+          className="mt-1 h-12 w-full rounded-xl border border-[#d0d5dd] px-3 text-base font-normal normal-case tracking-normal text-[#1c2430] disabled:bg-[#f2f4f7]"
+        />
+      </label>
+      <label className="mt-3 block text-xs font-medium uppercase tracking-wide text-[#667085]">
+        Truck registration
+        <input
+          value={truckRego}
+          onChange={(event) => setTruckRego(event.target.value)}
+          disabled={watch || saving}
+          autoCapitalize="characters"
+          className="mt-1 h-12 w-full rounded-xl border border-[#d0d5dd] px-3 text-base font-normal normal-case tracking-normal text-[#1c2430] disabled:bg-[#f2f4f7]"
+        />
+      </label>
+      <label className="mt-3 block text-xs font-medium uppercase tracking-wide text-[#667085]">
+        Trailer registration
+        <input
+          value={trailerRego}
+          onChange={(event) => setTrailerRego(event.target.value)}
+          disabled={watch || saving}
+          autoCapitalize="characters"
+          placeholder="Leave blank if there is no trailer"
+          className="mt-1 h-12 w-full rounded-xl border border-[#d0d5dd] px-3 text-base font-normal normal-case tracking-normal text-[#1c2430] placeholder:text-[#98a2b3] disabled:bg-[#f2f4f7]"
+        />
+      </label>
+      <button
+        type="submit"
+        disabled={!ready || watch || saving}
+        className="mt-4 flex h-[3.15rem] w-full items-center justify-center rounded-2xl bg-[#1f9d55] px-4 text-lg font-semibold text-white disabled:opacity-60"
+      >
+        {saving ? 'Saving…' : 'Confirm job details'}
+      </button>
+    </form>
+  );
+}
+
+export default function DriverJobScreen({ id: idProp, mode = null }: { id?: string; mode?: DriverScreenMode }) {
   const params = useParams<{ id?: string }>();
   const id = idProp ?? params.id ?? '';
+  const watch = mode === 'watch';
+  const control = mode === 'control';
   const [job, setJob] = useState<DriverJob | null>(null);
+  const [plates, setPlates] = useState<SuggestedPlates | null>(null);
+  const [actorName, setActorName] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [savingStep, setSavingStep] = useState<number | null>(null);
@@ -90,7 +194,17 @@ export default function DriverJobScreen({ id: idProp }: { id?: string }) {
         return data;
       })
       .then((data) => {
-        if (!cancelled) setJob(data.row as DriverJob);
+        if (!cancelled) {
+          setJob(data.row as DriverJob);
+          setPlates(
+            data.plates && typeof data.plates === 'object'
+              ? {
+                  truckRego: String(data.plates.truckRego ?? ''),
+                  trailerRego: String(data.plates.trailerRego ?? ''),
+                }
+              : null,
+          );
+        }
       })
       .catch((e) => {
         if (!cancelled) setError(e instanceof Error ? e.message : String(e));
@@ -103,8 +217,88 @@ export default function DriverJobScreen({ id: idProp }: { id?: string }) {
     };
   }, [id]);
 
+  useEffect(() => {
+    if (!control || !id) return;
+    const actor = staffActorPayload();
+    if (!actor) {
+      setError('Sign in as an admin to control this job.');
+      return;
+    }
+    let cancelled = false;
+    fetch(`/api/driver-jobs/${encodeURIComponent(id)}/ghost`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ at: phoneLocalStamp(), actor, control: true }),
+    })
+      .then(async (response) => {
+        const data = await response.json();
+        if (!response.ok) throw new Error(data?.error ?? response.statusText);
+        if (!cancelled) setActorName(typeof data?.actor?.name === 'string' ? data.actor.name : actor.email);
+      })
+      .catch((err) => {
+        if (!cancelled) setError(err instanceof Error ? err.message : String(err));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [control, id]);
+
+  useEffect(() => {
+    if ((!watch && !control) || !id) return;
+    const timer = setInterval(() => {
+      fetch(`/api/driver-jobs/${encodeURIComponent(id)}`, { cache: 'no-store' })
+        .then(async (response) => {
+          const data = await response.json();
+          if (!response.ok) throw new Error(data?.error ?? response.statusText);
+          return data;
+        })
+        .then((data) => setJob(data.row as DriverJob))
+        .catch(() => undefined);
+    }, 15_000);
+    return () => clearInterval(timer);
+  }, [watch, control, id]);
+
+  function staffFields(): { control?: true; actor?: { email: string; role: 'Super Admin' | 'Admin' } } {
+    if (!control) return {};
+    const actor = staffActorPayload();
+    return actor ? { control: true, actor } : {};
+  }
+
+  async function confirmDetails(values: { driverName: string; truckRego: string; trailerRego: string }) {
+    if (!job || watch) return;
+    if (control && !staffActorPayload()) {
+      setError('Sign in as an admin to control this job.');
+      return;
+    }
+    setError(null);
+    setSavingStep(0);
+    try {
+      const res = await fetch(`/api/driver-jobs/${encodeURIComponent(id)}/details`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...values,
+          at: phoneLocalStamp(),
+          ...staffFields(),
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error ?? res.statusText);
+      setPlates({ truckRego: values.truckRego, trailerRego: values.trailerRego });
+      setJob(data.row as DriverJob);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSavingStep(null);
+    }
+  }
+
   async function passGate(step: number, options?: { confirmed?: boolean; endDiversion?: boolean }) {
-    if (!job) return;
+    if (!job || watch) return;
+    if (control && !staffActorPayload()) {
+      setError('Sign in as an admin to control this job.');
+      return;
+    }
     setError(null);
     setSavingStep(step);
     try {
@@ -116,6 +310,7 @@ export default function DriverJobScreen({ id: idProp }: { id?: string }) {
           at: phoneLocalStamp(),
           confirmed: options?.confirmed === true,
           endDiversion: options?.endDiversion === true,
+          ...staffFields(),
         }),
       });
       const data = await res.json();
@@ -140,11 +335,12 @@ export default function DriverJobScreen({ id: idProp }: { id?: string }) {
 
   async function declineGate(pending: { step: number; message: string }) {
     setConfirm(null);
+    if (watch) return;
     try {
       const res = await fetch(`/api/driver-jobs/${encodeURIComponent(id)}/log`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ step: pending.step, at: phoneLocalStamp(), detail: pending.message }),
+        body: JSON.stringify({ step: pending.step, at: phoneLocalStamp(), detail: pending.message, ...staffFields() }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data?.error ?? res.statusText);
@@ -158,7 +354,11 @@ export default function DriverJobScreen({ id: idProp }: { id?: string }) {
     setError(null);
     setResetting(true);
     try {
-      const res = await fetch(`/api/driver-jobs/${encodeURIComponent(id)}/reset`, { method: 'POST' });
+      const res = await fetch(`/api/driver-jobs/${encodeURIComponent(id)}/reset`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(staffFields()),
+      });
       const data = await res.json();
       if (!res.ok) throw new Error(data?.error ?? res.statusText);
       setJob(data.row as DriverJob);
@@ -228,14 +428,16 @@ export default function DriverJobScreen({ id: idProp }: { id?: string }) {
                   >
                     Log
                   </button>
-                  <button
-                    type="button"
-                    disabled={resetting}
-                    onClick={() => void resetJob()}
-                    className="block w-full border-t border-[#eaecf0] px-4 py-3 text-left text-base text-[#1c2430] disabled:opacity-60"
-                  >
-                    {resetting ? 'Resetting…' : 'Reset job'}
-                  </button>
+                  {!watch && (
+                    <button
+                      type="button"
+                      disabled={resetting}
+                      onClick={() => void resetJob()}
+                      className="block w-full border-t border-[#eaecf0] px-4 py-3 text-left text-base text-[#1c2430] disabled:opacity-60"
+                    >
+                      {resetting ? 'Resetting…' : 'Reset job'}
+                    </button>
+                  )}
                   <DriverLink
                     to="/home"
                     className="block w-full border-t border-[#eaecf0] px-4 py-3 text-left text-base text-[#1c2430]"
@@ -250,6 +452,16 @@ export default function DriverJobScreen({ id: idProp }: { id?: string }) {
         </div>
       </div>
 
+      {watch && (
+        <p className="mx-4 mb-3 rounded-xl bg-[#eff8ff] px-3 py-2 text-sm leading-snug text-[#175cd3]">
+          Watching only. These are the driver&apos;s buttons and fence alerts. Nothing on this screen can be tapped.
+        </p>
+      )}
+      {control && actorName && (
+        <p className="mx-4 mb-3 rounded-xl bg-[#fffaeb] px-3 py-2 text-sm leading-snug text-[#b54708]">
+          Controlling this job as {actorName}. Taps are stored in the job log as you, not the driver.
+        </p>
+      )}
       {error && <p className="mx-4 mb-3 rounded-xl bg-[#fee4e2] px-3 py-2 text-base text-[#b42318]">{error}</p>}
 
       {loading ? (
@@ -274,14 +486,22 @@ export default function DriverJobScreen({ id: idProp }: { id?: string }) {
             <ApproachMeters
               reading={approach.reading}
               loading={approach.loading}
-              corner={<DriverDiversionControl jobId={job.id} refreshKey={diversionRefresh} embedded />}
+              corner={<DriverDiversionControl jobId={job.id} refreshKey={diversionRefresh} embedded readOnly={watch} control={control} />}
             />
           ) : (
-            <DriverDiversionControl jobId={job.id} refreshKey={diversionRefresh} />
+            <DriverDiversionControl jobId={job.id} refreshKey={diversionRefresh} readOnly={watch} control={control} />
           )}
           <div className="flex flex-col gap-3 px-4 py-4 pb-[max(1.25rem,env(safe-area-inset-bottom))]">
+            <ConfirmJobDetails
+              key={`${job.id}:${job.step_0_click ?? 'open'}`}
+              job={job}
+              plates={plates}
+              watch={watch}
+              saving={savingStep === 0}
+              onConfirm={(values) => void confirmDetails(values)}
+            />
             {DRIVER_GATES.map((gate) => {
-              const active = gate.step === nextStep;
+              const active = gate.step === nextStep && (gate.step !== 1 || jobDetailsConfirmed(job));
               const complete = gate.step <= done;
               const manual = complete && gateManual(job, gate.step);
               const label = complete
@@ -296,7 +516,10 @@ export default function DriverJobScreen({ id: idProp }: { id?: string }) {
                   <button
                     type="button"
                     disabled={!active || savingStep != null || confirm != null}
-                    onClick={() => void passGate(gate.step)}
+                    onClick={() => {
+                      if (watch) return;
+                      void passGate(gate.step);
+                    }}
                     className={
                       active
                         ? 'flex h-[3.15rem] flex-1 items-center gap-2 rounded-2xl bg-[#1f9d55] px-4 text-left text-lg font-semibold text-white disabled:opacity-60'
@@ -305,7 +528,9 @@ export default function DriverJobScreen({ id: idProp }: { id?: string }) {
                   >
                     <span className="min-w-0 flex-1 truncate">{savingStep === gate.step ? 'Saving…' : label}</span>
                     {manual ? <span className="ml-2 shrink-0 text-xs font-medium text-[#667085]">Manual</span> : null}
-                    {marker === 'yellow' || marker === 'red' ? <ProximityMark kind={marker} /> : null}
+                    {marker === 'yellow' || marker === 'red' ? (
+                      <ProximityMark kind={marker} reminded={approach.reading?.remind === true} />
+                    ) : null}
                   </button>
                   {crossed ? (
                     <span className="w-12 shrink-0 text-right text-sm font-semibold tabular-nums text-[#b42318]" title={crossed}>

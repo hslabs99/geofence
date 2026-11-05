@@ -4,6 +4,7 @@ import { loadCurrentLocationSettings } from '@/lib/current-location-poll';
 import { ensureTblDriverJobsSchema } from '@/lib/ensure-tbl-driver-jobs-schema';
 import { listJobDiversions } from '@/lib/driver-diversions';
 import { recordDriverClick, readDriverJobLog } from '@/lib/driver-job-log';
+import { staffActorFromBody } from '@/lib/job-actor';
 import { DRIVER_GATES, DRIVER_JOB_COLUMNS, completedGateCount, isPhoneLocalStamp, type DriverJob } from '@/lib/driver-jobs';
 
 async function loadJob(id: string): Promise<DriverJob | null> {
@@ -43,7 +44,11 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     const job = await loadJob(id);
     if (!job) return NextResponse.json({ error: 'Job not found' }, { status: 404 });
 
-    const body = (await request.json()) as { step?: unknown; at?: unknown; detail?: unknown };
+    const body = (await request.json()) as { step?: unknown; at?: unknown; detail?: unknown; control?: unknown };
+    const actor = body.control === true ? await staffActorFromBody(body) : null;
+    if (body.control === true && !actor) {
+      return NextResponse.json({ error: 'Only an admin can control this job.' }, { status: 403 });
+    }
     const step = Number(body.step);
     const at = typeof body.at === 'string' ? body.at.trim() : '';
     const detail = typeof body.detail === 'string' ? body.detail.trim().slice(0, 500) : '';
@@ -64,6 +69,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       step,
       outcome: 'caution_decline',
       detail: detail || null,
+      actor,
     });
     return NextResponse.json({ ok: true });
   } catch (err) {

@@ -2,12 +2,14 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import DriverJobLog from '@/components/driver/DriverJobLog';
-import GateTrack, { type TruckMeters } from '@/components/driver/GateTrack';
+import GateTrack, { type CheckpointMark, type TruckMeters } from '@/components/driver/GateTrack';
 import { locationAgeSeconds } from '@/components/driver/useLocationAge';
 import {
   DRIVER_GATES,
   completedGateCount,
+  gateClock,
   gateManual,
+  minutesBetween,
   truckStage,
   wineryArrivalEta,
   type DriverJob,
@@ -28,6 +30,11 @@ const MODES = [
 
 function jobMode(done: number): string | null {
   return MODES.find((mode) => mode.match(done))?.title ?? null;
+}
+
+/** Started, and step 5 has not been recorded. */
+function isLiveJob(job: DriverJob): boolean {
+  return Boolean(job.step_1_click?.trim()) && !job.step_5_click?.trim();
 }
 
 /** Share of the fence-to-fence journey already behind the truck. */
@@ -106,6 +113,15 @@ function stageRank(done: number): number {
 function compareJobs(a: LiveDriverJob, b: LiveDriverJob): number {
   const doneA = completedGateCount(a);
   const doneB = completedGateCount(b);
+  const liveA = isLiveJob(a);
+  const liveB = isLiveJob(b);
+  if (liveA !== liveB) return liveA ? -1 : 1;
+  if (!liveA) {
+    const endedA = a.step_5_click?.trim() || '';
+    const endedB = b.step_5_click?.trim() || '';
+    if (endedA !== endedB) return endedB.localeCompare(endedA);
+    return a.job_id.localeCompare(b.job_id, undefined, { sensitivity: 'base' });
+  }
   const rank = stageRank(doneA) - stageRank(doneB);
   if (rank !== 0) return rank;
   if (doneA === 3) {
@@ -121,6 +137,22 @@ function compareJobs(a: LiveDriverJob, b: LiveDriverJob): number {
 
 function manualLabels(job: DriverJob): string[] {
   return DRIVER_GATES.filter((gate) => gateManual(job, gate.step)).map((gate) => `step ${gate.step} ${gate.title}`);
+}
+
+function checkpointText(
+  step: 2 | 3 | 4 | null,
+  alert: 'yellow' | 'red' | null,
+  crossedAt: string | null,
+  remind: boolean,
+): string | null {
+  if (step == null || alert == null) return null;
+  if (alert === 'yellow') return `Soft alert · close to the ${step === 4 ? 'winery' : 'vineyard'}`;
+  if (step === 3 && remind) return 'Hard alert · heading to the winery';
+  if (step === 3) {
+    const clock = gateClock(crossedAt);
+    return clock === '--:--' ? 'Hard alert · left the vineyard' : `Hard alert · left the vineyard · ${clock}`;
+  }
+  return step === 4 ? 'Hard alert · inside the winery' : 'Hard alert · inside the vineyard';
 }
 
 function travelMeters(job: DriverJob, place: LivePlace): TruckMeters | null {
@@ -150,7 +182,8 @@ function JobRow({ job }: { job: LiveDriverJob }) {
   const done = completedGateCount(job);
   const stage = truckStage(done);
   const manual = manualLabels(job);
-  const status = jobMode(done) ?? (stage ? stage.label.replace('\n', ' ') : 'Open');
+  const finished = Boolean(job.step_5_click?.trim());
+  const status = finished ? 'Finished' : jobMode(done) ?? (stage ? stage.label.replace('\n', ' ') : done === 0 ? 'Not started' : 'Open');
   const [openDetail, setOpenDetail] = useState(false);
   const [logOpen, setLogOpen] = useState(false);
   const [elapsed, setElapsed] = useState('00:00');
@@ -168,10 +201,32 @@ function JobRow({ job }: { job: LiveDriverJob }) {
   const fallbackEta = !liveEta && done === 3 ? wineryArrivalEta(job) : null;
   const travelled =
     total != null && remaining != null ? Math.min(total, Math.max(0, total - remaining)) : null;
-  const place = done === 1 || done === 2 ? job.vineyard_name : job.winery_name;
-  const leg =
-    done === 1 ? 'Step 1 → 2' : done === 2 ? 'Step 2' : done === 3 ? 'Step 3 → 4' : done === 4 ? 'Step 4' : 'Step';
+  const place = done === 0 ? job.vineyard_name : done === 1 || done === 2 ? job.vineyard_name : job.winery_name;
+  const leg = finished
+    ? 'Step 5'
+    : done === 1
+      ? 'Step 1 → 2'
+      : done === 2
+        ? 'Step 2'
+        : done === 3
+          ? 'Step 3 → 4'
+          : done === 4
+            ? 'Step 4'
+            : done === 0
+              ? 'Waiting'
+              : 'Step';
+  const jobMinutes = finished ? minutesBetween(job.step_1_click, job.step_5_click) : null;
   const mapHref = job.place.lat != null && job.place.lng != null ? `https://www.google.com/maps?q=${job.place.lat},${job.place.lng}` : null;
+  const alertText = checkpointText(
+    job.place.checkpointStep,
+    job.place.checkpointAlert,
+    job.place.checkpointCrossedAt,
+    job.place.checkpointRemind,
+  );
+  const checkpoint: CheckpointMark =
+    job.place.checkpointStep == null
+      ? null
+      : { step: job.place.checkpointStep, alert: job.place.checkpointAlert };
 
   useEffect(() => {
     if (!running) return;
@@ -202,6 +257,24 @@ function JobRow({ job }: { job: LiveDriverJob }) {
         </div>
         <div className="text-right text-xs">
           <p className="flex items-center justify-end gap-3">
+            <a
+              href={`/driver/job/${job.id}?mode=watch`}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="font-semibold text-[#175cd3] hover:underline"
+              title="Open a read-only view of this driver's buttons and fence alerts"
+            >
+              Watch
+            </a>
+            <a
+              href={`/driver/job/${job.id}?mode=control`}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="font-semibold text-[#b54708] hover:underline"
+              title="Open this job and act for the driver. Your name is stored in the job log."
+            >
+              Control
+            </a>
             <button type="button" onClick={() => setLogOpen(true)} className="font-semibold text-[#175cd3] hover:underline">
               Job log
             </button>
@@ -222,7 +295,9 @@ function JobRow({ job }: { job: LiveDriverJob }) {
           <p className={manual.length ? 'font-semibold text-[#b54708]' : 'text-zinc-500 dark:text-zinc-400'}>
             {manual.length ? `Manual override: ${manual.join(', ')}` : 'No manual override'}
           </p>
-          <p className="text-zinc-500 dark:text-zinc-400">{job.place.gpstimeNz ? `GPS ${job.place.gpstimeNz} NZ` : 'No GPS fix'}</p>
+          <p className="tabular-nums text-zinc-700 dark:text-zinc-200">
+            {job.place.gpstimeNz ? `Last GPS point ${job.place.gpstimeNz}` : 'No GPS fix'}
+          </p>
           {running && (
             <button
               type="button"
@@ -258,14 +333,32 @@ function JobRow({ job }: { job: LiveDriverJob }) {
                 {etaMins != null ? `${etaMins === 1 ? '1 min' : `${etaMins} min`} to ETA` : 'ETA —'}
               </p>
             </>
+          ) : finished ? (
+            <>
+              <p className="text-[11px] tabular-nums text-zinc-800">Ended {gateClock(job.step_5_click)}</p>
+              <p className="text-[11px] text-zinc-600">
+                {jobMinutes != null ? `${jobMinutes === 1 ? '1 min' : `${jobMinutes} min`} from start to end` : 'Start to end —'}
+              </p>
+            </>
           ) : (
             <p className="text-[11px] text-zinc-600">
-              {done === 2 ? 'Loading' : done === 4 ? 'Unloading' : 'On this step'} {travelledMin ?? '—'}
+              {done === 0 ? 'Not started' : done === 2 ? 'Loading' : done === 4 ? 'Unloading' : 'On this step'}{' '}
+              {done === 0 ? '' : (travelledMin ?? '—')}
             </p>
           )}
+          <p className="text-[11px] tabular-nums text-zinc-700">
+            {job.place.gpstimeNz ? `Last GPS ${job.place.gpstimeNz}` : 'No GPS fix'}
+          </p>
+          {alertText ? (
+            <p className={`text-[11px] font-semibold ${job.place.checkpointAlert === 'red' ? 'text-[#b42318]' : 'text-[#b54708]'}`}>
+              {alertText}
+            </p>
+          ) : null}
         </div>
         <div className="min-w-0 flex-1">
       <GateTrack
+        live
+        checkpoint={checkpoint}
         job={job}
         travelMeters={travelMeters(job, job.place)}
         placeNames={{ vineyard: job.vineyard_name, winery: job.winery_name }}
@@ -306,9 +399,18 @@ export default function RealTimeJobs() {
   const [filterWinery, setFilterWinery] = useState('');
   const [filterVineyard, setFilterVineyard] = useState('');
   const [filterStatus, setFilterStatus] = useState('');
+  const [onlyLive, setOnlyLive] = useState(false);
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  const [nextRefreshAt, setNextRefreshAt] = useState<number | null>(null);
+
+  useEffect(() => {
+    const id = setInterval(() => setNowMs(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
+    setNextRefreshAt(Date.now() + pollMs);
 
     async function load() {
       try {
@@ -328,12 +430,21 @@ export default function RealTimeJobs() {
     }
 
     void load();
-    const timer = setInterval(() => void load(), pollMs);
+    const timer = setInterval(() => {
+      setNextRefreshAt(Date.now() + pollMs);
+      void load();
+    }, pollMs);
     return () => {
       cancelled = true;
       clearInterval(timer);
     };
   }, [pollMs]);
+
+  const pollSeconds = Math.max(1, Math.round(pollMs / 1000));
+  const secondsLeft =
+    nextRefreshAt == null ? null : Math.min(pollSeconds, Math.max(0, Math.ceil((nextRefreshAt - nowMs) / 1000)));
+  const refreshLabel =
+    loading && nextRefreshAt == null ? 'Loading…' : secondsLeft == null ? '…' : secondsLeft <= 0 ? 'Refreshing…' : `Next refresh in ${secondsLeft}s`;
 
   const drivers = useMemo(() => distinct(rows, 'driver'), [rows]);
   const wineries = useMemo(() => distinct(rows, 'winery_name'), [rows]);
@@ -346,19 +457,22 @@ export default function RealTimeJobs() {
         if (filterWinery && row.winery_name?.trim() !== filterWinery) return false;
         if (filterVineyard && row.vineyard_name?.trim() !== filterVineyard) return false;
         if (filterStatus && jobMode(completedGateCount(row)) !== filterStatus) return false;
+        if (onlyLive && !isLiveJob(row)) return false;
         return true;
       })
       .sort(compareJobs);
-  }, [rows, filterDriver, filterWinery, filterVineyard, filterStatus]);
+  }, [rows, filterDriver, filterWinery, filterVineyard, filterStatus, onlyLive]);
 
   return (
     <div>
       <p className="mb-3 text-sm text-zinc-600 dark:text-zinc-400">
-        Open jobs only: the driver has passed step 1 and has not passed step 5. Each row is the same gate track the driver sees.
-        Green is a GPS tap, amber is a manual override, and the dashed time on Arrive winery is the ETA from the trip out.
-        The metres under the line are the estimated journey between the fences. While a truck is en route, that also shows
-        how far through the journey it is, the metres still to go, and a rough ETA from the share already covered.
-        Filter by mode together with a vineyard or winery to see what is about to arrive. Trucks coming in are listed first.
+        Every job stays on this list, including ones that have finished step 5, so the log is still here for a debrief.
+        Turn on Only live jobs to hide finished jobs and jobs that have not started. The long gaps are the roads to and from the vineyard.
+        Steps 2 and 3 sit inside the vineyard wheel, with a clock for how long the truck has been there.
+        Steps 4 and 5 sit inside the winery wheel.
+        On a road, the truck steps along in 20% increments of the fence-to-fence gap. Soft and hard marks match the alert on the driver button.
+        Each row shows the time of the last GPS point. The list tells you how many seconds remain until the next refresh.
+        Filter by mode together with a vineyard or winery to see what is about to arrive. Live trucks are listed first, then finished jobs with the latest ending time first.
       </p>
 
       <div className="mb-4 rounded-lg border border-zinc-200 bg-white p-3 dark:border-zinc-700 dark:bg-zinc-900">
@@ -408,7 +522,25 @@ export default function RealTimeJobs() {
               ))}
             </select>
           </div>
+          <label className="flex items-center gap-2 pb-1 text-xs font-medium text-zinc-700 dark:text-zinc-200">
+            <input
+              type="checkbox"
+              checked={onlyLive}
+              onChange={(e) => setOnlyLive(e.target.checked)}
+              className="h-4 w-4 rounded border-zinc-300"
+            />
+            Only live jobs
+          </label>
         </div>
+      </div>
+
+      <div className="sticky top-0 z-10 mb-3 flex items-center justify-between rounded-lg border border-zinc-200 bg-white px-3 py-2 text-sm dark:border-zinc-700 dark:bg-zinc-900">
+        <span className="text-zinc-600 dark:text-zinc-300">
+          {loading
+            ? 'Loading jobs…'
+            : `${visible.length} ${onlyLive ? 'live ' : ''}job${visible.length === 1 ? '' : 's'}`}
+        </span>
+        <span className="font-semibold tabular-nums text-zinc-900 dark:text-zinc-100">{refreshLabel}</span>
       </div>
 
       {error && (
@@ -416,9 +548,13 @@ export default function RealTimeJobs() {
       )}
 
       {loading ? (
-        <p className="text-zinc-600 dark:text-zinc-400">Loading open jobs…</p>
+        <p className="text-zinc-600 dark:text-zinc-400">Loading jobs…</p>
       ) : visible.length === 0 ? (
-        <p className="text-sm text-zinc-500 dark:text-zinc-400">No open jobs. A job appears here after the driver starts it, and leaves when the job ends.</p>
+        <p className="text-sm text-zinc-500 dark:text-zinc-400">
+          {onlyLive
+            ? 'No live jobs. A live job has started and has not finished step 5. Turn off Only live jobs to see finished jobs.'
+            : 'No jobs.'}
+        </p>
       ) : (
         <div className="flex flex-col gap-3">
           {visible.map((job) => (
@@ -428,8 +564,8 @@ export default function RealTimeJobs() {
       )}
 
       <p className="mt-3 text-xs text-zinc-500 dark:text-zinc-400">
-        {loading ? '…' : `${visible.length} open job${visible.length === 1 ? '' : 's'}`}
-        {` · refreshes every ${Math.round(pollMs / 1000)}s`}
+        {loading ? '…' : `${visible.length} ${onlyLive ? 'live ' : ''}job${visible.length === 1 ? '' : 's'}`}
+        {` · ${refreshLabel}`}
       </p>
     </div>
   );

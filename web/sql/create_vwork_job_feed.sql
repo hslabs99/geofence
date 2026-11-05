@@ -2,7 +2,8 @@
 -- Datetimes are the API strings, stored verbatim.
 CREATE TABLE IF NOT EXISTS vwork_job_feed (
   id                       bigserial PRIMARY KEY,
-  job_id                   varchar NOT NULL UNIQUE,
+  account                  varchar NOT NULL DEFAULT 'delegat',
+  job_id                   varchar NOT NULL,
   customer                 varchar,
   template                 varchar,
   worker                   varchar,
@@ -56,6 +57,9 @@ CREATE TABLE IF NOT EXISTS vwork_job_feed (
   custom_fields            text,
   fetched_at               text NOT NULL
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_vwork_job_feed_account_job_id
+  ON vwork_job_feed (account, job_id);
 
 CREATE INDEX IF NOT EXISTS idx_vwork_job_feed_fetched_at
   ON vwork_job_feed (fetched_at DESC);

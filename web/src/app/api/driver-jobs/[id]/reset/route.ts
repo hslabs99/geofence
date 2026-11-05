@@ -1,13 +1,19 @@
 import { NextResponse } from 'next/server';
 import { query } from '@/lib/db';
-import { clearDriverJobLog } from '@/lib/driver-job-log';
+import { clearDriverJobLog, recordStaffControl } from '@/lib/driver-job-log';
 import { ensureTblDriverJobsSchema } from '@/lib/ensure-tbl-driver-jobs-schema';
 import { DRIVER_JOB_COLUMNS, phoneLocalStamp, type DriverJob } from '@/lib/driver-jobs';
+import { staffActorFromBody } from '@/lib/job-actor';
 
 /** POST: clear step click times so the job can be tested again. */
-export async function POST(_request: Request, { params }: { params: Promise<{ id: string }> }) {
+export async function POST(request: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
     await ensureTblDriverJobsSchema();
+    const body = await request.json().catch(() => ({}));
+    const actor = (body as { control?: unknown }).control === true ? await staffActorFromBody(body) : null;
+    if ((body as { control?: unknown }).control === true && !actor) {
+      return NextResponse.json({ error: 'Only an admin can control this job.' }, { status: 403 });
+    }
     const { id } = await params;
     const jobId = Number(id);
     if (!Number.isInteger(jobId) || jobId <= 0) {
@@ -16,7 +22,9 @@ export async function POST(_request: Request, { params }: { params: Promise<{ id
 
     const rows = await query<DriverJob>(
       `UPDATE tbl_driver_jobs
-       SET step_1_click = NULL,
+       SET step_0_click = NULL,
+           confirmed_driver = NULL,
+           step_1_click = NULL,
            step_2_click = NULL,
            step_3_click = NULL,
            step_4_click = NULL,
@@ -30,7 +38,11 @@ export async function POST(_request: Request, { params }: { params: Promise<{ id
     );
     const row = rows[0];
     if (!row) return NextResponse.json({ error: 'Job not found' }, { status: 404 });
-    await clearDriverJobLog(jobId, phoneLocalStamp());
+    const at = phoneLocalStamp();
+    await clearDriverJobLog(jobId, at);
+    if (actor) {
+      await recordStaffControl({ driverJobId: jobId, at, detail: 'Reset the job', actor });
+    }
     return NextResponse.json({ row });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

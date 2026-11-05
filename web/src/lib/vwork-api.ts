@@ -272,15 +272,49 @@ export function isoLocal(date: Date): string {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}${sign}${pad(Math.floor(abs / 60))}:${pad(abs % 60)}`;
 }
 
-export function vworkApiKeyState(): 'missing' | 'placeholder' | 'ready' {
-  const key = process.env.VWORK_API_KEY?.trim() ?? '';
+export type VworkKeyState = 'missing' | 'placeholder' | 'ready';
+export type VworkAccountId = 'delegat' | 'others';
+
+export type VworkAccountStatus = {
+  id: VworkAccountId;
+  label: string;
+  state: VworkKeyState;
+};
+
+const ACCOUNT_DEFS: { id: VworkAccountId; label: string; envNames: string[] }[] = [
+  { id: 'delegat', label: 'Delegat', envNames: ['VWORK_API_KEY_DELEGAT', 'VWORK_API_KEY'] },
+  { id: 'others', label: 'Others', envNames: ['VWORK_API_KEY_OTHERS'] },
+];
+
+function keyState(raw: string): VworkKeyState {
+  const key = raw.trim();
   if (!key) return 'missing';
   if (/^replace/i.test(key) || key.toLowerCase() === 'placeholder' || key.toLowerCase() === 'your-api-key') return 'placeholder';
   return 'ready';
 }
 
+function accountRecords(): (VworkAccountStatus & { apiKey: string | null })[] {
+  return ACCOUNT_DEFS.map((def) => {
+    const raw = def.envNames.map((name) => process.env[name]?.trim() ?? '').find((value) => value !== '') ?? '';
+    const state = keyState(raw);
+    return { id: def.id, label: def.label, state, apiKey: state === 'ready' ? raw : null };
+  });
+}
+
+/** Delegat and Others, without the key values. */
+export function vworkAccountStatus(): VworkAccountStatus[] {
+  return accountRecords().map(({ id, label, state }) => ({ id, label, state }));
+}
+
+export function vworkApiKeyState(): VworkKeyState {
+  const accounts = accountRecords();
+  if (accounts.some((account) => account.state === 'ready')) return 'ready';
+  if (accounts.some((account) => account.state === 'placeholder')) return 'placeholder';
+  return 'missing';
+}
+
 export function vworkApiConfigured(): boolean {
-  return vworkApiKeyState() === 'ready';
+  return accountRecords().some((account) => account.apiKey);
 }
 
 function jobsUrl(): string {
@@ -288,16 +322,23 @@ function jobsUrl(): string {
   return `${base}/api/v5/jobs.xml`;
 }
 
-export async function listVworkJobsUpdatedSince(updatedAt: string): Promise<{ jobs: VworkFeedRow[]; pages: number; truncated: boolean }> {
-  const apiKey = process.env.VWORK_API_KEY?.trim();
-  if (!apiKey || !vworkApiConfigured()) throw new Error('VWORK_API_KEY is not set');
+export function readyVworkAccounts(): { id: VworkAccountId; label: string; apiKey: string }[] {
+  return accountRecords().flatMap((account) => (account.apiKey ? [{ id: account.id, label: account.label, apiKey: account.apiKey }] : []));
+}
+
+export async function listVworkJobsUpdatedSince(
+  updatedAt: string,
+  apiKey?: string,
+): Promise<{ jobs: VworkFeedRow[]; pages: number; truncated: boolean }> {
+  const key = apiKey?.trim() || readyVworkAccounts()[0]?.apiKey;
+  if (!key) throw new Error('No VWork API key is ready');
   const jobs: VworkFeedRow[] = [];
   let page = 1;
   let totalPages = 1;
   let pages = 0;
   while (page <= totalPages && pages < MAX_PAGES) {
     const url = new URL(jobsUrl());
-    url.searchParams.set('api_key', apiKey);
+    url.searchParams.set('api_key', key);
     url.searchParams.set('updated_at', updatedAt);
     url.searchParams.set('per_page', String(PER_PAGE));
     url.searchParams.set('page', String(page));
@@ -315,4 +356,100 @@ export async function listVworkJobsUpdatedSince(updatedAt: string): Promise<{ jo
     page += 1;
   }
   return { jobs, pages, truncated: page <= totalPages };
+}
+
+function apiBase(): string {
+  return (process.env.VWORK_API_BASE?.trim() || DEFAULT_API_BASE).replace(/\/$/, '');
+}
+
+/** Clock digits stay as the phone recorded them. The offset is Pacific/Auckland so VWork shows that same clock. */
+export function vworkCompletedAt(phoneStamp: string): string {
+  const match = phoneStamp.trim().match(/^(\d{4}-\d{2}-\d{2}) (\d{2}):(\d{2}):(\d{2})$/);
+  if (!match) throw new Error('Step time must be YYYY-MM-DD HH:MM:SS');
+  const year = Number(match[1].slice(0, 4));
+  const month = Number(match[1].slice(5, 7));
+  const day = Number(match[1].slice(8, 10));
+  const hour = Number(match[2]);
+  const minute = Number(match[3]);
+  const second = Number(match[4]);
+  const utc = new Date(Date.UTC(year, month - 1, day, hour, minute, second));
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat('en-US', {
+      timeZone: 'Pacific/Auckland',
+      hour12: false,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    })
+      .formatToParts(utc)
+      .map((part) => [part.type, part.value]),
+  );
+  const shownHour = parts.hour === '24' ? 0 : Number(parts.hour);
+  const shown = Date.UTC(Number(parts.year), Number(parts.month) - 1, Number(parts.day), shownHour, Number(parts.minute), Number(parts.second));
+  const minutes = Math.round((shown - utc.getTime()) / 60000);
+  const sign = minutes >= 0 ? '+' : '-';
+  const abs = Math.abs(minutes);
+  const offset = `${sign}${String(Math.floor(abs / 60)).padStart(2, '0')}:${String(abs % 60).padStart(2, '0')}`;
+  return `${match[1]}T${match[2]}:${match[3]}:${match[4]}${offset}`;
+}
+
+function xmlText(value: string): string {
+  return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+/** Marks one named step complete on the VWork job. Other fields stay as they are. */
+export async function completeVworkJobStep(input: {
+  account: VworkAccountId;
+  vworkJobId: string;
+  stepName: string;
+  completedAt: string;
+}): Promise<void> {
+  const account = readyVworkAccounts().find((item) => item.id === input.account);
+  if (!account) throw new Error(`${input.account} API key is not ready`);
+  const url = new URL(`${apiBase()}/api/v5/jobs/${encodeURIComponent(input.vworkJobId)}.xml`);
+  url.searchParams.set('api_key', account.apiKey);
+  const body = `<?xml version="1.0" encoding="utf-8"?><job><steps type="array"><step><name>${xmlText(input.stepName)}</name><completed_at>${xmlText(input.completedAt)}</completed_at></step></steps></job>`;
+  const res = await fetch(url, {
+    method: 'PUT',
+    headers: { 'Accept-Encoding': 'gzip', 'Content-Type': 'application/xml; charset=utf-8' },
+    body,
+    cache: 'no-store',
+  });
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error(`VWork step ${res.status}: ${text.replace(/\s+/g, ' ').slice(0, 240)}`);
+  }
+}
+
+export type VworkUserRow = { id: string; name: string };
+
+export async function listVworkUsers(apiKey: string): Promise<{ users: VworkUserRow[]; pages: number; truncated: boolean }> {
+  const users: VworkUserRow[] = [];
+  let page = 1;
+  let totalPages = 1;
+  let pages = 0;
+  while (page <= totalPages && pages < MAX_PAGES) {
+    const url = new URL(`${apiBase()}/api/v5/users.xml`);
+    url.searchParams.set('api_key', apiKey);
+    url.searchParams.set('per_page', String(PER_PAGE));
+    url.searchParams.set('page', String(page));
+    const res = await fetch(url, { headers: { 'Accept-Encoding': 'gzip' }, cache: 'no-store' });
+    const xml = await res.text();
+    if (!res.ok) throw new Error(`VWork users ${res.status}: ${xml.replace(/\s+/g, ' ').slice(0, 240)}`);
+    const root = parseXmlElement(xml);
+    const usersEl = root.name === 'users' ? root : root.children.find((child) => child.name === 'users');
+    const found = (usersEl?.children ?? root.children).filter((child) => child.name === 'user');
+    for (const user of found) {
+      const id = childText(user, 'id');
+      const name = childText(user, 'name');
+      if (id && name) users.push({ id, name });
+    }
+    totalPages = Number(usersEl?.attrs.total_pages ?? '1') || 1;
+    pages += 1;
+    page += 1;
+  }
+  return { users, pages, truncated: page <= totalPages };
 }

@@ -1,13 +1,14 @@
 import { query, execute } from '@/lib/db';
 import { deleteJobDiversions, listJobDiversions } from '@/lib/driver-diversions';
 import { DRIVER_GATES, gateManual, type DriverJob } from '@/lib/driver-jobs';
+import { type JobActor } from '@/lib/job-actor';
 
 export type ClickOutcome = 'caution_decline' | 'caution_accept' | 'auto_accept';
 
 export type DriverLogEvent = {
   id: string;
   at: string;
-  kind: 'fence' | 'click';
+  kind: 'fence' | 'click' | 'ghost';
   title: string;
   detail: string | null;
 };
@@ -35,6 +36,9 @@ export async function ensureDriverJobLogSchema(): Promise<void> {
   await execute(`
     CREATE INDEX IF NOT EXISTS idx_tbl_driver_job_log_job
       ON tbl_driver_job_log (driver_job_id, id)`);
+  await execute(`ALTER TABLE tbl_driver_job_log ADD COLUMN IF NOT EXISTS actor_name text`);
+  await execute(`ALTER TABLE tbl_driver_job_log ADD COLUMN IF NOT EXISTS actor_email text`);
+  await execute(`ALTER TABLE tbl_driver_job_log ADD COLUMN IF NOT EXISTS actor_role text`);
   logEnsured = true;
 }
 
@@ -57,22 +61,69 @@ export async function recordDriverClick(input: {
   step: number;
   outcome: ClickOutcome;
   detail: string | null;
+  actor?: JobActor | null;
 }): Promise<void> {
   await ensureDriverJobLogSchema();
   await execute(
-    `INSERT INTO tbl_driver_job_log (driver_job_id, at, kind, step, outcome, detail)
-     VALUES ($1, CAST($2 AS timestamp without time zone), 'click', $3, $4, $5)`,
-    [input.driverJobId, input.at, input.step, input.outcome, input.detail],
+    `INSERT INTO tbl_driver_job_log (driver_job_id, at, kind, step, outcome, detail, actor_name, actor_email, actor_role)
+     VALUES ($1, CAST($2 AS timestamp without time zone), 'click', $3, $4, $5, $6, $7, $8)`,
+    [
+      input.driverJobId,
+      input.at,
+      input.step,
+      input.outcome,
+      input.detail,
+      input.actor?.name ?? null,
+      input.actor?.email ?? null,
+      input.actor?.role ?? null,
+    ],
+  );
+}
+
+/** Admin opened the job, or did something that is not a gate tap. A repeat in the same second is ignored. */
+export async function recordStaffControl(input: {
+  driverJobId: number;
+  at: string;
+  detail: string;
+  actor: JobActor;
+}): Promise<void> {
+  await ensureDriverJobLogSchema();
+  const existing = await query<{ id: number }>(
+    `SELECT id
+     FROM tbl_driver_job_log
+     WHERE driver_job_id = $1
+       AND kind = 'ghost'
+       AND lower(btrim(actor_email)) = lower(btrim($2))
+       AND at = CAST($3 AS timestamp without time zone)
+       AND detail = $4
+     LIMIT 1`,
+    [input.driverJobId, input.actor.email, input.at, input.detail],
+  );
+  if (existing.length > 0) return;
+  await execute(
+    `INSERT INTO tbl_driver_job_log (driver_job_id, at, kind, step, outcome, detail, actor_name, actor_email, actor_role)
+     VALUES ($1, CAST($2 AS timestamp without time zone), 'ghost', NULL, NULL, $3, $4, $5, $6)`,
+    [input.driverJobId, input.at, input.detail, input.actor.name, input.actor.email, input.actor.role],
   );
 }
 
 type StoredClick = {
   id: number;
   at: string;
+  kind: string;
   step: number | null;
   outcome: string | null;
   detail: string | null;
+  actor_name: string | null;
+  actor_role: string | null;
 };
+
+function byActor(row: Pick<StoredClick, 'actor_name' | 'actor_role'>): string | null {
+  const name = row.actor_name?.trim() || '';
+  const role = row.actor_role?.trim() || '';
+  if (!name || !role) return null;
+  return `By ${role} ${name}`;
+}
 
 type FenceFix = {
   id: number;
@@ -94,6 +145,7 @@ function dayStart(stamp: string | null | undefined): string {
 }
 
 function gateTitle(step: number): string {
+  if (step === 0) return 'Confirm job details';
   return DRIVER_GATES.find((gate) => gate.step === step)?.title ?? `Step ${step}`;
 }
 
@@ -114,11 +166,14 @@ export async function readDriverJobLog(job: DriverJob): Promise<DriverLogEvent[]
   const stored = await query<StoredClick>(
     `SELECT id,
             to_char(at, 'YYYY-MM-DD HH24:MI:SS') AS at,
+            kind,
             step,
             outcome,
-            detail
+            detail,
+            actor_name,
+            actor_role
      FROM tbl_driver_job_log
-     WHERE driver_job_id = $1 AND kind = 'click'
+     WHERE driver_job_id = $1 AND kind IN ('click', 'ghost')
      ORDER BY id ASC`,
     [job.id],
   );
@@ -127,13 +182,24 @@ export async function readDriverJobLog(job: DriverJob): Promise<DriverLogEvent[]
   let seq = 0;
 
   for (const row of stored) {
+    if (row.kind === 'ghost') {
+      events.push({
+        id: `ghost-${row.id}`,
+        at: row.at,
+        kind: 'ghost',
+        title: 'Admin control',
+        detail: [byActor(row), row.detail?.trim() || null].filter(Boolean).join(' — ') || 'Admin control',
+        seq: seq++,
+      });
+      continue;
+    }
     if (!isOutcome(row.outcome) || row.step == null) continue;
     events.push({
       id: `click-${row.id}`,
       at: row.at,
       kind: 'click',
       title: `Step ${row.step} · ${gateTitle(row.step)}`,
-      detail: [OUTCOME_LABEL[row.outcome], row.detail?.trim() || null].filter(Boolean).join(' — ') || OUTCOME_LABEL[row.outcome],
+      detail: [byActor(row), OUTCOME_LABEL[row.outcome], row.detail?.trim() || null].filter(Boolean).join(' — '),
       seq: seq++,
     });
   }
@@ -152,6 +218,25 @@ export async function readDriverJobLog(job: DriverJob): Promise<DriverLogEvent[]
       detail: OUTCOME_LABEL[outcome],
       seq: seq++,
     });
+  }
+
+  if (job.step_0_click?.trim()) {
+    const at = job.step_0_click.trim();
+    const already = stored.some((row) => row.step === 0 && row.at === at && row.outcome !== 'caution_decline');
+    if (!already) {
+      const detail = [job.confirmed_driver, job.truck_rego, job.trailer_rego]
+        .map((value) => value?.trim() || '')
+        .filter(Boolean)
+        .join(' · ');
+      events.push({
+        id: `step-0-${at}`,
+        at,
+        kind: 'click',
+        title: 'Step 0 · Confirm job details',
+        detail: detail || OUTCOME_LABEL.auto_accept,
+        seq: seq++,
+      });
+    }
   }
 
   const since = dayStart(job.step_1_click) || dayStart(job.planned_start_time);

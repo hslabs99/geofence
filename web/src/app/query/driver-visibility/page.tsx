@@ -3,6 +3,8 @@
 import { useEffect, useMemo, useState } from 'react';
 import StaffOnlyGate from '@/components/StaffOnlyGate';
 import DriverAppPreview from '@/components/driver/DriverAppPreview';
+import { DriverLookup } from '@/components/driver/DriverLookup';
+import { JobQueueIssues } from '@/components/driver/JobQueueIssues';
 import RealTimeJobs from '@/components/driver/RealTimeJobs';
 
 type DriverJobRow = {
@@ -19,10 +21,22 @@ type DriverJobRow = {
 };
 
 type DeviceOption = { deviceName: string; imei: string };
+type DriverUserOption = { value: string; label: string };
 
 function cell(value: string | null | undefined): string {
   const s = value == null ? '' : String(value).trim();
   return s || '—';
+}
+
+function TrashIcon() {
+  return (
+    <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" className="h-4 w-4" aria-hidden="true">
+      <path strokeLinecap="round" d="M4.5 6.5h11" />
+      <path strokeLinecap="round" strokeLinejoin="round" d="M8 6.5V5.2A1.2 1.2 0 0 1 9.2 4h1.6A1.2 1.2 0 0 1 12 5.2v1.3" />
+      <path strokeLinecap="round" strokeLinejoin="round" d="M6.2 6.5l.6 9.1a1.2 1.2 0 0 0 1.2 1.1h4a1.2 1.2 0 0 0 1.2-1.1l.6-9.1" />
+      <path strokeLinecap="round" d="M8.5 9.2v4.6M11.5 9.2v4.6" />
+    </svg>
+  );
 }
 
 const emptyJobForm = {
@@ -41,6 +55,7 @@ function DriverVisibilityPageContent() {
   const [filterWinery, setFilterWinery] = useState('');
   const [filterVineyard, setFilterVineyard] = useState('');
   const [drivers, setDrivers] = useState<string[]>([]);
+  const [driverUsers, setDriverUsers] = useState<DriverUserOption[]>([]);
   const [wineries, setWineries] = useState<string[]>([]);
   const [vineyards, setVineyards] = useState<string[]>([]);
   const [fenceNames, setFenceNames] = useState<string[]>([]);
@@ -53,7 +68,45 @@ function DriverVisibilityPageContent() {
   const [editingId, setEditingId] = useState<number | null>(null);
   const [saving, setSaving] = useState(false);
   const [addError, setAddError] = useState<string | null>(null);
-  const [tab, setTab] = useState<'queue' | 'live' | 'app'>('queue');
+  const [pendingDelete, setPendingDelete] = useState<DriverJobRow | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [tab, setTab] = useState<'queue' | 'issues' | 'drivers' | 'live' | 'app'>('queue');
+  const [issueCount, setIssueCount] = useState(0);
+  const [driversMissing, setDriversMissing] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    const loadCount = () => {
+      fetch('/api/driver-jobs/queue-issues', { cache: 'no-store' })
+        .then(async (response) => {
+          const data = await response.json();
+          if (!response.ok) return;
+          if (!cancelled) setIssueCount(Number(data?.open ?? 0));
+        })
+        .catch(() => undefined);
+    };
+    loadCount();
+    const timer = setInterval(loadCount, 15000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [listVersion]);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch('/api/driver-jobs/drivers', { cache: 'no-store' })
+      .then(async (response) => {
+        const data = await response.json();
+        if (!response.ok || cancelled) return;
+        setDriversMissing(Number(data?.missing ?? 0));
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     const params = new URLSearchParams();
@@ -73,9 +126,29 @@ function DriverVisibilityPageContent() {
         if (cancelled) return;
         setRows(Array.isArray(d?.rows) ? (d.rows as DriverJobRow[]) : []);
         setDrivers(Array.isArray(d?.drivers) ? d.drivers.map((x: unknown) => String(x)) : []);
+        setDriverUsers(
+          Array.isArray(d?.driverUsers)
+            ? d.driverUsers.flatMap((user: { value?: unknown; label?: unknown }) => {
+                const value = String(user?.value ?? '').trim();
+                if (!value) return [];
+                const label = String(user?.label ?? '').trim() || value;
+                return [{ value, label }];
+              })
+            : [],
+        );
         setWineries(Array.isArray(d?.wineries) ? d.wineries.map((x: unknown) => String(x)) : []);
         setVineyards(Array.isArray(d?.vineyards) ? d.vineyards.map((x: unknown) => String(x)) : []);
         setFenceNames(Array.isArray(d?.fenceNames) ? d.fenceNames.map((x: unknown) => String(x)) : []);
+        const loaded = Array.isArray(d?.rows) ? (d.rows as DriverJobRow[]) : [];
+        setJobForm((current) => {
+          if (editingId == null) return current;
+          const row = loaded.find((item) => item.id === editingId);
+          if (!row) return current;
+          const winery = current.winery_geo_fence.trim() ? current.winery_geo_fence : (row.winery_geo_fence ?? '');
+          const vineyard = current.vineyard_geo_fence.trim() ? current.vineyard_geo_fence : (row.vineyard_geo_fence ?? '');
+          if (winery === current.winery_geo_fence && vineyard === current.vineyard_geo_fence) return current;
+          return { ...current, winery_geo_fence: winery, vineyard_geo_fence: vineyard };
+        });
       })
       .catch((e) => {
         if (cancelled) return;
@@ -131,16 +204,63 @@ function DriverVisibilityPageContent() {
     return [...devices, { deviceName: jobForm.imei, imei: jobForm.imei }];
   }, [devices, jobForm.imei]);
 
-  function setFence(key: 'winery_name' | 'vineyard_name' | 'winery_geo_fence' | 'vineyard_geo_fence', value: string) {
+  const driverOptions = useMemo(() => {
+    const current = jobForm.driver.trim();
+    if (!current || driverUsers.some((driver) => driver.value === current)) return driverUsers;
+    return [{ value: current, label: current }, ...driverUsers];
+  }, [driverUsers, jobForm.driver]);
+
+  function setName(key: 'winery_name' | 'vineyard_name', value: string) {
+    const fenceKey = key === 'winery_name' ? 'winery_geo_fence' : 'vineyard_geo_fence';
+    const exact = fenceNames.find((name) => name.toLowerCase() === value.trim().toLowerCase()) ?? '';
     setJobForm((current) => {
-      if (key === 'winery_name' && !current.winery_geo_fence.trim()) {
-        return { ...current, winery_name: value, winery_geo_fence: value };
-      }
-      if (key === 'vineyard_name' && !current.vineyard_geo_fence.trim()) {
-        return { ...current, vineyard_name: value, vineyard_geo_fence: value };
-      }
+      if (!current[fenceKey].trim() && exact) return { ...current, [key]: value, [fenceKey]: exact };
       return { ...current, [key]: value };
     });
+  }
+
+  function askDelete(row: DriverJobRow) {
+    setDeleteError(null);
+    setPendingDelete(row);
+  }
+
+  function closeDelete() {
+    if (deleting) return;
+    setPendingDelete(null);
+    setDeleteError(null);
+  }
+
+  useEffect(() => {
+    if (!pendingDelete || deleting) return;
+    function onKey(event: KeyboardEvent) {
+      if (event.key !== 'Escape') return;
+      setPendingDelete(null);
+      setDeleteError(null);
+    }
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [pendingDelete, deleting]);
+
+  async function confirmDelete() {
+    if (!pendingDelete || deleting) return;
+    setDeleting(true);
+    setDeleteError(null);
+    try {
+      const res = await fetch(`/api/driver-jobs/${pendingDelete.id}`, { method: 'DELETE' });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.error ?? res.statusText);
+      if (editingId === pendingDelete.id) {
+        setEditingId(null);
+        setJobForm(emptyJobForm);
+        setAddError(null);
+      }
+      setPendingDelete(null);
+      setListVersion((n) => n + 1);
+    } catch (err) {
+      setDeleteError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setDeleting(false);
+    }
   }
 
   function startEdit(row: DriverJobRow) {
@@ -197,7 +317,7 @@ function DriverVisibilityPageContent() {
       <div className="mb-4">
         <h1 className="text-2xl font-semibold text-zinc-900 dark:text-zinc-100">Driver Visibility</h1>
         <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
-          Job Queue lists and edits jobs. Real Time Jobs shows each open job on the same step track the driver sees. The driver app tab opens the same phone app used at /driver, as the driver you select.
+          Job Queue lists and edits jobs. Job Queue Issues is where a VWork winery, vineyard, or driver name still needs one match. Drivers lists the driver users and the TrackSolid IMEI for each driver ID. Real Time Jobs shows every job on the same step track the driver sees, and keeps a finished job on the list for the debrief. The driver app tab opens the same phone app used at /driver, as the driver you select.
         </p>
       </div>
 
@@ -205,6 +325,8 @@ function DriverVisibilityPageContent() {
         {(
           [
             ['queue', 'Job Queue'],
+            ['issues', issueCount > 0 ? `Job Queue Issues (${issueCount})` : 'Job Queue Issues'],
+            ['drivers', driversMissing > 0 ? `Drivers (${driversMissing})` : 'Drivers'],
             ['live', 'Real Time Jobs'],
             ['app', 'Driver app'],
           ] as const
@@ -212,17 +334,31 @@ function DriverVisibilityPageContent() {
           <button
             key={id}
             type="button"
-            onClick={() => setTab(id)}
+            onClick={() => {
+              setTab(id);
+              if (id === 'queue') setListVersion((version) => version + 1);
+            }}
             className={`-mb-px border-b-2 px-3 py-2 text-sm font-medium ${
               tab === id
                 ? 'border-zinc-900 text-zinc-900 dark:border-zinc-100 dark:text-zinc-100'
-                : 'border-transparent text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200'
+                : (id === 'issues' && issueCount > 0) || (id === 'drivers' && driversMissing > 0)
+                  ? 'border-transparent text-amber-700 dark:text-amber-300'
+                  : 'border-transparent text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200'
             }`}
           >
             {label}
           </button>
         ))}
       </div>
+
+      {tab === 'issues' && (
+        <JobQueueIssues
+          onChange={setIssueCount}
+          onResolved={() => setListVersion((version) => version + 1)}
+        />
+      )}
+
+      {tab === 'drivers' && <DriverLookup onChange={setDriversMissing} />}
 
       {tab === 'app' && <DriverAppPreview />}
 
@@ -243,24 +379,40 @@ function DriverVisibilityPageContent() {
         </h2>
         {addError && <p className="mb-2 text-sm text-red-600 dark:text-red-400">{addError}</p>}
         <div className="flex flex-wrap items-end gap-3">
-          {(
-            [
-              ['job_id', 'Job ID'],
-              ['driver', 'Driver'],
-              ['planned_start_time', 'Planned start'],
-            ] as const
-          ).map(([key, label]) => (
-            <div key={key}>
-              <label className="mb-0.5 block text-[11px] font-medium text-zinc-500 dark:text-zinc-400">{label}</label>
-              <input
-                type="text"
-                value={jobForm[key]}
-                onChange={(e) => setJobForm((f) => ({ ...f, [key]: e.target.value }))}
-                placeholder={key === 'planned_start_time' ? '2026-10-15 08:00' : undefined}
-                className={selectCls}
-              />
-            </div>
-          ))}
+          <div>
+            <label className="mb-0.5 block text-[11px] font-medium text-zinc-500 dark:text-zinc-400">Job ID</label>
+            <input
+              type="text"
+              value={jobForm.job_id}
+              onChange={(e) => setJobForm((f) => ({ ...f, job_id: e.target.value }))}
+              className={selectCls}
+            />
+          </div>
+          <div>
+            <label className="mb-0.5 block text-[11px] font-medium text-zinc-500 dark:text-zinc-400">Driver</label>
+            <select
+              value={jobForm.driver}
+              onChange={(e) => setJobForm((f) => ({ ...f, driver: e.target.value }))}
+              className={selectCls}
+            >
+              <option value="">Select driver</option>
+              {driverOptions.map((driver) => (
+                <option key={driver.value} value={driver.value}>
+                  {driver.label}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className="mb-0.5 block text-[11px] font-medium text-zinc-500 dark:text-zinc-400">Planned start</label>
+            <input
+              type="text"
+              value={jobForm.planned_start_time}
+              onChange={(e) => setJobForm((f) => ({ ...f, planned_start_time: e.target.value }))}
+              placeholder="2026-10-15 08:00"
+              className={selectCls}
+            />
+          </div>
           <div>
             <label className="mb-0.5 block text-[11px] font-medium text-zinc-500 dark:text-zinc-400">Device</label>
             <select
@@ -280,6 +432,20 @@ function DriverVisibilityPageContent() {
             [
               ['winery_name', 'Winery'],
               ['vineyard_name', 'Vineyard'],
+            ] as const
+          ).map(([key, label]) => (
+            <div key={key}>
+              <label className="mb-0.5 block text-[11px] font-medium text-zinc-500 dark:text-zinc-400">{label}</label>
+              <input
+                type="text"
+                value={jobForm[key]}
+                onChange={(e) => setName(key, e.target.value)}
+                className={`${selectCls} max-w-[22rem]`}
+              />
+            </div>
+          ))}
+          {(
+            [
               ['winery_geo_fence', 'Winery geofence'],
               ['vineyard_geo_fence', 'Vineyard geofence'],
             ] as const
@@ -288,7 +454,7 @@ function DriverVisibilityPageContent() {
               <label className="mb-0.5 block text-[11px] font-medium text-zinc-500 dark:text-zinc-400">{label}</label>
               <select
                 value={jobForm[key]}
-                onChange={(e) => setFence(key, e.target.value)}
+                onChange={(e) => setJobForm((current) => ({ ...current, [key]: e.target.value }))}
                 className={`${selectCls} max-w-[22rem]`}
               >
                 <option value="">Select fence</option>
@@ -324,7 +490,17 @@ function DriverVisibilityPageContent() {
       </form>
 
       <div className="mb-4 rounded-lg border border-zinc-200 bg-white p-3 dark:border-zinc-700 dark:bg-zinc-900">
-        <h2 className="mb-2 text-xs font-semibold uppercase tracking-wide text-zinc-500 dark:text-zinc-400">Filters</h2>
+        <div className="mb-2 flex items-center justify-between gap-3">
+          <h2 className="text-xs font-semibold uppercase tracking-wide text-zinc-500 dark:text-zinc-400">Filters</h2>
+          <button
+            type="button"
+            onClick={() => setListVersion((n) => n + 1)}
+            disabled={loading}
+            className="rounded border border-zinc-300 px-3 py-1 text-xs font-medium text-zinc-700 disabled:opacity-50 dark:border-zinc-600 dark:text-zinc-200"
+          >
+            {loading ? 'Refreshing…' : 'Refresh'}
+          </button>
+        </div>
         <div className="flex flex-wrap items-end gap-3">
           <div>
             <label className="mb-0.5 block text-[11px] font-medium text-zinc-500 dark:text-zinc-400">Driver</label>
@@ -437,13 +613,24 @@ function DriverVisibilityPageContent() {
                       {cell(row.vineyard_geo_fence)}
                     </td>
                     <td className="px-2 py-1.5">
-                      <button
-                        type="button"
-                        onClick={() => startEdit(row)}
-                        className="font-medium text-blue-700 hover:underline dark:text-blue-300"
-                      >
-                        Edit
-                      </button>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => startEdit(row)}
+                          className="font-medium text-blue-700 hover:underline dark:text-blue-300"
+                        >
+                          Edit
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => askDelete(row)}
+                          aria-label={`Delete job ${row.job_id || row.id}`}
+                          title="Delete job"
+                          className="rounded p-0.5 text-red-600 hover:bg-red-50 hover:text-red-800 dark:text-red-400 dark:hover:bg-red-950/40 dark:hover:text-red-300"
+                        >
+                          <TrashIcon />
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 ))
@@ -456,6 +643,64 @@ function DriverVisibilityPageContent() {
       <p className="mt-3 text-xs text-zinc-500 dark:text-zinc-400">
         {loading ? '…' : `${rows.length} job${rows.length === 1 ? '' : 's'}`}
       </p>
+
+      {pendingDelete && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="delete-job-title"
+        >
+          <div className="w-full max-w-lg rounded-lg bg-white p-5 shadow-xl dark:bg-zinc-900">
+            <h2 id="delete-job-title" className="text-lg font-semibold text-zinc-900 dark:text-zinc-100">
+              Delete this job?
+            </h2>
+            <p className="mt-2 text-sm text-zinc-600 dark:text-zinc-300">
+              This permanently removes the job below, including its step log and diversions. This cannot be undone.
+            </p>
+            <dl className="mt-4 grid grid-cols-[9rem_1fr] gap-x-3 gap-y-1 rounded border border-zinc-200 bg-zinc-50 p-3 text-sm dark:border-zinc-700 dark:bg-zinc-800">
+              {(
+                [
+                  ['Job ID', pendingDelete.job_id],
+                  ['Truck ID', pendingDelete.truck_id],
+                  ['IMEI', pendingDelete.imei],
+                  ['Driver', pendingDelete.driver],
+                  ['Planned start', pendingDelete.planned_start_time],
+                  ['Winery', pendingDelete.winery_name],
+                  ['Vineyard', pendingDelete.vineyard_name],
+                  ['Winery geofence', pendingDelete.winery_geo_fence],
+                  ['Vineyard geofence', pendingDelete.vineyard_geo_fence],
+                ] as const
+              ).map(([label, value]) => (
+                <div key={label} className="contents">
+                  <dt className="text-zinc-500 dark:text-zinc-400">{label}</dt>
+                  <dd className="font-medium text-zinc-900 dark:text-zinc-100">{cell(value)}</dd>
+                </div>
+              ))}
+            </dl>
+            {deleteError && <p className="mt-2 text-sm text-red-600 dark:text-red-400">{deleteError}</p>}
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                disabled={deleting}
+                onClick={closeDelete}
+                className="rounded border border-zinc-300 px-3 py-1.5 text-sm dark:border-zinc-600"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={deleting}
+                autoFocus
+                onClick={() => void confirmDelete()}
+                className="rounded bg-red-600 px-3 py-1.5 text-sm font-medium text-white disabled:opacity-40"
+              >
+                {deleting ? 'Deleting…' : 'Delete job'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
       </>
       )}
     </div>

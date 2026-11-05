@@ -15,6 +15,7 @@ export type ApproachReading = {
   beenInside?: boolean;
   proximity?: 'yellow' | 'red' | null;
   crossedAt?: string | null;
+  remind?: boolean;
   limitMeters?: number;
   gpstimeNz?: string | null;
   fetchedAt?: string | null;

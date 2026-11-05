@@ -5,7 +5,7 @@ import { useEffect, useState } from 'react';
 type DriverLogEvent = {
   id: string;
   at: string;
-  kind: 'fence' | 'click';
+  kind: 'fence' | 'click' | 'ghost';
   title: string;
   detail: string | null;
 };
@@ -108,7 +108,7 @@ export default function DriverJobLog({ jobId }: { jobId: number }) {
             {events.map((event) => (
               <li key={event.id} className="rounded-2xl bg-white px-4 py-3 shadow-[0_1px_2px_rgba(16,24,40,0.06)]">
                 <p className="text-xs tabular-nums text-[#667085]">{event.at}</p>
-                <p className={`mt-0.5 text-base font-semibold ${event.kind === 'fence' ? 'text-[#175cd3]' : 'text-[#1c2430]'}`}>
+                <p className={`mt-0.5 text-base font-semibold ${event.kind === 'fence' ? 'text-[#175cd3]' : event.kind === 'ghost' ? 'text-[#b54708]' : 'text-[#1c2430]'}`}>
                   {event.title}
                 </p>
                 {event.detail ? <p className="mt-0.5 text-sm leading-snug text-[#475467]">{event.detail}</p> : null}

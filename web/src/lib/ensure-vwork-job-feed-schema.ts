@@ -62,6 +62,20 @@ export async function ensureVworkJobFeedSchema(): Promise<void> {
       custom_fields            text,
       fetched_at               text NOT NULL
     )`);
+  await execute(`ALTER TABLE vwork_job_feed ADD COLUMN IF NOT EXISTS account varchar`);
+  await execute(`UPDATE vwork_job_feed SET account = 'delegat' WHERE account IS NULL OR btrim(account) = ''`);
+  await execute(`ALTER TABLE vwork_job_feed ALTER COLUMN account SET DEFAULT 'delegat'`);
+  await execute(`ALTER TABLE vwork_job_feed ALTER COLUMN account SET NOT NULL`);
+  await execute(`
+    DO $$
+    BEGIN
+      IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'vwork_job_feed_job_id_key') THEN
+        ALTER TABLE vwork_job_feed DROP CONSTRAINT vwork_job_feed_job_id_key;
+      END IF;
+    END $$`);
+  await execute(`
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_vwork_job_feed_account_job_id
+      ON vwork_job_feed (account, job_id)`);
   await execute(`
     CREATE INDEX IF NOT EXISTS idx_vwork_job_feed_fetched_at ON vwork_job_feed (fetched_at DESC)`);
   ensured = true;

@@ -14,10 +14,17 @@ type Settings = {
   lookbackDays: number;
 };
 
+type AccountStatus = {
+  id: string;
+  label: string;
+  state: 'missing' | 'placeholder' | 'ready';
+};
+
 type Status = {
   running: boolean;
   settings?: Settings;
   keyState?: 'missing' | 'placeholder' | 'ready';
+  accounts?: AccountStatus[];
   configured?: boolean;
   lastPolltime: string | null;
   lastSummary: string | null;
@@ -48,6 +55,7 @@ export function VworkApiPanel() {
   const [lookbackDays, setLookbackDays] = useState('2');
   const [dirty, setDirty] = useState(false);
   const [tick, setTick] = useState(0);
+  const [driverSync, setDriverSync] = useState<string | null>(null);
 
   const load = useCallback(() => {
     fetch('/api/admin/vwork-api', { cache: 'no-store' })
@@ -80,6 +88,34 @@ export function VworkApiPanel() {
     setLookbackDays(String(status.settings.lookbackDays));
   }, [dirty, status]);
 
+  async function syncDrivers() {
+    setBusy(true);
+    setError(null);
+    setDriverSync(null);
+    try {
+      const response = await fetch('/api/admin/vwork-api', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'sync-drivers' }),
+      });
+      const data = (await response.json()) as Status & {
+        drivers?: { created?: string[]; already?: number; scanned?: number };
+      };
+      if (!response.ok) throw new Error(data.error ?? response.statusText);
+      setStatus(stamp(data));
+      const created = data.drivers?.created ?? [];
+      setDriverSync(
+        created.length > 0
+          ? `Added ${created.length} driver${created.length === 1 ? '' : 's'}: ${created.join(', ')}. Password is 123456.`
+          : `No new driver codes. ${data.drivers?.already ?? 0} already in Users, from ${data.drivers?.scanned ?? 0} VWork driver codes.`,
+      );
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function act(action: 'start' | 'stop' | 'once' | 'settings') {
     setBusy(true);
     setError(null);
@@ -110,13 +146,18 @@ export function VworkApiPanel() {
   return (
     <div className="mt-4">
       <p className="max-w-3xl text-sm text-zinc-600 dark:text-zinc-400">
-        Polls the VWork jobs API and stores jobs that are not already in VWork jobs. Open jobs from that feed are added to the Driver Visibility job queue. Completed and cancelled jobs stay in the feed. Planned times are stored as the API sent them. Closing the browser leaves the poll running.
+        Polls both VWork accounts, Delegat and Others, and stores jobs that are not already in VWork jobs. Open jobs from that feed are added to the Driver Visibility job queue. Completed and cancelled jobs stay in the feed. Planned times are stored as the API sent them. Closing the browser leaves the poll running.
       </p>
+      <ul className="mt-3 space-y-1 text-sm text-zinc-700 dark:text-zinc-200">
+        {(status?.accounts ?? []).map((account) => (
+          <li key={account.id}>
+            {account.label}: {account.state === 'ready' ? 'key ready' : account.state === 'placeholder' ? 'key is still a placeholder' : 'key is not set'}
+          </li>
+        ))}
+      </ul>
       {keyState !== 'ready' && (
         <p className="mt-3 text-sm text-amber-800 dark:text-amber-200">
-          {keyState === 'placeholder'
-            ? 'VWORK_API_KEY is still the placeholder. The poll can run, and it will queue jobs already in the feed, but it will not call VWork until the key is replaced.'
-            : 'VWORK_API_KEY is not set. The poll can queue jobs already in the feed, but it will not call VWork until the key is added.'}
+          Neither VWORK_API_KEY_DELEGAT nor VWORK_API_KEY_OTHERS is ready. The poll can queue jobs already in the feed, and it will not call VWork.
         </p>
       )}
       {error && (
@@ -187,7 +228,16 @@ export function VworkApiPanel() {
         >
           Run once
         </button>
+        <button
+          type="button"
+          disabled={busy || keyState !== 'ready'}
+          onClick={() => void syncDrivers()}
+          className="rounded border border-zinc-300 px-3 py-1.5 text-sm dark:border-zinc-600"
+        >
+          Sync Drivers
+        </button>
       </div>
+      {driverSync && <p className="mt-3 text-sm text-zinc-700 dark:text-zinc-200">{driverSync}</p>}
       <p className="mt-3 text-sm text-zinc-700 dark:text-zinc-200">
         {status?.running ? `Running. Next poll in ${nextIn ?? '—'}s.` : 'Stopped.'}
         {status?.lastPolltime ? ` Last poll ${status.lastPolltime}.` : ''}

@@ -2,11 +2,12 @@
 
 import { useEffect, useState } from 'react';
 import { DriverLink, useDriverNav } from '@/components/driver/driver-nav';
-import { DRIVER_GATES, completedGateCount, truckStage, type DriverJob } from '@/lib/driver-jobs';
+import { DRIVER_GATES, completedGateCount, jobDetailsConfirmed, truckStage, type DriverJob } from '@/lib/driver-jobs';
 
 function nextLabel(job: DriverJob): string {
   const done = completedGateCount(job);
   if (done >= DRIVER_GATES.length) return 'Finished';
+  if (done === 0 && !jobDetailsConfirmed(job)) return 'Confirm job details';
   return truckStage(done)?.label ?? DRIVER_GATES[0].title;
 }
 

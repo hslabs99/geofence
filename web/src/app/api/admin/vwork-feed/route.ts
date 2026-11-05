@@ -32,7 +32,7 @@ export async function POST(request: Request) {
     return NextResponse.json({ ok: true, ...result, queue, ...list });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    const status = message.includes('VWORK_API_KEY') ? 400 : 500;
+    const status = message.includes('VWork API key') || message.includes('VWORK_API_KEY') ? 400 : 500;
     return NextResponse.json({ error: message }, { status });
   }
 }

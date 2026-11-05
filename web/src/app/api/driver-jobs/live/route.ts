@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 import { loadLiveDriverJobs } from '@/lib/live-driver-jobs';
 
-/** GET: open driver jobs (step 1 recorded, step 5 not yet) with vineyard and winery metres. */
+/** GET: every driver job, including finished ones, with vineyard and winery metres. */
 export async function GET() {
   try {
     const data = await loadLiveDriverJobs();

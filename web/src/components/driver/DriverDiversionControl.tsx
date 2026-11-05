@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react';
 import { locationAgeSeconds } from '@/components/driver/useLocationAge';
 import { phoneLocalStamp } from '@/lib/driver-jobs';
+import { staffActorPayload } from '@/lib/staff-session';
 
 type DiversionType = { id: number; name: string };
 type JobDiversion = {
@@ -40,10 +41,16 @@ export default function DriverDiversionControl({
   jobId,
   refreshKey = 0,
   embedded = false,
+  readOnly = false,
+  control = false,
 }: {
   jobId: number;
   refreshKey?: number;
   embedded?: boolean;
+  /** Staff watch mode. The button stays visible and does not start or stop anything. */
+  readOnly?: boolean;
+  /** Staff control mode. Starts and stops are stored as the admin. */
+  control?: boolean;
 }) {
   const [types, setTypes] = useState<DiversionType[]>([]);
   const [open, setOpen] = useState<JobDiversion | null>(null);
@@ -87,14 +94,25 @@ export default function DriverDiversionControl({
     return () => clearInterval(id);
   }, [open?.started_at]);
 
+  function staffFields(): { control?: true; actor?: { email: string; role: 'Super Admin' | 'Admin' } } {
+    if (!control) return {};
+    const actor = staffActorPayload();
+    return actor ? { control: true, actor } : {};
+  }
+
   async function start() {
+    if (readOnly) return;
+    if (control && !staffActorPayload()) {
+      setError('Sign in as an admin to control this job.');
+      return;
+    }
     setBusy(true);
     setError(null);
     try {
       const res = await fetch(`/api/driver-jobs/${jobId}/diversions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ typeName, note, expected, at: phoneLocalStamp() }),
+        body: JSON.stringify({ typeName, note, expected, at: phoneLocalStamp(), ...staffFields() }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data?.error ?? res.statusText);
@@ -111,13 +129,18 @@ export default function DriverDiversionControl({
   }
 
   async function stop() {
+    if (readOnly) return;
+    if (control && !staffActorPayload()) {
+      setError('Sign in as an admin to control this job.');
+      return;
+    }
     setBusy(true);
     setError(null);
     try {
       const res = await fetch(`/api/driver-jobs/${jobId}/diversions/stop`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ at: phoneLocalStamp() }),
+        body: JSON.stringify({ at: phoneLocalStamp(), ...staffFields() }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data?.error ?? res.statusText);
@@ -139,6 +162,7 @@ export default function DriverDiversionControl({
             tabIndex={-1}
             onMouseDown={(event) => event.preventDefault()}
             onClick={() => {
+              if (readOnly) return;
               setError(null);
               setStopping(true);
             }}
@@ -152,6 +176,7 @@ export default function DriverDiversionControl({
             tabIndex={-1}
             onMouseDown={(event) => event.preventDefault()}
             onClick={() => {
+              if (readOnly) return;
               setError(null);
               setStarting(true);
             }}

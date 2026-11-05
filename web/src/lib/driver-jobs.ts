@@ -21,7 +21,12 @@ export type DriverJob = {
   vineyard_name: string | null;
   winery_geo_fence: string | null;
   vineyard_geo_fence: string | null;
+  step_0_click: string | null;
   step_1_click: string | null;
+  truck_rego: string | null;
+  trailer_rego: string | null;
+  /** Name typed at step 0. Blank on the next job; plates are remembered on the truck. */
+  confirmed_driver: string | null;
   step_2_click: string | null;
   step_3_click: string | null;
   step_4_click: string | null;
@@ -43,7 +48,11 @@ export const DRIVER_JOB_COLUMNS = `
   vineyard_name,
   winery_geo_fence,
   vineyard_geo_fence,
+  to_char(step_0_click, 'YYYY-MM-DD HH24:MI:SS') AS step_0_click,
   to_char(step_1_click, 'YYYY-MM-DD HH24:MI:SS') AS step_1_click,
+  truck_rego,
+  trailer_rego,
+  confirmed_driver,
   to_char(step_2_click, 'YYYY-MM-DD HH24:MI:SS') AS step_2_click,
   to_char(step_3_click, 'YYYY-MM-DD HH24:MI:SS') AS step_3_click,
   to_char(step_4_click, 'YYYY-MM-DD HH24:MI:SS') AS step_4_click,
@@ -52,6 +61,11 @@ export const DRIVER_JOB_COLUMNS = `
   step_3_manual,
   step_4_manual
 `;
+
+/** Step 0 is saved. Step 1 stays locked until this is true. */
+export function jobDetailsConfirmed(job: { step_0_click?: string | null }): boolean {
+  return Boolean(job.step_0_click?.trim());
+}
 
 /** The driver confirmed this gate while the GPS reading did not. */
 export function gateManual(job: Pick<DriverJob, 'step_2_manual' | 'step_3_manual' | 'step_4_manual'>, step: number): boolean {
@@ -84,6 +98,16 @@ export function minutesBetween(earlier: string | null | undefined, later: string
   const delta = end - start;
   if (delta < 0) return null;
   return Math.round(delta / 60000);
+}
+
+/** Whole seconds from an earlier stamp to a later one. Same verbatim clock math as minutesBetween. */
+export function secondsBetween(earlier: string | null | undefined, later: string | null | undefined): number | null {
+  const start = stampUtcMs(earlier);
+  const end = stampUtcMs(later);
+  if (start == null || end == null) return null;
+  const delta = end - start;
+  if (delta < 0) return null;
+  return Math.round(delta / 1000);
 }
 
 /** Parse YYYY-MM-DD HH:MM:SS as calendar numbers. Difference math uses UTC fields so the clock is not shifted. */

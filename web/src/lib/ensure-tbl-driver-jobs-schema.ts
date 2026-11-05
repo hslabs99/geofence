@@ -55,6 +55,7 @@ export async function ensureTblDriverJobsSchema(): Promise<void> {
       END IF;
     END $$`);
 
+  await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS step_0_click timestamp without time zone`);
   await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS step_1_click timestamp without time zone`);
   await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS step_2_click timestamp without time zone`);
   await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS step_3_click timestamp without time zone`);
@@ -67,6 +68,22 @@ export async function ensureTblDriverJobsSchema(): Promise<void> {
   await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS step_3_manual boolean`);
   await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS step_4_manual boolean`);
   await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS log_cleared_at timestamp without time zone`);
+  await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS vwork_account text`);
+  await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS vwork_job_id text`);
+  await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS vwork_step_1_name text`);
+  await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS vwork_step_2_name text`);
+  await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS vwork_step_3_name text`);
+  await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS vwork_step_4_name text`);
+  await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS vwork_step_5_name text`);
+  await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS truck_rego text`);
+  await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS trailer_rego text`);
+  await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS confirmed_driver text`);
+  await execute(`
+    CREATE TABLE IF NOT EXISTS tbl_truck_plates (
+      truck_id      text PRIMARY KEY,
+      truck_rego    text,
+      trailer_rego  text
+    )`);
 
   driverJobsEnsured = true;
 }
