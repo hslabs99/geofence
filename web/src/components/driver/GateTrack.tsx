@@ -1,7 +1,7 @@
 'use client';
 
 import { useLocationAge } from '@/components/driver/useLocationAge';
-import { DRIVER_GATES, completedGateCount, gateClock, gateManual, minutesBetween, secondsBetween, truckStage, wineryArrivalEta, type DriverJob, type TruckLoad } from '@/lib/driver-jobs';
+import { DRIVER_GATES, completedGateCount, gateActivity, gateClock, gateFenceHover, gateShownGps, gateStartDate, minutesBetween, secondsBetween, truckStage, wineryArrivalEta, type DriverJob, type GateFenceKind, type TruckLoad } from '@/lib/driver-jobs';
 
 function TruckIcon({ load }: { load: TruckLoad }) {
   return (
@@ -82,6 +82,27 @@ function JourneyOnBar({
   );
 }
 
+const FENCE_WORD: Record<GateFenceKind, string> = { hard: 'Hard', soft: 'Soft', manual: 'Manual' };
+
+function fenceCircleClass(kind: GateFenceKind): string {
+  if (kind === 'soft') return 'bg-[#e0a100] text-[11px] font-semibold text-[#1c2430] shadow-sm';
+  if (kind === 'manual') return 'bg-[#b54708] text-[11px] font-semibold text-white shadow-sm';
+  return 'bg-[#1f9d55] text-[11px] font-semibold text-white shadow-sm';
+}
+
+function FenceWord({ kind, gps }: { kind: GateFenceKind; gps: string | null }) {
+  const tone = kind === 'hard' ? 'text-[#1f9d55]' : 'text-[#b54708]';
+  const clock = gps ? gateClock(gps) : null;
+  return (
+    <span className="mt-1 text-center">
+      <span className={`block text-[8px] font-bold uppercase leading-none ${tone}`}>{FENCE_WORD[kind]}</span>
+      {clock && clock !== '--:--' ? (
+        <span className={`mt-0.5 block text-[9px] font-semibold tabular-nums leading-none ${tone}`}>{clock}</span>
+      ) : null}
+    </span>
+  );
+}
+
 /** Portrait gate strip: done gates show the tap time, the truck sits on the way to the next gate. */
 function PhoneGateTrack({
   job,
@@ -128,20 +149,22 @@ function PhoneGateTrack({
           </div>
         ))}
       </div>
-      <div className={`relative mt-1 ${journey?.meters != null ? 'h-[5.4rem]' : 'h-[4.6rem]'}`}>
+      <div className={`relative mt-1 ${journey?.meters != null ? 'min-h-[5.4rem]' : 'min-h-[4.6rem]'}`}>
         <div className="absolute left-[10%] right-[10%] top-[1.05rem] h-[2px] bg-[#d5dbe3]" />
         <div className="relative grid grid-cols-5">
           {DRIVER_GATES.map((gate, index) => {
             const stamp = job[gate.key];
             const complete = index < done;
-            const manual = complete && gateManual(job, gate.step);
+            const activity = complete ? gateActivity(job, gate.step) : null;
+            const gps = activity ? gateShownGps(job, gate.step) : null;
+            const hover = activity ? gateFenceHover(job, gate.step) : null;
             const estimate = !complete && gate.step === 4 && eta ? (eta.match(/(\d{2}:\d{2})$/)?.[1] ?? eta) : null;
             return (
-              <div key={gate.step} className="flex flex-col items-center">
+              <div key={gate.step} className="flex flex-col items-center" title={hover ?? undefined}>
                 <div
                   className={
-                    manual
-                      ? 'flex h-9 w-9 items-center justify-center rounded-full bg-[#b54708] text-[11px] font-semibold text-white shadow-sm'
+                    activity
+                      ? `flex h-9 w-9 items-center justify-center rounded-full ${fenceCircleClass(activity)}`
                       : complete
                         ? 'flex h-9 w-9 items-center justify-center rounded-full bg-[#1f9d55] text-[11px] font-semibold text-white shadow-sm'
                         : estimate
@@ -151,13 +174,7 @@ function PhoneGateTrack({
                 >
                   {complete ? gateClock(stamp) : estimate ?? '--:--'}
                 </div>
-                {manual && (
-                  <span className="mt-1 text-center text-[8px] font-bold uppercase leading-tight text-[#b54708]">
-                    Manual
-                    <br />
-                    no GPS
-                  </span>
-                )}
+                {activity ? <FenceWord kind={activity} gps={gps} /> : null}
               </div>
             );
           })}
@@ -257,23 +274,25 @@ function LiveGateDot({
   const gate = DRIVER_GATES[step - 1];
   const done = completedGateCount(job);
   const complete = step <= done;
-  const manual = complete && gateManual(job, step);
+  const activity = complete ? gateActivity(job, step) : null;
+  const gps = activity ? gateShownGps(job, step) : null;
+  const hover = activity ? gateFenceHover(job, step) : null;
   const estimate = !complete && step === 4 && eta ? (eta.match(/(\d{2}:\d{2})$/)?.[1] ?? eta) : null;
   const stamp = job[gate.key];
-  const face =
-    manual
-      ? 'bg-[#b54708] text-[11px] font-semibold text-white shadow-sm'
-      : complete
-        ? 'bg-[#1f9d55] text-[11px] font-semibold text-white shadow-sm'
-        : alert === 'red'
-          ? 'border-2 border-[#f04438] bg-[#fef3f2] text-[11px] font-semibold text-[#b42318]'
-          : alert === 'yellow'
-            ? 'border-2 border-[#e0a100] bg-[#fffaeb] text-[11px] font-semibold text-[#b54708]'
-            : estimate
-              ? 'border-2 border-dashed border-[#1f9d55] bg-[#f7f8fa] text-[10px] font-semibold text-[#1f9d55]'
-              : 'border-2 border-dashed border-[#c5ccd6] bg-[#f7f8fa] text-[11px] font-medium text-[#b0b7c3]';
+  const startedOn = step === 1 && complete ? gateStartDate(stamp) : null;
+  const face = activity
+    ? fenceCircleClass(activity)
+    : complete
+      ? 'bg-[#1f9d55] text-[11px] font-semibold text-white shadow-sm'
+      : alert === 'red'
+        ? 'border-2 border-[#f04438] bg-[#fef3f2] text-[11px] font-semibold text-[#b42318]'
+        : alert === 'yellow'
+          ? 'border-2 border-[#e0a100] bg-[#fffaeb] text-[11px] font-semibold text-[#b54708]'
+          : estimate
+            ? 'border-2 border-dashed border-[#1f9d55] bg-[#f7f8fa] text-[10px] font-semibold text-[#1f9d55]'
+            : 'border-2 border-dashed border-[#c5ccd6] bg-[#f7f8fa] text-[11px] font-medium text-[#b0b7c3]';
   return (
-    <div className="relative z-[2] flex flex-col items-center">
+    <div className="relative z-[2] flex flex-col items-center" title={hover ?? undefined}>
       <div className={`flex h-9 w-9 items-center justify-center rounded-full ${face}`}>
         {complete ? gateClock(stamp) : estimate ?? '--:--'}
       </div>
@@ -281,11 +300,11 @@ function LiveGateDot({
         <span className={`mt-1 text-[8px] font-bold uppercase leading-none ${alert === 'red' ? 'text-[#b42318]' : 'text-[#b54708]'}`}>
           {alert === 'red' ? 'Hard' : 'Soft'}
         </span>
-      ) : manual ? (
-        <span className="mt-1 text-center text-[8px] font-bold uppercase leading-tight text-[#b54708]">
-          Manual
-          <br />
-          no GPS
+      ) : activity ? (
+        <FenceWord kind={activity} gps={gps} />
+      ) : startedOn ? (
+        <span className="mt-1 whitespace-nowrap text-[9px] font-semibold leading-none text-[#344054]" title={stamp ?? undefined}>
+          {startedOn}
         </span>
       ) : (
         <span className="mt-1 block h-[8px]" />

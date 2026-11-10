@@ -6,7 +6,12 @@ import Sidebar from '@/components/Sidebar';
 /** Staff shell. The driver phone app under /driver does not use the sidebar or staff page frame. */
 export default function AppChrome({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
-  if (pathname === '/driver' || pathname.startsWith('/driver/')) {
+  if (
+    pathname === '/driver' ||
+    pathname.startsWith('/driver/') ||
+    pathname === '/resolve-mappings' ||
+    pathname.startsWith('/resolve-mappings/')
+  ) {
     return <>{children}</>;
   }
 

@@ -23,6 +23,7 @@ env:
   # VWork jobs API: set VWORK_API_KEY_DELEGAT, VWORK_API_KEY_OTHERS, and VWORK_API_BASE
   # in the App Hosting environment. Each key polls that vWork account. Leave a key as
   # replace-me until that account should be polled. The poll reads them at runtime.
+  # Mapping emails use https://geofence--cel-geosystem.us-east4.hosted.app unless PUBLIC_APP_URL is set.
   - variable: TRACKSOLID_APP_KEY
     secret: TRACKSOLID_APP_KEY
     availability: [RUNTIME]

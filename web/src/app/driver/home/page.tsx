@@ -75,8 +75,14 @@ export default function DriverHomePage() {
                 to={`/job/${job.id}`}
                 className="block rounded-2xl bg-white px-4 py-4 shadow-[0_1px_2px_rgba(16,24,40,0.06)]"
               >
-                <div className="text-xl font-semibold text-[#175cd3] underline decoration-[#175cd3]/40 underline-offset-2">
-                  {job.job_id}
+                <div className="min-w-0">
+                  {job.company_name?.trim() ? (
+                    <div className="truncate text-sm font-medium text-[#344054]">{job.company_name}</div>
+                  ) : null}
+                  {job.group_name?.trim() ? <div className="truncate text-sm text-[#667085]">{job.group_name}</div> : null}
+                  <div className="text-xl font-semibold text-[#175cd3] underline decoration-[#175cd3]/40 underline-offset-2">
+                    {job.job_id}
+                  </div>
                 </div>
                 <p className="mt-1 text-base text-[#1c2430]">
                   {[job.vineyard_name, job.winery_name].filter(Boolean).join(' → ') || 'No vineyard or winery'}

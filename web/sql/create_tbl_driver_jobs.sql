@@ -21,6 +21,18 @@ CREATE TABLE IF NOT EXISTS tbl_driver_jobs (
   step_2_manual       boolean,
   step_3_manual       boolean,
   step_4_manual       boolean,
+  step_2_fence        text,
+  step_3_fence        text,
+  step_4_fence        text,
+  step_2_soft_gps     timestamp without time zone,
+  step_2_hard_gps     timestamp without time zone,
+  step_3_soft_gps     timestamp without time zone,
+  step_3_hard_gps     timestamp without time zone,
+  step_4_soft_gps     timestamp without time zone,
+  step_4_hard_gps     timestamp without time zone,
+  step_2_gps_done     boolean,
+  step_3_gps_done     boolean,
+  step_4_gps_done     boolean,
   log_cleared_at      timestamp without time zone
 );
 

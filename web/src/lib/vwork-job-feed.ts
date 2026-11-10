@@ -1,7 +1,9 @@
 import { execute, query } from '@/lib/db';
 import { ensureVworkJobFeedSchema } from '@/lib/ensure-vwork-job-feed-schema';
 import {
+  groupNamesForIds,
   isoLocal,
+  listVworkGroups,
   listVworkJobsUpdatedSince,
   readyVworkAccounts,
   vworkAccountStatus,
@@ -31,6 +33,7 @@ const INSERT_COLUMNS = [
   'asset_name',
   'customer_third_party_id',
   'groups',
+  'group_name',
   'create_date',
   'source_updated_at',
   'step_1_name',
@@ -84,6 +87,7 @@ export type VworkFeedListRow = {
   account: string | null;
   job_id: string;
   customer: string | null;
+  group_name: string | null;
   template: string | null;
   worker: string | null;
   status: string | null;
@@ -111,6 +115,7 @@ async function writeLog(details: Record<string, unknown>): Promise<void> {
   }
 }
 
+/** Job ids do not overlap across the two APIs, so a stored id is that job wherever it is. */
 async function existingJobIds(ids: string[]): Promise<Set<string>> {
   if (ids.length === 0) return new Set();
   const rows = await query<{ job_id: string }>(
@@ -120,13 +125,35 @@ async function existingJobIds(ids: string[]): Promise<Set<string>> {
   return new Set(rows.map((row) => row.job_id));
 }
 
-async function existingFeedIds(account: VworkAccountId, ids: string[]): Promise<Set<string>> {
+async function rememberTruckSources(account: VworkAccountId, truckIds: string[], seenAt: string): Promise<void> {
+  const ids = [...new Set(truckIds.map((id) => id.trim()).filter((id) => id !== ''))];
+  for (const truckId of ids) {
+    await execute(
+      `INSERT INTO vwork_truck_sources (account, truck_id, first_seen_at)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (account, lower(btrim(truck_id))) DO NOTHING`,
+      [account, truckId, seenAt],
+    );
+  }
+}
+
+async function existingFeedIds(ids: string[]): Promise<Set<string>> {
   if (ids.length === 0) return new Set();
   const rows = await query<{ job_id: string }>(
-    `SELECT job_id::text AS job_id FROM vwork_job_feed WHERE account = $1 AND job_id::text = ANY($2::text[])`,
-    [account, ids],
+    `SELECT job_id::text AS job_id FROM vwork_job_feed WHERE job_id::text = ANY($1::text[])`,
+    [ids],
   );
   return new Set(rows.map((row) => row.job_id));
+}
+
+async function fillGroupName(jobId: string, groupName: string | null): Promise<void> {
+  if (!groupName) return;
+  await execute(
+    `UPDATE vwork_job_feed
+     SET group_name = $2
+     WHERE job_id = $1 AND (group_name IS NULL OR btrim(group_name) = '')`,
+    [jobId, groupName],
+  );
 }
 
 async function insertFeedRow(row: VworkFeedRow, fetchedAt: string, account: VworkAccountId): Promise<void> {
@@ -138,7 +165,7 @@ async function insertFeedRow(row: VworkFeedRow, fetchedAt: string, account: Vwor
   });
   const placeholders = columns.map((_, index) => `$${index + 1}`).join(', ');
   await execute(
-    `INSERT INTO vwork_job_feed (${columns.join(', ')}) VALUES (${placeholders}) ON CONFLICT (account, job_id) DO NOTHING`,
+    `INSERT INTO vwork_job_feed (${columns.join(', ')}) VALUES (${placeholders}) ON CONFLICT (job_id) DO NOTHING`,
     values,
   );
 }
@@ -165,11 +192,21 @@ export async function checkVworkJobFeed(lookbackDays: number): Promise<{
   for (const account of readyVworkAccounts()) {
     try {
       const listed = await listVworkJobsUpdatedSince(updatedSince, account.apiKey);
+      const groupList = await listVworkGroups(account.apiKey).catch(() => ({ groups: new Map<string, string>() }));
       const ids = [...new Set(listed.jobs.map((job) => job.job_id))];
-      const [inJobs, inFeed] = await Promise.all([existingJobIds(ids), existingFeedIds(account.id, ids)]);
+      const [inJobs, inFeed] = await Promise.all([existingJobIds(ids), existingFeedIds(ids)]);
+      await rememberTruckSources(
+        account.id,
+        listed.jobs.map((job) => job.truck_id ?? ''),
+        fetchedAt,
+      );
       let inserted = 0;
       for (const job of listed.jobs) {
-        if (inJobs.has(job.job_id) || inFeed.has(job.job_id)) continue;
+        job.group_name = groupNamesForIds(job.groups, groupList.groups);
+        if (inJobs.has(job.job_id) || inFeed.has(job.job_id)) {
+          await fillGroupName(job.job_id, job.group_name);
+          continue;
+        }
         await insertFeedRow(job, fetchedAt, account.id);
         inFeed.add(job.job_id);
         inserted += 1;
@@ -250,7 +287,7 @@ export async function listVworkJobFeed(limit = 80): Promise<{
   const [countRows, rows] = await Promise.all([
     query<{ n: number }>('SELECT count(*)::int AS n FROM vwork_job_feed'),
     query<VworkFeedListRow>(
-      `SELECT account, job_id, customer, template, worker, status, planned_start_time, vineyard_name, delivery_winery, truck_id, truck_rego, fetched_at
+      `SELECT account, job_id, customer, group_name, template, worker, status, planned_start_time, vineyard_name, delivery_winery, truck_id, truck_rego, fetched_at
        FROM vwork_job_feed
        ORDER BY id DESC
        LIMIT $1`,

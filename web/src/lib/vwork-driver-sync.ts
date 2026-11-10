@@ -3,7 +3,7 @@ import { execute, query } from '@/lib/db';
 import { ensureDriverUserSchema } from '@/lib/ensure-driver-user';
 import { listVworkUsers, readyVworkAccounts } from '@/lib/vwork-api';
 
-/** Driver codes such as 01-HBD: digits, a hyphen, then letters. */
+/** VWork driver IDs: digits, a hyphen, then letters. 01-HBD and 2026-Lee both pass. */
 const DRIVER_CODE = /^\d+-[A-Za-z]+$/;
 const DEFAULT_PASSWORD = '123456';
 

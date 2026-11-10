@@ -6,6 +6,7 @@ import { ensureVworkJobFeedSchema } from '@/lib/ensure-vwork-job-feed-schema';
 import { linkQueuedJobsToVwork } from '@/lib/vwork-job-steps';
 import { applyVworkDriverResolution, refreshDriverImeisFromTracksolid } from '@/lib/driver-imei-sync';
 import { applyVworkFenceResolution } from '@/lib/vwork-fence-resolve';
+import { notifyUnresolvedMappings } from '@/lib/mapping-mail';
 
 const CLOSED_STATUS = new Set(['completed', 'complete', 'cancelled', 'canceled', 'archived', 'deleted', 'invoiced']);
 const BATCH = 200;
@@ -19,6 +20,8 @@ type FeedJob = {
   planned_start_time: string | null;
   vineyard_name: string | null;
   delivery_winery: string | null;
+  customer: string | null;
+  group_name: string | null;
   truck_id: string | null;
   truck_rego: string | null;
   trailer_rego: string | null;
@@ -125,6 +128,14 @@ async function settleImportedJobs(): Promise<void> {
   await applyVworkDriverResolution();
 }
 
+async function notifyAfterImport(): Promise<void> {
+  try {
+    await notifyUnresolvedMappings();
+  } catch (err) {
+    console.error('[mapping-mail]', err);
+  }
+}
+
 /** Copies open VWork feed jobs that are not already in the driver job queue. */
 export async function enqueueVworkFeedJobs(): Promise<VworkFeedQueueResult> {
   await ensureVworkJobFeedSchema();
@@ -135,11 +146,12 @@ export async function enqueueVworkFeedJobs(): Promise<VworkFeedQueueResult> {
   await linkQueuedJobsToVwork();
   const pending = await query<FeedJob>(
     `SELECT f.account, f.job_id, f.worker, f.driver_name, f.status, f.planned_start_time,
-            f.vineyard_name, f.delivery_winery, f.truck_id, f.truck_rego, f.trailer_rego,
+            f.vineyard_name, f.delivery_winery, f.customer, f.group_name, f.truck_id, f.truck_rego, f.trailer_rego,
             f.step_1_name, f.step_2_name, f.step_3_name, f.step_4_name, f.step_5_name
      FROM vwork_job_feed f
      WHERE NOT EXISTS (
-       SELECT 1 FROM tbl_driver_jobs j WHERE j.job_id = f.job_id
+       SELECT 1 FROM tbl_driver_jobs j
+       WHERE j.job_id = f.job_id
      )
      ORDER BY f.id
      LIMIT $1`,
@@ -151,6 +163,7 @@ export async function enqueueVworkFeedJobs(): Promise<VworkFeedQueueResult> {
   const skippedClosed = batch.length - open.length;
   if (open.length === 0) {
     await settleImportedJobs();
+    await notifyAfterImport();
     return { considered: batch.length, queued: 0, skippedClosed, remaining };
   }
 
@@ -187,12 +200,15 @@ export async function enqueueVworkFeedJobs(): Promise<VworkFeedQueueResult> {
     const inserted = await execute(
       `INSERT INTO tbl_driver_jobs (
          job_id, truck_id, imei, driver, planned_start_time, winery_name, vineyard_name,
-         winery_geo_fence, vineyard_geo_fence, truck_rego, trailer_rego, vwork_account, vwork_job_id,
+         winery_geo_fence, vineyard_geo_fence, truck_rego, trailer_rego, vwork_account, company_name, group_name, vwork_job_id,
          vwork_step_1_name, vwork_step_2_name, vwork_step_3_name, vwork_step_4_name, vwork_step_5_name
        )
        SELECT $1, $2, $3, $4, CAST(NULLIF($5, '') AS timestamp without time zone), $6, $7, $8, $9,
-              $10, $11, $12, $13, $14, $15, $16, $17, $18
-       WHERE NOT EXISTS (SELECT 1 FROM tbl_driver_jobs WHERE job_id = $1)`,
+              $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20
+       WHERE NOT EXISTS (
+         SELECT 1 FROM tbl_driver_jobs existing
+         WHERE existing.job_id = $1
+       )`,
       [
         job.job_id,
         truckId,
@@ -206,6 +222,8 @@ export async function enqueueVworkFeedJobs(): Promise<VworkFeedQueueResult> {
         job.truck_rego?.trim() || null,
         job.trailer_rego?.trim() || null,
         job.account,
+        job.customer?.trim() || null,
+        job.group_name?.trim() || null,
         job.job_id,
         job.step_1_name,
         job.step_2_name,
@@ -218,5 +236,6 @@ export async function enqueueVworkFeedJobs(): Promise<VworkFeedQueueResult> {
   }
 
   await settleImportedJobs();
+  await notifyAfterImport();
   return { considered: batch.length, queued, skippedClosed, remaining };
 }

@@ -31,7 +31,19 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
            step_5_click = NULL,
            step_2_manual = NULL,
            step_3_manual = NULL,
-           step_4_manual = NULL
+           step_4_manual = NULL,
+           step_2_fence = NULL,
+           step_3_fence = NULL,
+           step_4_fence = NULL,
+           step_2_soft_gps = NULL,
+           step_2_hard_gps = NULL,
+           step_3_soft_gps = NULL,
+           step_3_hard_gps = NULL,
+           step_4_soft_gps = NULL,
+           step_4_hard_gps = NULL,
+           step_2_gps_done = NULL,
+           step_3_gps_done = NULL,
+           step_4_gps_done = NULL
        WHERE id = $1
        RETURNING ${DRIVER_JOB_COLUMNS}`,
       [jobId],

@@ -177,6 +177,13 @@ export async function listOpenVworkFenceIssues(): Promise<{
     createdAt: string;
     jobs: { id: number; jobId: string; driver: string | null; plannedStart: string | null }[];
   }[];
+  resolved: {
+    id: number;
+    kind: 'Winery' | 'Vineyard' | 'Driver';
+    vworkName: string;
+    mappedTo: string;
+    resolvedAt: string;
+  }[];
 }> {
   try {
     await refreshDriverImeisFromTracksolid(false);
@@ -239,7 +246,32 @@ export async function listOpenVworkFenceIssues(): Promise<{
     });
   }
   const openRows = await query<{ n: number }>(`SELECT count(*)::int AS n FROM vwork_job_queue_issues WHERE status = 'open'`);
-  return { open: openRows[0]?.n ?? applied.open, fences, drivers, rows };
+  const resolvedRows = await query<{
+    id: number;
+    kind: 'Winery' | 'Vineyard' | 'Driver';
+    vwork_name: string;
+    resolved_fence: string | null;
+    resolved_at: string | null;
+  }>(
+    `SELECT id, kind, vwork_name, resolved_fence, resolved_at
+     FROM vwork_job_queue_issues
+     WHERE status = 'resolved' AND resolved_at IS NOT NULL
+     ORDER BY resolved_at DESC, id DESC
+     LIMIT 40`,
+  );
+  return {
+    open: openRows[0]?.n ?? applied.open,
+    fences,
+    drivers,
+    rows,
+    resolved: resolvedRows.map((row) => ({
+      id: row.id,
+      kind: row.kind,
+      vworkName: row.vwork_name,
+      mappedTo: (row.resolved_fence ?? '').trim(),
+      resolvedAt: row.resolved_at ?? '',
+    })),
+  };
 }
 
 async function resolveDriverIssue(issueId: number, vworkName: string, driverLabel: string): Promise<void> {

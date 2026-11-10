@@ -13,6 +13,10 @@ export type DriverGateKey = (typeof DRIVER_GATES)[number]['key'];
 export type DriverJob = {
   id: number;
   job_id: string;
+  /** VWork customer. Shown above the job id. */
+  company_name: string | null;
+  /** VWork group name. Shown above the job id. */
+  group_name: string | null;
   truck_id: string | null;
   imei: string | null;
   driver: string | null;
@@ -31,15 +35,30 @@ export type DriverJob = {
   step_3_click: string | null;
   step_4_click: string | null;
   step_5_click: string | null;
-  /** True when the driver confirmed the click while GPS did not. */
+  /** True when the driver confirmed the click from outside the soft fence. */
   step_2_manual: boolean | null;
   step_3_manual: boolean | null;
   step_4_manual: boolean | null;
+  /** Fence the truck was in when the driver tapped: hard, soft, or manual. */
+  step_2_fence: GateFenceKind | null;
+  step_3_fence: GateFenceKind | null;
+  step_4_fence: GateFenceKind | null;
+  /** GPS clock for the soft-band crossing nearest this tap. Verbatim, same digits as gpstime_nz. */
+  step_2_soft_gps: string | null;
+  step_2_hard_gps: string | null;
+  step_3_soft_gps: string | null;
+  step_3_hard_gps: string | null;
+  step_4_soft_gps: string | null;
+  step_4_hard_gps: string | null;
+  /** VWork account this job was polled from: delegat or others. */
+  vwork_account: string | null;
 };
 
 export const DRIVER_JOB_COLUMNS = `
   id,
   job_id,
+  company_name,
+  group_name,
   truck_id,
   imei,
   driver,
@@ -59,20 +78,223 @@ export const DRIVER_JOB_COLUMNS = `
   to_char(step_5_click, 'YYYY-MM-DD HH24:MI:SS') AS step_5_click,
   step_2_manual,
   step_3_manual,
-  step_4_manual
+  step_4_manual,
+  step_2_fence,
+  step_3_fence,
+  step_4_fence,
+  to_char(step_2_soft_gps, 'YYYY-MM-DD HH24:MI:SS') AS step_2_soft_gps,
+  to_char(step_2_hard_gps, 'YYYY-MM-DD HH24:MI:SS') AS step_2_hard_gps,
+  to_char(step_3_soft_gps, 'YYYY-MM-DD HH24:MI:SS') AS step_3_soft_gps,
+  to_char(step_3_hard_gps, 'YYYY-MM-DD HH24:MI:SS') AS step_3_hard_gps,
+  to_char(step_4_soft_gps, 'YYYY-MM-DD HH24:MI:SS') AS step_4_soft_gps,
+  to_char(step_4_hard_gps, 'YYYY-MM-DD HH24:MI:SS') AS step_4_hard_gps,
+  vwork_account
 `;
+
+/** Where the truck was when the driver tapped a fence gate. */
+export type GateFenceKind = 'hard' | 'soft' | 'manual';
+
+/**
+ * Hard is inside the polygon. Soft is outside it but inside the confirm band.
+ * Manual is outside that band, or there is no GPS fix. A vineyard departure that
+ * already crossed the polygon stays hard even when the tap itself is past the band.
+ */
+export function gateFenceKind(input: {
+  step: 2 | 3 | 4;
+  meters: number | null;
+  beenInside: boolean;
+  limitMeters: number;
+}): GateFenceKind {
+  if (input.meters === 0) return 'hard';
+  if (input.meters != null && input.meters <= input.limitMeters) return 'soft';
+  if (input.step === 3 && input.beenInside) return 'hard';
+  return 'manual';
+}
+
+function storedFence(value: string | null | undefined): GateFenceKind | null {
+  if (value === 'hard' || value === 'soft' || value === 'manual') return value;
+  return null;
+}
+
+/** Stored fence for a completed gate. Null on steps that are not a fence tap. */
+export function gateFence(
+  job: Pick<DriverJob, 'step_2_fence' | 'step_3_fence' | 'step_4_fence'>,
+  step: number,
+): GateFenceKind | null {
+  if (step === 2) return storedFence(job.step_2_fence);
+  if (step === 3) return storedFence(job.step_3_fence);
+  if (step === 4) return storedFence(job.step_4_fence);
+  return null;
+}
+
+/**
+ * Hard, soft, or manual for a fence tap.
+ * Older rows with no stored fence still count a manual confirm as manual.
+ */
+export function gateActivity(
+  job: Pick<DriverJob, 'step_2_manual' | 'step_3_manual' | 'step_4_manual' | 'step_2_fence' | 'step_3_fence' | 'step_4_fence'>,
+  step: number,
+): GateFenceKind | null {
+  const stored = gateFence(job, step);
+  if (stored) return stored;
+  if (step === 2 && job.step_2_manual === true) return 'manual';
+  if (step === 3 && job.step_3_manual === true) return 'manual';
+  if (step === 4 && job.step_4_manual === true) return 'manual';
+  return null;
+}
 
 /** Step 0 is saved. Step 1 stays locked until this is true. */
 export function jobDetailsConfirmed(job: { step_0_click?: string | null }): boolean {
   return Boolean(job.step_0_click?.trim());
 }
 
-/** The driver confirmed this gate while the GPS reading did not. */
-export function gateManual(job: Pick<DriverJob, 'step_2_manual' | 'step_3_manual' | 'step_4_manual'>, step: number): boolean {
-  if (step === 2) return job.step_2_manual === true;
-  if (step === 3) return job.step_3_manual === true;
-  if (step === 4) return job.step_4_manual === true;
-  return false;
+export type MetersFix = { at: string; meters: number | null };
+
+/**
+ * GPS times for the soft band and the hard polygon nearest this tap.
+ * Enter keeps the first sample inside. Leave keeps the last sample still inside.
+ */
+export function fenceGpsAtClick(
+  fixes: MetersFix[],
+  limitMeters: number,
+  clickAt: string,
+  edge: 'enter' | 'leave',
+): { softAt: string | null; hardAt: string | null } {
+  const soft: string[] = [];
+  const hard: string[] = [];
+  let prevSoft = false;
+  let prevHard = false;
+  let prevAt: string | null = null;
+  for (const fix of fixes) {
+    const at = fix.at?.trim() ?? '';
+    if (!at || fix.meters == null) continue;
+    const inSoft = fix.meters <= limitMeters;
+    const inHard = fix.meters === 0;
+    if (edge === 'enter') {
+      if (inSoft && !prevSoft) soft.push(at);
+      if (inHard && !prevHard) hard.push(at);
+    } else if (prevAt) {
+      if (!inSoft && prevSoft) soft.push(prevAt);
+      if (!inHard && prevHard) hard.push(prevAt);
+    }
+    prevSoft = inSoft;
+    prevHard = inHard;
+    prevAt = at;
+  }
+  return { softAt: closestStamp(soft, clickAt), hardAt: closestStamp(hard, clickAt) };
+}
+
+function closestStamp(stamps: string[], clickAt: string): string | null {
+  const click = stampUtcMs(clickAt);
+  let best: string | null = null;
+  let bestDist = Number.POSITIVE_INFINITY;
+  for (const stamp of stamps) {
+    const ms = stampUtcMs(stamp);
+    if (ms == null || click == null) continue;
+    const dist = Math.abs(ms - click);
+    if (dist < bestDist) {
+      best = stamp;
+      bestDist = dist;
+    }
+  }
+  return best ?? stamps[0] ?? null;
+}
+
+type FenceGpsJob = Pick<
+  DriverJob,
+  | 'step_2_click'
+  | 'step_3_click'
+  | 'step_4_click'
+  | 'step_2_manual'
+  | 'step_3_manual'
+  | 'step_4_manual'
+  | 'step_2_fence'
+  | 'step_3_fence'
+  | 'step_4_fence'
+  | 'step_2_soft_gps'
+  | 'step_2_hard_gps'
+  | 'step_3_soft_gps'
+  | 'step_3_hard_gps'
+  | 'step_4_soft_gps'
+  | 'step_4_hard_gps'
+>;
+
+function gpsStamp(job: FenceGpsJob, step: number, edge: 'soft' | 'hard'): string | null {
+  const value =
+    step === 2
+      ? edge === 'soft'
+        ? job.step_2_soft_gps
+        : job.step_2_hard_gps
+      : step === 3
+        ? edge === 'soft'
+          ? job.step_3_soft_gps
+          : job.step_3_hard_gps
+        : step === 4
+          ? edge === 'soft'
+            ? job.step_4_soft_gps
+            : job.step_4_hard_gps
+          : null;
+  const stamp = value?.trim() ?? '';
+  return stamp || null;
+}
+
+/** GPS clock shown under a hard or soft gate. The circle itself stays the button time. */
+export function gateShownGps(job: FenceGpsJob, step: number): string | null {
+  const kind = gateActivity(job, step);
+  if (kind !== 'hard' && kind !== 'soft') return null;
+  return gpsStamp(job, step, kind);
+}
+
+function gapSentence(earlierName: string, earlier: string, laterName: string, later: string): string | null {
+  const forward = minutesBetween(earlier, later);
+  if (forward === 0) return `${earlierName} and ${laterName} are the same minute`;
+  if (forward != null) {
+    const mins = forward === 1 ? '1 min' : `${forward} min`;
+    return `${laterName} is ${mins} after ${earlierName}`;
+  }
+  const back = minutesBetween(later, earlier);
+  if (back === 0) return `${earlierName} and ${laterName} are the same minute`;
+  if (back != null) {
+    const mins = back === 1 ? '1 min' : `${back} min`;
+    return `${earlierName} is ${mins} after ${laterName}`;
+  }
+  return null;
+}
+
+/** Hover text: button time, soft GPS, hard GPS, and the gap between them. */
+export function gateFenceHover(job: FenceGpsJob, step: number): string | null {
+  const kind = gateActivity(job, step);
+  if (kind == null || (step !== 2 && step !== 3 && step !== 4)) return null;
+  const clickKey = step === 2 ? 'step_2_click' : step === 3 ? 'step_3_click' : 'step_4_click';
+  const click = job[clickKey]?.trim() || '';
+  const button = click || '--:--';
+  if (kind === 'manual') return `Button ${button}. Outside the soft fence, so there is no GPS fence time.`;
+  const soft = gpsStamp(job, step, 'soft');
+  const hard = gpsStamp(job, step, 'hard');
+  const verb = step === 3 ? 'Left' : 'Entered';
+  const parts = [
+    `Button ${button}`,
+    soft ? `${verb} the soft fence ${soft}` : 'No soft fence time',
+    hard ? `${verb} the hard fence ${hard}` : 'No hard fence time',
+  ];
+  if (soft && hard) {
+    const between = gapSentence('the soft fence', soft, 'the hard fence', hard);
+    if (between) parts.push(between.charAt(0).toUpperCase() + between.slice(1));
+  }
+  const shown = kind === 'hard' ? hard : soft;
+  if (shown && click) {
+    const between = gapSentence('the button', click, 'the GPS', shown);
+    if (between) parts.push(between.charAt(0).toUpperCase() + between.slice(1));
+  }
+  return `${parts.join('. ')}.`;
+}
+
+/** The driver tapped this gate from outside the soft fence. */
+export function gateManual(
+  job: Pick<DriverJob, 'step_2_manual' | 'step_3_manual' | 'step_4_manual' | 'step_2_fence' | 'step_3_fence' | 'step_4_fence'>,
+  step: number,
+): boolean {
+  return gateActivity(job, step) === 'manual';
 }
 
 export type TruckLoad = 'empty' | 'half' | 'full';
@@ -160,6 +382,24 @@ export function gateClock(stamp: string | null | undefined): string {
   if (stamp == null) return '--:--';
   const match = String(stamp).match(/(\d{2}):(\d{2})/);
   return match ? `${match[1]}:${match[2]}` : '--:--';
+}
+
+const GATE_WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'] as const;
+const GATE_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'] as const;
+
+/**
+ * Weekday and calendar date from a stored timestamp, for the step 1 marker.
+ * The date is the digits in the string. Nothing is shifted into another timezone.
+ */
+export function gateStartDate(stamp: string | null | undefined): string | null {
+  if (stamp == null) return null;
+  const match = String(stamp).trim().match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (!match) return null;
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+  const weekday = GATE_WEEKDAYS[new Date(Date.UTC(Number(match[1]), month - 1, day)).getUTCDay()];
+  return `${weekday} ${day} ${GATE_MONTHS[month - 1]}`;
 }
 
 /**

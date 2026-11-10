@@ -6,6 +6,7 @@ type FeedRow = {
   account: string | null;
   job_id: string;
   customer: string | null;
+  group_name: string | null;
   template: string | null;
   worker: string | null;
   status: string | null;
@@ -94,7 +95,7 @@ export function VworkFeedPanel() {
   return (
     <div className="mt-4">
       <p className="max-w-3xl text-sm text-zinc-600 dark:text-zinc-400">
-        Checks the Delegat and Others VWork accounts for jobs updated in the last few days. A job is added here only when its id is not already in VWork jobs and not already in this feed for that account. Open jobs are then added to the Driver Visibility job queue. Planned times are stored as the API sent them.
+        Checks the Delegat and Others VWork accounts. Each job stores which account it came from. The company and group sit above the job id. The API key is never shown. A job id is unique across both accounts, so an id already stored is not added again. Open jobs then go to the Driver Visibility job queue. Planned times are stored as the API sent them.
       </p>
       {!configured && (
         <p className="mt-3 text-sm text-amber-800 dark:text-amber-200">
@@ -143,7 +144,7 @@ export function VworkFeedPanel() {
         <table className="min-w-full text-left text-xs">
           <thead className="bg-zinc-100 dark:bg-zinc-800">
             <tr>
-              {['Account', 'Job', 'Customer', 'Worker', 'Status', 'Planned start', 'Vineyard', 'Winery', 'Registration', 'Fetched'].map((heading) => (
+              {['Account', 'Job', 'Worker', 'Status', 'Planned start', 'Vineyard', 'Winery', 'Truck ID', 'Registration', 'Fetched'].map((heading) => (
                 <th key={heading} className="px-2 py-2 font-medium text-zinc-500">{heading}</th>
               ))}
             </tr>
@@ -157,14 +158,18 @@ export function VworkFeedPanel() {
               rows.map((row) => (
                 <tr key={`${row.account ?? ''}-${row.job_id}`} className="border-t border-zinc-100 dark:border-zinc-800">
                   <td className="px-2 py-1.5">{row.account || '—'}</td>
-                  <td className="px-2 py-1.5 font-mono">{row.job_id}</td>
-                  <td className="px-2 py-1.5">{row.customer || '—'}</td>
+                  <td className="px-2 py-1.5">
+                    <div className="text-[11px] font-medium text-zinc-700 dark:text-zinc-200">{row.customer || '—'}</div>
+                    <div className="text-[11px] text-zinc-500">{row.group_name || '—'}</div>
+                    <div className="font-mono">{row.job_id}</div>
+                  </td>
                   <td className="px-2 py-1.5">{row.worker || '—'}</td>
                   <td className="px-2 py-1.5">{row.status || '—'}</td>
                   <td className="px-2 py-1.5 font-mono">{row.planned_start_time || '—'}</td>
                   <td className="px-2 py-1.5">{row.vineyard_name || '—'}</td>
                   <td className="px-2 py-1.5">{row.delivery_winery || '—'}</td>
-                  <td className="px-2 py-1.5">{row.truck_rego || row.truck_id || '—'}</td>
+                  <td className="px-2 py-1.5 font-mono">{row.truck_id || '—'}</td>
+                  <td className="px-2 py-1.5">{row.truck_rego || '—'}</td>
                   <td className="px-2 py-1.5 font-mono">{row.fetched_at || '—'}</td>
                 </tr>
               ))

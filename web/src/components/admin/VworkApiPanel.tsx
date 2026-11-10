@@ -18,6 +18,7 @@ type AccountStatus = {
   id: string;
   label: string;
   state: 'missing' | 'placeholder' | 'ready';
+  sharesKeyWith?: 'delegat' | 'others' | null;
 };
 
 type Status = {
@@ -47,7 +48,13 @@ function countdown(status: Status | null, tick: number): number | null {
   return Math.max(0, Math.ceil((status.nextPollAtMs - now) / 1000));
 }
 
-export function VworkApiPanel() {
+export function VworkApiPanel({
+  view = 'service',
+  onRunningChange,
+}: {
+  view?: 'service' | 'log';
+  onRunningChange?: (running: boolean) => void;
+}) {
   const [status, setStatus] = useState<Status | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -81,6 +88,10 @@ export function VworkApiPanel() {
     const id = setInterval(() => setTick((n) => n + 1), 1000);
     return () => clearInterval(id);
   }, []);
+
+  useEffect(() => {
+    if (status) onRunningChange?.(status.running);
+  }, [status, onRunningChange]);
 
   useEffect(() => {
     if (dirty || !status?.settings) return;
@@ -145,17 +156,32 @@ export function VworkApiPanel() {
 
   return (
     <div className="mt-4">
+      {view === 'log' ? (
+        <p className="max-w-3xl text-sm text-zinc-600 dark:text-zinc-400">
+          Poll log for the VWork jobs service. Start and stop that service on Services.
+        </p>
+      ) : (
       <p className="max-w-3xl text-sm text-zinc-600 dark:text-zinc-400">
-        Polls both VWork accounts, Delegat and Others, and stores jobs that are not already in VWork jobs. Open jobs from that feed are added to the Driver Visibility job queue. Completed and cancelled jobs stay in the feed. Planned times are stored as the API sent them. Closing the browser leaves the poll running.
+        Reads open jobs from the Delegat and Others VWork accounts and adds them to the driver job queue. Each job and truck id keeps the account it came from. Stage updates are sent back to that same account. Completed and cancelled jobs stay in the feed. Planned times are stored as the API sent them. The poll log is under VWork API.
       </p>
+      )}
+      {view === 'service' && (
       <ul className="mt-3 space-y-1 text-sm text-zinc-700 dark:text-zinc-200">
         {(status?.accounts ?? []).map((account) => (
           <li key={account.id}>
-            {account.label}: {account.state === 'ready' ? 'key ready' : account.state === 'placeholder' ? 'key is still a placeholder' : 'key is not set'}
+            {account.label}:{' '}
+            {account.sharesKeyWith
+              ? `key is the same as ${account.sharesKeyWith === 'delegat' ? 'Delegat' : 'Others'}, so this account is not polled on its own`
+              : account.state === 'ready'
+                ? 'key ready'
+                : account.state === 'placeholder'
+                  ? 'key is still a placeholder'
+                  : 'key is not set'}
           </li>
         ))}
       </ul>
-      {keyState !== 'ready' && (
+      )}
+      {view === 'service' && keyState !== 'ready' && (
         <p className="mt-3 text-sm text-amber-800 dark:text-amber-200">
           Neither VWORK_API_KEY_DELEGAT nor VWORK_API_KEY_OTHERS is ready. The poll can queue jobs already in the feed, and it will not call VWork.
         </p>
@@ -163,6 +189,7 @@ export function VworkApiPanel() {
       {error && (
         <div className="mt-3 rounded bg-red-100 p-3 text-sm text-red-800 dark:bg-red-900/30 dark:text-red-200">{error}</div>
       )}
+      {view === 'service' && (
       <div className="mt-3 flex flex-wrap items-end gap-3 rounded-lg border border-zinc-200 bg-white p-3 dark:border-zinc-700 dark:bg-zinc-900">
         <button
           type="button"
@@ -237,13 +264,15 @@ export function VworkApiPanel() {
           Sync Drivers
         </button>
       </div>
-      {driverSync && <p className="mt-3 text-sm text-zinc-700 dark:text-zinc-200">{driverSync}</p>}
+      )}
+      {view === 'service' && driverSync && <p className="mt-3 text-sm text-zinc-700 dark:text-zinc-200">{driverSync}</p>}
       <p className="mt-3 text-sm text-zinc-700 dark:text-zinc-200">
         {status?.running ? `Running. Next poll in ${nextIn ?? '—'}s.` : 'Stopped.'}
         {status?.lastPolltime ? ` Last poll ${status.lastPolltime}.` : ''}
       </p>
       {status?.lastSummary && <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-300">{status.lastSummary}</p>}
       {status?.lastError && <p className="mt-1 text-sm text-red-700 dark:text-red-300">{status.lastError}</p>}
+      {view === 'log' && (
       <div className="mt-3 max-h-[50vh] overflow-auto rounded-lg border border-zinc-200 bg-white dark:border-zinc-700 dark:bg-zinc-900">
         <table className="min-w-full text-left text-xs">
           <thead className="sticky top-0 bg-zinc-100 dark:bg-zinc-800">
@@ -274,6 +303,7 @@ export function VworkApiPanel() {
           </tbody>
         </table>
       </div>
+      )}
     </div>
   );
 }

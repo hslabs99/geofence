@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useMemo, useState } from 'react';
+import DriverDiversionSetup from '@/components/admin/DriverDiversionSetup';
 import StaffOnlyGate from '@/components/StaffOnlyGate';
 import DriverAppPreview from '@/components/driver/DriverAppPreview';
 import { DriverLookup } from '@/components/driver/DriverLookup';
@@ -10,6 +11,8 @@ import RealTimeJobs from '@/components/driver/RealTimeJobs';
 type DriverJobRow = {
   id: number;
   job_id: string;
+  company_name: string | null;
+  group_name: string | null;
   truck_id: string | null;
   imei: string | null;
   driver: string | null;
@@ -71,7 +74,7 @@ function DriverVisibilityPageContent() {
   const [pendingDelete, setPendingDelete] = useState<DriverJobRow | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
-  const [tab, setTab] = useState<'queue' | 'issues' | 'drivers' | 'live' | 'app'>('queue');
+  const [tab, setTab] = useState<'queue' | 'issues' | 'drivers' | 'live' | 'app' | 'app-settings'>('queue');
   const [issueCount, setIssueCount] = useState(0);
   const [driversMissing, setDriversMissing] = useState(0);
 
@@ -317,7 +320,7 @@ function DriverVisibilityPageContent() {
       <div className="mb-4">
         <h1 className="text-2xl font-semibold text-zinc-900 dark:text-zinc-100">Driver Visibility</h1>
         <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
-          Job Queue lists and edits jobs. Job Queue Issues is where a VWork winery, vineyard, or driver name still needs one match. Drivers lists the driver users and the TrackSolid IMEI for each driver ID. Real Time Jobs shows every job on the same step track the driver sees, and keeps a finished job on the list for the debrief. The driver app tab opens the same phone app used at /driver, as the driver you select.
+          Job Queue lists and edits jobs. Job Queue Issues is where a VWork winery, vineyard, or driver name still needs one match. Drivers lists the driver users and the TrackSolid IMEI for each driver ID. Real Time Jobs shows every job on the same step track the driver sees, and keeps a finished job on the list for the debrief. Driver app logins opens the same phone app used at /driver, as the driver you select. Driver app settings holds the diversion reasons.
         </p>
       </div>
 
@@ -328,7 +331,8 @@ function DriverVisibilityPageContent() {
             ['issues', issueCount > 0 ? `Job Queue Issues (${issueCount})` : 'Job Queue Issues'],
             ['drivers', driversMissing > 0 ? `Drivers (${driversMissing})` : 'Drivers'],
             ['live', 'Real Time Jobs'],
-            ['app', 'Driver app'],
+            ['app', 'Driver app logins'],
+            ['app-settings', 'Driver app settings'],
           ] as const
         ).map(([id, label]) => (
           <button
@@ -353,6 +357,7 @@ function DriverVisibilityPageContent() {
 
       {tab === 'issues' && (
         <JobQueueIssues
+          showMailConfig
           onChange={setIssueCount}
           onResolved={() => setListVersion((version) => version + 1)}
         />
@@ -361,6 +366,13 @@ function DriverVisibilityPageContent() {
       {tab === 'drivers' && <DriverLookup onChange={setDriversMissing} />}
 
       {tab === 'app' && <DriverAppPreview />}
+
+      {tab === 'app-settings' && (
+        <section>
+          <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Driver app settings</h2>
+          <DriverDiversionSetup />
+        </section>
+      )}
 
       {tab === 'live' && <RealTimeJobs />}
 
@@ -585,8 +597,10 @@ function DriverVisibilityPageContent() {
               ) : (
                 rows.map((row) => (
                   <tr key={row.id} className="border-b border-zinc-100 dark:border-zinc-800">
-                    <td className="border-r border-zinc-100 px-2 py-1.5 font-mono text-zinc-900 dark:border-zinc-800 dark:text-zinc-100">
-                      {cell(row.job_id)}
+                    <td className="border-r border-zinc-100 px-2 py-1.5 text-zinc-900 dark:border-zinc-800 dark:text-zinc-100">
+                      <div className="text-[11px] font-medium text-zinc-700 dark:text-zinc-200">{cell(row.company_name)}</div>
+                      <div className="text-[11px] text-zinc-500 dark:text-zinc-400">{cell(row.group_name)}</div>
+                      <div className="font-mono">{cell(row.job_id)}</div>
                     </td>
                     <td className="border-r border-zinc-100 px-2 py-1.5 text-zinc-800 dark:border-zinc-800 dark:text-zinc-200">
                       {cell(row.truck_id)}
@@ -661,6 +675,8 @@ function DriverVisibilityPageContent() {
             <dl className="mt-4 grid grid-cols-[9rem_1fr] gap-x-3 gap-y-1 rounded border border-zinc-200 bg-zinc-50 p-3 text-sm dark:border-zinc-700 dark:bg-zinc-800">
               {(
                 [
+                  ['Company', pendingDelete.company_name],
+                  ['Group', pendingDelete.group_name],
                   ['Job ID', pendingDelete.job_id],
                   ['Truck ID', pendingDelete.truck_id],
                   ['IMEI', pendingDelete.imei],

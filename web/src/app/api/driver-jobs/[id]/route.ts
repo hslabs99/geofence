@@ -5,6 +5,7 @@ import { ensureDriverDiversionsSchema } from '@/lib/driver-diversions';
 import { ensureDriverJobLogSchema } from '@/lib/driver-job-log';
 import { ensureTblDriverJobsSchema } from '@/lib/ensure-tbl-driver-jobs-schema';
 import { DRIVER_JOB_COLUMNS, type DriverJob } from '@/lib/driver-jobs';
+import { fillGateGpsTimes } from '@/lib/fill-gate-gps';
 import { platesToConfirm } from '@/lib/truck-plates';
 
 /** GET one driver job for the phone job page. */
@@ -16,6 +17,7 @@ export async function GET(_request: Request, { params }: { params: Promise<{ id:
     if (!Number.isInteger(jobId) || jobId <= 0) {
       return NextResponse.json({ error: 'Job not found' }, { status: 404 });
     }
+    await fillGateGpsTimes(jobId);
     const rows = await query<DriverJob>(
       `SELECT ${DRIVER_JOB_COLUMNS} FROM tbl_driver_jobs WHERE id = $1`,
       [jobId],

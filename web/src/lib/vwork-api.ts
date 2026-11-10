@@ -23,6 +23,7 @@ export type VworkFeedRow = {
   asset_name: string | null;
   customer_third_party_id: string | null;
   groups: string | null;
+  group_name: string | null;
   create_date: string | null;
   source_updated_at: string | null;
   step_1_name: string | null;
@@ -154,6 +155,7 @@ function blankRow(): VworkFeedRow {
     asset_name: null,
     customer_third_party_id: null,
     groups: null,
+    group_name: null,
     create_date: null,
     source_updated_at: null,
     step_1_name: null,
@@ -279,7 +281,15 @@ export type VworkAccountStatus = {
   id: VworkAccountId;
   label: string;
   state: VworkKeyState;
+  /** Set when this account's key is the same string as an earlier account. That account is not polled again. */
+  sharesKeyWith: VworkAccountId | null;
 };
+
+export function normalizeVworkAccount(value: string | null | undefined): VworkAccountId | null {
+  const text = value?.trim().toLowerCase();
+  if (text === 'delegat' || text === 'others') return text;
+  return null;
+}
 
 const ACCOUNT_DEFS: { id: VworkAccountId; label: string; envNames: string[] }[] = [
   { id: 'delegat', label: 'Delegat', envNames: ['VWORK_API_KEY_DELEGAT', 'VWORK_API_KEY'] },
@@ -294,16 +304,20 @@ function keyState(raw: string): VworkKeyState {
 }
 
 function accountRecords(): (VworkAccountStatus & { apiKey: string | null })[] {
+  const firstReadyKey = new Map<string, VworkAccountId>();
   return ACCOUNT_DEFS.map((def) => {
     const raw = def.envNames.map((name) => process.env[name]?.trim() ?? '').find((value) => value !== '') ?? '';
     const state = keyState(raw);
-    return { id: def.id, label: def.label, state, apiKey: state === 'ready' ? raw : null };
+    const apiKey = state === 'ready' ? raw : null;
+    const earlier = apiKey ? firstReadyKey.get(apiKey) : undefined;
+    if (apiKey && !earlier) firstReadyKey.set(apiKey, def.id);
+    return { id: def.id, label: def.label, state, sharesKeyWith: earlier ?? null, apiKey };
   });
 }
 
 /** Delegat and Others, without the key values. */
 export function vworkAccountStatus(): VworkAccountStatus[] {
-  return accountRecords().map(({ id, label, state }) => ({ id, label, state }));
+  return accountRecords().map(({ id, label, state, sharesKeyWith }) => ({ id, label, state, sharesKeyWith }));
 }
 
 export function vworkApiKeyState(): VworkKeyState {
@@ -323,7 +337,9 @@ function jobsUrl(): string {
 }
 
 export function readyVworkAccounts(): { id: VworkAccountId; label: string; apiKey: string }[] {
-  return accountRecords().flatMap((account) => (account.apiKey ? [{ id: account.id, label: account.label, apiKey: account.apiKey }] : []));
+  return accountRecords().flatMap((account) =>
+    account.apiKey && !account.sharesKeyWith ? [{ id: account.id, label: account.label, apiKey: account.apiKey }] : [],
+  );
 }
 
 export async function listVworkJobsUpdatedSince(
@@ -407,8 +423,9 @@ export async function completeVworkJobStep(input: {
   stepName: string;
   completedAt: string;
 }): Promise<void> {
-  const account = readyVworkAccounts().find((item) => item.id === input.account);
-  if (!account) throw new Error(`${input.account} API key is not ready`);
+  const accountId = normalizeVworkAccount(input.account);
+  const account = accountId ? accountRecords().find((item) => item.id === accountId) : undefined;
+  if (!account?.apiKey) throw new Error(`${input.account} API key is not ready`);
   const url = new URL(`${apiBase()}/api/v5/jobs/${encodeURIComponent(input.vworkJobId)}.xml`);
   url.searchParams.set('api_key', account.apiKey);
   const body = `<?xml version="1.0" encoding="utf-8"?><job><steps type="array"><step><name>${xmlText(input.stepName)}</name><completed_at>${xmlText(input.completedAt)}</completed_at></step></steps></job>`;
@@ -422,6 +439,44 @@ export async function completeVworkJobStep(input: {
   if (!res.ok) {
     throw new Error(`VWork step ${res.status}: ${text.replace(/\s+/g, ' ').slice(0, 240)}`);
   }
+}
+
+/** First group id on a job is `9150`. The name, such as Hawkes Bay, comes from the groups list. */
+export function groupNamesForIds(groupIds: string | null, byId: Map<string, string>): string | null {
+  const ids = (groupIds ?? '')
+    .split(/[^0-9A-Za-z_-]+/)
+    .map((id) => id.trim())
+    .filter((id) => id !== '');
+  const names = [...new Set(ids.map((id) => byId.get(id)?.trim() || '').filter((name) => name !== ''))];
+  return names.length > 0 ? names.join(', ') : null;
+}
+
+export async function listVworkGroups(apiKey: string): Promise<{ groups: Map<string, string>; pages: number; truncated: boolean }> {
+  const groups = new Map<string, string>();
+  let page = 1;
+  let totalPages = 1;
+  let pages = 0;
+  while (page <= totalPages && pages < MAX_PAGES) {
+    const url = new URL(`${apiBase()}/api/v5/groups.xml`);
+    url.searchParams.set('api_key', apiKey);
+    url.searchParams.set('per_page', String(PER_PAGE));
+    url.searchParams.set('page', String(page));
+    const res = await fetch(url, { headers: { 'Accept-Encoding': 'gzip' }, cache: 'no-store' });
+    const xml = await res.text();
+    if (!res.ok) throw new Error(`VWork groups ${res.status}: ${xml.replace(/\s+/g, ' ').slice(0, 240)}`);
+    const root = parseXmlElement(xml);
+    const groupsEl = root.name === 'groups' ? root : root.children.find((child) => child.name === 'groups');
+    const found = (groupsEl?.children ?? root.children).filter((child) => child.name === 'group');
+    for (const group of found) {
+      const id = childText(group, 'id');
+      const name = childText(group, 'name');
+      if (id && name) groups.set(id, name);
+    }
+    totalPages = Number(groupsEl?.attrs.total_pages ?? '1') || 1;
+    pages += 1;
+    page += 1;
+  }
+  return { groups, pages, truncated: page <= totalPages };
 }
 
 export type VworkUserRow = { id: string; name: string };

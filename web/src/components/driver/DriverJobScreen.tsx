@@ -8,33 +8,46 @@ import { DriverLink } from '@/components/driver/driver-nav';
 import DriverDiversionControl from '@/components/driver/DriverDiversionControl';
 import DriverJobLog from '@/components/driver/DriverJobLog';
 import GateTrack from '@/components/driver/GateTrack';
-import { DRIVER_GATES, completedGateCount, gateClock, gateManual, jobDetailsConfirmed, phoneLocalStamp, wineryArrivalEta, type DriverJob } from '@/lib/driver-jobs';
+import { DRIVER_GATES, completedGateCount, gateActivity, gateClock, gateFenceHover, gateShownGps, jobDetailsConfirmed, phoneLocalStamp, wineryArrivalEta, type DriverJob } from '@/lib/driver-jobs';
 import { staffActorPayload } from '@/lib/staff-session';
 
 export type DriverScreenMode = 'control' | 'watch' | null;
 
+const MAP_PIN =
+  'M12 0C7.6 0 4 3.4 4 7.6 4 12.8 12 22 12 22s8-9.2 8-14.4C20 3.4 16.4 0 12 0zm0 10.6a3 3 0 1 1 0-6 3 3 0 0 1 0 6z';
+
 function ProximityMark({ kind, reminded }: { kind: 'yellow' | 'red'; reminded?: boolean }) {
-  const color = kind === 'yellow' ? '#e0a100' : '#f04438';
   const title = kind === 'yellow'
     ? 'Close to the fence. Tap as you cross.'
     : reminded
       ? 'Tap depart. You are heading back to the winery.'
       : 'Tap now. The fence crossing has already happened.';
-  const pin =
-    'M12 0C7.6 0 4 3.4 4 7.6 4 12.8 12 22 12 22s8-9.2 8-14.4C20 3.4 16.4 0 12 0zm0 10.6a3 3 0 1 1 0-6 3 3 0 0 1 0 6z';
+  if (kind === 'red') {
+    return (
+      <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center" title={title} aria-label={title}>
+        <svg width="34" height="34" viewBox="0 0 34 34" aria-hidden="true">
+          <circle cx="17" cy="17" r="14.2" fill="white" stroke="#f04438" strokeWidth="3" />
+          <g transform="translate(10.05 7.4) scale(0.58)">
+            <path fill="#f04438" fillRule="evenodd" d={MAP_PIN} />
+            <circle cx="12" cy="7.6" r="2.3" fill="white" />
+          </g>
+        </svg>
+      </span>
+    );
+  }
   return (
-    <span className="inline-flex h-9 w-11 shrink-0 items-center justify-center rounded-lg bg-white" title={title}>
+    <span className="inline-flex h-9 w-11 shrink-0 items-center justify-center rounded-lg bg-white" title={title} aria-label={title}>
       <svg width="40" height="24" viewBox="0 0 64 38" aria-hidden="true">
         <g transform="translate(1 0) scale(0.78)">
-          <path fill={color} fillRule="evenodd" d={pin} />
+          <path fill="#e0a100" fillRule="evenodd" d={MAP_PIN} />
           <circle cx="12" cy="7.6" r="2.3" fill="white" />
         </g>
         <g transform="translate(33 0) scale(0.78)">
-          <path fill={color} fillRule="evenodd" d={pin} />
+          <path fill="#e0a100" fillRule="evenodd" d={MAP_PIN} />
           <circle cx="12" cy="7.6" r="2.3" fill="white" />
         </g>
         {[8, 18, 28, 38, 48, 58].map((cx) => (
-          <circle key={cx} cx={cx} cy="34.5" r="1.7" fill={color} />
+          <circle key={cx} cx={cx} cy="34.5" r="1.7" fill="#e0a100" />
         ))}
       </svg>
     </span>
@@ -53,9 +66,14 @@ function FenceLine({ label, name, jobId }: { label: string; name: string | null;
         <p className="mt-0.5 truncate text-base text-[#1c2430]">{fence || '—'}</p>
       </div>
       {mapHref ? (
-        <a href={mapHref} target="_blank" rel="noopener noreferrer" className="shrink-0 text-base font-semibold text-[#175cd3]">
-          View on Map
-        </a>
+        <div className="flex shrink-0 gap-3">
+          <a href={mapHref} target="_blank" rel="noopener noreferrer" className="text-base font-semibold text-[#175cd3]">
+            Map
+          </a>
+          <a href={`${mapHref}&route=1`} target="_blank" rel="noopener noreferrer" className="text-base font-semibold text-[#175cd3]">
+            Route
+          </a>
+        </div>
       ) : null}
     </div>
   );
@@ -65,7 +83,7 @@ function JobDetails({ job }: { job: DriverJob }) {
   return (
     <details className="group mx-4 mb-3 rounded-2xl bg-white px-4 shadow-[0_1px_2px_rgba(16,24,40,0.06)]">
       <summary className="flex h-12 cursor-pointer list-none items-center justify-between text-base font-semibold text-[#1c2430] [&::-webkit-details-marker]:hidden">
-        Job details
+        Details (Wine,Vine,Maps)
         <span className="text-sm font-medium text-[#667085] group-open:hidden">Show</span>
         <span className="hidden text-sm font-medium text-[#667085] group-open:inline">Hide</span>
       </summary>
@@ -391,6 +409,10 @@ export default function DriverJobScreen({ id: idProp, mode = null }: { id?: stri
               ‹
             </DriverLink>
             <div className="min-w-0">
+            {job?.company_name?.trim() ? (
+              <p className="truncate text-xs font-medium text-[#344054]">{job.company_name}</p>
+            ) : null}
+            {job?.group_name?.trim() ? <p className="truncate text-xs text-[#667085]">{job.group_name}</p> : null}
             <h1 className="truncate text-xl font-semibold tracking-tight text-[#1c2430]">{job?.job_id || (loading ? '…' : 'Job')}</h1>
             {job && (
               <p className="mt-0.5 truncate text-sm text-[#475467]">
@@ -503,7 +525,9 @@ export default function DriverJobScreen({ id: idProp, mode = null }: { id?: stri
             {DRIVER_GATES.map((gate) => {
               const active = gate.step === nextStep && (gate.step !== 1 || jobDetailsConfirmed(job));
               const complete = gate.step <= done;
-              const manual = complete && gateManual(job, gate.step);
+              const activity = complete ? gateActivity(job, gate.step) : null;
+              const gps = activity ? gateShownGps(job, gate.step) : null;
+              const hover = activity ? gateFenceHover(job, gate.step) : null;
               const label = complete
                 ? `Step ${gate.step} · ${gate.title} · ${gateClock(job[gate.key])}`
                 : gate.step === 4 && wineryEta
@@ -511,33 +535,47 @@ export default function DriverJobScreen({ id: idProp, mode = null }: { id?: stri
                   : `Step ${gate.step} · ${gate.title}`;
               const marker = active ? approach.reading?.proximity : null;
               const crossed = active && marker === 'red' ? approach.reading?.crossedAt : null;
+              const crossedLabel = crossed
+                ? gate.step === 3
+                  ? `GPS left the fence at ${gateClock(crossed)}`
+                  : `GPS entered the fence at ${gateClock(crossed)}`
+                : null;
               return (
-                <div key={gate.step} className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    disabled={!active || savingStep != null || confirm != null}
-                    onClick={() => {
-                      if (watch) return;
-                      void passGate(gate.step);
-                    }}
-                    className={
-                      active
-                        ? 'flex h-[3.15rem] flex-1 items-center gap-2 rounded-2xl bg-[#1f9d55] px-4 text-left text-lg font-semibold text-white disabled:opacity-60'
-                        : 'flex h-[3.15rem] flex-1 items-center rounded-2xl bg-[#e4e7ec] px-4 text-left text-base font-medium text-[#98a2b3]'
-                    }
-                  >
-                    <span className="min-w-0 flex-1 truncate">{savingStep === gate.step ? 'Saving…' : label}</span>
-                    {manual ? <span className="ml-2 shrink-0 text-xs font-medium text-[#667085]">Manual</span> : null}
-                    {marker === 'yellow' || marker === 'red' ? (
-                      <ProximityMark kind={marker} reminded={approach.reading?.remind === true} />
+                <button
+                  key={gate.step}
+                  type="button"
+                  disabled={!active || savingStep != null || confirm != null}
+                  title={hover ?? undefined}
+                  onClick={() => {
+                    if (watch) return;
+                    void passGate(gate.step);
+                  }}
+                  className={
+                    active
+                      ? 'flex min-h-[3.15rem] w-full items-center gap-2 rounded-2xl bg-[#1f9d55] px-4 py-2 text-left text-lg font-semibold text-white disabled:opacity-60'
+                      : 'flex h-[3.15rem] w-full items-center rounded-2xl bg-[#e4e7ec] px-4 text-left text-base font-medium text-[#98a2b3]'
+                  }
+                >
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate">{savingStep === gate.step ? 'Saving…' : label}</span>
+                    {crossedLabel ? (
+                      <span className="mt-0.5 block truncate text-[11px] font-medium leading-tight text-white/90" title={crossed ?? undefined}>
+                        {crossedLabel}
+                      </span>
                     ) : null}
-                  </button>
-                  {crossed ? (
-                    <span className="w-12 shrink-0 text-right text-sm font-semibold tabular-nums text-[#b42318]" title={crossed}>
-                      {gateClock(crossed)}
+                  </span>
+                  {activity ? (
+                    <span
+                      className={`ml-2 shrink-0 text-xs font-semibold ${activity === 'hard' ? 'text-[#1f9d55]' : 'text-[#b54708]'}`}
+                    >
+                      {activity === 'hard' ? 'Hard' : activity === 'soft' ? 'Soft' : 'Manual'}
+                      {gps ? ` ${gateClock(gps)}` : ''}
                     </span>
                   ) : null}
-                </div>
+                  {marker === 'yellow' || marker === 'red' ? (
+                    <ProximityMark kind={marker} reminded={approach.reading?.remind === true} />
+                  ) : null}
+                </button>
               );
             })}
             {nextStep == null && (

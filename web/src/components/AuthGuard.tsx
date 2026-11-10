@@ -26,6 +26,7 @@ export default function AuthGuard({ children }: { children: React.ReactNode }) {
     const onDriverLogin = pathname === '/driver';
     const onDriverApp = isDriverAppPath(pathname);
     const onDbSwitch = pathname === '/db-switch';
+    const onResolve = pathname === '/resolve-mappings' || pathname.startsWith('/resolve-mappings/');
 
     if (onLogin && session) {
       window.location.replace(session === 'Driver' ? DRIVER_HOME : '/');
@@ -35,7 +36,7 @@ export default function AuthGuard({ children }: { children: React.ReactNode }) {
       window.location.replace(session === 'Driver' ? DRIVER_HOME : '/');
       return;
     }
-    if (session === 'Driver' && !onDriverApp && !onDbSwitch) {
+    if (session === 'Driver' && !onDriverApp && !onDbSwitch && !onResolve) {
       window.location.replace(DRIVER_HOME);
       return;
     }
@@ -43,7 +44,7 @@ export default function AuthGuard({ children }: { children: React.ReactNode }) {
       window.location.replace('/driver');
       return;
     }
-    if (!onLogin && !onDriverApp && !onDbSwitch && !session) {
+    if (!onLogin && !onDriverApp && !onDbSwitch && !onResolve && !session) {
       window.location.replace('/login');
       return;
     }

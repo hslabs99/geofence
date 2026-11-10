@@ -66,17 +66,47 @@ export async function ensureVworkJobFeedSchema(): Promise<void> {
   await execute(`UPDATE vwork_job_feed SET account = 'delegat' WHERE account IS NULL OR btrim(account) = ''`);
   await execute(`ALTER TABLE vwork_job_feed ALTER COLUMN account SET DEFAULT 'delegat'`);
   await execute(`ALTER TABLE vwork_job_feed ALTER COLUMN account SET NOT NULL`);
+  await execute(`ALTER TABLE vwork_job_feed ADD COLUMN IF NOT EXISTS group_name varchar`);
   await execute(`
-    DO $$
-    BEGIN
-      IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'vwork_job_feed_job_id_key') THEN
-        ALTER TABLE vwork_job_feed DROP CONSTRAINT vwork_job_feed_job_id_key;
-      END IF;
-    END $$`);
+    DELETE FROM vwork_job_feed a
+    USING vwork_job_feed b
+    WHERE a.job_id = b.job_id AND a.id > b.id`);
+  await execute(`DROP INDEX IF EXISTS uq_vwork_job_feed_account_job_id`);
   await execute(`
-    CREATE UNIQUE INDEX IF NOT EXISTS uq_vwork_job_feed_account_job_id
-      ON vwork_job_feed (account, job_id)`);
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_vwork_job_feed_job_id
+      ON vwork_job_feed (job_id)`);
   await execute(`
     CREATE INDEX IF NOT EXISTS idx_vwork_job_feed_fetched_at ON vwork_job_feed (fetched_at DESC)`);
+  await execute(`
+    CREATE TABLE IF NOT EXISTS vwork_truck_sources (
+      id             bigserial PRIMARY KEY,
+      account        varchar NOT NULL,
+      truck_id       varchar NOT NULL,
+      first_seen_at  text NOT NULL
+    )`);
+  await execute(`
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_vwork_truck_sources_account_truck
+      ON vwork_truck_sources (account, lower(btrim(truck_id)))`);
+  await execute(`
+    INSERT INTO vwork_truck_sources (account, truck_id, first_seen_at)
+    SELECT DISTINCT ON (account, lower(btrim(truck_id)))
+           account,
+           btrim(truck_id),
+           fetched_at
+    FROM vwork_job_feed
+    WHERE truck_id IS NOT NULL AND btrim(truck_id) <> ''
+    ORDER BY account, lower(btrim(truck_id)), id
+    ON CONFLICT DO NOTHING`);
+  await execute(`
+    DELETE FROM vwork_truck_sources o
+    USING vwork_truck_sources d
+    WHERE o.account = 'others'
+      AND d.account = 'delegat'
+      AND lower(btrim(o.truck_id)) = lower(btrim(d.truck_id))
+      AND NOT EXISTS (
+        SELECT 1 FROM vwork_job_feed f
+        WHERE f.account = 'others'
+          AND lower(btrim(f.truck_id)) = lower(btrim(o.truck_id))
+      )`);
   ensured = true;
 }

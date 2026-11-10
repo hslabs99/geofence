@@ -1,3 +1,4 @@
+import { backfillGateFences } from '@/lib/backfill-gate-fence';
 import { execute } from '@/lib/db';
 
 let driverJobsEnsured = false;
@@ -67,8 +68,22 @@ export async function ensureTblDriverJobsSchema(): Promise<void> {
   await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS step_2_manual boolean`);
   await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS step_3_manual boolean`);
   await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS step_4_manual boolean`);
+  await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS step_2_fence text`);
+  await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS step_3_fence text`);
+  await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS step_4_fence text`);
+  await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS step_2_soft_gps timestamp without time zone`);
+  await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS step_2_hard_gps timestamp without time zone`);
+  await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS step_3_soft_gps timestamp without time zone`);
+  await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS step_3_hard_gps timestamp without time zone`);
+  await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS step_4_soft_gps timestamp without time zone`);
+  await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS step_4_hard_gps timestamp without time zone`);
+  await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS step_2_gps_done boolean`);
+  await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS step_3_gps_done boolean`);
+  await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS step_4_gps_done boolean`);
   await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS log_cleared_at timestamp without time zone`);
   await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS vwork_account text`);
+  await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS company_name text`);
+  await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS group_name text`);
   await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS vwork_job_id text`);
   await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS vwork_step_1_name text`);
   await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS vwork_step_2_name text`);
@@ -85,5 +100,6 @@ export async function ensureTblDriverJobsSchema(): Promise<void> {
       trailer_rego  text
     )`);
 
+  await backfillGateFences();
   driverJobsEnsured = true;
 }

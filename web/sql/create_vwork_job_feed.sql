@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS vwork_job_feed (
   asset_name               varchar,
   customer_third_party_id  varchar,
   groups                   varchar,
+  group_name               varchar,
   create_date              text,
   source_updated_at        text,
   step_1_name              varchar,
@@ -58,8 +59,9 @@ CREATE TABLE IF NOT EXISTS vwork_job_feed (
   fetched_at               text NOT NULL
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS uq_vwork_job_feed_account_job_id
-  ON vwork_job_feed (account, job_id);
+-- Job ids do not overlap across the Delegat and Others APIs.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_vwork_job_feed_job_id
+  ON vwork_job_feed (job_id);
 
 CREATE INDEX IF NOT EXISTS idx_vwork_job_feed_fetched_at
   ON vwork_job_feed (fetched_at DESC);

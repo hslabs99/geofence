@@ -1,9 +1,9 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import DriverDiversionSetup from '@/components/admin/DriverDiversionSetup';
 import { VworkApiPanel } from '@/components/admin/VworkApiPanel';
 import { VworkFeedPanel } from '@/components/admin/VworkFeedPanel';
+import { VworkGateUpdatesPanel } from '@/components/admin/VworkGateUpdatesPanel';
 
 type Row = {
   id: number;
@@ -182,6 +182,34 @@ function shareOfLimit(count: number, limit: number): string {
   return `${rounded}%`;
 }
 
+type ServiceTab = 'services' | 'rows' | 'summary' | 'log' | 'vwork-api' | 'gate-updates' | 'vwork';
+
+const SERVICE_GROUPS: { id: 'services' | 'tracksolid' | 'vwork'; label: string; tabs: readonly [ServiceTab, string][] }[] = [
+  {
+    id: 'services',
+    label: 'Services',
+    tabs: [],
+  },
+  {
+    id: 'tracksolid',
+    label: 'Track Solid API',
+    tabs: [
+      ['rows', 'Location data'],
+      ['summary', 'Poll summary'],
+      ['log', 'Poll log'],
+    ],
+  },
+  {
+    id: 'vwork',
+    label: 'VWork API',
+    tabs: [
+      ['vwork-api', 'VWork API'],
+      ['gate-updates', 'Gate updates'],
+      ['vwork', 'VWork feed'],
+    ],
+  },
+];
+
 export default function CurrentLocationsAdminPage() {
   const [status, setStatus] = useState<Status | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -196,7 +224,9 @@ export default function CurrentLocationsAdminPage() {
   const [alertEmails, setAlertEmails] = useState('');
   const [checkerSeconds, setCheckerSeconds] = useState('60');
   const [emailNotice, setEmailNotice] = useState<string | null>(null);
-  const [tab, setTab] = useState<'service' | 'rows' | 'summary' | 'log' | 'vwork-api' | 'vwork'>('service');
+  const [tab, setTab] = useState<ServiceTab>('services');
+  const [vworkRunning, setVworkRunning] = useState<boolean | null>(null);
+  const [gateRunning, setGateRunning] = useState<boolean | null>(null);
   const [confirmEmpty, setConfirmEmpty] = useState(false);
   const [tick, setTick] = useState(0);
   const [locationSort, setLocationSort] = useState<LocationColumn>('polltime');
@@ -325,8 +355,7 @@ export default function CurrentLocationsAdminPage() {
     <div className="w-full min-w-0 p-6">
       <h1 className="text-2xl font-semibold text-zinc-900 dark:text-zinc-100">Service management</h1>
       <p className="mt-1 max-w-3xl text-sm text-zinc-600 dark:text-zinc-400">
-        Polls every truck on the account in one TrackSolid location call. A row is written only when that truck’s GPS time is newer than the one already stored. Save applies the poll seconds straight away while the service is running.
-        A flush removes rows older than the hour limit, and runs on its own minute interval. Closing the browser leaves the poll running. Stopping the server stops it.
+        Services is the list of what runs on this server. Each one says what it is for. Closing the browser leaves a running service going. Stopping the server stops it.
       </p>
 
       {error && (
@@ -336,34 +365,84 @@ export default function CurrentLocationsAdminPage() {
         <div className="mt-4 rounded bg-amber-100 p-3 text-sm text-amber-900 dark:bg-amber-900/30 dark:text-amber-100">{emailNotice}</div>
       )}
 
-      <div className="mt-6 flex gap-2 border-b border-zinc-200 dark:border-zinc-700">
-        {(
-          [
-            ['service', 'Service'],
-            ['rows', 'Location data'],
-            ['summary', 'Poll summary'],
-            ['log', 'Poll log'],
-            ['vwork-api', 'VWork API'],
-            ['vwork', 'VWork feed'],
-          ] as const
-        ).map(([id, label]) => (
-          <button
-            key={id}
-            type="button"
-            onClick={() => setTab(id)}
-            className={`-mb-px border-b-2 px-3 py-2 text-sm font-medium ${
-              tab === id
-                ? 'border-zinc-900 text-zinc-900 dark:border-zinc-100 dark:text-zinc-100'
-                : 'border-transparent text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200'
-            }`}
-          >
-            {label}
-          </button>
-        ))}
+      <div className="mt-6">
+        <div className="inline-flex rounded-lg border border-zinc-200 bg-zinc-100 p-1 dark:border-zinc-700 dark:bg-zinc-800">
+          {SERVICE_GROUPS.map((group) => {
+            const active = group.id === 'services' ? tab === 'services' : group.tabs.some(([id]) => id === tab);
+            return (
+              <button
+                key={group.id}
+                type="button"
+                onClick={() => {
+                  if (active) return;
+                  setTab(group.id === 'services' ? 'services' : group.tabs[0][0]);
+                }}
+                className={`rounded-md px-3 py-1.5 text-sm font-semibold ${
+                  active
+                    ? 'bg-white text-zinc-900 shadow-sm dark:bg-zinc-900 dark:text-zinc-100'
+                    : 'text-zinc-600 hover:text-zinc-900 dark:text-zinc-300 dark:hover:text-zinc-100'
+                }`}
+              >
+                {group.label}
+              </button>
+            );
+          })}
+        </div>
+        {tab !== 'services' && (
+          <div className="mt-3 flex gap-2 border-b border-zinc-200 dark:border-zinc-700">
+            {SERVICE_GROUPS.find((group) => group.tabs.some(([id]) => id === tab))!.tabs.map(([id, label]) => (
+              <button
+                key={id}
+                type="button"
+                onClick={() => setTab(id)}
+                className={`-mb-px border-b-2 px-3 py-2 text-sm font-medium ${
+                  tab === id
+                    ? 'border-zinc-900 text-zinc-900 dark:border-zinc-100 dark:text-zinc-100'
+                    : 'border-transparent text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200'
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        )}
       </div>
 
-      {tab === 'service' && (
+      {tab === 'services' && (
       <>
+      <nav aria-label="Service status" className="mt-6 grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+        {(
+          [
+            ['service-track-solid', 'Track Solid locations', status == null ? null : status.running, status?.running ? 'Running' : 'Paused'],
+            ['service-location-alerts', 'Location alerts', status?.alerts == null ? null : status.alerts.checkerRunning, status?.alerts?.checkerRunning ? 'Running' : 'Stopped'],
+            ['service-vwork-jobs', 'VWork jobs', vworkRunning, vworkRunning ? 'Running' : 'Stopped'],
+            ['service-gate-updates', 'Gate updates', gateRunning, gateRunning ? 'Running' : 'Stopped'],
+          ] as const
+        ).map(([id, label, running, stateLabel]) => (
+          <a
+            key={id}
+            href={`#${id}`}
+            onClick={(event) => {
+              const target = document.getElementById(id);
+              if (!target) return;
+              event.preventDefault();
+              target.scrollIntoView({ block: 'start' });
+              history.replaceState(null, '', `#${id}`);
+            }}
+            className="flex items-center justify-between gap-3 rounded-lg border border-zinc-200 bg-white px-3 py-2 text-sm hover:bg-zinc-50 dark:border-zinc-700 dark:bg-zinc-900 dark:hover:bg-zinc-800"
+          >
+            <span className="font-medium text-zinc-900 underline decoration-zinc-300 underline-offset-2 dark:text-zinc-100 dark:decoration-zinc-600">{label}</span>
+            <span className={running == null ? 'text-zinc-400' : running ? 'font-medium text-emerald-700 dark:text-emerald-400' : 'font-medium text-amber-700 dark:text-amber-400'}>
+              {running == null ? '…' : stateLabel}
+            </span>
+          </a>
+        ))}
+      </nav>
+      <section id="service-track-solid" className="mt-8 scroll-mt-6">
+        <h2 className="text-lg font-semibold text-zinc-900 dark:text-zinc-100">Track Solid locations</h2>
+        <p className="mt-1 max-w-3xl text-sm text-zinc-600 dark:text-zinc-400">
+          Polls every truck on the account in one TrackSolid location call. A row is written only when that truck’s GPS time is newer than the one already stored. Save applies the poll seconds straight away while the service is running. A flush removes rows older than the hour limit, and runs on its own minute interval. Location data, the poll summary, and the poll log are under Track Solid API.
+        </p>
       <div className="mt-4 flex flex-wrap items-end gap-3 rounded-lg border border-zinc-200 bg-white p-3 dark:border-zinc-700 dark:bg-zinc-900">
         <button
           type="button"
@@ -494,8 +573,6 @@ export default function CurrentLocationsAdminPage() {
           Save
         </button>
       </div>
-
-      <DriverDiversionSetup />
 
       <div className="mt-3 flex flex-wrap items-end gap-3 rounded-lg border border-zinc-200 bg-white p-3 dark:border-zinc-700 dark:bg-zinc-900">
         <label className="text-sm text-zinc-700 dark:text-zinc-200">
@@ -652,8 +729,8 @@ export default function CurrentLocationsAdminPage() {
       </div>
       )}
 
-      <div className="mt-4 max-w-3xl rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900">
-        <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Alerts</h2>
+      <div id="service-location-alerts" className="mt-4 max-w-3xl scroll-mt-6 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900">
+        <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">Location alerts</h2>
         <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-300">
           Stop the service checker before you stop the location poll. A planned stop then sends only the stop email. If the checker is still running and finds the poll stopped, for any reason, it sends one alert and does not send again until the poll is started.
         </p>
@@ -731,6 +808,18 @@ export default function CurrentLocationsAdminPage() {
           <p className="mt-1 text-sm text-red-700 dark:text-red-300">{status.alerts.lastEmailError}</p>
         )}
       </div>
+      </section>
+
+      <section id="service-vwork-jobs" className="mt-10 scroll-mt-6 border-t border-zinc-200 pt-8 dark:border-zinc-700">
+        <h2 className="text-lg font-semibold text-zinc-900 dark:text-zinc-100">VWork jobs</h2>
+        <VworkApiPanel view="service" onRunningChange={setVworkRunning} />
+      </section>
+
+      <section id="service-gate-updates" className="mt-10 scroll-mt-6 border-t border-zinc-200 pt-8 dark:border-zinc-700">
+        <h2 className="text-lg font-semibold text-zinc-900 dark:text-zinc-100">Gate updates</h2>
+        <VworkGateUpdatesPanel view="service" onRunningChange={setGateRunning} />
+      </section>
+      <div className="h-[70vh]" aria-hidden="true" />
       </>
       )}
 
@@ -853,7 +942,9 @@ export default function CurrentLocationsAdminPage() {
       </div>
       )}
 
-      {tab === 'vwork-api' && <VworkApiPanel />}
+      {tab === 'vwork-api' && <VworkApiPanel view="log" />}
+
+      {tab === 'gate-updates' && <VworkGateUpdatesPanel view="queue" />}
 
       {tab === 'vwork' && <VworkFeedPanel />}
 

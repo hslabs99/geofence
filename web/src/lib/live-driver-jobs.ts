@@ -4,14 +4,18 @@ import { ensureCurrentLocationsSchema, fillCurrentLocationGpsTimeNz } from '@/li
 import { ensureTblDriverJobsSchema } from '@/lib/ensure-tbl-driver-jobs-schema';
 import { loadCurrentLocationSettings } from '@/lib/current-location-poll';
 import { fenceProximity, loadDepartureFixes, vineyardDeparture } from '@/lib/gate-proximity';
-import { completedGateCount, DRIVER_JOB_COLUMNS, type DriverJob } from '@/lib/driver-jobs';
+import { completedGateCount, DRIVER_JOB_COLUMNS, type DriverJob, type GateFenceKind } from '@/lib/driver-jobs';
+import { fillGateGpsTimes } from '@/lib/fill-gate-gps';
 
 export type LivePlace = {
   vineyardMeters: number | null;
   vineyardInside: boolean;
   wineryMeters: number | null;
   wineryInside: boolean;
-  /** Stored NZ GPS clock, verbatim. */
+  /**
+   * Last GPS clock received for this truck, verbatim.
+   * A finished job stops at step 5, so a later ping on the same truck is not used.
+   */
   gpstimeNz: string | null;
   /** Stored poll clock, verbatim. */
   fetchedAt: string | null;
@@ -68,11 +72,17 @@ function flagOf(value: unknown): boolean | null {
   return null;
 }
 
+function fenceOf(value: unknown): GateFenceKind | null {
+  if (value === 'hard' || value === 'soft' || value === 'manual') return value;
+  return null;
+}
+
 export async function loadLiveDriverJobs(): Promise<{ rows: LiveDriverJob[]; driverAppPollSeconds: number }> {
   await ensureTblDriverJobsSchema();
   await ensureDriverDiversionsSchema();
   await ensureCurrentLocationsSchema();
   await fillCurrentLocationGpsTimeNz();
+  await fillGateGpsTimes();
   const settings = await loadCurrentLocationSettings();
   const driverAppPollSeconds = settings.driverAppPollSeconds;
 
@@ -99,6 +109,7 @@ export async function loadLiveDriverJobs(): Promise<{ rows: LiveDriverJob[]; dri
                 split_part(c.coordinates, ',', 2)::float8 AS lng
          FROM tbl_current_locations c
          WHERE c.coordinates ~ '^-?[0-9]+(\\.[0-9]+)?,-?[0-9]+(\\.[0-9]+)?$'
+           AND c.gpstime_nz IS NOT NULL
            AND (
              (btrim(coalesce(j.imei, '')) <> '' AND btrim(c.imei) = btrim(j.imei))
              OR (
@@ -106,10 +117,15 @@ export async function loadLiveDriverJobs(): Promise<{ rows: LiveDriverJob[]; dri
                AND lower(btrim(c.truck_id)) = lower(btrim(j.truck_id))
              )
            )
+           AND (
+             nullif(btrim(coalesce(j.step_5_click, '')), '') IS NULL
+             OR c.gpstime_nz <= nullif(btrim(j.step_5_click), '')::timestamp
+           )
          ORDER BY CASE
                     WHEN btrim(coalesce(j.imei, '')) <> '' AND btrim(c.imei) = btrim(j.imei) THEN 0
                     ELSE 1
                   END,
+                  c.gpstime_nz DESC,
                   c.id DESC
          LIMIT 1
        ) lat ON true
@@ -164,6 +180,8 @@ export async function loadLiveDriverJobs(): Promise<{ rows: LiveDriverJob[]; dri
     const job: LiveDriverJob = {
       id: Number(row.id),
       job_id: row.job_id,
+      company_name: row.company_name,
+      group_name: row.group_name,
       truck_id: row.truck_id,
       imei: row.imei,
       driver: row.driver,
@@ -184,6 +202,16 @@ export async function loadLiveDriverJobs(): Promise<{ rows: LiveDriverJob[]; dri
       step_2_manual: flagOf(row.step_2_manual),
       step_3_manual: flagOf(row.step_3_manual),
       step_4_manual: flagOf(row.step_4_manual),
+      step_2_fence: fenceOf(row.step_2_fence),
+      step_3_fence: fenceOf(row.step_3_fence),
+      step_4_fence: fenceOf(row.step_4_fence),
+      step_2_soft_gps: row.step_2_soft_gps?.trim() || null,
+      step_2_hard_gps: row.step_2_hard_gps?.trim() || null,
+      step_3_soft_gps: row.step_3_soft_gps?.trim() || null,
+      step_3_hard_gps: row.step_3_hard_gps?.trim() || null,
+      step_4_soft_gps: row.step_4_soft_gps?.trim() || null,
+      step_4_hard_gps: row.step_4_hard_gps?.trim() || null,
+      vwork_account: row.vwork_account,
       place: {
         vineyardMeters,
         vineyardInside: vineyardMeters === 0,

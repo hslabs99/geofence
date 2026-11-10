@@ -168,6 +168,7 @@ function warningFor(
     if (!fence) return 'This job has no vineyard GPS fence. Please confirm you are leaving the vineyard now.';
     if (meters == null) return 'We have no GPS reading for this truck. Please confirm you are leaving the vineyard now.';
     if (inside) return 'You are still inside the vineyard. Please confirm you are leaving the vineyard now.';
+    if (meters <= limitMeters) return null;
     if (!beenInside) return 'You have not been in the vineyard. Please confirm you are leaving the vineyard now.';
     return null;
   }
@@ -382,6 +383,7 @@ function departureWarning(
   limitMeters: number,
   depart: VineyardDeparture,
 ): string | null {
+  if (meters != null && meters > 0 && meters <= limitMeters) return null;
   if (depart.proximity === 'red' && depart.remind) {
     return 'You have not been in the vineyard. Please confirm you are leaving the vineyard now.';
   }

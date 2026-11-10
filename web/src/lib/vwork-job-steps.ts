@@ -1,7 +1,7 @@
 import { execute, query } from '@/lib/db';
 import { ensureTblDriverJobsSchema } from '@/lib/ensure-tbl-driver-jobs-schema';
 import { ensureVworkJobFeedSchema } from '@/lib/ensure-vwork-job-feed-schema';
-import { completeVworkJobStep, vworkCompletedAt, type VworkAccountId } from '@/lib/vwork-api';
+import { completeVworkJobStep, normalizeVworkAccount, vworkCompletedAt } from '@/lib/vwork-api';
 
 const STEP_COLUMN = {
   1: 'vwork_step_1_name',
@@ -18,6 +18,8 @@ export async function linkQueuedJobsToVwork(): Promise<void> {
   await execute(
     `UPDATE tbl_driver_jobs j
      SET vwork_account = f.account,
+         company_name = NULLIF(btrim(f.customer), ''),
+         group_name = NULLIF(btrim(f.group_name), ''),
          vwork_job_id = f.job_id,
          vwork_step_1_name = f.step_1_name,
          vwork_step_2_name = f.step_2_name,
@@ -26,23 +28,42 @@ export async function linkQueuedJobsToVwork(): Promise<void> {
          vwork_step_5_name = f.step_5_name
      FROM (
        SELECT DISTINCT ON (job_id)
-         job_id, account, step_1_name, step_2_name, step_3_name, step_4_name, step_5_name
+         job_id, account, customer, group_name, step_1_name, step_2_name, step_3_name, step_4_name, step_5_name
        FROM vwork_job_feed
-       ORDER BY job_id, id DESC
+       ORDER BY job_id, id
      ) f
      WHERE j.job_id = f.job_id
        AND j.vwork_job_id IS NULL`,
   );
+  await execute(
+    `UPDATE tbl_driver_jobs j
+     SET company_name = COALESCE(NULLIF(btrim(j.company_name), ''), NULLIF(btrim(f.customer), '')),
+         group_name = COALESCE(NULLIF(btrim(j.group_name), ''), NULLIF(btrim(f.group_name), '')),
+         vwork_account = COALESCE(NULLIF(btrim(j.vwork_account), ''), f.account)
+     FROM (
+       SELECT DISTINCT ON (job_id) job_id, account, customer, group_name
+       FROM vwork_job_feed
+       ORDER BY job_id, id
+     ) f
+     WHERE j.job_id = f.job_id
+       AND (
+         j.company_name IS NULL OR btrim(j.company_name) = ''
+         OR j.group_name IS NULL OR btrim(j.group_name) = ''
+         OR j.vwork_account IS NULL OR btrim(j.vwork_account) = ''
+       )`,
+  );
 }
 
 /**
- * Writes the passed gate back to the VWork job.
+ * Writes one queued gate to the VWork job.
+ * The driver tap only enqueues. This runs later, from the gate-update service.
  * Jobs with no VWork hook are left alone. A VWork failure does not undo the gate.
  */
 export async function pushDriverGateToVwork(
   driverJobId: number,
   step: number,
   at: string,
+  queuedAccount?: string | null,
 ): Promise<{ sent: boolean; error?: string }> {
   const column = STEP_COLUMN[step as keyof typeof STEP_COLUMN];
   if (!column) return { sent: false };
@@ -54,10 +75,11 @@ export async function pushDriverGateToVwork(
     [driverJobId],
   );
   const row = rows[0];
-  const account = row?.vwork_account?.trim() as VworkAccountId | undefined;
+  const account = normalizeVworkAccount(queuedAccount) ?? normalizeVworkAccount(row?.vwork_account);
   const vworkJobId = row?.vwork_job_id?.trim() ?? '';
   const stepName = row?.step_name?.trim() ?? '';
-  if (!account || !vworkJobId || !stepName) return { sent: false };
+  if (!vworkJobId || !stepName) return { sent: false };
+  if (!account) return { sent: false, error: 'This job has no VWork account, so the stage was not sent' };
   try {
     await completeVworkJobStep({
       account,

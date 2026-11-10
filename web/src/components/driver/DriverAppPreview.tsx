@@ -16,7 +16,13 @@ function screenFor(path: string) {
   const params = new URLSearchParams(splitAt === -1 ? '' : path.slice(splitAt + 1));
   if (pathname === '/locations') return <DriverLocationsPage />;
   if (pathname === '/map') {
-    return <DriverMapScreen job={params.get('job') ?? ''} fence={params.get('fence') ?? ''} />;
+    return (
+      <DriverMapScreen
+        job={params.get('job') ?? ''}
+        fence={params.get('fence') ?? ''}
+        route={params.get('route') === '1'}
+      />
+    );
   }
   const job = pathname.match(/^\/job\/([^/]+)/);
   if (job) return <DriverJobScreen id={decodeURIComponent(job[1])} />;

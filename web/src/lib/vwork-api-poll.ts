@@ -137,8 +137,12 @@ function summaryText(input: {
   queue: VworkFeedQueueResult;
 }): string {
   const waiting = vworkAccountStatus()
-    .filter((account) => account.state !== 'ready')
-    .map((account) => `${account.label}: key ${account.state}`);
+    .filter((account) => account.state !== 'ready' || account.sharesKeyWith)
+    .map((account) =>
+      account.sharesKeyWith
+        ? `${account.label}: same key as ${account.sharesKeyWith}, not polled on its own`
+        : `${account.label}: key ${account.state}`,
+    );
   const pulled = input.accounts.map((account) =>
     account.error
       ? `${account.label}: ${account.error}`

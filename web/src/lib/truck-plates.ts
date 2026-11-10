@@ -1,6 +1,7 @@
 import { execute, query } from '@/lib/db';
 import { ensureTblDriverJobsSchema } from '@/lib/ensure-tbl-driver-jobs-schema';
 import { ensureVworkJobFeedSchema } from '@/lib/ensure-vwork-job-feed-schema';
+import { normalizeVworkAccount } from '@/lib/vwork-api';
 import type { DriverJob } from '@/lib/driver-jobs';
 
 export type TruckPlates = {
@@ -50,13 +51,15 @@ export async function platesToConfirm(job: DriverJob): Promise<TruckPlates> {
   const onJob = { truckRego: cleanPlate(job.truck_rego), trailerRego: cleanPlate(job.trailer_rego) };
   if (onJob.truckRego || onJob.trailerRego) return onJob;
   await ensureVworkJobFeedSchema();
+  const account = normalizeVworkAccount(job.vwork_account);
   const feed = await query<{ truck_rego: string | null; trailer_rego: string | null }>(
     `SELECT truck_rego, trailer_rego
      FROM vwork_job_feed
      WHERE job_id = $1
+       AND ($2::text IS NULL OR account = $2)
      ORDER BY id DESC
      LIMIT 1`,
-    [job.job_id],
+    [job.job_id, account],
   );
   const row = feed[0];
   return { truckRego: cleanPlate(row?.truck_rego), trailerRego: cleanPlate(row?.trailer_rego) };

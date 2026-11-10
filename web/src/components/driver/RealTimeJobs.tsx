@@ -249,11 +249,17 @@ function JobRow({ job }: { job: LiveDriverJob }) {
             {textOf(job.truck_id)}
             <span className="ml-2 font-normal text-zinc-600 dark:text-zinc-300">{textOf(job.driver)}</span>
           </p>
-          <p className="mt-0.5 text-xs text-zinc-600 dark:text-zinc-400">
-            <span className="font-mono text-zinc-800 dark:text-zinc-200">{textOf(job.job_id)}</span>
-            {' · '}
-            {textOf(job.vineyard_name)} → {textOf(job.winery_name)}
-          </p>
+          <div className="mt-0.5 text-xs text-zinc-600 dark:text-zinc-400">
+            {job.company_name?.trim() ? (
+              <div className="font-medium text-zinc-700 dark:text-zinc-200">{job.company_name}</div>
+            ) : null}
+            {job.group_name?.trim() ? <div>{job.group_name}</div> : null}
+            <div>
+              <span className="font-mono text-zinc-800 dark:text-zinc-200">{textOf(job.job_id)}</span>
+              {' · '}
+              {textOf(job.vineyard_name)} → {textOf(job.winery_name)}
+            </div>
+          </div>
         </div>
         <div className="text-right text-xs">
           <p className="flex items-center justify-end gap-3">
@@ -471,7 +477,9 @@ export default function RealTimeJobs() {
         Steps 2 and 3 sit inside the vineyard wheel, with a clock for how long the truck has been there.
         Steps 4 and 5 sit inside the winery wheel.
         On a road, the truck steps along in 20% increments of the fence-to-fence gap. Soft and hard marks match the alert on the driver button.
-        Each row shows the time of the last GPS point. The list tells you how many seconds remain until the next refresh.
+        A recorded tap is Hard inside the fence, Soft inside the soft band, and Manual only when the truck is outside the soft fence as well.
+        The clock in the circle is the button tap. The clock under Soft or Hard is the GPS time for that fence. Hover the gate to see the soft time, the hard time, and the gap.
+        Step 1 shows the day and date the job started. Each row shows the last GPS point received for that truck. Once the job has finished, that time stops at the end of the job, so a later ping on the same truck does not move it. The list tells you how many seconds remain until the next refresh.
         Filter by mode together with a vineyard or winery to see what is about to arrive. Live trucks are listed first, then finished jobs with the latest ending time first.
       </p>
 

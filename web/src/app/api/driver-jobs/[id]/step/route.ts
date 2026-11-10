@@ -5,11 +5,12 @@ import { expectedDurationLabel, openJobDiversion, stopJobDiversion } from '@/lib
 import { recordDriverClick } from '@/lib/driver-job-log';
 import { readStepProximity } from '@/lib/gate-proximity';
 import { staffActorFromBody } from '@/lib/job-actor';
-import { pushDriverGateToVwork } from '@/lib/vwork-job-steps';
+import { enqueueDriverGateUpdate } from '@/lib/vwork-gate-queue';
 import {
   DRIVER_GATES,
   DRIVER_JOB_COLUMNS,
   completedGateCount,
+  gateFenceKind,
   isPhoneLocalStamp,
   type DriverJob,
 } from '@/lib/driver-jobs';
@@ -22,7 +23,7 @@ const STEP_COLUMN = {
   5: 'step_5_click',
 } as const;
 
-/** POST: record the next gate only, using the phone clock string as given. */
+/** POST: record the next gate only, using the phone clock string as given. VWork is queued, not called here. */
 export async function POST(request: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
     await ensureTblDriverJobsSchema();
@@ -85,25 +86,36 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     }
 
     const gateStep = step === 2 || step === 3 || step === 4 ? step : null;
-    const warning = gateStep ? (await readStepProximity(current, gateStep)).warning : null;
+    const reading = gateStep ? await readStepProximity(current, gateStep) : null;
+    const warning = reading?.warning ?? null;
     if (body.confirmed !== true && warning) {
       return NextResponse.json({ needsConfirm: true, message: warning });
     }
 
     const column = STEP_COLUMN[step as keyof typeof STEP_COLUMN];
     const manualColumn = step === 2 ? 'step_2_manual' : step === 3 ? 'step_3_manual' : step === 4 ? 'step_4_manual' : null;
+    const fenceColumn = step === 2 ? 'step_2_fence' : step === 3 ? 'step_3_fence' : step === 4 ? 'step_4_fence' : null;
+    const fenceKind = reading
+      ? gateFenceKind({
+          step: reading.step,
+          meters: reading.meters,
+          beenInside: reading.beenInside,
+          limitMeters: reading.limitMeters,
+        })
+      : null;
     const rows = await query<DriverJob>(
-      manualColumn
+      manualColumn && fenceColumn
         ? `UPDATE tbl_driver_jobs
            SET ${column} = CAST($2 AS timestamp without time zone),
-               ${manualColumn} = $3
+               ${manualColumn} = $3,
+               ${fenceColumn} = $4
            WHERE id = $1 AND ${column} IS NULL
            RETURNING ${DRIVER_JOB_COLUMNS}`
         : `UPDATE tbl_driver_jobs
            SET ${column} = CAST($2 AS timestamp without time zone)
            WHERE id = $1 AND ${column} IS NULL
            RETURNING ${DRIVER_JOB_COLUMNS}`,
-      manualColumn ? [jobId, at, warning != null] : [jobId, at],
+      manualColumn ? [jobId, at, fenceKind === 'manual', fenceKind] : [jobId, at],
     );
     const row = rows[0];
     if (!row) return NextResponse.json({ error: 'That gate is not the next step' }, { status: 409 });
@@ -119,7 +131,21 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     } catch {
       // The gate click is already stored. The log can be rebuilt from it.
     }
-    const vwork = await pushDriverGateToVwork(jobId, step, at);
+    const gateTitle = DRIVER_GATES.find((gate) => gate.step === step)?.title ?? `Step ${step}`;
+    let vwork: { queued: boolean; error?: string } = { queued: true };
+    try {
+      await enqueueDriverGateUpdate({
+        driverJobId: jobId,
+        jobId: current.job_id,
+        step,
+        stepTitle: gateTitle,
+        stageAt: at,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error('[driver-step] gate update was not queued', message);
+      vwork = { queued: false, error: message };
+    }
     return NextResponse.json({ row, vwork });
   } catch (err) {
     const code = (err as { code?: string }).code;
