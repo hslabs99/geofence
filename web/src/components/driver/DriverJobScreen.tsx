@@ -7,8 +7,9 @@ import ApproachMeters, { useJobApproach } from '@/components/driver/ApproachMete
 import { DriverLink } from '@/components/driver/driver-nav';
 import DriverDiversionControl from '@/components/driver/DriverDiversionControl';
 import DriverJobLog from '@/components/driver/DriverJobLog';
+import GateSpeechPlayer from '@/components/driver/GateSpeechPlayer';
 import GateTrack from '@/components/driver/GateTrack';
-import { DRIVER_GATES, completedGateCount, gateActivity, gateClock, gateFenceHover, gateShownGps, jobDetailsConfirmed, phoneLocalStamp, wineryArrivalEta, type DriverJob } from '@/lib/driver-jobs';
+import { DRIVER_GATES, completedGateCount, gateActivity, gateClock, gateFenceHover, gateShownGps, jobDetailsConfirmed, phoneLocalStamp, wineryArrivalEta, type DriverJob, type JobLegs } from '@/lib/driver-jobs';
 import { staffActorPayload } from '@/lib/staff-session';
 
 export type DriverScreenMode = 'control' | 'watch' | null;
@@ -186,12 +187,21 @@ function ConfirmJobDetails({
   );
 }
 
+function legsFrom(data: { legs?: Partial<JobLegs> | null }): JobLegs | null {
+  const legs = data.legs;
+  if (!legs || typeof legs !== 'object') return null;
+  const out = typeof legs.outMeters === 'number' ? legs.outMeters : null;
+  const back = typeof legs.backMeters === 'number' ? legs.backMeters : null;
+  return { outMeters: out, backMeters: back };
+}
+
 export default function DriverJobScreen({ id: idProp, mode = null }: { id?: string; mode?: DriverScreenMode }) {
   const params = useParams<{ id?: string }>();
   const id = idProp ?? params.id ?? '';
   const watch = mode === 'watch';
   const control = mode === 'control';
   const [job, setJob] = useState<DriverJob | null>(null);
+  const [legs, setLegs] = useState<JobLegs | null>(null);
   const [plates, setPlates] = useState<SuggestedPlates | null>(null);
   const [actorName, setActorName] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
@@ -214,6 +224,8 @@ export default function DriverJobScreen({ id: idProp, mode = null }: { id?: stri
       .then((data) => {
         if (!cancelled) {
           setJob(data.row as DriverJob);
+          const nextLegs = legsFrom(data);
+          if (nextLegs) setLegs(nextLegs);
           setPlates(
             data.plates && typeof data.plates === 'object'
               ? {
@@ -270,7 +282,11 @@ export default function DriverJobScreen({ id: idProp, mode = null }: { id?: stri
           if (!response.ok) throw new Error(data?.error ?? response.statusText);
           return data;
         })
-        .then((data) => setJob(data.row as DriverJob))
+        .then((data) => {
+          setJob(data.row as DriverJob);
+          const nextLegs = legsFrom(data);
+          if (nextLegs) setLegs(nextLegs);
+        })
         .catch(() => undefined);
     }, 15_000);
     return () => clearInterval(timer);
@@ -344,6 +360,8 @@ export default function DriverJobScreen({ id: idProp, mode = null }: { id?: stri
       }
       setConfirm(null);
       setJob(data.row as DriverJob);
+      const nextLegs = legsFrom(data);
+      if (nextLegs) setLegs(nextLegs);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -380,6 +398,7 @@ export default function DriverJobScreen({ id: idProp, mode = null }: { id?: stri
       const data = await res.json();
       if (!res.ok) throw new Error(data?.error ?? res.statusText);
       setJob(data.row as DriverJob);
+      setLegs((current) => ({ outMeters: null, backMeters: current?.backMeters ?? null }));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -395,6 +414,17 @@ export default function DriverJobScreen({ id: idProp, mode = null }: { id?: stri
     job && (done === 1 || done === 3) && approach.reading
       ? { meters: approach.reading.meters ?? null, inside: approach.reading.inside === true }
       : null;
+  const remaining = travelMeters ? (travelMeters.inside ? 0 : travelMeters.meters) : null;
+  const journey = legs
+    ? {
+        outMeters: done >= 1 ? legs.outMeters : null,
+        backMeters: legs.backMeters,
+        active: done === 1 ? ('out' as const) : done === 3 ? ('back' as const) : null,
+        remaining,
+        eta: done === 3 ? wineryEta : null,
+      }
+    : null;
+  const tripMeters = done === 1 ? legs?.outMeters ?? null : done === 3 ? legs?.backMeters ?? null : null;
 
   return (
     <div className="relative flex min-h-full flex-1 flex-col">
@@ -491,7 +521,13 @@ export default function DriverJobScreen({ id: idProp, mode = null }: { id?: stri
       ) : !job ? (
         <p className="px-4 text-base text-[#667085]">Job not found.</p>
       ) : (
-        view === 'log' ? (
+        <>
+          <GateSpeechPlayer
+            step={approach.reading?.step}
+            alert={approach.reading?.proximity ?? null}
+            remind={approach.reading?.remind === true}
+          />
+          {view === 'log' ? (
           <>
             <div className="px-4 pb-2">
               <button type="button" onClick={() => setView('job')} className="h-10 text-base font-semibold text-[#175cd3]">
@@ -503,11 +539,12 @@ export default function DriverJobScreen({ id: idProp, mode = null }: { id?: stri
         ) : (
         <>
           <JobDetails job={job} />
-          <GateTrack job={job} travelMeters={travelMeters} />
+          <GateTrack job={job} travelMeters={travelMeters} journey={journey} />
           {done === 1 || done === 2 || done === 3 ? (
             <ApproachMeters
               reading={approach.reading}
               loading={approach.loading}
+              tripMeters={tripMeters}
               corner={<DriverDiversionControl jobId={job.id} refreshKey={diversionRefresh} embedded readOnly={watch} control={control} />}
             />
           ) : (
@@ -615,7 +652,8 @@ export default function DriverJobScreen({ id: idProp, mode = null }: { id?: stri
             </div>
           )}
         </>
-        )
+          )}
+        </>
       )}
     </div>
   );

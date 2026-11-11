@@ -219,7 +219,7 @@ async function drainVworkGateUpdatesNow(options?: {
             `UPDATE vwork_gate_updates
              SET status = 'failed', error = $2, claimed_at = NULL
              WHERE id = $1::bigint`,
-            [row.id, result.error.slice(0, 500)],
+            [row.id, result.error.slice(0, 4000)],
           );
         } else {
           skipped += 1;

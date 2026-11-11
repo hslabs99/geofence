@@ -1,4 +1,5 @@
 import { execute, query } from '@/lib/db';
+import { ensureDriverJobDismissedSchema, feedJobNotQueued } from '@/lib/driver-job-dismiss';
 import { ensureDriverUserSchema } from '@/lib/ensure-driver-user';
 import { ensureTblDevicesSchema } from '@/lib/ensure-tbl-devices-schema';
 import { ensureTblDriverJobsSchema } from '@/lib/ensure-tbl-driver-jobs-schema';
@@ -136,10 +137,11 @@ async function notifyAfterImport(): Promise<void> {
   }
 }
 
-/** Copies open VWork feed jobs that are not already in the driver job queue. */
+/** Copies open VWork feed jobs that are not already in the driver job queue and were not removed from it. */
 export async function enqueueVworkFeedJobs(): Promise<VworkFeedQueueResult> {
   await ensureVworkJobFeedSchema();
   await ensureTblDriverJobsSchema();
+  await ensureDriverJobDismissedSchema();
   await ensureTblDevicesSchema();
   await ensureDriverUserSchema();
 
@@ -149,10 +151,7 @@ export async function enqueueVworkFeedJobs(): Promise<VworkFeedQueueResult> {
             f.vineyard_name, f.delivery_winery, f.customer, f.group_name, f.truck_id, f.truck_rego, f.trailer_rego,
             f.step_1_name, f.step_2_name, f.step_3_name, f.step_4_name, f.step_5_name
      FROM vwork_job_feed f
-     WHERE NOT EXISTS (
-       SELECT 1 FROM tbl_driver_jobs j
-       WHERE j.job_id = f.job_id
-     )
+     WHERE ${feedJobNotQueued('f.job_id')}
      ORDER BY f.id
      LIMIT $1`,
     [BATCH + 1],
@@ -205,10 +204,7 @@ export async function enqueueVworkFeedJobs(): Promise<VworkFeedQueueResult> {
        )
        SELECT $1, $2, $3, $4, CAST(NULLIF($5, '') AS timestamp without time zone), $6, $7, $8, $9,
               $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20
-       WHERE NOT EXISTS (
-         SELECT 1 FROM tbl_driver_jobs existing
-         WHERE existing.job_id = $1
-       )`,
+       WHERE ${feedJobNotQueued('$1')}`,
       [
         job.job_id,
         truckId,

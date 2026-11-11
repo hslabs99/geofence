@@ -1,6 +1,12 @@
 import { query } from '@/lib/db';
 import { loadCurrentLocationSettings } from '@/lib/current-location-poll';
-import { completedGateCount, type DriverJob } from '@/lib/driver-jobs';
+import { completedGateCount, type DriverJob, type GateFenceKind, type JobLegs } from '@/lib/driver-jobs';
+
+/** Shown on step 1 when the latest fix is outside the winery and outside the soft band around it. */
+export const START_AWAY_WARNING =
+  'You are starting a job you are not in or near the winery. Confirm you are starting from your current location.';
+
+const COORD = `^-?[0-9]+(\\.[0-9]+)?,-?[0-9]+(\\.[0-9]+)?$`;
 
 export type GateProximity = {
   step: 2 | 3 | 4;
@@ -200,27 +206,41 @@ function metersOf(value: unknown): number | null {
   return Number.isFinite(n) ? Math.round(n) : null;
 }
 
+/** GPS clock when the fix has one. The poll clock is only a stand-in when GPS time is missing. */
+function clockOf(fix: DepartureFix): string {
+  const gps = fix.gpstimeNz?.trim() ?? '';
+  if (gps) return gps;
+  return fix.polltime?.trim() ?? '';
+}
+
 function atOrBefore(fix: DepartureFix, step2At: string): boolean {
   if (!step2At) return false;
-  const gps = fix.gpstimeNz?.trim() ?? '';
-  const polled = fix.polltime?.trim() ?? '';
-  return (gps !== '' && gps <= step2At) || (polled !== '' && polled <= step2At);
+  const clock = clockOf(fix);
+  return clock !== '' && clock <= step2At;
 }
 
 function usableFixes(fixes: DepartureFix[]): DepartureFix[] {
   return fixes.filter((fix) => fix.vineyardMeters != null);
 }
 
-/** Last fix at the gate 2 tap, then every later fix. The drive to the vineyard stays out of the later list. */
+/**
+ * Last fix at the gate 2 tap, then every later fix.
+ * A later GPS time stays in the later list even when its poll time is earlier than the tap.
+ */
 function splitAtGate2(fixes: DepartureFix[], step2At: string): { arrival: DepartureFix | null; after: DepartureFix[]; all: DepartureFix[] } {
   const all = usableFixes(fixes);
-  let arrivalIndex = -1;
-  for (let i = 0; i < all.length; i++) {
-    if (atOrBefore(all[i], step2At)) arrivalIndex = i;
+  if (all.length === 0) return { arrival: null, after: [], all };
+  const tap = step2At.trim();
+  if (!tap) return { arrival: all[0], after: all.slice(1), all };
+
+  let arrival: DepartureFix | null = null;
+  const after: DepartureFix[] = [];
+  for (const fix of all) {
+    if (atOrBefore(fix, tap)) arrival = fix;
+    else after.push(fix);
   }
-  if (arrivalIndex === -1 && all.length > 0) arrivalIndex = 0;
-  if (arrivalIndex === -1) return { arrival: null, after: [], all };
-  return { arrival: all[arrivalIndex], after: all.slice(arrivalIndex + 1), all };
+  if (!arrival) return { arrival: all[0], after: all.slice(1), all };
+  return { arrival, after, all };
 }
 
 /** Red while the latest fix is outside the polygon. The time is the fix after the last inside fix. */
@@ -233,11 +253,25 @@ function polygonExit(fixes: DepartureFix[]): VineyardDeparture {
 }
 
 /**
+ * Hard vineyard exit whose leave is after the gate 2 tap.
+ * A manual arrival still counts once a later fix is inside the polygon and the latest fix is outside it.
+ * An exit whose GPS time is at or before the tap stays off, so the drive in does not page the driver.
+ */
+function hardExitAfterTap(fixes: DepartureFix[], step2At: string): VineyardDeparture | null {
+  const exit = polygonExit(fixes);
+  if (exit.proximity !== 'red') return null;
+  const tap = step2At.trim();
+  const at = exit.crossedAt?.trim() ?? '';
+  if (tap && at && at <= tap) return null;
+  return exit;
+}
+
+/**
  * Gate 3 marker after gate 2.
- * A tap inside the polygon still goes red on the first later fix outside that polygon.
- * A tap inside the soft band goes red on the first later fix outside the band, and stays red.
- * A manual tap outside the band goes red once two fixes after that tap are each farther from the vineyard
- * and closer to the winery, unless a later fix enters the polygon. That red is only a reminder.
+ * A leave of the hard polygon after the tap goes red, including when gate 2 was manual.
+ * A tap inside the soft band goes red on the first later fix outside the band.
+ * A manual tap that never enters the polygon goes red once the truck is moving away from the vineyard
+ * toward the winery. That red is only a reminder.
  */
 export function vineyardDeparture(input: {
   step2Manual: boolean;
@@ -246,6 +280,9 @@ export function vineyardDeparture(input: {
   fixes: DepartureFix[];
 }): VineyardDeparture {
   const { arrival, after, all } = splitAtGate2(input.fixes, input.step2At);
+  const hard = hardExitAfterTap(all, input.step2At);
+  if (hard) return hard;
+
   if (arrival?.vineyardMeters === 0) return polygonExit(all);
 
   if (!input.step2Manual) {
@@ -254,20 +291,112 @@ export function vineyardDeparture(input: {
     return { proximity: 'red', crossedAt: exit.gpstimeNz ?? null, remind: false };
   }
 
-  const enteredAt = after.findIndex((fix) => fix.vineyardMeters === 0);
-  if (enteredAt >= 0) return polygonExit(after.slice(enteredAt));
-
-  // Both readings are after the tap, so the loading fix itself is not the start of the trip.
-  for (let i = 1; i < after.length; i++) {
-    const prev = after[i - 1];
-    const cur = after[i];
+  // Pairs after the tap only. The reading at the tap is not the start of the trip home.
+  const tap = input.step2At.trim();
+  const moving = all.filter((fix) => {
+    if (!tap) return true;
+    const clock = clockOf(fix);
+    return clock === '' || clock > tap;
+  });
+  for (let i = 1; i < moving.length; i++) {
+    const prev = moving[i - 1];
+    const cur = moving[i];
     if (prev.vineyardMeters == null || cur.vineyardMeters == null) continue;
-    if (prev.wineryMeters == null || cur.wineryMeters == null) continue;
-    if (cur.vineyardMeters > prev.vineyardMeters && cur.wineryMeters < prev.wineryMeters) {
-      return { proximity: 'red', crossedAt: null, remind: true };
-    }
+    const vineyardDelta = cur.vineyardMeters - prev.vineyardMeters;
+    if (vineyardDelta <= 0 || cur.vineyardMeters <= input.limitMeters) continue;
+    const prevWinery = prev.wineryMeters;
+    const curWinery = cur.wineryMeters;
+    const wineryKnown = prevWinery != null && curWinery != null;
+    const wineryDelta = wineryKnown ? prevWinery - curWinery : null;
+    if (wineryKnown && (wineryDelta == null || wineryDelta <= 0)) continue;
+    if (vineyardDelta < 30 && (wineryDelta == null || wineryDelta < 30)) continue;
+    return { proximity: 'red', crossedAt: null, remind: true };
   }
   return NO_DEPARTURE;
+}
+
+/** Where the GPS track sits on the live board. Driver taps do not move this. */
+export type GpsGhost = {
+  place: 'out' | 'vineyard' | 'back' | 'winery';
+  /** Share of the active road already covered. Empty while the fix is inside a place. */
+  percent: number | null;
+  vineyardEnteredAt: string | null;
+  vineyardLeftAt: string | null;
+  wineryEnteredAt: string | null;
+};
+
+/**
+ * GPS-only place for one job.
+ * Inside the vineyard polygon sits in the vineyard. After that visit, the return road
+ * runs until the winery polygon. Before the first vineyard entry, the truck is on the road out.
+ * The winery entry time is the first fix inside the winery after the vineyard exit.
+ * Once that fence is passed, the truck stays in the winery. A later sample outside the polygon does not put it back on the road.
+ */
+export function gpsGhostFromFixes(input: {
+  fixes: DepartureFix[];
+  vineyardMeters: number | null;
+  wineryMeters: number | null;
+  /** Metres from the job-start fix to the vineyard fence. */
+  outMeters: number | null;
+  /** Metres from the vineyard fence to the winery fence. */
+  backMeters: number | null;
+  latestAt?: string | null;
+}): GpsGhost {
+  let vineyardEnteredAt: string | null = null;
+  let vineyardLeftAt: string | null = null;
+  let wineryEnteredAt: string | null = null;
+  let seenVineyard = false;
+  let prevVineyard = false;
+  let departed = false;
+
+  for (const fix of input.fixes) {
+    const at = clockOf(fix) || null;
+    if (fix.vineyardMeters != null) {
+      const inVineyard = fix.vineyardMeters === 0;
+      if (inVineyard) {
+        if (!vineyardEnteredAt) vineyardEnteredAt = at;
+        seenVineyard = true;
+        vineyardLeftAt = null;
+        wineryEnteredAt = null;
+        departed = false;
+      } else if (prevVineyard) {
+        vineyardLeftAt = at;
+        departed = true;
+      }
+      prevVineyard = inVineyard;
+    }
+    if (departed && fix.wineryMeters === 0 && !wineryEnteredAt) wineryEnteredAt = at;
+  }
+
+  const inVineyard = input.vineyardMeters === 0;
+  const inWinery = input.wineryMeters === 0;
+  if (inVineyard) seenVineyard = true;
+
+  let place: GpsGhost['place'];
+  if (inVineyard) place = 'vineyard';
+  else if (wineryEnteredAt || (seenVineyard && inWinery)) place = 'winery';
+  else if (seenVineyard) place = 'back';
+  else place = 'out';
+
+  const latestAt = input.latestAt?.trim() || null;
+  if (place === 'vineyard') {
+    vineyardLeftAt = null;
+    wineryEnteredAt = null;
+    if (!vineyardEnteredAt) vineyardEnteredAt = latestAt;
+  } else if (place === 'back' && !vineyardLeftAt) {
+    vineyardLeftAt = latestAt;
+  } else if (place === 'winery' && !wineryEnteredAt) {
+    wineryEnteredAt = latestAt;
+  }
+
+  const remaining = place === 'out' ? input.vineyardMeters : place === 'back' ? input.wineryMeters : null;
+  const total = place === 'out' ? input.outMeters : place === 'back' ? input.backMeters : null;
+  const percent =
+    remaining == null || total == null || total <= 0
+      ? null
+      : Math.min(100, Math.max(0, Math.round((1 - remaining / total) * 100)));
+
+  return { place, percent, vineyardEnteredAt, vineyardLeftAt, wineryEnteredAt };
 }
 
 type DepartureJob = {
@@ -275,6 +404,8 @@ type DepartureJob = {
   imei: string;
   truck: string;
   since: string;
+  /** Last GPS clock to include. Empty keeps every later fix. */
+  until: string;
   vineyardFence: string;
   wineryFence: string;
 };
@@ -313,8 +444,8 @@ export async function loadDepartureFixes(jobs: DepartureJob[]): Promise<Map<numb
               WHERE j.winery_fence <> ''
                 AND lower(btrim(g.fence_name)) = lower(btrim(j.winery_fence))
             ))::int AS winery_meters
-     FROM unnest($1::int[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[])
-       AS j(id, imei, truck, since_at, vineyard_fence, winery_fence)
+     FROM unnest($1::int[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[])
+       AS j(id, imei, truck, since_at, until_at, vineyard_fence, winery_fence)
      CROSS JOIN LATERAL (
        SELECT id,
               to_char(gpstime_nz, 'YYYY-MM-DD HH24:MI:SS') AS gpstime_nz,
@@ -325,6 +456,11 @@ export async function loadDepartureFixes(jobs: DepartureJob[]): Promise<Map<numb
          AND (
            (j.imei <> '' AND btrim(c.imei) = j.imei)
            OR (j.truck <> '' AND lower(btrim(c.truck_id)) = lower(btrim(j.truck)))
+         )
+         AND (
+           j.until_at = ''
+           OR c.gpstime_nz <= NULLIF(j.until_at, '')::timestamp
+           OR (c.gpstime_nz IS NULL AND c.polltime <= NULLIF(j.until_at, ''))
          )
          AND (
            j.since_at = ''
@@ -357,6 +493,7 @@ export async function loadDepartureFixes(jobs: DepartureJob[]): Promise<Map<numb
       wanted.map((job) => job.imei),
       wanted.map((job) => job.truck),
       wanted.map((job) => job.since),
+      wanted.map((job) => job.until),
       wanted.map((job) => job.vineyardFence),
       wanted.map((job) => job.wineryFence),
     ],
@@ -398,6 +535,7 @@ async function readDepartureProximity(job: DriverJob, fence: string, limitMeters
       imei: job.imei?.trim() || '',
       truck: job.truck_id?.trim() || '',
       since: job.step_1_click?.trim() ?? '',
+      until: '',
       vineyardFence: fence,
       wineryFence: (job.winery_geo_fence || job.winery_name)?.trim() || '',
     },
@@ -455,6 +593,101 @@ export async function readStepProximity(job: DriverJob, step: 2 | 3 | 4): Promis
   if (step === 3) return readDepartureProximity(job, fence, limitMeters);
   const fixes = await fixesSince(job.imei?.trim() || '', job.truck_id?.trim() || '', fence, sinceFor(job, step));
   return readingFromFixes(step, target, fence, limitMeters, fixes);
+}
+
+export type JobStartPlace = {
+  wineryMeters: number | null;
+  vineyardMeters: number | null;
+  /** Inside the winery polygon, or inside the soft band around it. */
+  nearWinery: boolean;
+  limitMeters: number;
+  fence: GateFenceKind;
+};
+
+/**
+ * Latest truck fix against the winery and the vineyard.
+ * Near means inside the winery polygon or within the same soft band used for the other gates.
+ * The vineyard metres are the outbound leg, frozen onto the job when step 1 is saved.
+ */
+export async function readJobStart(job: DriverJob): Promise<JobStartPlace> {
+  const limitMeters = (await loadCurrentLocationSettings()).confirmAwayMeters;
+  const wineryFence = (job.winery_geo_fence || job.winery_name)?.trim() || '';
+  const vineyardFence = (job.vineyard_geo_fence || job.vineyard_name)?.trim() || '';
+  const imei = job.imei?.trim() || '';
+  const truck = job.truck_id?.trim() || '';
+  const empty = (fence: GateFenceKind): JobStartPlace => ({
+    wineryMeters: null,
+    vineyardMeters: null,
+    nearWinery: false,
+    limitMeters,
+    fence,
+  });
+  if (!imei && !truck) return empty('manual');
+
+  const rows = await query<{ winery_meters: number | null; vineyard_meters: number | null }>(
+    `WITH fix AS (
+       SELECT split_part(c.coordinates, ',', 2)::float8 AS lng,
+              split_part(c.coordinates, ',', 1)::float8 AS lat
+       FROM tbl_current_locations c
+       WHERE c.coordinates ~ '${COORD}'
+         AND (
+           ($1 <> '' AND btrim(c.imei) = $1)
+           OR ($2 <> '' AND lower(btrim(c.truck_id)) = lower(btrim($2)))
+         )
+       ORDER BY CASE
+                  WHEN $1 <> '' AND btrim(c.imei) = $1 THEN 0
+                  ELSE 1
+                END,
+                c.gpstime_nz DESC NULLS LAST,
+                c.id DESC
+       LIMIT 1
+     )
+     SELECT round(MIN(ST_Distance(
+              ST_Transform(ST_Force2D(g.geom), 4326)::geography,
+              ST_SetSRID(ST_MakePoint(fix.lng, fix.lat), 4326)::geography
+            )) FILTER (WHERE $3 <> '' AND lower(btrim(g.fence_name)) = lower($3)))::int AS vineyard_meters,
+            round(MIN(ST_Distance(
+              ST_Transform(ST_Force2D(g.geom), 4326)::geography,
+              ST_SetSRID(ST_MakePoint(fix.lng, fix.lat), 4326)::geography
+            )) FILTER (WHERE $4 <> '' AND lower(btrim(g.fence_name)) = lower($4)))::int AS winery_meters
+     FROM fix
+     LEFT JOIN tbl_geofences g
+       ON g.geom IS NOT NULL
+      AND (
+        ($3 <> '' AND lower(btrim(g.fence_name)) = lower($3))
+        OR ($4 <> '' AND lower(btrim(g.fence_name)) = lower($4))
+      )`,
+    [imei, truck, vineyardFence, wineryFence],
+  );
+  const vineyardMeters = metersOf(rows[0]?.vineyard_meters);
+  const wineryMeters = metersOf(rows[0]?.winery_meters);
+  const nearWinery = wineryMeters != null && wineryMeters <= limitMeters;
+  const fence: GateFenceKind = !nearWinery ? 'manual' : wineryMeters === 0 ? 'hard' : 'soft';
+  return { wineryMeters, vineyardMeters, nearWinery, limitMeters, fence };
+}
+
+/** Outbound metres stored at step 1, and the vineyard-fence to winery-fence return. */
+export async function readJobLegs(
+  job: Pick<DriverJob, 'start_vineyard_meters' | 'vineyard_geo_fence' | 'vineyard_name' | 'winery_geo_fence' | 'winery_name'>,
+): Promise<JobLegs> {
+  const outMeters = metersOf(job.start_vineyard_meters);
+  const vineyard = (job.vineyard_geo_fence || job.vineyard_name)?.trim() || '';
+  const winery = (job.winery_geo_fence || job.winery_name)?.trim() || '';
+  if (!vineyard || !winery) return { outMeters, backMeters: null };
+  const rows = await query<{ back_meters: number | null }>(
+    `SELECT round(MIN(ST_Distance(
+              ST_Transform(ST_Force2D(v.geom), 4326)::geography,
+              ST_Transform(ST_Force2D(w.geom), 4326)::geography
+            )))::int AS back_meters
+     FROM tbl_geofences v
+     JOIN tbl_geofences w ON true
+     WHERE v.geom IS NOT NULL
+       AND w.geom IS NOT NULL
+       AND lower(btrim(v.fence_name)) = lower($1)
+       AND lower(btrim(w.fence_name)) = lower($2)`,
+    [vineyard, winery],
+  );
+  return { outMeters, backMeters: metersOf(rows[0]?.back_meters) };
 }
 
 /** Proximity for whichever of gates 2, 3, or 4 is the next click. */

@@ -32,12 +32,67 @@ function jobMode(done: number): string | null {
   return MODES.find((mode) => mode.match(done))?.title ?? null;
 }
 
+function RefreshClock({
+  secondsLeft,
+  pollSeconds,
+  refreshing,
+  onRefresh,
+}: {
+  secondsLeft: number | null;
+  pollSeconds: number;
+  refreshing: boolean;
+  onRefresh: () => void;
+}) {
+  const fraction =
+    secondsLeft == null || pollSeconds <= 0 ? 0 : Math.min(1, Math.max(0, secondsLeft / pollSeconds));
+  const radius = 14;
+  const circumference = 2 * Math.PI * radius;
+  const label =
+    refreshing || (secondsLeft != null && secondsLeft <= 0)
+      ? 'Refreshing'
+      : secondsLeft == null
+        ? 'Waiting for the next refresh'
+        : `Next refresh in ${secondsLeft} seconds`;
+
+  return (
+    <div className="flex items-center gap-2">
+      <div className="relative h-9 w-9 shrink-0" role="timer" aria-label={label} title={label}>
+        <svg viewBox="0 0 36 36" className="h-9 w-9 -rotate-90" aria-hidden="true">
+          <circle cx="18" cy="18" r={radius} fill="none" className="stroke-zinc-200 dark:stroke-zinc-700" strokeWidth="3" />
+          <circle
+            cx="18"
+            cy="18"
+            r={radius}
+            fill="none"
+            className="stroke-blue-600 transition-[stroke-dashoffset] duration-1000 ease-linear dark:stroke-blue-400"
+            strokeWidth="3"
+            strokeLinecap="round"
+            strokeDasharray={circumference}
+            strokeDashoffset={circumference * (1 - fraction)}
+          />
+        </svg>
+        <span className="absolute inset-0 flex items-center justify-center text-[11px] font-semibold tabular-nums text-zinc-900 dark:text-zinc-100">
+          {secondsLeft == null ? '…' : secondsLeft}
+        </span>
+      </div>
+      <button
+        type="button"
+        onClick={onRefresh}
+        disabled={refreshing}
+        className="rounded border border-zinc-300 px-2.5 py-1 text-xs font-medium text-zinc-800 hover:bg-zinc-50 disabled:opacity-50 dark:border-zinc-600 dark:text-zinc-100 dark:hover:bg-zinc-800"
+      >
+        {refreshing ? 'Refreshing…' : 'Refresh now'}
+      </button>
+    </div>
+  );
+}
+
 /** Started, and step 5 has not been recorded. */
 function isLiveJob(job: DriverJob): boolean {
   return Boolean(job.step_1_click?.trim()) && !job.step_5_click?.trim();
 }
 
-/** Share of the fence-to-fence journey already behind the truck. */
+/** Share of this road already behind the truck. Outbound uses the start fix. The return uses the two fences. */
 function journeyShare(total: number | null, remaining: number | null): number | null {
   if (total == null || remaining == null || total <= 0) return null;
   return Math.min(100, Math.max(0, Math.round((1 - remaining / total) * 100)));
@@ -192,7 +247,7 @@ function JobRow({ job }: { job: LiveDriverJob }) {
   const now = new Date(nowMs);
   const travelling = done === 1 || done === 3;
   const remaining = done === 1 ? job.place.vineyardMeters : done === 3 ? job.place.wineryMeters : null;
-  const total = job.place.journeyMeters;
+  const total = done === 1 ? job.place.outMeters : done === 3 ? job.place.backMeters : null;
   const share = travelling ? journeyShare(total, remaining) : null;
   const legStart = done === 1 ? job.step_1_click : done === 2 ? job.step_2_click : done === 3 ? job.step_3_click : done === 4 ? job.step_4_click : null;
   const travelledMin = minuteLabel(locationAgeSeconds(legStart, now));
@@ -217,6 +272,18 @@ function JobRow({ job }: { job: LiveDriverJob }) {
               : 'Step';
   const jobMinutes = finished ? minutesBetween(job.step_1_click, job.step_5_click) : null;
   const mapHref = job.place.lat != null && job.place.lng != null ? `https://www.google.com/maps?q=${job.place.lat},${job.place.lng}` : null;
+  const imei = job.imei?.trim() ?? '';
+  const truckId = job.truck_id?.trim() ?? '';
+  const currentHref = imei
+    ? `/api/current-locations/map?imei=${encodeURIComponent(imei)}`
+    : truckId
+      ? `/api/current-locations/map?truck=${encodeURIComponent(truckId)}`
+      : null;
+  const currentTitle = imei
+    ? `Latest GPS fix for IMEI ${imei}. Opens in Google Maps, including before the job starts.`
+    : truckId
+      ? `This job has no IMEI. Opens the latest GPS fix for truck ${truckId} in Google Maps.`
+      : 'This job has no IMEI';
   const alertText = checkpointText(
     job.place.checkpointStep,
     job.place.checkpointAlert,
@@ -290,6 +357,21 @@ function JobRow({ job }: { job: LiveDriverJob }) {
               </a>
             ) : (
               <span className="text-zinc-400">Map</span>
+            )}
+            {currentHref ? (
+              <a
+                href={currentHref}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="font-semibold text-[#175cd3] hover:underline"
+                title={currentTitle}
+              >
+                Current location
+              </a>
+            ) : (
+              <span className="text-zinc-400" title={currentTitle}>
+                Current location
+              </span>
             )}
           </p>
           {liveEta && (
@@ -369,11 +451,13 @@ function JobRow({ job }: { job: LiveDriverJob }) {
         travelMeters={travelMeters(job, job.place)}
         placeNames={{ vineyard: job.vineyard_name, winery: job.winery_name }}
         journey={{
-          meters: job.place.journeyMeters,
+          outMeters: done >= 1 ? job.place.outMeters : null,
+          backMeters: job.place.backMeters,
           active: done === 1 ? 'out' : done === 3 ? 'back' : null,
           remaining,
           eta: liveEta,
         }}
+        ghost={job.place.ghost}
       />
         </div>
       </div>
@@ -408,6 +492,8 @@ export default function RealTimeJobs() {
   const [onlyLive, setOnlyLive] = useState(false);
   const [nowMs, setNowMs] = useState(() => Date.now());
   const [nextRefreshAt, setNextRefreshAt] = useState<number | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const [refreshNonce, setRefreshNonce] = useState(0);
 
   useEffect(() => {
     const id = setInterval(() => setNowMs(Date.now()), 1000);
@@ -419,6 +505,7 @@ export default function RealTimeJobs() {
     setNextRefreshAt(Date.now() + pollMs);
 
     async function load() {
+      setRefreshing(true);
       try {
         const res = await fetch('/api/driver-jobs/live', { cache: 'no-store' });
         const data = await res.json();
@@ -431,7 +518,10 @@ export default function RealTimeJobs() {
       } catch (err) {
         if (!cancelled) setError(err instanceof Error ? err.message : String(err));
       } finally {
-        if (!cancelled) setLoading(false);
+        if (!cancelled) {
+          setRefreshing(false);
+          setLoading(false);
+        }
       }
     }
 
@@ -444,7 +534,7 @@ export default function RealTimeJobs() {
       cancelled = true;
       clearInterval(timer);
     };
-  }, [pollMs]);
+  }, [pollMs, refreshNonce]);
 
   const pollSeconds = Math.max(1, Math.round(pollMs / 1000));
   const secondsLeft =
@@ -476,10 +566,10 @@ export default function RealTimeJobs() {
         Turn on Only live jobs to hide finished jobs and jobs that have not started. The long gaps are the roads to and from the vineyard.
         Steps 2 and 3 sit inside the vineyard wheel, with a clock for how long the truck has been there.
         Steps 4 and 5 sit inside the winery wheel.
-        On a road, the truck steps along in 20% increments of the fence-to-fence gap. Soft and hard marks match the alert on the driver button.
+        On the road to the vineyard, the truck steps along in 20% increments of the gap from its location at job start to the vineyard fence. On the road back, it uses the gap between the vineyard fence and the winery fence. Soft and hard marks match the alert on the driver button.
         A recorded tap is Hard inside the fence, Soft inside the soft band, and Manual only when the truck is outside the soft fence as well.
         The clock in the circle is the button tap. The clock under Soft or Hard is the GPS time for that fence. Hover the gate to see the soft time, the hard time, and the gap.
-        Step 1 shows the day and date the job started. Each row shows the last GPS point received for that truck. Once the job has finished, that time stops at the end of the job, so a later ping on the same truck does not move it. The list tells you how many seconds remain until the next refresh.
+        Step 1 shows the day and date the job started. Each row shows the last GPS point received for that truck. Once the job has finished, that time stops at the end of the job, so a later ping on the same truck does not move it. Current location opens the latest stored fix for that IMEI in a new Google Maps tab, including when the job has not started. The ring at the top right counts down to the next refresh. Refresh now loads the list immediately.
         Filter by mode together with a vineyard or winery to see what is about to arrive. Live trucks are listed first, then finished jobs with the latest ending time first.
       </p>
 
@@ -548,7 +638,12 @@ export default function RealTimeJobs() {
             ? 'Loading jobs…'
             : `${visible.length} ${onlyLive ? 'live ' : ''}job${visible.length === 1 ? '' : 's'}`}
         </span>
-        <span className="font-semibold tabular-nums text-zinc-900 dark:text-zinc-100">{refreshLabel}</span>
+        <RefreshClock
+          secondsLeft={secondsLeft}
+          pollSeconds={pollSeconds}
+          refreshing={refreshing}
+          onRefresh={() => setRefreshNonce((nonce) => nonce + 1)}
+        />
       </div>
 
       {error && (

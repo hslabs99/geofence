@@ -3,7 +3,7 @@ import { query } from '@/lib/db';
 import { ensureTblDriverJobsSchema } from '@/lib/ensure-tbl-driver-jobs-schema';
 import { expectedDurationLabel, openJobDiversion, stopJobDiversion } from '@/lib/driver-diversions';
 import { recordDriverClick } from '@/lib/driver-job-log';
-import { readStepProximity } from '@/lib/gate-proximity';
+import { readJobLegs, readJobStart, readStepProximity, START_AWAY_WARNING } from '@/lib/gate-proximity';
 import { staffActorFromBody } from '@/lib/job-actor';
 import { enqueueDriverGateUpdate } from '@/lib/vwork-gate-queue';
 import {
@@ -87,9 +87,54 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
 
     const gateStep = step === 2 || step === 3 || step === 4 ? step : null;
     const reading = gateStep ? await readStepProximity(current, gateStep) : null;
-    const warning = reading?.warning ?? null;
+    const start = step === 1 ? await readJobStart(current) : null;
+    const warning = start && !start.nearWinery ? START_AWAY_WARNING : (reading?.warning ?? null);
     if (body.confirmed !== true && warning) {
       return NextResponse.json({ needsConfirm: true, message: warning });
+    }
+
+    if (step === 1 && start) {
+      const rows = await query<DriverJob>(
+        `UPDATE tbl_driver_jobs
+         SET step_1_click = CAST($2 AS timestamp without time zone),
+             step_1_manual = $3,
+             step_1_fence = $4,
+             start_vineyard_meters = $5
+         WHERE id = $1 AND step_1_click IS NULL
+         RETURNING ${DRIVER_JOB_COLUMNS}`,
+        [jobId, at, !start.nearWinery, start.fence, start.vineyardMeters],
+      );
+      const row = rows[0];
+      if (!row) return NextResponse.json({ error: 'That gate is not the next step' }, { status: 409 });
+      try {
+        await recordDriverClick({
+          driverJobId: jobId,
+          at,
+          step,
+          outcome: warning ? 'caution_accept' : 'auto_accept',
+          detail: warning,
+          actor,
+        });
+      } catch {
+        // The gate click is already stored. The log can be rebuilt from it.
+      }
+      const gateTitle = DRIVER_GATES.find((gate) => gate.step === step)?.title ?? `Step ${step}`;
+      let vwork: { queued: boolean; error?: string } = { queued: true };
+      try {
+        await enqueueDriverGateUpdate({
+          driverJobId: jobId,
+          jobId: current.job_id,
+          step,
+          stepTitle: gateTitle,
+          stageAt: at,
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.error('[driver-step] gate update was not queued', message);
+        vwork = { queued: false, error: message };
+      }
+      const legs = await readJobLegs(row);
+      return NextResponse.json({ row, vwork, legs });
     }
 
     const column = STEP_COLUMN[step as keyof typeof STEP_COLUMN];
@@ -146,7 +191,8 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
       console.error('[driver-step] gate update was not queued', message);
       vwork = { queued: false, error: message };
     }
-    return NextResponse.json({ row, vwork });
+    const legs = await readJobLegs(row);
+    return NextResponse.json({ row, vwork, legs });
   } catch (err) {
     const code = (err as { code?: string }).code;
     if (code === '22007' || code === '22008') {

@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
-import { query } from '@/lib/db';
+import { getClient, query } from '@/lib/db';
 import { ensureTblDriverJobsSchema } from '@/lib/ensure-tbl-driver-jobs-schema';
+import { clearDismissedDriverJob, ensureDriverJobDismissedSchema } from '@/lib/driver-job-dismiss';
 import { driverJobWriteFromBody } from '@/lib/driver-job-fields';
 import { DRIVER_JOB_COLUMNS, type DriverJob } from '@/lib/driver-jobs';
 
@@ -134,27 +135,42 @@ export async function GET(request: Request) {
 export async function POST(request: Request) {
   try {
     await ensureTblDriverJobsSchema();
+    await ensureDriverJobDismissedSchema();
     const body = (await request.json()) as Record<string, unknown>;
     const parsed = await driverJobWriteFromBody(body);
     if (!parsed.ok) return NextResponse.json({ error: parsed.error }, { status: 400 });
     const job = parsed.job;
 
-    const rows = await query<DriverJobRow>(
-      `INSERT INTO tbl_driver_jobs (
-         job_id, truck_id, imei, driver, planned_start_time, winery_name, vineyard_name,
-         winery_geo_fence, vineyard_geo_fence
-       )
-       VALUES (
-         $1, $2, $3, $4,
-         CAST(NULLIF($5, '') AS timestamp without time zone),
-         $6, $7, $8, $9
-       )
-       RETURNING ${DRIVER_JOB_COLUMNS}`,
-      [job.jobId, job.truckId, job.imei, job.driver, job.plannedRaw ?? '', job.winery, job.vineyard, job.wineryFence, job.vineyardFence],
-    );
-    const row = rows[0];
-    if (!row) return NextResponse.json({ error: 'Insert failed' }, { status: 500 });
-    return NextResponse.json({ row });
+    const client = await getClient();
+    try {
+      await client.query('BEGIN');
+      await clearDismissedDriverJob(client, job.jobId);
+      const inserted = await client.query<DriverJobRow>(
+        `INSERT INTO tbl_driver_jobs (
+           job_id, truck_id, imei, driver, planned_start_time, winery_name, vineyard_name,
+           winery_geo_fence, vineyard_geo_fence
+         )
+         VALUES (
+           $1, $2, $3, $4,
+           CAST(NULLIF($5, '') AS timestamp without time zone),
+           $6, $7, $8, $9
+         )
+         RETURNING ${DRIVER_JOB_COLUMNS}`,
+        [job.jobId, job.truckId, job.imei, job.driver, job.plannedRaw ?? '', job.winery, job.vineyard, job.wineryFence, job.vineyardFence],
+      );
+      const row = inserted.rows[0];
+      if (!row) {
+        await client.query('ROLLBACK');
+        return NextResponse.json({ error: 'Insert failed' }, { status: 500 });
+      }
+      await client.query('COMMIT');
+      return NextResponse.json({ row });
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw err;
+    } finally {
+      client.release();
+    }
   } catch (err) {
     const code = (err as { code?: string }).code;
     if (code === '22007' || code === '22008') {

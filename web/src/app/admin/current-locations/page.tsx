@@ -1,9 +1,11 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import GateSpeechPanel from '@/components/admin/GateSpeechPanel';
 import { VworkApiPanel } from '@/components/admin/VworkApiPanel';
 import { VworkFeedPanel } from '@/components/admin/VworkFeedPanel';
 import { VworkGateUpdatesPanel } from '@/components/admin/VworkGateUpdatesPanel';
+import { tracksolidDayCallCost } from '@/lib/tracksolid-call-math';
 
 type Row = {
   id: number;
@@ -182,9 +184,29 @@ function shareOfLimit(count: number, limit: number): string {
   return `${rounded}%`;
 }
 
-type ServiceTab = 'services' | 'rows' | 'summary' | 'log' | 'vwork-api' | 'gate-updates' | 'vwork';
+function quotaShare(count: number, limit: number, overLimit: boolean): string {
+  const share = shareOfLimit(count, limit);
+  if (!overLimit || limit <= 0) return share;
+  const pct = (count / limit) * 100;
+  if (Math.round(pct) <= 100) return `${Math.round(pct * 10) / 10}%`;
+  return share;
+}
 
-const SERVICE_GROUPS: { id: 'services' | 'tracksolid' | 'vwork'; label: string; tabs: readonly [ServiceTab, string][] }[] = [
+function pollDayLine(rawSeconds: string): { text: string; overLimit: boolean } | null {
+  const seconds = Number(rawSeconds);
+  const cost = tracksolidDayCallCost(seconds);
+  if (!cost) return null;
+  const polls = cost.polls.toLocaleString();
+  const calls = cost.calls.toLocaleString();
+  const limit = cost.limit.toLocaleString();
+  const share = quotaShare(cost.calls, cost.limit, cost.overLimit);
+  const rule = `${polls} polls a day · ${calls} TrackSolid calls · ${share} of the ${limit} daily limit (${cost.callsPerPoll} per poll, plus ${cost.tokenCalls} token calls). This interval ${cost.overLimit ? 'goes past it' : 'stays inside it'}.`;
+  return { text: rule, overLimit: cost.overLimit };
+}
+
+type ServiceTab = 'services' | 'rows' | 'summary' | 'log' | 'vwork-api' | 'gate-updates' | 'vwork' | 'gate-speech';
+
+const SERVICE_GROUPS: { id: 'services' | 'tracksolid' | 'vwork' | 'gate-speech'; label: string; tabs: readonly [ServiceTab, string][] }[] = [
   {
     id: 'services',
     label: 'Services',
@@ -208,7 +230,16 @@ const SERVICE_GROUPS: { id: 'services' | 'tracksolid' | 'vwork'; label: string; 
       ['vwork', 'VWork feed'],
     ],
   },
+  {
+    id: 'gate-speech',
+    label: 'Gate Speech',
+    tabs: [],
+  },
 ];
+
+function groupTab(group: (typeof SERVICE_GROUPS)[number]): ServiceTab {
+  return group.tabs[0]?.[0] ?? (group.id === 'gate-speech' ? 'gate-speech' : 'services');
+}
 
 export default function CurrentLocationsAdminPage() {
   const [status, setStatus] = useState<Status | null>(null);
@@ -254,9 +285,10 @@ export default function CurrentLocationsAdminPage() {
   }, [load]);
 
   useEffect(() => {
+    if (tab !== 'services') return;
     const id = setInterval(() => setTick((n) => n + 1), 1000);
     return () => clearInterval(id);
-  }, []);
+  }, [tab]);
 
   useEffect(() => {
     if (dirty || !status?.settings) return;
@@ -351,6 +383,8 @@ export default function CurrentLocationsAdminPage() {
     setLocationSortDir('asc');
   }
 
+  const pollDay = pollDayLine(pollSeconds);
+
   return (
     <div className="w-full min-w-0 p-6">
       <h1 className="text-2xl font-semibold text-zinc-900 dark:text-zinc-100">Service management</h1>
@@ -368,14 +402,14 @@ export default function CurrentLocationsAdminPage() {
       <div className="mt-6">
         <div className="inline-flex rounded-lg border border-zinc-200 bg-zinc-100 p-1 dark:border-zinc-700 dark:bg-zinc-800">
           {SERVICE_GROUPS.map((group) => {
-            const active = group.id === 'services' ? tab === 'services' : group.tabs.some(([id]) => id === tab);
+            const active = group.tabs.length === 0 ? tab === group.id : group.tabs.some(([id]) => id === tab);
             return (
               <button
                 key={group.id}
                 type="button"
                 onClick={() => {
                   if (active) return;
-                  setTab(group.id === 'services' ? 'services' : group.tabs[0][0]);
+                  setTab(groupTab(group));
                 }}
                 className={`rounded-md px-3 py-1.5 text-sm font-semibold ${
                   active
@@ -388,7 +422,7 @@ export default function CurrentLocationsAdminPage() {
             );
           })}
         </div>
-        {tab !== 'services' && (
+        {SERVICE_GROUPS.some((group) => group.tabs.some(([id]) => id === tab)) && (
           <div className="mt-3 flex gap-2 border-b border-zinc-200 dark:border-zinc-700">
             {SERVICE_GROUPS.find((group) => group.tabs.some(([id]) => id === tab))!.tabs.map(([id, label]) => (
               <button
@@ -452,22 +486,29 @@ export default function CurrentLocationsAdminPage() {
         >
           Start
         </button>
-        <label className="text-sm text-zinc-700 dark:text-zinc-200">
-          Poll every
-          <input
-            type="number"
-            min={5}
-            max={3600}
-            step={1}
-            value={pollSeconds}
-            onChange={(e) => {
-              setDirty(true);
-              setPollSeconds(e.target.value);
-            }}
-            className="mx-2 w-20 rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800"
-          />
-          seconds
-        </label>
+        <div className="text-sm text-zinc-700 dark:text-zinc-200">
+          <label>
+            Poll every
+            <input
+              type="number"
+              min={5}
+              max={3600}
+              step={1}
+              value={pollSeconds}
+              onChange={(e) => {
+                setDirty(true);
+                setPollSeconds(e.target.value);
+              }}
+              className="mx-2 w-20 rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+            />
+            seconds
+          </label>
+          {pollDay && (
+            <p className={`mt-1 max-w-xl text-xs ${pollDay.overLimit ? 'font-medium text-amber-700 dark:text-amber-400' : 'text-zinc-500 dark:text-zinc-400'}`}>
+              {pollDay.text}
+            </p>
+          )}
+        </div>
         <button
           type="button"
           disabled={busy}
@@ -947,6 +988,8 @@ export default function CurrentLocationsAdminPage() {
       {tab === 'gate-updates' && <VworkGateUpdatesPanel view="queue" />}
 
       {tab === 'vwork' && <VworkFeedPanel />}
+
+      {tab === 'gate-speech' && <GateSpeechPanel />}
 
       {confirmEmpty && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4" role="dialog" aria-modal="true" aria-labelledby="empty-locations-title">

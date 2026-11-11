@@ -3,7 +3,7 @@ import { ensureDriverDiversionsSchema } from '@/lib/driver-diversions';
 import { ensureCurrentLocationsSchema, fillCurrentLocationGpsTimeNz } from '@/lib/ensure-current-locations-schema';
 import { ensureTblDriverJobsSchema } from '@/lib/ensure-tbl-driver-jobs-schema';
 import { loadCurrentLocationSettings } from '@/lib/current-location-poll';
-import { fenceProximity, loadDepartureFixes, vineyardDeparture } from '@/lib/gate-proximity';
+import { fenceProximity, gpsGhostFromFixes, loadDepartureFixes, vineyardDeparture, type GpsGhost } from '@/lib/gate-proximity';
 import { completedGateCount, DRIVER_JOB_COLUMNS, type DriverJob, type GateFenceKind } from '@/lib/driver-jobs';
 import { fillGateGpsTimes } from '@/lib/fill-gate-gps';
 
@@ -22,8 +22,10 @@ export type LivePlace = {
   /** Latest fix, same order as the stored coordinates string. */
   lat: number | null;
   lng: number | null;
-  /** Shortest metres between the winery fence and the vineyard fence. */
-  journeyMeters: number | null;
+  /** Metres from the GPS fix at job start to the vineyard fence. Empty before the job starts. */
+  outMeters: number | null;
+  /** Shortest metres between the vineyard fence and the winery fence. */
+  backMeters: number | null;
   /** Next checkpoint the driver can tap. */
   checkpointStep: 2 | 3 | 4 | null;
   /** Same yellow/red marker as the driver button. Yellow is soft, red is hard. */
@@ -32,6 +34,8 @@ export type LivePlace = {
   checkpointCrossedAt: string | null;
   /** Gate 3 red because the truck is heading to the winery without a fence exit. */
   checkpointRemind: boolean;
+  /** GPS place on the live board. Driver taps do not move it. */
+  ghost: GpsGhost;
 };
 
 export type LiveDiversion = {
@@ -192,6 +196,9 @@ export async function loadLiveDriverJobs(): Promise<{ rows: LiveDriverJob[]; dri
       vineyard_geo_fence: row.vineyard_geo_fence,
       step_0_click: row.step_0_click,
       step_1_click: row.step_1_click,
+      step_1_manual: flagOf(row.step_1_manual),
+      step_1_fence: fenceOf(row.step_1_fence),
+      start_vineyard_meters: metersOf(row.start_vineyard_meters),
       truck_rego: row.truck_rego,
       trailer_rego: row.trailer_rego,
       confirmed_driver: row.confirmed_driver,
@@ -221,29 +228,48 @@ export async function loadLiveDriverJobs(): Promise<{ rows: LiveDriverJob[]; dri
         fetchedAt: row.fix_polltime?.trim() || null,
         lat: coordOf(row.lat),
         lng: coordOf(row.lng),
-        journeyMeters: metersOf(row.journey_meters),
+        outMeters: metersOf(row.start_vineyard_meters),
+        backMeters: metersOf(row.journey_meters),
         checkpointStep: null,
         checkpointAlert: null,
         checkpointCrossedAt: null,
         checkpointRemind: false,
+        ghost: gpsGhostFromFixes({
+          fixes: [],
+          vineyardMeters,
+          wineryMeters,
+          outMeters: metersOf(row.start_vineyard_meters),
+          backMeters: metersOf(row.journey_meters),
+          latestAt: row.gpstime_nz?.trim() || null,
+        }),
       },
       diversion: null,
     };
     return job;
   });
 
-  const departing = rows.filter((job) => completedGateCount(job) === 2);
+  const tracked = rows.filter((job) => Boolean(job.step_1_click?.trim()));
   const tracks = await loadDepartureFixes(
-    departing.map((job) => ({
+    tracked.map((job) => ({
       id: job.id,
       imei: job.imei?.trim() || '',
       truck: job.truck_id?.trim() || '',
       since: job.step_1_click?.trim() || '',
+      until: job.step_5_click?.trim() || '',
       vineyardFence: (job.vineyard_geo_fence || job.vineyard_name || '').trim(),
       wineryFence: (job.winery_geo_fence || job.winery_name || '').trim(),
     })),
   );
   for (const job of rows) {
+    const fixes = tracks.get(job.id) ?? [];
+    job.place.ghost = gpsGhostFromFixes({
+      fixes,
+      vineyardMeters: job.place.vineyardMeters,
+      wineryMeters: job.place.wineryMeters,
+      outMeters: job.place.outMeters,
+      backMeters: job.place.backMeters,
+      latestAt: job.place.gpstimeNz,
+    });
     const done = completedGateCount(job);
     const step = done === 1 ? 2 : done === 2 ? 3 : done === 3 ? 4 : null;
     job.place.checkpointStep = step;
@@ -253,7 +279,7 @@ export async function loadLiveDriverJobs(): Promise<{ rows: LiveDriverJob[]; dri
         step2Manual: job.step_2_manual === true,
         step2At: job.step_2_click?.trim() ?? '',
         limitMeters: settings.confirmAwayMeters,
-        fixes: tracks.get(job.id) ?? [],
+        fixes,
       });
       job.place.checkpointAlert = depart.proximity;
       job.place.checkpointCrossedAt = depart.crossedAt;

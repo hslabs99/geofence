@@ -7,6 +7,7 @@ import DriverAppPreview from '@/components/driver/DriverAppPreview';
 import { DriverLookup } from '@/components/driver/DriverLookup';
 import { JobQueueIssues } from '@/components/driver/JobQueueIssues';
 import RealTimeJobs from '@/components/driver/RealTimeJobs';
+import { completedGateCount } from '@/lib/driver-jobs';
 
 type DriverJobRow = {
   id: number;
@@ -21,7 +22,18 @@ type DriverJobRow = {
   vineyard_name: string | null;
   winery_geo_fence: string | null;
   vineyard_geo_fence: string | null;
+  step_1_click: string | null;
+  step_2_click: string | null;
+  step_3_click: string | null;
+  step_4_click: string | null;
+  step_5_click: string | null;
 };
+
+const STAGE_NAME = ['Not started', 'Start job', 'Arrive vineyard', 'Depart vineyard', 'Arrive winery', 'End job'] as const;
+
+function jobStage(row: DriverJobRow): number {
+  return completedGateCount(row);
+}
 
 type DeviceOption = { deviceName: string; imei: string };
 type DriverUserOption = { value: string; label: string };
@@ -39,6 +51,36 @@ function TrashIcon() {
       <path strokeLinecap="round" strokeLinejoin="round" d="M6.2 6.5l.6 9.1a1.2 1.2 0 0 0 1.2 1.1h4a1.2 1.2 0 0 0 1.2-1.1l.6-9.1" />
       <path strokeLinecap="round" d="M8.5 9.2v4.6M11.5 9.2v4.6" />
     </svg>
+  );
+}
+
+function FenceMapMark({ mapped }: { mapped: boolean }) {
+  const label = mapped ? 'Geofence mapped' : 'Geofence not mapped';
+  return (
+    <span
+      title={label}
+      aria-label={label}
+      className={`inline-flex shrink-0 ${mapped ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}
+    >
+      {mapped ? (
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2.2" className="h-3.5 w-3.5" aria-hidden="true">
+          <path strokeLinecap="round" strokeLinejoin="round" d="M3 8.2 6.2 11.5 13 4.5" />
+        </svg>
+      ) : (
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2.2" className="h-3.5 w-3.5" aria-hidden="true">
+          <path strokeLinecap="round" d="M4 4l8 8M12 4 4 12" />
+        </svg>
+      )}
+    </span>
+  );
+}
+
+function placeCell(name: string | null | undefined, fence: string | null | undefined) {
+  return (
+    <span className="inline-flex items-center gap-1.5">
+      {cell(name)}
+      <FenceMapMark mapped={Boolean((fence ?? '').trim())} />
+    </span>
   );
 }
 
@@ -249,14 +291,16 @@ function DriverVisibilityPageContent() {
     setDeleting(true);
     setDeleteError(null);
     try {
-      const res = await fetch(`/api/driver-jobs/${pendingDelete.id}`, { method: 'DELETE' });
+      const deletedId = pendingDelete.id;
+      const res = await fetch(`/api/driver-jobs/${deletedId}`, { method: 'DELETE' });
       const data = await res.json();
-      if (!res.ok) throw new Error(data?.error ?? res.statusText);
-      if (editingId === pendingDelete.id) {
+      if (!res.ok || data?.ok !== true) throw new Error(data?.error ?? res.statusText);
+      if (editingId === deletedId) {
         setEditingId(null);
         setJobForm(emptyJobForm);
         setAddError(null);
       }
+      setRows((current) => current.filter((row) => row.id !== deletedId));
       setPendingDelete(null);
       setListVersion((n) => n + 1);
     } catch (err) {
@@ -561,6 +605,9 @@ function DriverVisibilityPageContent() {
                   Job ID
                 </th>
                 <th className="border-r border-zinc-200 px-2 py-2 text-xs font-medium text-zinc-500 dark:border-zinc-700 dark:text-zinc-400">
+                  Status
+                </th>
+                <th className="border-r border-zinc-200 px-2 py-2 text-xs font-medium text-zinc-500 dark:border-zinc-700 dark:text-zinc-400">
                   Truck ID
                 </th>
                 <th className="border-r border-zinc-200 px-2 py-2 text-xs font-medium text-zinc-500 dark:border-zinc-700 dark:text-zinc-400">
@@ -590,7 +637,7 @@ function DriverVisibilityPageContent() {
             <tbody>
               {rows.length === 0 ? (
                 <tr>
-                  <td colSpan={10} className="px-3 py-6 text-sm text-zinc-500 dark:text-zinc-400">
+                  <td colSpan={11} className="px-3 py-6 text-sm text-zinc-500 dark:text-zinc-400">
                     No jobs match these filters.
                   </td>
                 </tr>
@@ -601,6 +648,10 @@ function DriverVisibilityPageContent() {
                       <div className="text-[11px] font-medium text-zinc-700 dark:text-zinc-200">{cell(row.company_name)}</div>
                       <div className="text-[11px] text-zinc-500 dark:text-zinc-400">{cell(row.group_name)}</div>
                       <div className="font-mono">{cell(row.job_id)}</div>
+                    </td>
+                    <td className="border-r border-zinc-100 px-2 py-1.5 text-zinc-900 dark:border-zinc-800 dark:text-zinc-100">
+                      <div className="font-medium">Stage {jobStage(row)}</div>
+                      <div className="text-[11px] text-zinc-500 dark:text-zinc-400">{STAGE_NAME[jobStage(row)]}</div>
                     </td>
                     <td className="border-r border-zinc-100 px-2 py-1.5 text-zinc-800 dark:border-zinc-800 dark:text-zinc-200">
                       {cell(row.truck_id)}
@@ -615,10 +666,10 @@ function DriverVisibilityPageContent() {
                       {cell(row.planned_start_time)}
                     </td>
                     <td className="border-r border-zinc-100 px-2 py-1.5 text-zinc-800 dark:border-zinc-800 dark:text-zinc-200">
-                      {cell(row.winery_name)}
+                      {placeCell(row.winery_name, row.winery_geo_fence)}
                     </td>
                     <td className="border-r border-zinc-100 px-2 py-1.5 text-zinc-800 dark:border-zinc-800 dark:text-zinc-200">
-                      {cell(row.vineyard_name)}
+                      {placeCell(row.vineyard_name, row.vineyard_geo_fence)}
                     </td>
                     <td className="border-r border-zinc-100 px-2 py-1.5 text-zinc-800 dark:border-zinc-800 dark:text-zinc-200">
                       {cell(row.winery_geo_fence)}
@@ -670,7 +721,7 @@ function DriverVisibilityPageContent() {
               Delete this job?
             </h2>
             <p className="mt-2 text-sm text-zinc-600 dark:text-zinc-300">
-              This permanently removes the job below, including its step log and diversions. This cannot be undone.
+              This removes the job below from the queue, including its step log and diversions.
             </p>
             <dl className="mt-4 grid grid-cols-[9rem_1fr] gap-x-3 gap-y-1 rounded border border-zinc-200 bg-zinc-50 p-3 text-sm dark:border-zinc-700 dark:bg-zinc-800">
               {(

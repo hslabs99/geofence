@@ -26,7 +26,64 @@ export async function backfillGateFences(): Promise<void> {
   await backfillArrival(2, limit);
   await backfillArrival(4, limit);
   await backfillDeparture(limit);
+  await backfillStartPlace(limit);
   backfilled = true;
+}
+
+/** Freeze the outbound metres, and the away-from-winery mark, from the GPS point nearest step 1. */
+async function backfillStartPlace(limit: number): Promise<void> {
+  await execute(
+    `UPDATE tbl_driver_jobs AS job
+     SET start_vineyard_meters = COALESCE(job.start_vineyard_meters, v.vineyard_meters),
+         step_1_fence = COALESCE(job.step_1_fence, v.kind),
+         step_1_manual = COALESCE(job.step_1_manual, (v.kind = 'manual'))
+     FROM (
+       SELECT j.id,
+              p.vineyard_meters,
+              CASE
+                WHEN names.winery = '' THEN NULL
+                WHEN p.winery_meters IS NULL THEN NULL
+                WHEN p.winery_meters = 0 THEN 'hard'
+                WHEN p.winery_meters <= $1 THEN 'soft'
+                ELSE 'manual'
+              END AS kind
+       FROM tbl_driver_jobs j
+       CROSS JOIN LATERAL (
+         SELECT btrim(coalesce(nullif(btrim(coalesce(j.winery_geo_fence, '')), ''), j.winery_name, '')) AS winery,
+                btrim(coalesce(nullif(btrim(coalesce(j.vineyard_geo_fence, '')), ''), j.vineyard_name, '')) AS vineyard
+       ) names
+       JOIN LATERAL (
+         SELECT round(MIN(ST_Distance(
+                  ST_Transform(ST_Force2D(g.geom), 4326)::geography,
+                  ST_SetSRID(ST_MakePoint(
+                    split_part(loc.coordinates, ',', 2)::float8,
+                    split_part(loc.coordinates, ',', 1)::float8
+                  ), 4326)::geography
+                )) FILTER (WHERE names.vineyard <> '' AND lower(btrim(g.fence_name)) = lower(names.vineyard)))::int AS vineyard_meters,
+                round(MIN(ST_Distance(
+                  ST_Transform(ST_Force2D(g.geom), 4326)::geography,
+                  ST_SetSRID(ST_MakePoint(
+                    split_part(loc.coordinates, ',', 2)::float8,
+                    split_part(loc.coordinates, ',', 1)::float8
+                  ), 4326)::geography
+                )) FILTER (WHERE names.winery <> '' AND lower(btrim(g.fence_name)) = lower(names.winery)))::int AS winery_meters
+         FROM (
+           ${pointSql('step_1_click')}
+         ) loc
+         JOIN tbl_geofences g
+           ON g.geom IS NOT NULL
+          AND (
+            (names.vineyard <> '' AND lower(btrim(g.fence_name)) = lower(names.vineyard))
+            OR (names.winery <> '' AND lower(btrim(g.fence_name)) = lower(names.winery))
+          )
+       ) p ON true
+       WHERE j.step_1_click IS NOT NULL
+         AND (j.start_vineyard_meters IS NULL OR j.step_1_fence IS NULL)
+     ) v
+     WHERE job.id = v.id
+       AND (v.vineyard_meters IS NOT NULL OR v.kind IS NOT NULL)`,
+    [limit],
+  );
 }
 
 function fenceNameSql(step: 2 | 4): string {

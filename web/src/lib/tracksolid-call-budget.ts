@@ -1,11 +1,15 @@
 import { execute, query } from '@/lib/db';
+import {
+  pollsInWindow,
+  tokenCallsInSpan,
+  TRACKSOLID_CALLS_PER_POLL,
+  TRACKSOLID_DAILY_CALL_LIMIT,
+  tracksolidDayCallCost,
+} from '@/lib/tracksolid-call-math';
 
-/** HK, EU, and US nodes. TrackSolid restores this 24 hours after the first call of the window. */
-export const TRACKSOLID_DAILY_CALL_LIMIT = 8640;
+export { TRACKSOLID_DAILY_CALL_LIMIT } from '@/lib/tracksolid-call-math';
+
 const WINDOW_MS = 24 * 60 * 60 * 1000;
-const TOKEN_MS = 7200 * 1000;
-/** Device list plus one location call. The account is under the 100-IMEI limit, so one location call covers it. */
-const CALLS_PER_POLL = 2;
 const SETTINGS_TYPE = 'TracksolidCallWindow';
 
 let ensured = false;
@@ -93,22 +97,6 @@ async function recordTracksolidCallInner(input: { endpointKey: string; method: s
   );
 }
 
-function pollsIn(ms: number, intervalSeconds: number): number {
-  if (ms <= 0 || intervalSeconds <= 0) return 0;
-  return Math.floor(ms / (intervalSeconds * 1000));
-}
-
-function tokenCallsUntil(now: number, end: number, expiresAtMs: number | null, pollRunning: boolean): number {
-  if (!pollRunning || end <= now) return 0;
-  let next = expiresAtMs != null && expiresAtMs > now ? expiresAtMs : now;
-  let count = 0;
-  while (next < end && count < 100) {
-    count += 1;
-    next += TOKEN_MS;
-  }
-  return count;
-}
-
 export async function tracksolidCallBudget(input: {
   endpointKey: string;
   pollIntervalSeconds: number;
@@ -133,13 +121,12 @@ export async function tracksolidCallBudget(input: {
   const used = rows.reduce((sum, row) => sum + Number(row.count), 0);
   const resetsAtMs = windowStart == null ? null : windowStart + WINDOW_MS;
   const remainingMs = resetsAtMs == null ? WINDOW_MS : Math.max(0, resetsAtMs - now);
-  const futurePolls = input.pollRunning ? pollsIn(remainingMs, input.pollIntervalSeconds) : 0;
-  const futureTokens = tokenCallsUntil(now, now + remainingMs, input.tokenExpiresAtMs, input.pollRunning);
+  const futurePolls = input.pollRunning ? pollsInWindow(remainingMs, input.pollIntervalSeconds) : 0;
+  const futureTokens = tokenCallsInSpan(now, now + remainingMs, input.tokenExpiresAtMs, input.pollRunning);
   const forecast = windowStart == null && !input.pollRunning
     ? 0
-    : used + futurePolls * CALLS_PER_POLL + futureTokens;
-  const fullDayAtInterval =
-    pollsIn(WINDOW_MS, input.pollIntervalSeconds) * CALLS_PER_POLL + tokenCallsUntil(0, WINDOW_MS, 0, true);
+    : used + futurePolls * TRACKSOLID_CALLS_PER_POLL + futureTokens;
+  const fullDayAtInterval = tracksolidDayCallCost(input.pollIntervalSeconds)?.calls ?? 0;
 
   return {
     limit: TRACKSOLID_DAILY_CALL_LIMIT,
@@ -148,7 +135,7 @@ export async function tracksolidCallBudget(input: {
     fullDayAtInterval,
     pollIntervalSeconds: input.pollIntervalSeconds,
     pollRunning: input.pollRunning,
-    callsPerPoll: CALLS_PER_POLL,
+    callsPerPoll: TRACKSOLID_CALLS_PER_POLL,
     windowStartedAt: windowStart == null ? null : localClock(windowStart),
     resetsAt: resetsAtMs == null ? null : localClock(resetsAtMs),
     resetsAtMs,

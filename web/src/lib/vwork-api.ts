@@ -416,6 +416,81 @@ function xmlText(value: string): string {
   return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
+function vworkFailure(status: number, xml: string): string {
+  const messages = [...xml.matchAll(/<message>([^<]*)<\/message>/g)]
+    .map((match) => decodeXml(match[1]).trim())
+    .filter((message) => message !== '');
+  if (messages.length > 0) return `VWork step ${status}: ${messages.join('; ')}`;
+  return `VWork step ${status}: ${xml.replace(/\s+/g, ' ').slice(0, 500)}`;
+}
+
+type RequiredCustomField = { name: string; type: string; value: string; options: string[] };
+
+const pickListCache = new Map<string, string[]>();
+
+async function pickListValues(apiKey: string, pickListId: string): Promise<string[]> {
+  const cached = pickListCache.get(pickListId);
+  if (cached) return cached;
+  try {
+    const url = new URL(`${apiBase()}/api/v5/pick_lists/${encodeURIComponent(pickListId)}.xml`);
+    url.searchParams.set('api_key', apiKey);
+    const res = await fetch(url, { headers: { 'Accept-Encoding': 'gzip' }, cache: 'no-store' });
+    const xml = await res.text();
+    if (!res.ok) return [];
+    const root = parseXmlElement(xml);
+    const list = root.name === 'pick_list' ? root : root.children.find((child) => child.name === 'pick_list');
+    const items = list?.children.find((child) => child.name === 'pick_list_items');
+    const values = (items?.children ?? [])
+      .filter((child) => child.name === 'pick_list_item')
+      .map((child) => childText(child, 'value'))
+      .filter((value): value is string => Boolean(value));
+    pickListCache.set(pickListId, values);
+    return values;
+  } catch {
+    return [];
+  }
+}
+
+function requiredFieldLabel(field: RequiredCustomField): string {
+  if (field.value.trim()) return `${field.name} = ${field.value.trim()}`;
+  if (field.options.length > 0) return `${field.name} (${field.options.join(' / ')})`;
+  if (field.type === 'image') return `${field.name} (photo)`;
+  if (field.type === 'number') return `${field.name} (number)`;
+  if (field.type === 'datetime') return `${field.name} (date)`;
+  if (field.type && field.type !== 'text') return `${field.name} (${field.type})`;
+  return `${field.name} (text)`;
+}
+
+/** Required custom fields on the job, empty ones first, with pick-list choices where VWork has them. */
+async function requiredCustomFieldDetail(apiKey: string, vworkJobId: string): Promise<string> {
+  const url = new URL(`${apiBase()}/api/v5/jobs/${encodeURIComponent(vworkJobId)}.xml`);
+  url.searchParams.set('api_key', apiKey);
+  const res = await fetch(url, { headers: { 'Accept-Encoding': 'gzip' }, cache: 'no-store' });
+  const xml = await res.text();
+  if (!res.ok) return '';
+  const root = parseXmlElement(xml);
+  const job = root.name === 'job' ? root : root.children.find((child) => child.name === 'job');
+  const wrap = job?.children.find((child) => child.name === 'custom_fields');
+  const fields = wrap?.children.filter((child) => child.name === 'custom_field') ?? [];
+  const required: RequiredCustomField[] = [];
+  for (const field of fields) {
+    if (childText(field, 'permission') !== 'required') continue;
+    const name = childText(field, 'name');
+    if (!name) continue;
+    const type = childText(field, 'type') ?? 'text';
+    const value = childText(field, 'value') ?? '';
+    const pickListId = childText(field, 'pick_list_id');
+    const options = type === 'pick_list' && pickListId && value.trim() === '' ? await pickListValues(apiKey, pickListId) : [];
+    required.push({ name, type, value, options });
+  }
+  const empty = required.filter((field) => field.value.trim() === '');
+  const filled = required.filter((field) => field.value.trim() !== '');
+  const parts: string[] = [];
+  if (empty.length > 0) parts.push(`Empty required fields: ${empty.map(requiredFieldLabel).join('; ')}`);
+  if (filled.length > 0) parts.push(`Filled required fields: ${filled.map(requiredFieldLabel).join('; ')}`);
+  return parts.join('. ');
+}
+
 /** Marks one named step complete on the VWork job. Other fields stay as they are. */
 export async function completeVworkJobStep(input: {
   account: VworkAccountId;
@@ -424,8 +499,15 @@ export async function completeVworkJobStep(input: {
   completedAt: string;
 }): Promise<void> {
   const accountId = normalizeVworkAccount(input.account);
-  const account = accountId ? accountRecords().find((item) => item.id === accountId) : undefined;
+  const records = accountRecords();
+  const account = accountId ? records.find((item) => item.id === accountId) : undefined;
   if (!account?.apiKey) throw new Error(`${input.account} API key is not ready`);
+  if (account.sharesKeyWith) {
+    const other = records.find((item) => item.id === account.sharesKeyWith);
+    throw new Error(
+      `${account.label} is using the ${other?.label ?? account.sharesKeyWith} API key, so this job was not sent. Set a separate key for ${account.label} on the server that sends gate updates, then restart that server.`,
+    );
+  }
   const url = new URL(`${apiBase()}/api/v5/jobs/${encodeURIComponent(input.vworkJobId)}.xml`);
   url.searchParams.set('api_key', account.apiKey);
   const body = `<?xml version="1.0" encoding="utf-8"?><job><steps type="array"><step><name>${xmlText(input.stepName)}</name><completed_at>${xmlText(input.completedAt)}</completed_at></step></steps></job>`;
@@ -437,7 +519,12 @@ export async function completeVworkJobStep(input: {
   });
   const text = await res.text();
   if (!res.ok) {
-    throw new Error(`VWork step ${res.status}: ${text.replace(/\s+/g, ' ').slice(0, 240)}`);
+    let message = vworkFailure(res.status, text);
+    if (/required custom fields/i.test(message)) {
+      const detail = await requiredCustomFieldDetail(account.apiKey, input.vworkJobId).catch(() => '');
+      if (detail) message = `${message}. ${detail}`;
+    }
+    throw new Error(message);
   }
 }
 

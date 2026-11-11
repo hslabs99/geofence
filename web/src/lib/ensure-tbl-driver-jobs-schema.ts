@@ -65,6 +65,9 @@ export async function ensureTblDriverJobsSchema(): Promise<void> {
   await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS winery_geo_fence text`);
   await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS vineyard_geo_fence text`);
   await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS imei text`);
+  await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS step_1_manual boolean`);
+  await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS step_1_fence text`);
+  await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS start_vineyard_meters integer`);
   await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS step_2_manual boolean`);
   await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS step_3_manual boolean`);
   await execute(`ALTER TABLE tbl_driver_jobs ADD COLUMN IF NOT EXISTS step_4_manual boolean`);

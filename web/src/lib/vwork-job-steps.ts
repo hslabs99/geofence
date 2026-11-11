@@ -3,13 +3,48 @@ import { ensureTblDriverJobsSchema } from '@/lib/ensure-tbl-driver-jobs-schema';
 import { ensureVworkJobFeedSchema } from '@/lib/ensure-vwork-job-feed-schema';
 import { completeVworkJobStep, normalizeVworkAccount, vworkCompletedAt } from '@/lib/vwork-api';
 
-const STEP_COLUMN = {
-  1: 'vwork_step_1_name',
-  2: 'vwork_step_2_name',
-  3: 'vwork_step_3_name',
-  4: 'vwork_step_4_name',
-  5: 'vwork_step_5_name',
-} as const;
+const STEP_COLUMNS = [
+  'vwork_step_1_name',
+  'vwork_step_2_name',
+  'vwork_step_3_name',
+  'vwork_step_4_name',
+  'vwork_step_5_name',
+] as const;
+
+/** Driver gate, then the VWork step names that gate should complete. */
+const GATE_STEP_NAMES: Record<number, string[]> = {
+  1: ['start job'],
+  2: ['arrive vineyard'],
+  3: ['depart vineyard'],
+  4: ['arrive winery'],
+  5: ['end job', 'job completed', 'complete job', 'job complete'],
+};
+
+function normStepName(value: string): string {
+  return value.trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+/**
+ * Picks the VWork step name for a driver gate.
+ * A four-step template keeps "Job Completed" in slot 4. That belongs to End job,
+ * and Arrive winery is left alone because that template has no winery step.
+ */
+export function vworkStepNameForGate(step: number, names: Array<string | null | undefined>): string {
+  const wanted = GATE_STEP_NAMES[step];
+  if (!wanted) return '';
+  const cleaned = names.map((name) => name?.trim() ?? '');
+  for (const alias of wanted) {
+    const found = cleaned.find((name) => name !== '' && normStepName(name) === alias);
+    if (found) return found;
+  }
+  const slot = cleaned[step - 1] ?? '';
+  if (!slot) return '';
+  const slotKey = normStepName(slot);
+  const claimedByOther = Object.entries(GATE_STEP_NAMES).some(
+    ([other, aliases]) => Number(other) !== step && aliases.includes(slotKey),
+  );
+  return claimedByOther ? '' : slot;
+}
 
 /** Fills the VWork job id, account, and step names on queue rows that came from the feed. */
 export async function linkQueuedJobsToVwork(): Promise<void> {
@@ -65,11 +100,12 @@ export async function pushDriverGateToVwork(
   at: string,
   queuedAccount?: string | null,
 ): Promise<{ sent: boolean; error?: string }> {
-  const column = STEP_COLUMN[step as keyof typeof STEP_COLUMN];
-  if (!column) return { sent: false };
+  if (!GATE_STEP_NAMES[step]) return { sent: false };
   await linkQueuedJobsToVwork();
-  const rows = await query<{ vwork_account: string | null; vwork_job_id: string | null; step_name: string | null }>(
-    `SELECT vwork_account, vwork_job_id, ${column} AS step_name
+  const rows = await query<
+    { vwork_account: string | null; vwork_job_id: string | null } & Record<(typeof STEP_COLUMNS)[number], string | null>
+  >(
+    `SELECT vwork_account, vwork_job_id, ${STEP_COLUMNS.join(', ')}
      FROM tbl_driver_jobs
      WHERE id = $1`,
     [driverJobId],
@@ -77,7 +113,10 @@ export async function pushDriverGateToVwork(
   const row = rows[0];
   const account = normalizeVworkAccount(queuedAccount) ?? normalizeVworkAccount(row?.vwork_account);
   const vworkJobId = row?.vwork_job_id?.trim() ?? '';
-  const stepName = row?.step_name?.trim() ?? '';
+  const stepName = vworkStepNameForGate(
+    step,
+    STEP_COLUMNS.map((column) => row?.[column]),
+  );
   if (!vworkJobId || !stepName) return { sent: false };
   if (!account) return { sent: false, error: 'This job has no VWork account, so the stage was not sent' };
   try {

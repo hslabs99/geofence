@@ -1,9 +1,13 @@
 import { NextResponse } from 'next/server';
 import { getClient, query } from '@/lib/db';
 import { driverJobWriteFromBody } from '@/lib/driver-job-fields';
+import { dismissDriverJob, ensureDriverJobDismissedSchema } from '@/lib/driver-job-dismiss';
 import { ensureDriverDiversionsSchema } from '@/lib/driver-diversions';
 import { ensureDriverJobLogSchema } from '@/lib/driver-job-log';
 import { ensureTblDriverJobsSchema } from '@/lib/ensure-tbl-driver-jobs-schema';
+import { ensureVworkGateUpdateSchema } from '@/lib/ensure-vwork-gate-update-schema';
+import { ensureVworkJobFeedSchema } from '@/lib/ensure-vwork-job-feed-schema';
+import { readJobLegs } from '@/lib/gate-proximity';
 import { DRIVER_JOB_COLUMNS, type DriverJob } from '@/lib/driver-jobs';
 import { fillGateGpsTimes } from '@/lib/fill-gate-gps';
 import { platesToConfirm } from '@/lib/truck-plates';
@@ -25,7 +29,8 @@ export async function GET(_request: Request, { params }: { params: Promise<{ id:
     const row = rows[0];
     if (!row) return NextResponse.json({ error: 'Job not found' }, { status: 404 });
     const plates = row.step_0_click?.trim() ? null : await platesToConfirm(row);
-    return NextResponse.json({ row, plates });
+    const legs = await readJobLegs(row);
+    return NextResponse.json({ row, plates, legs });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     return NextResponse.json({ error: msg }, { status: 500 });
@@ -76,12 +81,15 @@ export async function PATCH(request: Request, { params }: { params: Promise<{ id
   }
 }
 
-/** DELETE: remove one job and the log and diversions stored against it. */
+/** DELETE: remove one job from the queue and keep the VWork feed from copying it back. */
 export async function DELETE(_request: Request, { params }: { params: Promise<{ id: string }> }) {
   try {
     await ensureTblDriverJobsSchema();
+    await ensureDriverJobDismissedSchema();
+    await ensureVworkJobFeedSchema();
     await ensureDriverJobLogSchema();
     await ensureDriverDiversionsSchema();
+    await ensureVworkGateUpdateSchema();
     const { id } = await params;
     const jobId = Number(id);
     if (!Number.isInteger(jobId) || jobId <= 0) {
@@ -100,9 +108,15 @@ export async function DELETE(_request: Request, { params }: { params: Promise<{ 
         await client.query('ROLLBACK');
         return NextResponse.json({ error: 'Job not found' }, { status: 404 });
       }
+      await dismissDriverJob(client, row.job_id);
       await client.query(`DELETE FROM tbl_driver_job_log WHERE driver_job_id = $1`, [jobId]);
       await client.query(`DELETE FROM tbl_driver_job_diversions WHERE driver_job_id = $1`, [jobId]);
-      await client.query(`DELETE FROM tbl_driver_jobs WHERE id = $1`, [jobId]);
+      await client.query(`DELETE FROM vwork_gate_updates WHERE driver_job_id = $1`, [jobId]);
+      const deleted = await client.query(`DELETE FROM tbl_driver_jobs WHERE id = $1`, [jobId]);
+      if ((deleted.rowCount ?? 0) < 1) {
+        await client.query('ROLLBACK');
+        return NextResponse.json({ error: 'Job not found' }, { status: 404 });
+      }
       await client.query('COMMIT');
       return NextResponse.json({ ok: true, row });
     } catch (err) {

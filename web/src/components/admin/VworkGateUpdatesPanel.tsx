@@ -331,7 +331,7 @@ export function VworkGateUpdatesPanel({
                   <td className="whitespace-nowrap px-2 py-1.5 font-mono">{row.executed_at || '—'}</td>
                   <td className="px-2 py-1.5">
                     <div>{statusLabel(row.status)}</div>
-                    {row.error ? <div className="mt-0.5 max-w-sm text-[11px] text-red-700 dark:text-red-300">{row.error}</div> : null}
+                    {row.error ? <div className="mt-0.5 max-w-xl whitespace-pre-wrap text-[11px] leading-snug text-red-700 dark:text-red-300">{row.error}</div> : null}
                   </td>
                 </tr>
               ))

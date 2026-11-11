@@ -1,6 +1,7 @@
 'use client';
 
 import { useLocationAge } from '@/components/driver/useLocationAge';
+import type { GpsGhost } from '@/lib/gate-proximity';
 import { DRIVER_GATES, completedGateCount, gateActivity, gateClock, gateFenceHover, gateShownGps, gateStartDate, minutesBetween, secondsBetween, truckStage, wineryArrivalEta, type DriverJob, type GateFenceKind, type TruckLoad } from '@/lib/driver-jobs';
 
 function TruckIcon({ load }: { load: TruckLoad }) {
@@ -35,15 +36,25 @@ function PhaseMinutes({ minutes, left }: { minutes: number; left: string }) {
 /** Metres to the next fence, shown under the truck on the way to the vineyard or the winery. */
 export type TruckMeters = { meters: number | null; inside: boolean };
 
-/** Fence-to-fence journey. The same winery is the start of the trip out and the end of the trip back. */
+/**
+ * The two road lengths.
+ * Out is the GPS fix at job start to the vineyard fence.
+ * Back is the vineyard fence to the winery fence.
+ */
 export type JourneyMeters = {
-  meters: number | null;
+  outMeters: number | null;
+  backMeters: number | null;
   /** Which connector the truck is on, when it is travelling. */
   active: 'out' | 'back' | null;
   remaining: number | null;
   /** Rough clock, from the share of the journey already covered. */
   eta: string | null;
 };
+
+const OUT_TITLE =
+  'Metres from the truck location at job start to the vineyard fence. The percentage compares metres still to go with that trip.';
+const BACK_TITLE =
+  'Metres between the vineyard fence and the winery fence. The percentage compares metres still to go with that trip.';
 
 function journeyPercent(total: number, remaining: number | null): number | null {
   if (remaining == null || total <= 0) return null;
@@ -56,18 +67,20 @@ function JourneyOnBar({
   remaining,
   eta,
   left,
+  title,
 }: {
   meters: number;
   percent: number | null;
   remaining: number | null;
   eta: string | null;
   left: string;
+  title: string;
 }) {
   return (
     <div
       className="absolute top-[2.05rem] z-[1] -translate-x-1/2 text-center"
       style={{ left }}
-      title="Estimated metres between the fences. The percentage compares metres still to go with that journey. The ETA is a rough rate from the share already covered."
+      title={title}
     >
       <span className="block whitespace-nowrap rounded bg-[#f3f5f7] px-0.5 text-[11px] font-bold leading-none tabular-nums text-[#344054]">
         {meters.toLocaleString('en-NZ')} m
@@ -114,7 +127,7 @@ function PhoneGateTrack({
   travelMeters?: TruckMeters | null;
   /** Staff listing only. Vineyard under gate 2, winery under gate 4. */
   placeNames?: { vineyard?: string | null; winery?: string | null } | null;
-  /** Staff listing only. Estimated fence-to-fence metres on the connectors. */
+  /** Staff listing only. Outbound metres from the start fix, and the return between the fences. */
   journey?: JourneyMeters | null;
 }) {
   const done = completedGateCount(job);
@@ -127,6 +140,9 @@ function PhoneGateTrack({
       : travelMeters.meters != null
         ? `${travelMeters.meters.toLocaleString('en-NZ')} m`
         : null;
+  const outMeters = journey?.outMeters ?? null;
+  const backMeters = journey?.backMeters ?? null;
+  const showJourney = outMeters != null || backMeters != null;
   const finishedLegs = DRIVER_GATES.slice(0, -1).flatMap((gate, index) => {
     if (done <= index + 1) return [];
     const minutes = minutesBetween(job[gate.key], job[DRIVER_GATES[index + 1].key]);
@@ -149,7 +165,7 @@ function PhoneGateTrack({
           </div>
         ))}
       </div>
-      <div className={`relative mt-1 ${journey?.meters != null ? 'min-h-[5.4rem]' : 'min-h-[4.6rem]'}`}>
+      <div className={`relative mt-1 ${showJourney ? 'min-h-[5.4rem]' : 'min-h-[4.6rem]'}`}>
         <div className="absolute left-[10%] right-[10%] top-[1.05rem] h-[2px] bg-[#d5dbe3]" />
         <div className="relative grid grid-cols-5">
           {DRIVER_GATES.map((gate, index) => {
@@ -182,23 +198,25 @@ function PhoneGateTrack({
         {finishedLegs.map((leg) => (
           <PhaseMinutes key={leg.step} minutes={leg.minutes} left={leg.left} />
         ))}
-        {journey?.meters != null && (
-          <>
-            <JourneyOnBar
-              meters={journey.meters}
-              percent={journey.active === 'out' ? journeyPercent(journey.meters, journey.remaining) : null}
-              remaining={journey.active === 'out' ? journey.remaining : null}
-              eta={journey.active === 'out' ? journey.eta : null}
-              left="20%"
-            />
-            <JourneyOnBar
-              meters={journey.meters}
-              percent={journey.active === 'back' ? journeyPercent(journey.meters, journey.remaining) : null}
-              remaining={journey.active === 'back' ? journey.remaining : null}
-              eta={journey.active === 'back' ? journey.eta : null}
-              left="60%"
-            />
-          </>
+        {outMeters != null && (
+          <JourneyOnBar
+            meters={outMeters}
+            percent={journey?.active === 'out' ? journeyPercent(outMeters, journey.remaining) : null}
+            remaining={journey?.active === 'out' ? journey.remaining : null}
+            eta={journey?.active === 'out' ? journey.eta : null}
+            left="20%"
+            title={OUT_TITLE}
+          />
+        )}
+        {backMeters != null && (
+          <JourneyOnBar
+            meters={backMeters}
+            percent={journey?.active === 'back' ? journeyPercent(backMeters, journey.remaining) : null}
+            remaining={journey?.active === 'back' ? journey.remaining : null}
+            eta={journey?.active === 'back' ? journey.eta : null}
+            left="60%"
+            title={BACK_TITLE}
+          />
         )}
         {stage && (
           <div
@@ -339,6 +357,7 @@ function RoadLeg({
   remaining,
   eta,
   minutes,
+  title,
 }: {
   /** Outbound line starts at the gate 1 rim. The return road runs between the two places. */
   connect: 'from-previous' | 'between';
@@ -349,6 +368,7 @@ function RoadLeg({
   remaining: number | null;
   eta: string | null;
   minutes: number | null;
+  title: string;
 }) {
   const snapped = snappedShare(truck ? percent : null);
   const reach = connect === 'from-previous' ? RIM_REACH : 0;
@@ -376,7 +396,7 @@ function RoadLeg({
         <div
           className="absolute inset-x-0 z-[1] text-center"
           style={{ top: 42 }}
-          title="Estimated metres between the fences. The percentage compares metres still to go with that journey. The truck steps along this road in 20% increments."
+          title={title}
         >
           <span className="block whitespace-nowrap text-[11px] font-bold leading-none tabular-nums text-[#344054]">
             {meters.toLocaleString('en-NZ')} m
@@ -398,29 +418,107 @@ function RoadLeg({
   );
 }
 
+function GhostTruck() {
+  return (
+    <span className="relative z-[2] block" title="GPS position. Driver taps do not move this truck.">
+      <svg width="28" height="16" viewBox="0 0 48 28" aria-hidden="true" className="text-[#667085]">
+        <rect x="1.5" y="3.5" width="27" height="14" rx="1.4" fill="#f3f5f7" stroke="currentColor" strokeWidth="2.2" />
+        <path d="M28.6 8.8h5.4l6.2 4.4v4.3H28.6V8.8z" fill="currentColor" />
+        <circle cx="12" cy="21.6" r="2.7" fill="currentColor" />
+        <circle cx="36.5" cy="21.6" r="2.7" fill="currentColor" />
+      </svg>
+    </span>
+  );
+}
+
+function GhostStamp({ at, title }: { at: string | null; title: string }) {
+  const clock = at ? gateClock(at) : '';
+  const shown = clock && clock !== '--:--' ? clock : '';
+  return (
+    <span
+      className="relative z-[2] block text-center text-[9px] font-semibold tabular-nums leading-none text-[#667085]"
+      title={shown ? `${title} · ${at}` : undefined}
+    >
+      {shown ? <span className="rounded bg-[#f3f5f7] px-0.5">{shown}</span> : '\u00a0'}
+    </span>
+  );
+}
+
+function GhostLine() {
+  return <div className="pointer-events-none absolute inset-x-0 top-1/2 h-px bg-[#98a2b3]" />;
+}
+
+function GhostTruckAt({ percent }: { percent: number | null }) {
+  const snapped = snappedShare(percent);
+  return (
+    <div className="absolute top-1/2 z-[2] -translate-x-1/2 -translate-y-1/2" style={{ left: `${snapped}%` }}>
+      <GhostTruck />
+    </div>
+  );
+}
+
+/** Grey GPS cells. They share the driver-track columns, so the times sit under the same gates. */
+function GpsGhostCells({ ghost }: { ghost: GpsGhost }) {
+  return (
+    <>
+      <div className="relative flex h-7 items-center justify-center" aria-hidden="true">
+        <GhostLine />
+        <span className="relative z-[2] rounded bg-[#f3f5f7] px-0.5 text-[8px] font-bold uppercase tracking-wide text-[#667085]">GPS</span>
+      </div>
+      <div className="relative h-7">
+        <GhostLine />
+        {ghost.place === 'out' ? <GhostTruckAt percent={ghost.percent} /> : null}
+      </div>
+      <div
+        className="relative grid h-7 items-center border-2 border-transparent px-1.5"
+        style={{ gridTemplateColumns: POD_COLS }}
+        aria-label="GPS position. Driver taps do not move this truck."
+      >
+        <GhostLine />
+        <GhostStamp at={ghost.vineyardEnteredAt} title="GPS entered the vineyard fence" />
+        <div className="relative z-[2] flex justify-center">{ghost.place === 'vineyard' ? <GhostTruck /> : null}</div>
+        <GhostStamp at={ghost.vineyardLeftAt} title="GPS left the vineyard fence" />
+      </div>
+      <div className="relative h-7">
+        <GhostLine />
+        {ghost.place === 'back' ? <GhostTruckAt percent={ghost.percent} /> : null}
+      </div>
+      <div className="relative grid h-7 items-center border-2 border-transparent px-1.5" style={{ gridTemplateColumns: POD_COLS }}>
+        <GhostLine />
+        <GhostStamp at={ghost.wineryEnteredAt} title="GPS entered the winery fence" />
+        <div className="relative z-[2] flex justify-center">{ghost.place === 'winery' ? <GhostTruck /> : null}</div>
+        <span />
+      </div>
+    </>
+  );
+}
+
 /**
  * Staff live track. The two long gaps are the roads.
  * Steps 2 and 3 sit inside the vineyard. Steps 4 and 5 sit inside the winery.
- * The truck does not travel inside either place.
+ * The green truck follows the driver taps. The grey truck under it follows GPS.
  */
 function LiveGateTrack({
   job,
   placeNames,
   journey,
   checkpoint,
+  ghost,
 }: {
   job: DriverJob;
   placeNames?: { vineyard?: string | null; winery?: string | null } | null;
   journey?: JourneyMeters | null;
   checkpoint?: CheckpointMark;
+  ghost?: GpsGhost | null;
 }) {
   const done = completedGateCount(job);
   const stage = truckStage(done);
   const eta = done === 3 ? wineryArrivalEta(job) : null;
   const alertFor = (step: 2 | 3 | 4) => (checkpoint?.step === step ? checkpoint.alert : null);
-  const outPercent = journey?.active === 'out' ? journeyPercent(journey.meters ?? 0, journey.remaining) : null;
-  const backPercent = journey?.active === 'back' ? journeyPercent(journey.meters ?? 0, journey.remaining) : null;
-  const journeyMeters = journey?.meters ?? null;
+  const outMeters = journey?.outMeters ?? null;
+  const backMeters = journey?.backMeters ?? null;
+  const outPercent = journey?.active === 'out' && outMeters != null ? journeyPercent(outMeters, journey.remaining) : null;
+  const backPercent = journey?.active === 'back' && backMeters != null ? journeyPercent(backMeters, journey.remaining) : null;
   const outMinutes = done > 1 ? minutesBetween(job.step_1_click, job.step_2_click) : null;
   const backMinutes = done > 3 ? minutesBetween(job.step_3_click, job.step_4_click) : null;
   const unloadMinutes = done > 4 ? minutesBetween(job.step_4_click, job.step_5_click) : null;
@@ -466,10 +564,11 @@ function LiveGateTrack({
           truck={done === 1}
           load={load}
           percent={outPercent}
-          meters={journeyMeters}
+          meters={outMeters}
           remaining={journey?.active === 'out' ? journey.remaining : null}
           eta={journey?.active === 'out' ? journey.eta : null}
           minutes={outMinutes}
+          title={OUT_TITLE}
         />
         <div
           className="relative z-[1] rounded-full border-2 border-[#3f6212] bg-[#eef6e8] px-1.5 py-1"
@@ -493,10 +592,11 @@ function LiveGateTrack({
           truck={done === 3}
           load={load}
           percent={backPercent}
-          meters={journeyMeters}
+          meters={backMeters}
           remaining={journey?.active === 'back' ? journey.remaining : null}
           eta={journey?.active === 'back' ? journey.eta : null}
           minutes={backMinutes}
+          title={BACK_TITLE}
         />
         <div
           className="relative z-[1] rounded-full border-2 border-[#3f6212] bg-[#eef6e8] px-1.5 py-1"
@@ -523,6 +623,7 @@ function LiveGateTrack({
             <LiveGateDot job={job} step={5} alert={null} eta={eta} />
           </div>
         </div>
+        {ghost ? <GpsGhostCells ghost={ghost} /> : null}
       </div>
     </div>
   );
@@ -540,7 +641,19 @@ export default function GateTrack({
   /** Staff listing. Draws the road / vineyard wheel and moves the truck along the active road. */
   live?: boolean;
   checkpoint?: CheckpointMark;
+  /** Staff listing. GPS truck and fence times, drawn under the driver track. */
+  ghost?: GpsGhost | null;
 }) {
-  if (live) return <LiveGateTrack job={props.job} placeNames={props.placeNames} journey={props.journey} checkpoint={props.checkpoint} />;
+  if (live) {
+    return (
+      <LiveGateTrack
+        job={props.job}
+        placeNames={props.placeNames}
+        journey={props.journey}
+        checkpoint={props.checkpoint}
+        ghost={props.ghost}
+      />
+    );
+  }
   return <PhoneGateTrack job={props.job} travelMeters={props.travelMeters} placeNames={props.placeNames} journey={props.journey} />;
 }

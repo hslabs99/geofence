@@ -9,7 +9,7 @@ import { DRIVER_JOB_COLUMNS, type DriverJob } from '@/lib/driver-jobs';
 /**
  * Distance and fence-transition marker for the next gate.
  * Step 2 and step 4: yellow while closing on the fence, red once inside.
- * Step 3: red when the truck leaves the polygon, leaves the soft band after a soft arrival, or heads toward the winery after a manual arrival.
+ * Step 3: red when the truck leaves the hard polygon after gate 2, including a manual arrival, leaves the soft band after a soft arrival, or heads toward the winery after a manual arrival that never enters.
  */
 export async function GET(_request: Request, { params }: { params: Promise<{ id: string }> }) {
   try {

@@ -49,6 +49,9 @@ export async function ensureCurrentLocationsSchema(): Promise<void> {
   await execute(`
     CREATE INDEX IF NOT EXISTS idx_tbl_current_locations_truck_lower
       ON tbl_current_locations (lower(truck_id), id DESC)`);
+  await execute(`
+    CREATE INDEX IF NOT EXISTS idx_tbl_current_locations_imei
+      ON tbl_current_locations (btrim(imei), gpstime_nz DESC NULLS LAST, id DESC)`);
   ensured = true;
   await fillCurrentLocationGpsTimeNz();
 }

@@ -11,9 +11,27 @@ import {
 } from '@/lib/celgps-migration-config';
 import { isDbUnreachableError } from '@/lib/celgps-db-verify';
 
-let pool: Pool | null = null;
-let poolTargetKey: string | null = null;
+type PgGlobal = typeof globalThis & {
+  __geodataPgPool?: Pool | null;
+  __geodataPgPoolKey?: string | null;
+};
+
+const pgGlobal = globalThis as PgGlobal;
+
+let pool: Pool | null = pgGlobal.__geodataPgPool ?? null;
+let poolTargetKey: string | null = pgGlobal.__geodataPgPoolKey ?? null;
 let failoverAttempted = false;
+
+function rememberPool(next: Pool, key: string): Pool {
+  if (pgGlobal.__geodataPgPool && pgGlobal.__geodataPgPool !== next) {
+    pgGlobal.__geodataPgPool.end().catch(() => undefined);
+  }
+  pgGlobal.__geodataPgPool = next;
+  pgGlobal.__geodataPgPoolKey = key;
+  pool = next;
+  poolTargetKey = key;
+  return next;
+}
 
 function poolTargetKeyFromEnv(): string {
   const cfg = resolveActiveAppDbConfig();
@@ -27,29 +45,29 @@ function getPool(): Pool {
   const key = poolTargetKeyFromEnv();
   if (pool && poolTargetKey === key) return pool;
 
-  if (pool) {
-    pool.end().catch(() => undefined);
+  const previous = pgGlobal.__geodataPgPool ?? pool;
+  if (previous) {
+    previous.end().catch(() => undefined);
+    pgGlobal.__geodataPgPool = null;
     pool = null;
   }
 
   const cfg = resolveActiveAppDbConfig();
   if (cfg.ok) {
-    pool = createMigrationPool(cfg, getAppPoolMax(cfg), PG_CONNECT_TIMEOUT_MS);
-    poolTargetKey = key;
-    return pool;
+    return rememberPool(createMigrationPool(cfg, getAppPoolMax(cfg), PG_CONNECT_TIMEOUT_MS), key);
   }
 
   if (process.env.DATABASE_URL) {
     const url = normalizeSupabaseDatabaseUrl(process.env.DATABASE_URL);
     const isSupabase = /supabase\.(co|com)|pooler\.supabase\.com/i.test(url);
-    pool = new Pool({
+    return rememberPool(new Pool({
       connectionString: url,
       max: isSupabase ? 4 : 10,
       connectionTimeoutMillis: PG_CONNECT_TIMEOUT_MS,
+      idleTimeoutMillis: 10000,
+      allowExitOnIdle: true,
       ...(isSupabase ? { ssl: { rejectUnauthorized: false } } : {}),
-    });
-    poolTargetKey = `legacy:DATABASE_URL`;
-    return pool;
+    }), 'legacy:DATABASE_URL');
   }
   const host = process.env.PGHOST?.trim() ?? '';
   if (!host || !process.env.PGUSER || !process.env.PGPASSWORD) {
@@ -58,7 +76,7 @@ function getPool(): Pool {
         'Missing DATABASE_URL or PGHOST/PGUSER/PGPASSWORD. Configure Cloud SQL or Supabase in DB Migration settings.'
     );
   }
-  pool = new Pool({
+  return rememberPool(new Pool({
     host,
     port: host.startsWith('/') ? undefined : parseInt(process.env.PGPORT || '5432', 10),
     user: process.env.PGUSER,
@@ -66,18 +84,19 @@ function getPool(): Pool {
     database: (process.env.PGDATABASE ?? 'geodata').trim(),
     max: 10,
     connectionTimeoutMillis: PG_CONNECT_TIMEOUT_MS,
-  });
-  poolTargetKey = `legacy:PGHOST`;
-  return pool;
+    idleTimeoutMillis: 10000,
+    allowExitOnIdle: true,
+  }), 'legacy:PGHOST');
 }
 
 /** Drop cached pool so the next query uses the updated DB target. */
 export function resetDbPool(): void {
-  if (pool) {
-    pool.end().catch(() => undefined);
-    pool = null;
-    poolTargetKey = null;
-  }
+  const current = pgGlobal.__geodataPgPool ?? pool;
+  if (current) current.end().catch(() => undefined);
+  pgGlobal.__geodataPgPool = null;
+  pgGlobal.__geodataPgPoolKey = null;
+  pool = null;
+  poolTargetKey = null;
 }
 
 async function maybeFailoverToSupabase(err: unknown): Promise<boolean> {
@@ -104,6 +123,10 @@ async function runQuery<T>(text: string, params?: unknown[], rowMode: 'rows' | '
       const res = await getPool().query(text, params);
       if (rowMode === 'rowCount') return res.rowCount ?? 0;
       return (res.rows as T[]) ?? [];
+    }
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/EMAXCONNSESSION|max clients reached in session mode/i.test(msg)) {
+      throw new Error('The database connection limit is full. Wait a few seconds and try again.');
     }
     throw err;
   }

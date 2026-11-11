@@ -656,6 +656,35 @@ export async function currentLocationCallBudget(): Promise<TracksolidCallBudget>
 
 const LOCATION_ROW_SQL = `SELECT id, truck_id, imei, location, to_char(gpstime_nz, 'YYYY-MM-DD HH24:MI:SS') AS gpstime_nz, gpstime, polltime, coordinates, fencename, softfencename FROM tbl_current_locations`;
 
+const STORED_COORDINATES = '^-?[0-9]+(\\.[0-9]+)?,-?[0-9]+(\\.[0-9]+)?$';
+
+/**
+ * Newest stored GPS fix for one IMEI, or for a truck when the job has no IMEI.
+ * This ignores job start and end, so staff can see where the truck is before a job starts.
+ * Returns the stored "lat,lng" string, unchanged.
+ */
+export async function latestStoredCoordinates(input: { imei?: string | null; truckId?: string | null }): Promise<string | null> {
+  await ensureCurrentLocationsSchema();
+  await fillCurrentLocationGpsTimeNz();
+  const imei = input.imei?.trim() ?? '';
+  const truckId = input.truckId?.trim() ?? '';
+  if (!imei && !truckId) return null;
+  const rows = await query<{ coordinates: string | null }>(
+    `SELECT coordinates
+     FROM tbl_current_locations
+     WHERE coordinates ~ '${STORED_COORDINATES}'
+       AND (
+         ($1 <> '' AND btrim(imei) = $1)
+         OR ($1 = '' AND $2 <> '' AND lower(btrim(truck_id)) = lower($2))
+       )
+     ORDER BY gpstime_nz DESC NULLS LAST, id DESC
+     LIMIT 1`,
+    [imei, truckId],
+  );
+  const coordinates = rows[0]?.coordinates?.trim() ?? '';
+  return /^-?[0-9]+(?:\.[0-9]+)?,-?[0-9]+(?:\.[0-9]+)?$/.test(coordinates) ? coordinates : null;
+}
+
 /** Newest row overall, and the newest row for one truck when a truck id is given. */
 export async function latestCurrentLocation(truckId?: string | null): Promise<{
   truck: CurrentLocationRow | null;

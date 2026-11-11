@@ -77,14 +77,14 @@ export default function DriverLocationsPage() {
         <DriverLink to="/home" className="inline-flex h-11 items-center text-base font-medium text-[#175cd3]">
           Jobs
         </DriverLink>
-        <h1 className="text-2xl font-semibold text-[#1c2430]">Locations</h1>
+        <h1 className="text-2xl font-semibold text-[#1c2430]">GPS Log</h1>
         <p className="mt-1 text-sm text-[#667085]">Each poll adds a row. Newest first.</p>
       </header>
       {error && <p className="mx-5 mb-3 rounded-xl bg-[#fee4e2] px-3 py-2 text-base text-[#b42318]">{error}</p>}
       {loading ? (
         <p className="px-5 text-base text-[#667085]">Loading…</p>
       ) : rows.length === 0 ? (
-        <p className="px-5 text-base text-[#667085]">No locations yet.</p>
+        <p className="px-5 text-base text-[#667085]">No GPS log yet.</p>
       ) : (
         <ul className="flex flex-col gap-3 px-4 pb-[max(1.5rem,env(safe-area-inset-bottom))]">
           {rows.map((row) => (

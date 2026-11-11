@@ -67,10 +67,13 @@ export default function ApproachMeters({
   reading,
   loading,
   corner,
+  tripMeters,
 }: {
   reading: ApproachReading | null;
   loading: boolean;
   corner?: ReactNode;
+  /** Full length of this road. Outbound is from the job-start fix. The return is fence to fence. */
+  tripMeters?: number | null;
 }) {
   const watching = reading?.active !== false && (reading != null || loading);
   if (!watching) {
@@ -80,6 +83,12 @@ export default function ApproachMeters({
   const leaving = reading?.step === 3;
   const place = reading?.target === 'winery' ? 'winery' : 'vineyard';
   const meters = typeof reading?.meters === 'number' ? reading.meters.toLocaleString('en-NZ') : null;
+  const trip =
+    typeof tripMeters === 'number'
+      ? place === 'winery'
+        ? `This trip is ${tripMeters.toLocaleString('en-NZ')} m from the vineyard fence to the winery fence.`
+        : `This trip is ${tripMeters.toLocaleString('en-NZ')} m from where the job started.`
+      : null;
 
   return (
     <div className="mx-4 mb-2 rounded-2xl bg-white px-4 py-2.5 shadow-[0_1px_2px_rgba(16,24,40,0.06)]">
@@ -110,7 +119,7 @@ export default function ApproachMeters({
               : 'The latest fix is on or inside the fence.'
             : leaving
               ? `Outside the edge of ${reading?.fence || place}.`
-              : `Remaining to the edge of ${reading?.fence || place}.`}
+              : `Remaining to the edge of ${reading?.fence || place}.${trip ? ` ${trip}` : ''}`}
         </p>
       )}
     </div>

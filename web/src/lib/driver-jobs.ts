@@ -27,6 +27,12 @@ export type DriverJob = {
   vineyard_geo_fence: string | null;
   step_0_click: string | null;
   step_1_click: string | null;
+  /** True when step 1 was confirmed away from the winery. There is no winery-exit fence for that start. */
+  step_1_manual: boolean | null;
+  /** hard or soft when the start fix was in or near the winery. manual when it was not. */
+  step_1_fence: GateFenceKind | null;
+  /** Metres from the GPS fix at step 1 to the vineyard fence. Empty before the job starts, or when that fix is missing. */
+  start_vineyard_meters: number | null;
   truck_rego: string | null;
   trailer_rego: string | null;
   /** Name typed at step 0. Blank on the next job; plates are remembered on the truck. */
@@ -69,6 +75,9 @@ export const DRIVER_JOB_COLUMNS = `
   vineyard_geo_fence,
   to_char(step_0_click, 'YYYY-MM-DD HH24:MI:SS') AS step_0_click,
   to_char(step_1_click, 'YYYY-MM-DD HH24:MI:SS') AS step_1_click,
+  step_1_manual,
+  step_1_fence,
+  start_vineyard_meters,
   truck_rego,
   trailer_rego,
   confirmed_driver,
@@ -118,9 +127,10 @@ function storedFence(value: string | null | undefined): GateFenceKind | null {
 
 /** Stored fence for a completed gate. Null on steps that are not a fence tap. */
 export function gateFence(
-  job: Pick<DriverJob, 'step_2_fence' | 'step_3_fence' | 'step_4_fence'>,
+  job: Pick<DriverJob, 'step_1_fence' | 'step_2_fence' | 'step_3_fence' | 'step_4_fence'>,
   step: number,
 ): GateFenceKind | null {
+  if (step === 1) return storedFence(job.step_1_fence);
   if (step === 2) return storedFence(job.step_2_fence);
   if (step === 3) return storedFence(job.step_3_fence);
   if (step === 4) return storedFence(job.step_4_fence);
@@ -132,9 +142,24 @@ export function gateFence(
  * Older rows with no stored fence still count a manual confirm as manual.
  */
 export function gateActivity(
-  job: Pick<DriverJob, 'step_2_manual' | 'step_3_manual' | 'step_4_manual' | 'step_2_fence' | 'step_3_fence' | 'step_4_fence'>,
+  job: Pick<
+    DriverJob,
+    | 'step_1_manual'
+    | 'step_1_fence'
+    | 'step_2_manual'
+    | 'step_3_manual'
+    | 'step_4_manual'
+    | 'step_2_fence'
+    | 'step_3_fence'
+    | 'step_4_fence'
+  >,
   step: number,
 ): GateFenceKind | null {
+  // A start inside or near the winery is a normal tap. Only an away start is marked manual, and it has no fence time.
+  if (step === 1) {
+    if (job.step_1_manual === true || job.step_1_fence === 'manual') return 'manual';
+    return null;
+  }
   const stored = gateFence(job, step);
   if (stored) return stored;
   if (step === 2 && job.step_2_manual === true) return 'manual';
@@ -202,6 +227,9 @@ function closestStamp(stamps: string[], clickAt: string): string | null {
 
 type FenceGpsJob = Pick<
   DriverJob,
+  | 'step_1_click'
+  | 'step_1_manual'
+  | 'step_1_fence'
   | 'step_2_click'
   | 'step_3_click'
   | 'step_4_click'
@@ -264,6 +292,10 @@ function gapSentence(earlierName: string, earlier: string, laterName: string, la
 /** Hover text: button time, soft GPS, hard GPS, and the gap between them. */
 export function gateFenceHover(job: FenceGpsJob, step: number): string | null {
   const kind = gateActivity(job, step);
+  if (step === 1 && kind === 'manual') {
+    const button = job.step_1_click?.trim() || '--:--';
+    return `Button ${button}. Started away from the winery. The trip to the vineyard is measured from this location.`;
+  }
   if (kind == null || (step !== 2 && step !== 3 && step !== 4)) return null;
   const clickKey = step === 2 ? 'step_2_click' : step === 3 ? 'step_3_click' : 'step_4_click';
   const click = job[clickKey]?.trim() || '';
@@ -291,11 +323,27 @@ export function gateFenceHover(job: FenceGpsJob, step: number): string | null {
 
 /** The driver tapped this gate from outside the soft fence. */
 export function gateManual(
-  job: Pick<DriverJob, 'step_2_manual' | 'step_3_manual' | 'step_4_manual' | 'step_2_fence' | 'step_3_fence' | 'step_4_fence'>,
+  job: Pick<
+    DriverJob,
+    | 'step_1_manual'
+    | 'step_1_fence'
+    | 'step_2_manual'
+    | 'step_3_manual'
+    | 'step_4_manual'
+    | 'step_2_fence'
+    | 'step_3_fence'
+    | 'step_4_fence'
+  >,
   step: number,
 ): boolean {
   return gateActivity(job, step) === 'manual';
 }
+
+/** The two road lengths. Out is frozen at job start. Back is the gap between the two fences. */
+export type JobLegs = {
+  outMeters: number | null;
+  backMeters: number | null;
+};
 
 export type TruckLoad = 'empty' | 'half' | 'full';
 
