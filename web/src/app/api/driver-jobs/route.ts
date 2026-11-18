@@ -4,6 +4,7 @@ import { ensureTblDriverJobsSchema } from '@/lib/ensure-tbl-driver-jobs-schema';
 import { clearDismissedDriverJob, ensureDriverJobDismissedSchema } from '@/lib/driver-job-dismiss';
 import { driverJobWriteFromBody } from '@/lib/driver-job-fields';
 import { DRIVER_JOB_COLUMNS, type DriverJob } from '@/lib/driver-jobs';
+import { loadCurrentLocationSettings } from '@/lib/current-location-poll';
 
 export type DriverJobRow = DriverJob;
 
@@ -73,7 +74,7 @@ export async function GET(request: Request) {
     }
     const whereClause = conditions.length ? ` WHERE ${conditions.join(' AND ')}` : '';
 
-    const [rows, driverRows, wineryRows, vineyardRows, fenceRows, userDriverRows] = await Promise.all([
+    const [rows, driverRows, wineryRows, vineyardRows, fenceRows, userDriverRows, settings] = await Promise.all([
       query<DriverJobRow>(
         `SELECT ${DRIVER_JOB_COLUMNS}
          FROM tbl_driver_jobs
@@ -114,6 +115,7 @@ export async function GET(request: Request) {
          WHERE LOWER(btrim(COALESCE(user_type, ''))) = 'driver'
          ORDER BY 1, 2`,
       ),
+      loadCurrentLocationSettings(),
     ]);
 
     return NextResponse.json({
@@ -124,6 +126,7 @@ export async function GET(request: Request) {
       wineries: rowsToSortedDistinct(wineryRows),
       vineyards: rowsToSortedDistinct(vineyardRows),
       fenceNames: rowsToSortedDistinct(fenceRows),
+      driverJobPollSeconds: settings.driverJobPollSeconds,
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

@@ -89,8 +89,10 @@ export default function DriverHomePage() {
   const nav = useDriverNav();
   const [jobs, setJobs] = useState<DriverJob[]>([]);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [openOnly, setOpenOnly] = useState(false);
+  const [jobPollMs, setJobPollMs] = useState(600_000);
 
   useLayoutEffect(() => {
     try {
@@ -102,25 +104,49 @@ export default function DriverHomePage() {
 
   useEffect(() => {
     let cancelled = false;
-    fetch('/api/driver-jobs', { cache: 'no-store' })
-      .then(async (r) => {
-        const data = await r.json();
-        if (!r.ok) throw new Error(data?.error ?? r.statusText);
-        return data;
-      })
-      .then((data) => {
-        if (!cancelled) setJobs(Array.isArray(data?.rows) ? (data.rows as DriverJob[]) : []);
-      })
-      .catch((e) => {
+    async function load() {
+      try {
+        const response = await fetch('/api/driver-jobs', { cache: 'no-store' });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data?.error ?? response.statusText);
+        if (cancelled) return;
+        setJobs(Array.isArray(data?.rows) ? (data.rows as DriverJob[]) : []);
+        setError(null);
+        const seconds = data?.driverJobPollSeconds;
+        if (typeof seconds === 'number' && seconds >= 60) setJobPollMs(seconds * 1000);
+      } catch (e) {
         if (!cancelled) setError(e instanceof Error ? e.message : String(e));
-      })
-      .finally(() => {
+      } finally {
         if (!cancelled) setLoading(false);
-      });
+      }
+    }
+    void load();
+    const timer = setInterval(() => void load(), jobPollMs);
     return () => {
       cancelled = true;
+      clearInterval(timer);
     };
-  }, []);
+  }, [jobPollMs]);
+
+  async function refreshJobs() {
+    setRefreshing(true);
+    setError(null);
+    try {
+      const refreshed = await fetch('/api/driver-jobs/refresh', { method: 'POST', cache: 'no-store' });
+      const payload = await refreshed.json();
+      if (!refreshed.ok) throw new Error(payload?.error ?? refreshed.statusText);
+      const response = await fetch('/api/driver-jobs', { cache: 'no-store' });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data?.error ?? response.statusText);
+      setJobs(Array.isArray(data?.rows) ? (data.rows as DriverJob[]) : []);
+      if (payload?.error) setError(String(payload.error));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRefreshing(false);
+      setLoading(false);
+    }
+  }
 
   function toggleOpenOnly() {
     setOpenOnly((current) => {
@@ -151,6 +177,14 @@ export default function DriverHomePage() {
       </header>
 
       <div className="flex items-center justify-between gap-3 px-5 pb-3">
+        <button
+          type="button"
+          disabled={refreshing}
+          onClick={() => void refreshJobs()}
+          className="h-10 shrink-0 rounded-full bg-[#1f9d55] px-4 text-sm font-semibold text-white disabled:opacity-60"
+        >
+          {refreshing ? 'Checking for jobs…' : 'Refresh'}
+        </button>
         <p className="text-sm font-medium text-[#475467]">{openOnly ? 'Show open jobs only' : 'All jobs'}</p>
         <button
           type="button"

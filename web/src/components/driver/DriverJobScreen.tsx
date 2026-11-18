@@ -212,6 +212,7 @@ export default function DriverJobScreen({ id: idProp, mode = null }: { id?: stri
   const [confirm, setConfirm] = useState<{ kind: 'diversion' | 'gate'; step: number; message: string } | null>(null);
   const [diversionRefresh, setDiversionRefresh] = useState(0);
   const [view, setView] = useState<'job' | 'log'>('job');
+  const [jobPollMs, setJobPollMs] = useState(600_000);
 
   useEffect(() => {
     let cancelled = false;
@@ -234,6 +235,9 @@ export default function DriverJobScreen({ id: idProp, mode = null }: { id?: stri
                 }
               : null,
           );
+          if (typeof data.driverJobPollSeconds === 'number' && data.driverJobPollSeconds >= 60) {
+            setJobPollMs(data.driverJobPollSeconds * 1000);
+          }
         }
       })
       .catch((e) => {
@@ -272,6 +276,28 @@ export default function DriverJobScreen({ id: idProp, mode = null }: { id?: stri
       cancelled = true;
     };
   }, [control, id]);
+
+  useEffect(() => {
+    if (watch || control || !id) return;
+    const timer = setInterval(() => {
+      fetch(`/api/driver-jobs/${encodeURIComponent(id)}`, { cache: 'no-store' })
+        .then(async (response) => {
+          const data = await response.json();
+          if (!response.ok) throw new Error(data?.error ?? response.statusText);
+          return data;
+        })
+        .then((data) => {
+          setJob(data.row as DriverJob);
+          const nextLegs = legsFrom(data);
+          if (nextLegs) setLegs(nextLegs);
+          if (typeof data.driverJobPollSeconds === 'number' && data.driverJobPollSeconds >= 60) {
+            setJobPollMs(data.driverJobPollSeconds * 1000);
+          }
+        })
+        .catch(() => undefined);
+    }, jobPollMs);
+    return () => clearInterval(timer);
+  }, [watch, control, id, jobPollMs]);
 
   useEffect(() => {
     if ((!watch && !control) || !id) return;

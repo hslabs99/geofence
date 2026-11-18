@@ -1,8 +1,8 @@
 import { execute, query } from '@/lib/db';
 import {
+  locationCallsPerPoll,
   pollsInWindow,
   tokenCallsInSpan,
-  TRACKSOLID_CALLS_PER_POLL,
   TRACKSOLID_DAILY_CALL_LIMIT,
   tracksolidDayCallCost,
 } from '@/lib/tracksolid-call-math';
@@ -14,14 +14,22 @@ const SETTINGS_TYPE = 'TracksolidCallWindow';
 
 let ensured = false;
 
+export type TracksolidDayBreakdown = {
+  locationCalls: number;
+  deviceListCalls: number;
+  tokenCalls: number;
+  calls: number;
+};
+
 export type TracksolidCallBudget = {
   limit: number;
   used: number;
   forecast: number;
   fullDayAtInterval: number;
-  pollIntervalSeconds: number;
+  locationIntervalSeconds: number;
+  deviceListIntervalSeconds: number;
   pollRunning: boolean;
-  callsPerPoll: number;
+  fullDay: TracksolidDayBreakdown;
   windowStartedAt: string | null;
   resetsAt: string | null;
   resetsAtMs: number | null;
@@ -99,7 +107,9 @@ async function recordTracksolidCallInner(input: { endpointKey: string; method: s
 
 export async function tracksolidCallBudget(input: {
   endpointKey: string;
-  pollIntervalSeconds: number;
+  locationIntervalSeconds: number;
+  deviceListIntervalSeconds: number;
+  deviceCount: number;
   pollRunning: boolean;
   tokenExpiresAtMs: number | null;
 }): Promise<TracksolidCallBudget> {
@@ -121,21 +131,36 @@ export async function tracksolidCallBudget(input: {
   const used = rows.reduce((sum, row) => sum + Number(row.count), 0);
   const resetsAtMs = windowStart == null ? null : windowStart + WINDOW_MS;
   const remainingMs = resetsAtMs == null ? WINDOW_MS : Math.max(0, resetsAtMs - now);
-  const futurePolls = input.pollRunning ? pollsInWindow(remainingMs, input.pollIntervalSeconds) : 0;
+  const perLocation = locationCallsPerPoll(input.deviceCount);
+  const futureLocations = input.pollRunning ? pollsInWindow(remainingMs, input.locationIntervalSeconds) * perLocation : 0;
+  const futureDevices = input.pollRunning ? pollsInWindow(remainingMs, input.deviceListIntervalSeconds) : 0;
   const futureTokens = tokenCallsInSpan(now, now + remainingMs, input.tokenExpiresAtMs, input.pollRunning);
   const forecast = windowStart == null && !input.pollRunning
     ? 0
-    : used + futurePolls * TRACKSOLID_CALLS_PER_POLL + futureTokens;
-  const fullDayAtInterval = tracksolidDayCallCost(input.pollIntervalSeconds)?.calls ?? 0;
+    : used + futureLocations + futureDevices + futureTokens;
+  const fullDay = tracksolidDayCallCost(
+    input.locationIntervalSeconds,
+    input.deviceListIntervalSeconds,
+    input.deviceCount,
+  );
+  const fullDayBreakdown: TracksolidDayBreakdown = fullDay
+    ? {
+        locationCalls: fullDay.locationCalls,
+        deviceListCalls: fullDay.deviceListCalls,
+        tokenCalls: fullDay.tokenCalls,
+        calls: fullDay.calls,
+      }
+    : { locationCalls: 0, deviceListCalls: 0, tokenCalls: 0, calls: 0 };
 
   return {
     limit: TRACKSOLID_DAILY_CALL_LIMIT,
     used,
     forecast,
-    fullDayAtInterval,
-    pollIntervalSeconds: input.pollIntervalSeconds,
+    fullDayAtInterval: fullDayBreakdown.calls,
+    locationIntervalSeconds: input.locationIntervalSeconds,
+    deviceListIntervalSeconds: input.deviceListIntervalSeconds,
     pollRunning: input.pollRunning,
-    callsPerPoll: TRACKSOLID_CALLS_PER_POLL,
+    fullDay: fullDayBreakdown,
     windowStartedAt: windowStart == null ? null : localClock(windowStart),
     resetsAt: resetsAtMs == null ? null : localClock(resetsAtMs),
     resetsAtMs,

@@ -164,6 +164,15 @@ async function deliver(stage: string, subject: string, text: string): Promise<{ 
   return result;
 }
 
+function deviceListEvery(seconds: number): string {
+  if (seconds % 3600 === 0) {
+    const hours = seconds / 3600;
+    return hours === 1 ? '1 hour' : `${hours} hours`;
+  }
+  if (seconds % 60 === 0) return `${seconds / 60} minutes`;
+  return `${seconds} seconds`;
+}
+
 /** Manual start of the location poll. One email. */
 export async function notifyPrimaryStarted(): Promise<{ ok: boolean; error?: string }> {
   await loadLocationAlertSettings();
@@ -173,7 +182,7 @@ export async function notifyPrimaryStarted(): Promise<{ ok: boolean; error?: str
   return deliver(
     'started',
     'Location service started',
-    `The location poll was started at ${at}. It polls every ${currentLocationPollStatus().settings.pollIntervalSeconds} seconds.`,
+    `The location poll was started at ${at}. It reads locations every ${currentLocationPollStatus().settings.pollIntervalSeconds} seconds and the device list every ${deviceListEvery(currentLocationPollStatus().settings.deviceListIntervalSeconds)}.`,
   );
 }
 

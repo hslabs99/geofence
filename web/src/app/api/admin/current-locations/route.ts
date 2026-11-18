@@ -8,6 +8,7 @@ import {
   currentLocationTokenStatus,
   emptyCurrentLocations,
   pollCurrentLocationsOnce,
+  refreshDeviceListNow,
   saveCurrentLocationSettings,
   startCurrentLocationPoll,
   stopCurrentLocationPoll,
@@ -41,9 +42,11 @@ async function snapshot() {
 function settingsFromBody(body: Partial<CurrentLocationSettings>): Partial<CurrentLocationSettings> {
   return {
     pollIntervalSeconds: body.pollIntervalSeconds,
+    deviceListIntervalSeconds: body.deviceListIntervalSeconds,
     flushOlderThanHours: body.flushOlderThanHours,
     flushEveryMinutes: body.flushEveryMinutes,
     driverAppPollSeconds: body.driverAppPollSeconds,
+    driverJobPollSeconds: body.driverJobPollSeconds,
     confirmAwayMeters: body.confirmAwayMeters,
   };
 }
@@ -81,6 +84,10 @@ export async function POST(request: Request) {
       const result = await pollCurrentLocationsOnce();
       return NextResponse.json({ ok: true, ...result, ...(await snapshot()) });
     }
+    if (action === 'refresh-devices') {
+      const result = await refreshDeviceListNow();
+      return NextResponse.json({ ok: true, ...result, ...(await snapshot()) });
+    }
     if (action === 'settings') {
       const saved = await saveCurrentLocationSettings(settings);
       return NextResponse.json({ ok: true, ...(await snapshot()), settings: saved });
@@ -108,7 +115,7 @@ export async function POST(request: Request) {
       return NextResponse.json({ ...(await snapshot()), ok: true, alerts });
     }
     return NextResponse.json(
-      { error: 'action must be start, stop, once, settings, empty, alert-settings, checker-start, or checker-stop' },
+      { error: 'action must be start, stop, once, refresh-devices, settings, empty, alert-settings, checker-start, or checker-stop' },
       { status: 400 },
     );
   } catch (err) {

@@ -153,10 +153,26 @@ function summaryText(input: {
   return `${live}. Queued ${input.queue.queued}, skipped ${input.queue.skippedClosed} closed${more}.`;
 }
 
+let flight: Promise<{ summary: string; queued: number; error: string | null }> | null = null;
+
 /** One pass: pull new VWork jobs into the feed when the key is ready, then queue open feed jobs. */
-export async function pollVworkApiOnce(): Promise<{ summary: string; queued: number }> {
+export function pollVworkApiOnce(): Promise<{ summary: string; queued: number; error: string | null }> {
+  if (flight) return flight;
+  flight = pollVworkApiInner().finally(() => {
+    flight = null;
+  });
+  return flight;
+}
+
+/** Driver refresh. Any poll already running is allowed to finish, then a new VWork pull starts. */
+export async function forceVworkJobRefresh(): Promise<{ summary: string; queued: number; error: string | null }> {
+  await loadVworkApiSettings();
+  if (flight) await flight.catch(() => undefined);
+  return pollVworkApiOnce();
+}
+
+async function pollVworkApiInner(): Promise<{ summary: string; queued: number; error: string | null }> {
   const s = state();
-  if (s.inFlight) return { summary: 'Skipped: previous poll still running', queued: 0 };
   s.inFlight = true;
   const at = localClock();
   s.lastPolltime = at;
@@ -184,13 +200,13 @@ export async function pollVworkApiOnce(): Promise<{ summary: string; queued: num
       remaining: queue.remaining,
       summary,
     });
-    return { summary, queued: queue.queued };
+    return { summary, queued: queue.queued, error: s.lastError };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     s.lastError = message;
     s.lastSummary = null;
     await writeLog('error', { at, error: message });
-    return { summary: message, queued: 0 };
+    return { summary: message, queued: 0, error: message };
   } finally {
     s.inFlight = false;
   }

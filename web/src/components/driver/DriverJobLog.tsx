@@ -38,7 +38,7 @@ function formatDuration(seconds: number | null): string {
   return `${sec} s`;
 }
 
-const POLL_MS = 30_000;
+const POLL_MS = 600_000;
 
 /** Fence crossings and gate clicks for one job. Newest first. */
 export default function DriverJobLog({ jobId }: { jobId: number }) {
@@ -60,8 +60,8 @@ export default function DriverJobLog({ jobId }: { jobId: number }) {
         if (cancelled) return;
         setEvents(Array.isArray(data?.events) ? (data.events as DriverLogEvent[]) : []);
         setDiversions(Array.isArray(data?.diversions) ? (data.diversions as DiversionRow[]) : []);
-        const seconds = data?.driverAppPollSeconds;
-        if (typeof seconds === 'number' && seconds >= 5) setPollMs(seconds * 1000);
+        const seconds = data?.driverJobPollSeconds;
+        if (typeof seconds === 'number' && seconds >= 60) setPollMs(seconds * 1000);
         setError(null);
       } catch (err) {
         if (!cancelled) setError(err instanceof Error ? err.message : String(err));

@@ -21,7 +21,7 @@ export async function GET(_request: Request, { params }: { params: Promise<{ id:
     const { id } = await params;
     const job = await loadJob(id);
     if (!job) return NextResponse.json({ error: 'Job not found' }, { status: 404 });
-    const driverAppPollSeconds = (await loadCurrentLocationSettings()).driverAppPollSeconds;
+    const driverJobPollSeconds = (await loadCurrentLocationSettings()).driverJobPollSeconds;
     const events = await readDriverJobLog(job);
     const clearedRows = await query<{ log_cleared_at: string | null }>(
       `SELECT to_char(log_cleared_at, 'YYYY-MM-DD HH24:MI:SS') AS log_cleared_at FROM tbl_driver_jobs WHERE id = $1`,
@@ -29,7 +29,7 @@ export async function GET(_request: Request, { params }: { params: Promise<{ id:
     );
     const clearedAt = clearedRows[0]?.log_cleared_at?.trim() || '';
     const diversions = (await listJobDiversions(job.id)).filter((row) => !clearedAt || row.started_at >= clearedAt);
-    return NextResponse.json({ events, diversions, driverAppPollSeconds });
+    return NextResponse.json({ events, diversions, driverJobPollSeconds });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return NextResponse.json({ error: message }, { status: 500 });

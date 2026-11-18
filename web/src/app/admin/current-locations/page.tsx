@@ -54,9 +54,11 @@ type LogRow = {
 
 type Settings = {
   pollIntervalSeconds: number;
+  deviceListIntervalSeconds: number;
   flushOlderThanHours: number;
   flushEveryMinutes: number;
   driverAppPollSeconds: number;
+  driverJobPollSeconds: number;
   confirmAwayMeters: number;
 };
 
@@ -119,9 +121,15 @@ type CallBudget = {
   used: number;
   forecast: number;
   fullDayAtInterval: number;
-  pollIntervalSeconds: number;
+  locationIntervalSeconds: number;
+  deviceListIntervalSeconds: number;
   pollRunning: boolean;
-  callsPerPoll: number;
+  fullDay: {
+    locationCalls: number;
+    deviceListCalls: number;
+    tokenCalls: number;
+    calls: number;
+  };
   windowStartedAt: string | null;
   resetsAt: string | null;
   resetsAtMs: number | null;
@@ -136,9 +144,14 @@ type Status = {
   token?: TokenInfo;
   calls?: CallBudget;
   nextPollAtMs?: number | null;
+  nextDeviceListAtMs?: number | null;
+  deviceCount?: number | null;
   serverNowMs?: number;
   receivedAt?: number;
   lastPolltime: string | null;
+  lastDeviceListAt?: string | null;
+  lastDeviceListCount?: number | null;
+  lastDeviceListError?: string | null;
   lastSummary: string | null;
   lastError: string | null;
   lastFlushAt?: string | null;
@@ -161,6 +174,32 @@ function estimatedServerNow(status: Status | null): number {
 function pollCountdown(status: Status | null): number | null {
   if (!status?.running || status.nextPollAtMs == null) return null;
   return Math.max(0, Math.ceil((status.nextPollAtMs - estimatedServerNow(status)) / 1000));
+}
+
+function deviceListCountdown(status: Status | null): number | null {
+  if (!status?.running || status.nextDeviceListAtMs == null) return null;
+  return Math.max(0, Math.ceil((status.nextDeviceListAtMs - estimatedServerNow(status)) / 1000));
+}
+
+const DRIVER_PHONES = 50;
+
+function driverReadLine(locationSecondsRaw: string, jobMinutesRaw: string): string | null {
+  const locationSeconds = Number(locationSecondsRaw);
+  const jobSeconds = Number(jobMinutesRaw) * 60;
+  if (!(locationSeconds > 0) || !(jobSeconds > 0)) return null;
+  const day = 24 * 60 * 60;
+  const locationReads = Math.floor(day / locationSeconds) * DRIVER_PHONES;
+  const jobReads = Math.floor(day / jobSeconds) * DRIVER_PHONES;
+  return `${DRIVER_PHONES} phones: ${locationReads.toLocaleString()} location reads + ${jobReads.toLocaleString()} job reads = ${(locationReads + jobReads).toLocaleString()} database reads a day.`;
+}
+
+function everyLabel(seconds: number): string {
+  if (seconds % 3600 === 0) {
+    const hours = seconds / 3600;
+    return hours === 1 ? '1 hour' : `${hours} hours`;
+  }
+  if (seconds % 60 === 0) return `${seconds / 60} minutes`;
+  return `${seconds} seconds`;
 }
 
 function tokenCountdown(status: Status | null): number | null {
@@ -192,15 +231,14 @@ function quotaShare(count: number, limit: number, overLimit: boolean): string {
   return share;
 }
 
-function pollDayLine(rawSeconds: string): { text: string; overLimit: boolean } | null {
-  const seconds = Number(rawSeconds);
-  const cost = tracksolidDayCallCost(seconds);
+function pollDayLine(rawLocationSeconds: string, rawDeviceMinutes: string, deviceCount: number): { text: string; overLimit: boolean } | null {
+  const locationSeconds = Number(rawLocationSeconds);
+  const deviceSeconds = Number(rawDeviceMinutes) * 60;
+  const cost = tracksolidDayCallCost(locationSeconds, deviceSeconds, deviceCount);
   if (!cost) return null;
-  const polls = cost.polls.toLocaleString();
-  const calls = cost.calls.toLocaleString();
   const limit = cost.limit.toLocaleString();
   const share = quotaShare(cost.calls, cost.limit, cost.overLimit);
-  const rule = `${polls} polls a day · ${calls} TrackSolid calls · ${share} of the ${limit} daily limit (${cost.callsPerPoll} per poll, plus ${cost.tokenCalls} token calls). This interval ${cost.overLimit ? 'goes past it' : 'stays inside it'}.`;
+  const rule = `${cost.locationCalls.toLocaleString()} location calls + ${cost.deviceListCalls.toLocaleString()} device-list calls + ${cost.tokenCalls} token calls = ${cost.calls.toLocaleString()} a day, ${share} of the ${limit} daily limit. This pair ${cost.overLimit ? 'goes past the limit' : 'stays inside the limit'}.`;
   return { text: rule, overLimit: cost.overLimit };
 }
 
@@ -246,7 +284,9 @@ export default function CurrentLocationsAdminPage() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [pollSeconds, setPollSeconds] = useState('30');
+  const [deviceMinutes, setDeviceMinutes] = useState('10');
   const [driverPollSeconds, setDriverPollSeconds] = useState('30');
+  const [driverJobMinutes, setDriverJobMinutes] = useState('10');
   const [confirmAwayMeters, setConfirmAwayMeters] = useState('100');
   const [flushHours, setFlushHours] = useState('72');
   const [flushEvery, setFlushEvery] = useState('60');
@@ -293,7 +333,9 @@ export default function CurrentLocationsAdminPage() {
   useEffect(() => {
     if (dirty || !status?.settings) return;
     setPollSeconds(String(status.settings.pollIntervalSeconds));
+    setDeviceMinutes(String(Math.round((status.settings.deviceListIntervalSeconds ?? 600) / 60)));
     setDriverPollSeconds(String(status.settings.driverAppPollSeconds ?? 30));
+    setDriverJobMinutes(String(Math.round((status.settings.driverJobPollSeconds ?? 600) / 60)));
     setConfirmAwayMeters(String(status.settings.confirmAwayMeters ?? 100));
     setFlushHours(String(status.settings.flushOlderThanHours));
     setFlushEvery(String(status.settings.flushEveryMinutes));
@@ -308,14 +350,16 @@ export default function CurrentLocationsAdminPage() {
   function settingsBody() {
     return {
       pollIntervalSeconds: Number(pollSeconds),
+      deviceListIntervalSeconds: Number(deviceMinutes) * 60,
       driverAppPollSeconds: Number(driverPollSeconds),
+      driverJobPollSeconds: Number(driverJobMinutes) * 60,
       confirmAwayMeters: Number(confirmAwayMeters),
       flushOlderThanHours: Number(flushHours),
       flushEveryMinutes: Number(flushEvery),
     };
   }
 
-  async function act(action: 'start' | 'stop' | 'once' | 'settings' | 'empty') {
+  async function act(action: 'start' | 'stop' | 'once' | 'refresh-devices' | 'settings' | 'empty') {
     setBusy(true);
     setError(null);
     try {
@@ -383,13 +427,13 @@ export default function CurrentLocationsAdminPage() {
     setLocationSortDir('asc');
   }
 
-  const pollDay = pollDayLine(pollSeconds);
+  const pollDay = pollDayLine(pollSeconds, deviceMinutes, status?.deviceCount ?? 0);
 
   return (
     <div className="w-full min-w-0 p-6">
       <h1 className="text-2xl font-semibold text-zinc-900 dark:text-zinc-100">Service management</h1>
       <p className="mt-1 max-w-3xl text-sm text-zinc-600 dark:text-zinc-400">
-        Services is the list of what runs on this server. Each one says what it is for. Closing the browser leaves a running service going. Stopping the server stops it.
+        Services is the list of what runs on this server. Each one says what it is for. Closing the browser leaves a running service going. When a driver signs in and these services are stopped, the phone waits on a starting screen and starts them. Stop still stops them until the next driver sign-in, or someone starts them here.
       </p>
 
       {error && (
@@ -475,20 +519,44 @@ export default function CurrentLocationsAdminPage() {
       <section id="service-track-solid" className="mt-8 scroll-mt-6">
         <h2 className="text-lg font-semibold text-zinc-900 dark:text-zinc-100">Track Solid locations</h2>
         <p className="mt-1 max-w-3xl text-sm text-zinc-600 dark:text-zinc-400">
-          Polls every truck on the account in one TrackSolid location call. A row is written only when that truck’s GPS time is newer than the one already stored. Save applies the poll seconds straight away while the service is running. A flush removes rows older than the hour limit, and runs on its own minute interval. Location data, the poll summary, and the poll log are under Track Solid API.
+          Locations and the device list run on separate timers. A location call reads every truck in one request and writes a row only when that truck’s GPS time is newer. The device list is names and IMEIs, so it can stay on a slow timer. Refresh devices now when new trucks are added. Save applies both frequencies while the service is running. Location data, the poll summary, and the poll log are under Track Solid API.
         </p>
-      <div className="mt-4 flex flex-wrap items-end gap-3 rounded-lg border border-zinc-200 bg-white p-3 dark:border-zinc-700 dark:bg-zinc-900">
-        <button
-          type="button"
-          disabled={busy || status?.running}
-          onClick={() => void act('start')}
-          className="rounded bg-emerald-600 px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50"
-        >
-          Start
-        </button>
-        <div className="text-sm text-zinc-700 dark:text-zinc-200">
-          <label>
-            Poll every
+      <div className="mt-4 rounded-lg border border-zinc-200 bg-white p-3 dark:border-zinc-700 dark:bg-zinc-900">
+        <div className="flex flex-wrap items-center gap-3">
+          <button
+            type="button"
+            disabled={busy || status?.running}
+            onClick={() => void act('start')}
+            className="rounded bg-emerald-600 px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50"
+          >
+            Start
+          </button>
+          <button
+            type="button"
+            disabled={busy || !status?.running}
+            onClick={() => void act('stop')}
+            className="rounded bg-zinc-700 px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50"
+          >
+            Stop
+          </button>
+          <p className="text-sm font-medium text-zinc-900 dark:text-zinc-100">
+            <span className={status?.running ? 'text-emerald-700 dark:text-emerald-400' : 'text-amber-700 dark:text-amber-400'}>
+              {status?.running ? 'Running' : 'Paused'}
+            </span>
+          </p>
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => setConfirmEmpty(true)}
+            className="ml-auto rounded border border-red-300 px-3 py-1.5 text-sm font-medium text-red-700 hover:bg-red-50 disabled:opacity-50 dark:border-red-800 dark:text-red-300 dark:hover:bg-red-950/40"
+          >
+            Empty table
+          </button>
+        </div>
+
+        <div className="mt-4 flex flex-wrap items-end gap-3 border-t border-zinc-200 pt-4 dark:border-zinc-700">
+          <label className="text-sm text-zinc-700 dark:text-zinc-200">
+            Locations every
             <input
               type="number"
               min={5}
@@ -503,76 +571,148 @@ export default function CurrentLocationsAdminPage() {
             />
             seconds
           </label>
+          <button
+            type="button"
+            onClick={() => {
+              setDirty(true);
+              setPollSeconds('15');
+            }}
+            className="rounded border border-zinc-300 px-2 py-1.5 text-xs dark:border-zinc-600"
+          >
+            15 sec
+          </button>
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => void act('once')}
+            className="rounded border border-zinc-300 px-3 py-1.5 text-sm dark:border-zinc-600"
+          >
+            Poll locations now
+          </button>
+          <p className="pb-1 text-sm text-zinc-600 dark:text-zinc-300">
+            {(() => {
+              void tick;
+              if (!status?.running) return status?.lastPolltime ? `Last location poll ${status.lastPolltime}` : 'Location poll is paused';
+              const left = pollCountdown(status);
+              const last = status.lastPolltime ? `Last ${status.lastPolltime}. ` : '';
+              if (left == null) return `${last}Next location poll time pending`;
+              if (left === 0) return `${last}Polling locations now`;
+              return `${last}${formatDuration(left)} to the next location poll`;
+            })()}
+          </p>
+        </div>
+
+        <div className="mt-4 flex flex-wrap items-end gap-3 border-t border-zinc-200 pt-4 dark:border-zinc-700">
+          <label className="text-sm text-zinc-700 dark:text-zinc-200">
+            Device list every
+            <input
+              type="number"
+              min={1}
+              max={1440}
+              step={1}
+              value={deviceMinutes}
+              onChange={(e) => {
+                setDirty(true);
+                setDeviceMinutes(e.target.value);
+              }}
+              className="mx-2 w-20 rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+            />
+            minutes
+          </label>
+          <button
+            type="button"
+            onClick={() => {
+              setDirty(true);
+              setDeviceMinutes('10');
+            }}
+            className="rounded border border-zinc-300 px-2 py-1.5 text-xs dark:border-zinc-600"
+          >
+            10 min
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setDirty(true);
+              setDeviceMinutes('60');
+            }}
+            className="rounded border border-zinc-300 px-2 py-1.5 text-xs dark:border-zinc-600"
+          >
+            1 hour
+          </button>
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => void act('refresh-devices')}
+            className="rounded border border-zinc-300 px-3 py-1.5 text-sm dark:border-zinc-600"
+          >
+            Refresh devices now
+          </button>
+          <p className="pb-1 text-sm text-zinc-600 dark:text-zinc-300">
+            {(() => {
+              void tick;
+              const count = status?.deviceCount ?? status?.lastDeviceListCount;
+              const counted = count == null ? '' : `${count} truck(s). `;
+              const last = status?.lastDeviceListAt ? `Last device list ${status.lastDeviceListAt}. ` : '';
+              if (!status?.running) return `${last}${counted}`.trim() || 'Device list has not been refreshed in this server process';
+              const left = deviceListCountdown(status);
+              if (left == null) return `${last}${counted}Next device list time pending`;
+              if (left === 0) return `${last}${counted}Refreshing the device list now`;
+              return `${last}${counted}${formatDuration(left)} to the next device list`;
+            })()}
+          </p>
+        </div>
+
+        <div className="mt-4 flex flex-wrap items-end gap-3 border-t border-zinc-200 pt-4 dark:border-zinc-700">
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => void act('settings')}
+            className="rounded bg-zinc-900 px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900"
+          >
+            Save
+          </button>
           {pollDay && (
-            <p className={`mt-1 max-w-xl text-xs ${pollDay.overLimit ? 'font-medium text-amber-700 dark:text-amber-400' : 'text-zinc-500 dark:text-zinc-400'}`}>
+            <p className={`max-w-3xl pb-1 text-sm ${pollDay.overLimit ? 'font-medium text-amber-700 dark:text-amber-400' : 'text-zinc-600 dark:text-zinc-300'}`}>
               {pollDay.text}
             </p>
           )}
         </div>
-        <button
-          type="button"
-          disabled={busy}
-          onClick={() => void act('settings')}
-          className="rounded bg-zinc-900 px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50 dark:bg-zinc-100 dark:text-zinc-900"
-        >
-          Save
-        </button>
-        <button
-          type="button"
-          disabled={busy || !status?.running}
-          onClick={() => void act('stop')}
-          className="rounded bg-zinc-700 px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50"
-        >
-          Stop
-        </button>
-        <button
-          type="button"
-          disabled={busy}
-          onClick={() => void act('once')}
-          className="rounded border border-zinc-300 px-3 py-1.5 text-sm dark:border-zinc-600"
-        >
-          Poll once
-        </button>
-        <div className="pb-1">
-          <p className="text-sm font-medium text-zinc-900 dark:text-zinc-100">
-            <span className={status?.running ? 'text-emerald-700 dark:text-emerald-400' : 'text-amber-700 dark:text-amber-400'}>
-              {status?.running ? 'Running' : 'Paused'}
-            </span>
-            {status?.running && (
-              <span className="font-normal text-zinc-600 dark:text-zinc-300">
-                {' '}
-                · {(() => {
-                  void tick;
-                  const left = pollCountdown(status);
-                  if (left == null) return 'next poll time pending';
-                  if (left === 0) return 'polling now';
-                  return `${left} seconds to the next poll`;
-                })()}
-              </span>
-            )}
-          </p>
-          {status?.lastPolltime && (
-            <p className="text-xs text-zinc-500">Last poll {status.lastPolltime}</p>
-          )}
-        </div>
-        <button
-          type="button"
-          disabled={busy}
-          onClick={() => setConfirmEmpty(true)}
-          className="ml-auto rounded border border-red-300 px-3 py-1.5 text-sm font-medium text-red-700 hover:bg-red-50 disabled:opacity-50 dark:border-red-800 dark:text-red-300 dark:hover:bg-red-950/40"
-        >
-          Empty table
-        </button>
+        {status?.lastDeviceListError && <p className="mt-2 text-sm text-red-700 dark:text-red-300">{status.lastDeviceListError}</p>}
       </div>
 
       <div className="mt-3 flex flex-wrap items-end gap-3 rounded-lg border border-zinc-200 bg-white p-3 dark:border-zinc-700 dark:bg-zinc-900">
         <div className="w-full">
           <p className="text-sm font-medium text-zinc-900 dark:text-zinc-100">Driver app</p>
           <p className="mt-0.5 max-w-3xl text-xs text-zinc-500">
-            The phone reads the latest stored location this often. A parked truck keeps the same GPS time, so that time can be much older than the fetch.
-            An arrival click farther than the metre limit asks the driver to confirm. Leaving the vineyard asks when the truck is still inside that fence.
+            Location is read often. The job list is read on a slow timer. Refresh on the phone asks VWork for new jobs, then reads the queue. The slow timer only reads the queue. These phone reads are database calls, not TrackSolid calls. A parked truck keeps the same GPS time, so that time can be much older than the location check. An arrival click farther than the metre limit asks the driver to confirm.
           </p>
         </div>
+        <label className="text-sm text-zinc-700 dark:text-zinc-200">
+          Check jobs every
+          <input
+            type="number"
+            min={1}
+            max={1440}
+            step={1}
+            value={driverJobMinutes}
+            onChange={(e) => {
+              setDirty(true);
+              setDriverJobMinutes(e.target.value);
+            }}
+            className="mx-2 w-20 rounded border border-zinc-300 bg-white px-2 py-1.5 text-sm dark:border-zinc-600 dark:bg-zinc-800"
+          />
+          minutes
+        </label>
+        <button
+          type="button"
+          onClick={() => {
+            setDirty(true);
+            setDriverJobMinutes('10');
+          }}
+          className="rounded border border-zinc-300 px-2 py-1.5 text-xs dark:border-zinc-600"
+        >
+          10 min
+        </button>
         <label className="text-sm text-zinc-700 dark:text-zinc-200">
           Check location every
           <input
@@ -613,6 +753,9 @@ export default function CurrentLocationsAdminPage() {
         >
           Save
         </button>
+        {driverReadLine(driverPollSeconds, driverJobMinutes) && (
+          <p className="w-full text-xs text-zinc-500">{driverReadLine(driverPollSeconds, driverJobMinutes)}</p>
+        )}
       </div>
 
       <div className="mt-3 flex flex-wrap items-end gap-3 rounded-lg border border-zinc-200 bg-white p-3 dark:border-zinc-700 dark:bg-zinc-900">
@@ -719,7 +862,7 @@ export default function CurrentLocationsAdminPage() {
       <div className="mt-4 rounded-lg border border-zinc-200 bg-white p-4 dark:border-zinc-700 dark:bg-zinc-900">
         <h2 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">API consumption</h2>
         <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-300">
-          The Hong Kong node allows {status.calls.limit.toLocaleString()} calls in each 24-hour window. The window starts at the first call and resets 24 hours later. Each poll is {status.calls.callsPerPoll} calls, and a token call is added about every 2 hours.
+          The Hong Kong node allows {status.calls.limit.toLocaleString()} calls in each 24-hour window. The window starts at the first call and resets 24 hours later. Location calls and device-list calls are counted on their own frequencies, then added, with a token call about every 2 hours.
         </p>
         <div className="mt-4 grid gap-4 sm:grid-cols-2">
           <div>
@@ -753,9 +896,9 @@ export default function CurrentLocationsAdminPage() {
         </p>
         <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-300">
           {status.calls.pollRunning
-            ? `If the poll keeps running every ${status.calls.pollIntervalSeconds} seconds until the window resets, this window finishes at ${status.calls.forecast.toLocaleString()} calls.`
+            ? `If locations keep running every ${status.calls.locationIntervalSeconds} seconds and the device list every ${everyLabel(status.calls.deviceListIntervalSeconds)} until the window resets, this window finishes at ${status.calls.forecast.toLocaleString()} calls.`
             : `The poll is paused, so the forecast stays at the ${status.calls.used.toLocaleString()} calls already made.`}
-          {' '}A full 24 hours at {status.calls.pollIntervalSeconds} seconds is {status.calls.fullDayAtInterval.toLocaleString()} calls, {shareOfLimit(status.calls.fullDayAtInterval, status.calls.limit)} of the limit.
+          {' '}A full 24 hours is {status.calls.fullDay.locationCalls.toLocaleString()} location calls + {status.calls.fullDay.deviceListCalls.toLocaleString()} device-list calls + {status.calls.fullDay.tokenCalls.toLocaleString()} token calls = {status.calls.fullDayAtInterval.toLocaleString()}, {shareOfLimit(status.calls.fullDayAtInterval, status.calls.limit)} of the limit.
         </p>
         {status.calls.byMethod.length > 0 && (
           <ul className="mt-3 space-y-1 text-sm text-zinc-700 dark:text-zinc-200">

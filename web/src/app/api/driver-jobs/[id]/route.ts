@@ -11,6 +11,7 @@ import { readJobLegs } from '@/lib/gate-proximity';
 import { DRIVER_JOB_COLUMNS, type DriverJob } from '@/lib/driver-jobs';
 import { fillGateGpsTimes } from '@/lib/fill-gate-gps';
 import { platesToConfirm } from '@/lib/truck-plates';
+import { loadCurrentLocationSettings } from '@/lib/current-location-poll';
 
 /** GET one driver job for the phone job page. */
 export async function GET(_request: Request, { params }: { params: Promise<{ id: string }> }) {
@@ -30,7 +31,8 @@ export async function GET(_request: Request, { params }: { params: Promise<{ id:
     if (!row) return NextResponse.json({ error: 'Job not found' }, { status: 404 });
     const plates = row.step_0_click?.trim() ? null : await platesToConfirm(row);
     const legs = await readJobLegs(row);
-    return NextResponse.json({ row, plates, legs });
+    const driverJobPollSeconds = (await loadCurrentLocationSettings()).driverJobPollSeconds;
+    return NextResponse.json({ row, plates, legs, driverJobPollSeconds });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     return NextResponse.json({ error: msg }, { status: 500 });

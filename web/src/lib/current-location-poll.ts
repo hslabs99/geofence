@@ -10,32 +10,41 @@ import {
   tracksolidNodeKey,
   TracksolidApiError,
   type CurrentLocationFix,
+  type DeviceItem,
   type TracksolidTokenStatus,
 } from '@/lib/tracksolid';
 import { tracksolidCallBudget, type TracksolidCallBudget } from '@/lib/tracksolid-call-budget';
+import { TRACKSOLID_IMEIS_PER_LOCATION_CALL } from '@/lib/tracksolid-call-math';
 
 const LOGTYPE = 'current_location_poll';
 const SETTINGS_TYPE = 'CurrentLocationPoll';
 
 export type CurrentLocationSettings = {
+  /** How often jimi.device.location.get runs. */
   pollIntervalSeconds: number;
+  /** How often jimi.user.device.list runs. Names and IMEIs change rarely. */
+  deviceListIntervalSeconds: number;
   flushOlderThanHours: number;
   flushEveryMinutes: number;
   /** How often the driver phone reads the latest stored location. */
   driverAppPollSeconds: number;
+  /** How often the driver phone reads the job list. Refresh on the phone checks immediately. */
+  driverJobPollSeconds: number;
   /** Ask before recording an arrival when the truck is farther than this from the fence. */
   confirmAwayMeters: number;
 };
 
 const DEFAULT_SETTINGS: CurrentLocationSettings = {
   pollIntervalSeconds: 30,
+  deviceListIntervalSeconds: 600,
   flushOlderThanHours: 72,
   flushEveryMinutes: 60,
   driverAppPollSeconds: 30,
+  driverJobPollSeconds: 600,
   confirmAwayMeters: 100,
 };
 /** TrackSolid jimi.device.location.get accepts up to 100 IMEIs per call. The account is ~53, so one call covers every group. */
-const IMEIS_PER_CALL = 100;
+const IMEIS_PER_CALL = TRACKSOLID_IMEIS_PER_LOCATION_CALL;
 
 /** YYYY-MM-DD HH:MM:SS from an API gpsTime, for an order comparison only. The stored value stays the original string. */
 function gpsTimeKey(value: string | null | undefined): string | null {
@@ -71,17 +80,24 @@ type PollState = {
   /** Previous build stored the poll timer here. Cleared on load so two timers cannot run. */
   timer?: ReturnType<typeof setInterval> | null;
   pollTimer: ReturnType<typeof setInterval> | null;
+  deviceListTimer: ReturnType<typeof setInterval> | null;
   flushTimer: ReturnType<typeof setInterval> | null;
   running: boolean;
   inFlight: boolean;
   flushing: boolean;
   settings: CurrentLocationSettings;
+  /** Last successful device list. Location polls reuse this until the next refresh. */
+  deviceCache: DeviceItem[] | null;
   lastPolltime: string | null;
   lastSummary: string | null;
   lastError: string | null;
+  lastDeviceListAt: string | null;
+  lastDeviceListCount: number | null;
+  lastDeviceListError: string | null;
   lastFlushAt: string | null;
   lastFlushDeleted: number | null;
   nextPollAtMs: number | null;
+  nextDeviceListAtMs: number | null;
   /** Bumped when the timer callback changes, so a running poll picks up the countdown. */
   generation: number;
   /** Set when the poll timer is armed or ticks. A stalled timer is restarted from this. */
@@ -95,17 +111,23 @@ function state(): PollState {
   if (!g[globalKey]) {
     g[globalKey] = {
       pollTimer: null,
+      deviceListTimer: null,
       flushTimer: null,
       running: false,
       inFlight: false,
       flushing: false,
       settings: { ...DEFAULT_SETTINGS },
+      deviceCache: null,
       lastPolltime: null,
       lastSummary: null,
       lastError: null,
+      lastDeviceListAt: null,
+      lastDeviceListCount: null,
+      lastDeviceListError: null,
       lastFlushAt: null,
       lastFlushDeleted: null,
       nextPollAtMs: null,
+      nextDeviceListAtMs: null,
       generation: 0,
       heartbeatMs: 0,
     };
@@ -116,18 +138,31 @@ function state(): PollState {
     s.timer = null;
     s.running = false;
   }
-  if (!s.settings || s.settings.pollIntervalSeconds == null || s.settings.driverAppPollSeconds == null || s.settings.confirmAwayMeters == null) {
+  if (
+    !s.settings ||
+    s.settings.pollIntervalSeconds == null ||
+    s.settings.deviceListIntervalSeconds == null ||
+    s.settings.driverAppPollSeconds == null ||
+    s.settings.driverJobPollSeconds == null ||
+    s.settings.confirmAwayMeters == null
+  ) {
     s.settings = { ...DEFAULT_SETTINGS, ...s.settings };
   }
   if (s.pollTimer === undefined) s.pollTimer = null;
+  if (s.deviceListTimer === undefined) s.deviceListTimer = null;
   if (s.flushTimer === undefined) s.flushTimer = null;
   if (s.flushing === undefined) s.flushing = false;
+  if (s.deviceCache === undefined) s.deviceCache = null;
   if (s.nextPollAtMs === undefined) s.nextPollAtMs = null;
+  if (s.nextDeviceListAtMs === undefined) s.nextDeviceListAtMs = null;
+  if (s.lastDeviceListAt === undefined) s.lastDeviceListAt = null;
+  if (s.lastDeviceListCount === undefined) s.lastDeviceListCount = null;
+  if (s.lastDeviceListError === undefined) s.lastDeviceListError = null;
   if (s.heartbeatMs == null) s.heartbeatMs = 0;
   if (s.running && s.pollTimer) {
     const intervalMs = Math.max(5, s.settings.pollIntervalSeconds) * 1000;
     const stalled = s.heartbeatMs === 0 || Date.now() - s.heartbeatMs > intervalMs + 15_000;
-    if (stalled) armTimers(s);
+    if (stalled || !s.deviceListTimer) armTimers(s);
     else if (s.nextPollAtMs == null) markNextPoll(s);
   }
   return s;
@@ -135,6 +170,10 @@ function state(): PollState {
 
 function markNextPoll(s: PollState): void {
   s.nextPollAtMs = Date.now() + s.settings.pollIntervalSeconds * 1000;
+}
+
+function markNextDeviceList(s: PollState): void {
+  s.nextDeviceListAtMs = Date.now() + s.settings.deviceListIntervalSeconds * 1000;
 }
 
 function clampInt(value: unknown, min: number, max: number, fallback: number): number {
@@ -146,9 +185,11 @@ function clampInt(value: unknown, min: number, max: number, fallback: number): n
 function normalizeSettings(input?: Partial<CurrentLocationSettings> | null): CurrentLocationSettings {
   return {
     pollIntervalSeconds: clampInt(input?.pollIntervalSeconds, 5, 3600, DEFAULT_SETTINGS.pollIntervalSeconds),
+    deviceListIntervalSeconds: clampInt(input?.deviceListIntervalSeconds, 60, 86400, DEFAULT_SETTINGS.deviceListIntervalSeconds),
     flushOlderThanHours: clampInt(input?.flushOlderThanHours, 1, 8760, DEFAULT_SETTINGS.flushOlderThanHours),
     flushEveryMinutes: clampInt(input?.flushEveryMinutes, 1, 1440, DEFAULT_SETTINGS.flushEveryMinutes),
     driverAppPollSeconds: clampInt(input?.driverAppPollSeconds, 5, 3600, DEFAULT_SETTINGS.driverAppPollSeconds),
+    driverJobPollSeconds: clampInt(input?.driverJobPollSeconds, 60, 86400, DEFAULT_SETTINGS.driverJobPollSeconds),
     confirmAwayMeters: clampInt(input?.confirmAwayMeters, 1, 100000, DEFAULT_SETTINGS.confirmAwayMeters),
   };
 }
@@ -158,15 +199,17 @@ async function readSettings(): Promise<CurrentLocationSettings> {
     `SELECT settingname, settingvalue
      FROM tbl_settings
      WHERE type = $1
-       AND settingname IN ('pollIntervalSeconds', 'pollIntervalMinutes', 'flushOlderThanHours', 'flushEveryMinutes', 'driverAppPollSeconds', 'confirmAwayMeters')`,
+       AND settingname IN ('pollIntervalSeconds', 'pollIntervalMinutes', 'deviceListIntervalSeconds', 'flushOlderThanHours', 'flushEveryMinutes', 'driverAppPollSeconds', 'driverJobPollSeconds', 'confirmAwayMeters')`,
     [SETTINGS_TYPE],
   );
   const found: Partial<CurrentLocationSettings> = {};
   for (const row of rows) {
     if (row.settingname === 'pollIntervalSeconds') found.pollIntervalSeconds = Number(row.settingvalue);
+    if (row.settingname === 'deviceListIntervalSeconds') found.deviceListIntervalSeconds = Number(row.settingvalue);
     if (row.settingname === 'flushOlderThanHours') found.flushOlderThanHours = Number(row.settingvalue);
     if (row.settingname === 'flushEveryMinutes') found.flushEveryMinutes = Number(row.settingvalue);
     if (row.settingname === 'driverAppPollSeconds') found.driverAppPollSeconds = Number(row.settingvalue);
+    if (row.settingname === 'driverJobPollSeconds') found.driverJobPollSeconds = Number(row.settingvalue);
     if (row.settingname === 'confirmAwayMeters') found.confirmAwayMeters = Number(row.settingvalue);
   }
   return normalizeSettings({ ...DEFAULT_SETTINGS, ...found });
@@ -205,10 +248,26 @@ function clearTimers(s: PollState): void {
     clearInterval(s.pollTimer);
     s.pollTimer = null;
   }
+  if (s.deviceListTimer) {
+    clearInterval(s.deviceListTimer);
+    s.deviceListTimer = null;
+  }
   if (s.flushTimer) {
     clearInterval(s.flushTimer);
     s.flushTimer = null;
   }
+}
+
+function armDeviceListTimer(s: PollState): void {
+  if (s.deviceListTimer) {
+    clearInterval(s.deviceListTimer);
+    s.deviceListTimer = null;
+  }
+  markNextDeviceList(s);
+  s.deviceListTimer = setInterval(() => {
+    markNextDeviceList(s);
+    void refreshDeviceListOnce();
+  }, s.settings.deviceListIntervalSeconds * 1000);
 }
 
 function armTimers(s: PollState): void {
@@ -220,6 +279,7 @@ function armTimers(s: PollState): void {
     markNextPoll(s);
     void pollCurrentLocationsOnce();
   }, s.settings.pollIntervalSeconds * 1000);
+  armDeviceListTimer(s);
   s.flushTimer = setInterval(() => {
     void flushOldCurrentLocations();
   }, s.settings.flushEveryMinutes * 60 * 1000);
@@ -387,7 +447,55 @@ async function stampFetchedTime(truckIds: string[], polltime: string): Promise<v
   );
 }
 
-/** One poll: every truck on the account, one jimi.device.location.get call, then one inserted row per truck. */
+/** One jimi.user.device.list call. Location polls reuse the result until the next refresh. */
+let deviceListFlight: Promise<{ count: number; summary: string }> | null = null;
+
+export function refreshDeviceListOnce(): Promise<{ count: number; summary: string }> {
+  if (deviceListFlight) return deviceListFlight;
+  deviceListFlight = refreshDeviceListInner().finally(() => {
+    deviceListFlight = null;
+  });
+  return deviceListFlight;
+}
+
+/** Immediate device-list call. When the service is running, the next automatic refresh waits a full interval. */
+export async function refreshDeviceListNow(): Promise<{ count: number; summary: string }> {
+  const result = await refreshDeviceListOnce();
+  const s = state();
+  if (s.running) armDeviceListTimer(s);
+  return result;
+}
+
+async function refreshDeviceListInner(): Promise<{ count: number; summary: string }> {
+  const s = state();
+  const at = pollClock();
+  try {
+    const endpoint = tracksolidEndpoint();
+    const token = { value: (await getAccessToken(endpoint)).token, refreshed: false };
+    const listed = await withToken(endpoint, token, (accessToken) => listDevices(accessToken, endpoint));
+    const devices = listed.devices.filter((d) => d.imei.trim() !== '');
+    s.deviceCache = devices;
+    s.lastDeviceListAt = at;
+    s.lastDeviceListCount = devices.length;
+    s.lastDeviceListError = null;
+    const summary = `Device list: ${devices.length} truck(s)`;
+    await writeLog('devices', {
+      at,
+      endpoint,
+      method: 'jimi.user.device.list',
+      deviceCount: devices.length,
+      summary,
+    });
+    return { count: devices.length, summary };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    s.lastDeviceListError = message;
+    await writeLog('devices-error', { at, error: message, method: 'jimi.user.device.list' });
+    return { count: s.deviceCache?.length ?? 0, summary: message };
+  }
+}
+
+/** One poll: cached trucks, one jimi.device.location.get call, then one inserted row per truck whose GPS time moved. */
 export async function pollCurrentLocationsOnce(): Promise<{ inserted: number; summary: string }> {
   const s = state();
   if (s.inFlight) {
@@ -399,9 +507,17 @@ export async function pollCurrentLocationsOnce(): Promise<{ inserted: number; su
   try {
     await ensureCurrentLocationsSchema();
     const endpoint = tracksolidEndpoint();
-    const token = { value: (await getAccessToken(endpoint)).token, refreshed: false };
-    const listed = await withToken(endpoint, token, (accessToken) => listDevices(accessToken, endpoint));
-    const devices = listed.devices.filter((d) => d.imei.trim() !== '');
+    let devices = s.deviceCache;
+    if (!devices) {
+      const refreshed = await refreshDeviceListOnce();
+      devices = state().deviceCache;
+      if (!devices) {
+        s.lastSummary = null;
+        s.lastError = refreshed.summary;
+        await writeLog('error', { polltime, error: refreshed.summary, method: 'jimi.user.device.list' });
+        return { inserted: 0, summary: refreshed.summary };
+      }
+    }
     const groupsFound = [
       ...new Set(devices.map((d) => (d.deviceGroup ?? '').trim()).filter((g) => g !== '')),
     ];
@@ -414,6 +530,7 @@ export async function pollCurrentLocationsOnce(): Promise<{ inserted: number; su
       return { inserted: 0, summary };
     }
 
+    const token = { value: (await getAccessToken(endpoint)).token, refreshed: false };
     const imeis = devices.map((d) => d.imei);
     const nameByImei = new Map(devices.map((d) => [d.imei, (d.deviceName ?? '').trim() || d.imei]));
     const groupByImei = new Map(devices.map((d) => [d.imei, (d.deviceGroup ?? '').trim() || null]));
@@ -565,7 +682,9 @@ export async function startCurrentLocationPoll(
   if (s.running && s.pollTimer) return { running: true, settings: s.settings };
   s.running = true;
   armTimers(s);
-  void pollCurrentLocationsOnce();
+  void refreshDeviceListOnce().then(() => {
+    if (state().deviceCache) void pollCurrentLocationsOnce();
+  });
   void flushOldCurrentLocations();
   return { running: true, settings: s.settings };
 }
@@ -575,6 +694,7 @@ export function stopCurrentLocationPoll(): { running: boolean; settings: Current
   clearTimers(s);
   s.running = false;
   s.nextPollAtMs = null;
+  s.nextDeviceListAtMs = null;
   return { running: false, settings: s.settings };
 }
 
@@ -617,9 +737,14 @@ export function currentLocationPollStatus(): {
   lastPolltime: string | null;
   lastSummary: string | null;
   lastError: string | null;
+  lastDeviceListAt: string | null;
+  lastDeviceListCount: number | null;
+  lastDeviceListError: string | null;
   lastFlushAt: string | null;
   lastFlushDeleted: number | null;
   nextPollAtMs: number | null;
+  nextDeviceListAtMs: number | null;
+  deviceCount: number | null;
   serverNowMs: number;
 } {
   const s = state();
@@ -631,9 +756,14 @@ export function currentLocationPollStatus(): {
     lastPolltime: s.lastPolltime,
     lastSummary: s.lastSummary,
     lastError: s.lastError,
+    lastDeviceListAt: s.lastDeviceListAt,
+    lastDeviceListCount: s.lastDeviceListCount,
+    lastDeviceListError: s.lastDeviceListError,
     lastFlushAt: s.lastFlushAt,
     lastFlushDeleted: s.lastFlushDeleted,
     nextPollAtMs: running ? s.nextPollAtMs : null,
+    nextDeviceListAtMs: running ? s.nextDeviceListAtMs : null,
+    deviceCount: s.deviceCache?.length ?? s.lastDeviceListCount,
     serverNowMs: Date.now(),
   };
 }
@@ -648,7 +778,9 @@ export async function currentLocationCallBudget(): Promise<TracksolidCallBudget>
   const s = state();
   return tracksolidCallBudget({
     endpointKey: tracksolidNodeKey(endpoint),
-    pollIntervalSeconds: s.settings.pollIntervalSeconds,
+    locationIntervalSeconds: s.settings.pollIntervalSeconds,
+    deviceListIntervalSeconds: s.settings.deviceListIntervalSeconds,
+    deviceCount: s.deviceCache?.length ?? s.lastDeviceListCount ?? 0,
     pollRunning: s.running && s.pollTimer != null,
     tokenExpiresAtMs: token.expiresAtMs,
   });
